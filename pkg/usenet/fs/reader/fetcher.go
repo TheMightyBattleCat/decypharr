@@ -239,21 +239,6 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 		}
 
-		// DIAGNOSTIC: compare what StreamBody decoded against the declared
-		// segment size, to tell whether a short segment is a decode truncation
-		// or a genuinely-short article on the server.
-		if bw, ok := writer.(*bufferStreamWriter); ok {
-			declared := sf.cache.segments[segIdx].Bytes
-			// TEMP: log EVERY segment (not just mismatches) to see whether the
-			// decoded-vs-declared gap is universal (yEnc overhead) or only on
-			// segments whose decoded size exceeds 1 MiB.
-			sf.cache.logger.Warn().
-				Int("segment", segIdx).
-				Int64("written", bw.written).
-				Int64("declared_bytes", declared).
-				Int64("gap", declared-bw.written).
-				Msg("DIAG: every-segment size")
-		}
 
 		return nil
 	})

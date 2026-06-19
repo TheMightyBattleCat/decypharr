@@ -315,32 +315,6 @@ func (sc *SegmentCache) ReadRangeInto(segIdx int, segOffset, length int64, dst [
 
 	size := sc.SegmentDataSize(segIdx)
 	if segOffset > size {
-		// The requested offset is past the actual decoded size of this
-		// segment. This happens when a segment's decoded payload is smaller
-		// than the size declared in the NZB (segments[idx].Bytes): the file
-		// offset table is built from declared sizes, but the real committed
-		// data is shorter. If the offset still falls within the DECLARED
-		// extent of the segment, treat the missing tail as zero-filled so
-		// playback survives the small gap instead of failing forever. Only
-		// the genuinely-out-of-range case (beyond declared size too) is a
-		// real error.
-		declared := sc.segments[segIdx].Bytes
-		if declared > size && segOffset < declared {
-			zeroLen := length
-			if segOffset+zeroLen > declared {
-				zeroLen = declared - segOffset
-			}
-			if zeroLen <= 0 {
-				sc.stats.CacheHits.Add(1)
-				return 0, true
-			}
-			for i := int64(0); i < zeroLen; i++ {
-				dst[i] = 0
-			}
-			sc.logger.Debug().Int("segment", segIdx).Int64("seg_offset", segOffset).Int64("actual_size", size).Int64("declared", declared).Int64("zero_filled", zeroLen).Msg("segment decoded shorter than declared; zero-filling tail gap")
-			sc.stats.CacheHits.Add(1)
-			return int(zeroLen), true
-		}
 		sc.stats.CacheMisses.Add(1)
 		return 0, false
 	}
