@@ -145,6 +145,7 @@ class RepairManager {
             arr: $('recheckArr').value,
             media_id: mediaId,
             fix: $('recheckFix').checked,
+            deep_verify: $('recheckDeepVerify')?.checked || false,
         };
         const btn = $('recheckMediaBtn');
         const out = $('recheckMediaResult');

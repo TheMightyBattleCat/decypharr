@@ -133,6 +133,9 @@ class ConfigManager {
         if ($('repair.stop_action')) $('repair.stop_action').value = repair.stop_action || '';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
+        if ($('repair.deep_verify_sweep')) $('repair.deep_verify_sweep').checked = !!repair.deep_verify_sweep;
+        if ($('repair.repair_on_playback_failure')) $('repair.repair_on_playback_failure').checked = !!repair.repair_on_playback_failure;
+        if ($('repair.repair_on_playback_scope')) $('repair.repair_on_playback_scope').value = repair.repair_on_playback_scope || 'entry';
     }
 
     collectRepairConfig() {
@@ -153,6 +156,9 @@ class ConfigManager {
             stop_action: $('repair.stop_action')?.value || '',
             auto_repair: $('repair.auto_repair')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
+            deep_verify_sweep: $('repair.deep_verify_sweep')?.checked || false,
+            repair_on_playback_failure: $('repair.repair_on_playback_failure')?.checked || false,
+            repair_on_playback_scope: $('repair.repair_on_playback_scope')?.value || 'entry',
             arrs,
         };
     }
@@ -1263,6 +1269,7 @@ class ConfigManager {
             processing_timeout: document.querySelector('[name="usenet.processing_timeout"]')?.value || "5m",
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,
             import_availability_sample_percent: parseInt(document.querySelector('[name="usenet.import_availability_sample_percent"]')?.value) || 1,
+            deep_verify_sample_percent: parseInt(document.querySelector('[name="usenet.deep_verify_sample_percent"]')?.value) || 0,
             disk_buffer_path: document.querySelector('[name="usenet.disk_buffer_path"]')?.value || "",
             buffer_memory: document.querySelector('[name="usenet.buffer_memory"]')?.value || ""
         };
@@ -1692,6 +1699,7 @@ class ConfigManager {
             'processing_timeout': usenet.processing_timeout,
             'availability_sample_percent': usenet.availability_sample_percent,
             'import_availability_sample_percent': usenet.import_availability_sample_percent,
+            'deep_verify_sample_percent': usenet.deep_verify_sample_percent,
             'disk_buffer_path': usenet.disk_buffer_path,
             'buffer_memory': usenet.buffer_memory
         };

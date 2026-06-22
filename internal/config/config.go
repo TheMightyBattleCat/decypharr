@@ -147,12 +147,47 @@ type RepairConfig struct {
 	// AutoRepair as-is; RepairStopActionRepair/RepairStopActionNoRepair force
 	// repair on/off for that stop only.
 	StopAction RepairStopAction `json:"stop_action,omitempty"`
+
+	// RepairOnPlaybackFailure, when true, escalates a streaming read that
+	// fails with a permanent NNTP article-not-found (430) into a background
+	// single-entry recheck (delete + re-search, same path as a sweep). This
+	// closes the detection gap where a file has a small live prefix (header
+	// segments) but a dead body: the availability sampler can pass it and the
+	// Arrs see a complete-looking file on disk, yet every playback read past
+	// the live prefix 430s. Such a file is never flagged broken by a normal
+	// sweep until its recheck interval lapses. With this enabled, the first
+	// failed playback triggers a confirming re-probe and self-heal. The
+	// recheck re-validates server-side, so a transient 430 will not cause a
+	// wrongful delete. Requires Enabled and AutoRepair to also be set.
+	RepairOnPlaybackFailure bool `json:"repair_on_playback_failure,omitempty"`
+
+	// RepairOnPlaybackScope controls how far a playback-failure repair reaches.
+	//   "entry"  (default): repair only the file that failed to play. Fastest —
+	//            the played title becomes watchable as soon as its replacement
+	//            lands, with no extra work.
+	//   "series": repair the failed file FIRST (so it's available soonest),
+	//            then kick off a background series-wide deep recheck + repair of
+	//            every other entry belonging to the same series/movie. Catches a
+	//            whole rotted season from a single play, at the cost of a larger
+	//            background pass. Honors RepairOnPlaybackFailure (must be on).
+	// Empty is treated as "entry".
+	RepairOnPlaybackScope string `json:"repair_on_playback_scope,omitempty"`
+
+	// DeepVerifySweep, when true, lets the scheduled repair sweep run the
+	// deep-verify BODY check (see Usenet.DeepVerifySamplePercent) in addition
+	// to the STAT availability sample. Off by default: deep verify transfers
+	// real segment data, so a full library sweep with it on can download a
+	// significant fraction of the library. Manual rechecks can request deep
+	// verify per-call regardless of this toggle. Has no effect unless
+	// Usenet.DeepVerifySamplePercent > 0.
+	DeepVerifySweep bool `json:"deep_verify_sweep,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.StopAction == ""
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.StopAction == "" &&
+		!r.RepairOnPlaybackFailure && !r.DeepVerifySweep && r.RepairOnPlaybackScope == ""
 }
 
 type Config struct {

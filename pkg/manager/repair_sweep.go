@@ -394,6 +394,7 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	file := item.Files[name]
 	res := fileResult{name: name}
 
+
 	if file == nil || file.InfoHash == "" {
 		res.reason = "missing_infohash"
 		return res
@@ -412,17 +413,34 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	}
 
 	if entry.IsNZB() {
-		return r.probeNZBFile(ctx, entry, name, res)
+		return r.probeNZBFile(ctx, entry, name, res, opts)
 	}
 	return r.probeTorrentFile(ctx, entry, file, name, res, opts)
 }
 
-func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult) fileResult {
+// resolveDeepVerifyPercent decides the deep-verify BODY-sample percent for a
+// probe. A per-run override (opts.DeepVerifyPercent) always wins. Otherwise the
+// scheduled sweep deep-verifies only when Repair.DeepVerifySweep is on, using
+// Usenet.DeepVerifySamplePercent; all other runs (e.g. manual rechecks without
+// an explicit override) default to STAT-only (0).
+func (r *Repair) resolveDeepVerifyPercent(opts RepairRunOptions) int {
+	if opts.DeepVerifyPercent != nil {
+		return *opts.DeepVerifyPercent
+	}
+	cfg := config.Get()
+	if cfg.Repair.DeepVerifySweep {
+		return cfg.Usenet.DeepVerifySamplePercent
+	}
+	return 0
+}
+
+func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult, opts RepairRunOptions) fileResult {
 	if r.manager.usenet == nil {
 		res.reason = "usenet_client_not_configured"
 		return res
 	}
-	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
+	deepPercent := r.resolveDeepVerifyPercent(opts)
+	err := r.manager.usenet.CheckFileWithDeepVerify(ctx, entry.InfoHash, name, deepPercent)
 	if err == nil {
 		res.healthy = true
 		return res
@@ -1334,11 +1352,54 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 	})
 }
 
+// RepairPlaybackFailure handles a repair triggered by a failed playback read.
+// It always repairs the played entry first so that title becomes available as
+// soon as a replacement lands. When scope is "series", it then runs a
+// background deep recheck + repair of the rest of the same series/movie, kicked
+// off only after the played entry's own repair pass completes. deepVerifyPercent
+// is applied to every recheck so breakage is confirmed via BODY, not STAT.
+func (r *Repair) RepairPlaybackFailure(ctx context.Context, entryName string, deepVerifyPercent *int, seriesScope bool) (*storage.EntryHealth, error) {
+	var onComplete func(final *storage.EntryHealth)
+	if seriesScope {
+		onComplete = func(final *storage.EntryHealth) {
+			// Detach from the (bounded) escalation context so the series pass
+			// isn't cut short when the trigger's context expires.
+			seriesCtx := r.parentCtx
+			r.RecheckSeriesForEntry(seriesCtx, entryName, true, deepVerifyPercent)
+		}
+	}
+	// Force NZB protocol scope: the read that triggered this was an NZB
+	// article-not-found, so we must probe it as NZB even when the global
+	// SkipNZBRepair / torrent-only scope would otherwise skip NZB files (which
+	// would make the probe roll up to "unknown" and repair nothing).
+	return r.recheckEntryWithCallback(ctx, entryName, true, deepVerifyPercent, string(config.ProtocolNZB), onComplete)
+}
+
 // RecheckEntry kicks off a recheck for a single entry and returns
 // immediately with an in-progress EntryHealth ack. The actual probe and
 // optional fix run in the background. With fix=true, broken Arr-known files
 // trigger delete + re-search after probing.
 func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (*storage.EntryHealth, error) {
+	return r.RecheckEntryWithOptions(ctx, entryName, fix, nil)
+}
+
+// RecheckEntryWithOptions is RecheckEntry with an optional deep-verify percent
+// override. deepVerifyPercent nil = configured behavior; non-nil forces deep
+// verify at the given percent for this recheck. The playback-failure
+// escalation passes a non-nil percent so the confirming re-probe BODY-checks
+// the segment that just failed, rather than trusting STAT (which can report a
+// purged-body article as present).
+func (r *Repair) RecheckEntryWithOptions(ctx context.Context, entryName string, fix bool, deepVerifyPercent *int) (*storage.EntryHealth, error) {
+	return r.recheckEntryWithCallback(ctx, entryName, fix, deepVerifyPercent, "", nil)
+}
+
+// recheckEntryWithCallback is RecheckEntryWithOptions with an optional callback
+// invoked (in the background goroutine) once the entry's probe + repair pass has
+// finished. The callback receives the final health status. It lets a caller
+// sequence follow-up work after the entry is handled — e.g. series-scope
+// playback repair runs the rest of the series only after the played file itself
+// is repaired and therefore available first.
+func (r *Repair) recheckEntryWithCallback(ctx context.Context, entryName string, fix bool, deepVerifyPercent *int, protocolScope string, onComplete func(final *storage.EntryHealth)) (*storage.EntryHealth, error) {
 	if entryName == "" {
 		return nil, errors.New("entry name is empty")
 	}
@@ -1355,23 +1416,32 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 	runID := "recheck-" + entryName
 	c := &candidate{name: entryName, item: item}
 
-	if ctx == nil {
-		ctx = r.parentCtx
+	// The probe + heal runs in a background goroutine that outlives this call.
+	// It must NOT use the caller's ctx: callers (e.g. the playback-failure
+	// escalation) create a short-lived context and cancel it as soon as this
+	// function returns the "started" ack, which would cancel the probe before
+	// it runs (every file rolls up as context_cancelled -> unknown -> no
+	// repair). Detach to the repair subsystem's lifetime context instead.
+	runCtx := r.parentCtx
+	if runCtx == nil {
+		runCtx = context.Background()
 	}
 	r.runWG.Add(1)
 	go func() {
 		defer r.runWG.Done()
 		if fix {
-			r.attachArrContext(ctx, c)
+			r.attachArrContext(runCtx, c)
 		}
 		heal := newHealCache()
-		final := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{}, fix)
-		if !fix || final.Status != storage.HealthBroken {
-			return
+		final := r.probeEntry(runCtx, runID, c, heal, RepairRunOptions{DeepVerifyPercent: deepVerifyPercent, ProtocolScope: protocolScope}, fix)
+		if fix && final.Status == storage.HealthBroken {
+			pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
+			var statsMu sync.Mutex
+			r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, final)
 		}
-		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
-		var statsMu sync.Mutex
-		r.healBrokenEntry(ctx, pseudo, &statsMu, entryName, final)
+		if onComplete != nil {
+			onComplete(final)
+		}
 	}()
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The
@@ -1391,6 +1461,14 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 // wins. fix runs the same delete + re-search pass a sweep would. Honors the
 // singleton run lock.
 func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix bool) (*storage.RepairRun, error) {
+	return r.RecheckMediaWithOptions(ctx, arrName, mediaID, fix, nil)
+}
+
+// RecheckMediaWithOptions is RecheckMedia with an optional deep-verify percent
+// override for this run. deepVerifyPercent nil = configured behavior (manual
+// rechecks are STAT-only unless DeepVerifySweep is on); non-nil forces deep
+// verify at the given percent for this run (0 disables it for the run).
+func (r *Repair) RecheckMediaWithOptions(ctx context.Context, arrName, mediaID string, fix bool, deepVerifyPercent *int) (*storage.RepairRun, error) {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
 		return nil, errors.New("media_id is required")
@@ -1445,14 +1523,14 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 			r.mu.Unlock()
 			cancel()
 		}()
-		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, fix)
+		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, fix, deepVerifyPercent)
 	}()
 	return run, nil
 }
 
 // executeRecheckMedia is the body of a media recheck. Mirrors executeSweep
 // but scoped to a specific media-id resolved through one or more Arrs.
-func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix bool) {
+func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix bool, deepVerifyPercent *int) {
 	candidates := make(map[string]*candidate)
 	var lastErr error
 	for _, a := range arrs {
@@ -1492,7 +1570,7 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	for name := range candidates {
 		mediaNames = append(mediaNames, name)
 	}
-	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, fix, nil)
+	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{DeepVerifyPercent: deepVerifyPercent}, fix, nil)
 	candidates = nil
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1568,6 +1646,82 @@ func (r *Repair) attachArrContext(ctx context.Context, c *candidate) {
 					c.contentMap[f.TargetPath] = f
 				}
 			}
+		}
+	}
+}
+
+// siblingEntriesForEntry finds every entry name that belongs to the same Arr
+// content (series or movie) as entryName. Used by series-scope playback repair
+// to recheck the rest of a title after the played file is handled. Returns the
+// sibling entry names excluding entryName itself.
+func (r *Repair) siblingEntriesForEntry(ctx context.Context, entryName string) []string {
+	siblings := make(map[string]struct{})
+	for _, a := range r.eligibleArrs(nil) {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		media, err := a.GetMedia(ctx, "")
+		if err != nil {
+			continue
+		}
+		for _, content := range media {
+			grouped := collectArrFiles(content)
+			// Does this content contain the played entry?
+			belongs := false
+			for entryPath := range grouped {
+				if filepath.Clean(filepath.Base(entryPath)) == entryName {
+					belongs = true
+					break
+				}
+			}
+			if !belongs {
+				continue
+			}
+			// Collect all entries under this content.
+			for entryPath := range grouped {
+				name := filepath.Clean(filepath.Base(entryPath))
+				if name != entryName {
+					siblings[name] = struct{}{}
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(siblings))
+	for name := range siblings {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RecheckSeriesForEntry runs a background deep recheck (+ repair when fix) of
+// every OTHER entry belonging to the same series/movie as entryName. The caller
+// is expected to have already repaired entryName itself, so the played title is
+// available first; this heals the rest of the title in the background. Each
+// sibling recheck runs asynchronously (RecheckEntryWithOptions returns
+// immediately and probes in its own goroutine); actual NNTP concurrency is
+// bounded by the repair bank, so this won't stampede connections. Rechecks that
+// collide with an in-progress probe of the same entry are skipped (the call
+// returns an error, logged at debug).
+func (r *Repair) RecheckSeriesForEntry(ctx context.Context, entryName string, fix bool, deepVerifyPercent *int) {
+	siblings := r.siblingEntriesForEntry(ctx, entryName)
+	if len(siblings) == 0 {
+		return
+	}
+	r.logger.Info().
+		Str("entry", entryName).
+		Int("siblings", len(siblings)).
+		Bool("fix", fix).
+		Msg("Playback repair: rechecking rest of series/movie")
+	for _, name := range siblings {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if _, err := r.recheckEntryWithCallback(ctx, name, fix, deepVerifyPercent, string(config.ProtocolNZB), nil); err != nil {
+			r.logger.Debug().
+				Err(err).
+				Str("entry", name).
+				Msg("Playback repair: sibling recheck not started")
 		}
 	}
 }

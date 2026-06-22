@@ -1010,6 +1010,43 @@ func (c *Client) Stat(ctx context.Context, messageID string) (int, string, error
 	return num, id, err
 }
 
+// VerifySegmentBody fetches and discards a segment's article BODY across
+// providers with the same failover the streaming read path uses. Unlike Stat,
+// which only confirms the article's overview/header entry exists (a 223), this
+// asks the provider to actually return the body — the same question playback
+// asks. Some providers answer STAT with 223 for an article whose body has been
+// purged or taken down, then return 430 on BODY; those "head alive, body dead"
+// files pass a STAT-based availability sample at any percent but fail every
+// real read. VerifySegmentBody catches them. It is heavier than Stat (transfers
+// the body), so callers should sample, not verify every segment.
+//
+// Returns nil if the body is fully retrievable. On a missing/purged body it
+// returns an ArticleNotFound error, so callers can use IsArticleNotFoundError
+// to distinguish a genuinely dead segment from a transient connection error.
+func (c *Client) VerifySegmentBody(ctx context.Context, messageID string) error {
+	if c.closed.Load() {
+		return errors.New("nntp client is closed")
+	}
+	return c.ExecuteWithFailover(ctx, func(conn *Connection) error {
+		// Issue a real BODY fetch — the same command the streaming reader uses
+		// — so deep verify hits exactly what playback hits. A HEAD/STAT-style
+		// check is NOT sufficient: STAT-alive/BODY-dead articles return 223 to
+		// STAT and to a header fetch, but 430 to BODY. We must fetch the body
+		// to detect them. The bytes are discarded; we only care that the full
+		// body transfers without an article-not-found / transfer error.
+		_, err := conn.GetBody(messageID)
+		return err
+	})
+}
+
+// RepairBankCapacity returns the number of concurrent workers the repair bank
+// allows, so callers (e.g. deep-verify BODY sampling) can bound their own
+// concurrency to avoid starving streaming connections. Returns 0 when no
+// repair pool is configured.
+func (c *Client) RepairBankCapacity() int {
+	return c.repairPool.Capacity()
+}
+
 type batchStatState struct {
 	sawNotFound bool
 	sawOtherErr bool

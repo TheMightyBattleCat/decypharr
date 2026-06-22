@@ -41,6 +41,13 @@ type RepairRunOptions struct {
 	AutoRepair        *bool
 	UnrestrictLink    bool
 	ProtocolScope     string
+	// DeepVerifyPercent overrides the deep-verify BODY-sample percent for this
+	// run only. nil = use the configured behavior (sweep: on only when
+	// Repair.DeepVerifySweep is set, using Usenet.DeepVerifySamplePercent;
+	// manual: off). A non-nil value forces deep verify for this run at the
+	// given percent (0 explicitly disables it for the run). Lets a manual
+	// recheck opt into deep verify without changing the sweep's behavior.
+	DeepVerifyPercent *int
 }
 
 type ClearRepairStateResult struct {

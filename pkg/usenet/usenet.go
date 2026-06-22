@@ -22,6 +22,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -506,8 +507,17 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 
 // CheckFile probes the availability of a single NZB file. Connection use is
 // gated by the NNTP client's repair bank so concurrent probes don't starve
-// streaming traffic.
+// streaming traffic. Deep-verify behavior follows configuration: it runs only
+// when Usenet.DeepVerifySamplePercent > 0 (callers that need per-call control
+// use CheckFileWithDeepVerify).
 func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
+	return u.CheckFileWithDeepVerify(ctx, nzoID, filename, -1)
+}
+
+// CheckFileWithDeepVerify is CheckFile with an explicit deep-verify percent.
+// deepVerifyPercent < 0 means "use the configured Usenet.DeepVerifySamplePercent";
+// >= 0 overrides it for this call (0 disables deep verify for this call).
+func (u *Usenet) CheckFileWithDeepVerify(ctx context.Context, nzoID, filename string, deepVerifyPercent int) error {
 	file, err := u.getFile(nzoID, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get file: %w", err)
@@ -518,12 +528,22 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 
 	cfg := config.Get()
 	samplePercent := cfg.Usenet.AvailabilitySamplePercent
-	err = u.CheckFileAvailability(ctx, file, samplePercent)
+	if deepVerifyPercent < 0 {
+		deepVerifyPercent = cfg.Usenet.DeepVerifySamplePercent
+	}
+	err = u.checkFileAvailability(ctx, file, samplePercent, deepVerifyPercent)
 	file.Segments = nil
 	return err
 }
 
+// CheckFileAvailability runs the STAT-based availability sample only (no deep
+// verify). Used by the import-time availability check, which is intentionally
+// light. The repair path uses checkFileAvailability with a deep-verify percent.
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
+	return u.checkFileAvailability(ctx, file, samplePercent, 0)
+}
+
+func (u *Usenet) checkFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent, deepVerifyPercent int) error {
 	// Sample segments based on configured percentage
 	messageIDs := u.sampleSegments(file.Segments, samplePercent)
 
@@ -563,11 +583,100 @@ func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFil
 		return customerror.UsenetSegmentMissingError
 	}
 
+	// STAT says every sampled segment is present. Some providers keep the
+	// overview entry (223 on STAT) alive after the body has been purged or
+	// taken down, returning 430 on BODY. Such "head alive, body dead" files
+	// pass the STAT sample at any percent yet fail every real read. When a
+	// deep-verify percent is in effect, BODY-fetch a sample to catch them.
+	if deepVerifyPercent > 0 {
+		if err := u.deepVerifyFile(ctx, file, deepVerifyPercent); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-// sampleSegments returns a sample of segment message IDs based on the given percentage.
-// Always includes first and last segments, then uniformly samples from the middle.
+// deepVerifyFile BODY-fetches a sample of the file's segments to confirm their
+// bodies are actually retrievable, not merely present per STAT. Any segment
+// that returns article-not-found marks the whole file unavailable. Connection
+// errors are non-fatal (mirrors the STAT path): we only fail on a definitive
+// missing body. Concurrency is bounded to the repair bank so deep verify does
+// not starve streaming connections.
+func (u *Usenet) deepVerifyFile(ctx context.Context, file *storage.NZBFile, percent int) error {
+	messageIDs := u.sampleSegments(file.Segments, percent)
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	limit := u.nntp.RepairBankCapacity()
+	if limit <= 0 {
+		limit = 4 // conservative default when no repair bank is configured
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+
+	var mu sync.Mutex
+	var missing int
+	var connErrors int
+
+	for _, msgID := range messageIDs {
+		msgID := msgID
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
+			}
+			err := u.nntp.VerifySegmentBody(gctx, msgID)
+			if err == nil {
+				return nil
+			}
+			if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
+				mu.Lock()
+				missing++
+				mu.Unlock()
+				// One definitively-missing body is enough to condemn the
+				// file; cancel the rest of the sample.
+				cancel()
+				return nil
+			}
+			// Connection/transient error — not a missing body. Count but
+			// don't condemn (matches the STAT path's treatment).
+			mu.Lock()
+			connErrors++
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	if missing > 0 {
+		u.logger.Warn().
+			Str("file", file.Name).
+			Int("total_segments", len(file.Segments)).
+			Int("deep_verified", len(messageIDs)).
+			Int("missing_bodies", missing).
+			Int("conn_errors", connErrors).
+			Msg("File is unavailable - segment body missing on deep verify (STAT-alive, BODY-dead)")
+		return customerror.UsenetSegmentMissingError
+	}
+
+	return nil
+}
+
+// sampleSegments returns a sample of segment message IDs based on the given
+// percentage. Dead bodies on a purged/taken-down file are almost always
+// CONTIGUOUS (a provider drops a run of articles, not scattered singles). To
+// catch a contiguous dead run, the gap between consecutively probed segments
+// must be smaller than the run. Evenly-spaced single points are optimal for
+// this per unit of budget, so the sample is uniform — but the stride is capped
+// (maxStride) so that even at a low percent we never step over a dead run
+// longer than that cap. The configured percent raises the budget (tighter
+// stride, more reliable); the cap is a floor on reliability. First and last
+// segments are always included (corruption frequently sits at boundaries).
 func (u *Usenet) sampleSegments(segments []storage.NZBSegment, percent int) []string {
 	total := len(segments)
 	if total == 0 {
@@ -583,15 +692,6 @@ func (u *Usenet) sampleSegments(segments []storage.NZBSegment, percent int) []st
 		return messageIDs
 	}
 
-	// Calculate target sample size (minimum 2 for first+last)
-	targetCount := (total * percent) / 100
-	if targetCount < 2 {
-		targetCount = 2
-	}
-	if targetCount > total {
-		targetCount = total
-	}
-
 	// For very small files, just check all
 	if total <= 3 {
 		messageIDs := make([]string, total)
@@ -601,27 +701,58 @@ func (u *Usenet) sampleSegments(segments []storage.NZBSegment, percent int) []st
 		return messageIDs
 	}
 
-	// Always include first and last
-	sampled := make([]string, 0, targetCount)
-	sampled = append(sampled, segments[0].MessageID)
+	// Budget from the configured percent (minimum 2 for first+last).
+	targetCount := (total * percent) / 100
+	if targetCount < 2 {
+		targetCount = 2
+	}
+	if targetCount > total {
+		targetCount = total
+	}
 
-	// Uniformly sample from the middle (excluding first and last)
-	middleCount := targetCount - 2 // Reserve 2 for first and last
-	if middleCount > 0 {
-		middleSegments := segments[1 : total-1]
-		step := float64(len(middleSegments)) / float64(middleCount+1)
+	// Reliability floor: never let the stride exceed maxStride, so any
+	// contiguous dead run longer than maxStride is guaranteed to be hit even
+	// if the percent budget alone would have strided further. This can raise
+	// the effective sample above the configured percent on large files; that
+	// is intentional — it is the cost of reliably catching short dead runs.
+	const maxStride = 8
+	minCountForStride := (total + maxStride - 1) / maxStride // ceil(total/maxStride)
+	if targetCount < minCountForStride {
+		targetCount = minCountForStride
+	}
+	if targetCount > total {
+		targetCount = total
+	}
 
-		for i := 0; i < middleCount; i++ {
-			idx := int(step * float64(i+1))
-			if idx >= len(middleSegments) {
-				idx = len(middleSegments) - 1
-			}
-			sampled = append(sampled, middleSegments[idx].MessageID)
+	// Evenly spaced sample of targetCount points across [0, total-1].
+	seen := make(map[int]struct{}, targetCount+2)
+	order := make([]int, 0, targetCount+2)
+	add := func(idx int) {
+		if idx < 0 || idx >= total {
+			return
+		}
+		if _, ok := seen[idx]; ok {
+			return
+		}
+		seen[idx] = struct{}{}
+		order = append(order, idx)
+	}
+
+	add(0)
+	add(total - 1)
+
+	if targetCount > 1 {
+		step := float64(total-1) / float64(targetCount-1)
+		for i := 0; i < targetCount; i++ {
+			add(int(step * float64(i)))
 		}
 	}
 
-	sampled = append(sampled, segments[total-1].MessageID)
-	return sampled
+	messageIDs := make([]string, 0, len(order))
+	for _, idx := range order {
+		messageIDs = append(messageIDs, segments[idx].MessageID)
+	}
+	return messageIDs
 }
 
 func (u *Usenet) Stop() {
@@ -705,6 +836,17 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 		return customerror.NewSilentError(cause).Permanent()
 	}
 
+	return nil
+}
+
+// FailedFileCause returns the recorded permanent failure for a file (e.g. an
+// article-not-found discovered during a prior read/prefetch), or nil if none.
+// Lets higher layers surface the real cause instead of a generic "no data"
+// error when a stream produces nothing because every segment is missing.
+func (u *Usenet) FailedFileCause(nzoID, filename string) error {
+	if cause, ok := u.failedFiles.Load(fsKey(nzoID, filename)); ok {
+		return cause
+	}
 	return nil
 }
 

@@ -445,6 +445,19 @@
                                                     adding an NZB (1-100, default: 1)</span>
                                             </div>
                                             <div>
+                                                <label class="label" for="usenet.deep_verify_sample_percent">
+                                                    <span class="font-medium">Deep Verify Sample %</span>
+                                                </label>
+                                                <input type="number" class="input w-full"
+                                                       name="usenet.deep_verify_sample_percent"
+                                                       id="usenet.deep_verify_sample_percent" min="0" max="100"
+                                                       placeholder="0">
+                                                <span class="text-sm opacity-70">Downloads (and discards) this % of
+                                                    segment bodies to catch files a provider reports present but whose
+                                                    data is gone. Uses real bandwidth — keep small (1 is a good start).
+                                                    0 = off. Only runs on sweeps when "Deep verify on sweep" is on.</span>
+                                            </div>
+                                            <div>
                                                 <label class="label" for="usenet.disk_buffer_path">
                                                     <span class="font-medium">Disk Buffer Path</span>
                                                 </label>
@@ -1413,6 +1426,33 @@
                                        id="repair.skip_nzb_repair" name="repair.skip_nzb_repair">
                                 <span class="label-text font-medium">Skip NZB repair</span>
                             </label>
+                            <label class="label cursor-pointer justify-start gap-3"
+                                   title="When on, the scheduled sweep also runs the Deep Verify body check (using Deep Verify Sample %). Off by default — deep verify on a full library sweep can download a large amount of data.">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.deep_verify_sweep" name="repair.deep_verify_sweep">
+                                <span class="label-text font-medium">Deep verify on sweep</span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-3"
+                                   title="When a playback read fails because a segment's body is missing, automatically recheck and repair that title. Requires Auto-repair.">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.repair_on_playback_failure" name="repair.repair_on_playback_failure">
+                                <span class="label-text font-medium">Repair on playback failure</span>
+                            </label>
+                        </div>
+
+                        <div class="mt-2">
+                            <label class="label" for="repair.repair_on_playback_scope">
+                                <span class="font-medium">Playback repair scope</span>
+                            </label>
+                            <select class="select select-bordered w-full max-w-xs"
+                                    id="repair.repair_on_playback_scope" name="repair.repair_on_playback_scope">
+                                <option value="entry">This file only (fastest)</option>
+                                <option value="series">This file first, then whole series/movie</option>
+                            </select>
+                            <span class="text-sm opacity-70 block mt-1">When "Repair on playback failure" fires:
+                                "This file only" repairs just the played title. "Whole series/movie" repairs the
+                                played file first (so it's watchable soonest), then deep-rechecks and repairs the rest
+                                of that series or movie in the background.</span>
                         </div>
                     </div>
                 </div>

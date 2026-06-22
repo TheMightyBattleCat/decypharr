@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +95,12 @@ type Downloaders struct {
 	// Circuit breaker - blocks all requests when max errors reached
 	circuitOpen   atomic.Bool  // True when circuit is "open" (blocking all requests)
 	circuitOpenAt atomic.Int64 // Unix nano timestamp when circuit opened
+
+	// playbackEscalated ensures the repair-on-playback-failure escalation
+	// fires at most once per Downloaders session. It is reset alongside the
+	// error budget whenever a session is torn down (StopAll / idle timeout),
+	// so a fresh playback can escalate again if the file is still broken.
+	playbackEscalated atomic.Bool
 }
 
 // ensureStreamTracked makes sure the active stream is registered when reads begin.
@@ -580,6 +587,14 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 		// moment under load from locking a file out of every ffprobe.
 		if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
 			dls.errorCount = maxErrorCount
+			// A permanent article-not-found during a live read is the signal a
+			// sweep's sampler can miss: the file's header segments are present
+			// (so it streams briefly and looks healthy on disk) but the body is
+			// gone. Escalate to a confirming single-entry recheck so the file
+			// is re-probed and, if genuinely broken, deleted + re-searched.
+			// Escalate on either classification: the cause may arrive wrapped
+			// as a permanent customerror rather than a bare nntp error.
+			dls.escalatePlaybackFailure(err)
 		}
 		// Trip circuit breaker when max errors reached
 		if dls.errorCount >= maxErrorCount {
@@ -753,6 +768,72 @@ func (dls *Downloaders) openCircuitLocked() {
 	dls.item.cache.circuitBreakers.Add(1)
 }
 
+// escalatePlaybackFailure asks the repair system to recheck this entry after a
+// streaming read failed with a permanent NNTP article-not-found. It is the
+// safety net for "head alive, body dead" files that a sampling availability
+// probe can pass. The recheck re-validates against the providers and only
+// deletes + re-searches when the file is confirmed broken, so a transient 430
+// cannot cause a wrongful delete.
+//
+// Fire-and-forget on its own goroutine and context: countErrors runs under
+// dls.mu on the read hot path, and RecheckEntry must not block it. Guarded so
+// it runs at most once per session.
+func (dls *Downloaders) escalatePlaybackFailure(cause error) {
+	cfg := config.Get().Repair
+	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
+		return
+	}
+	if dls.manager == nil || dls.item == nil || dls.item.entry == nil {
+		return
+	}
+	// Only NZB entries are repaired through the usenet recheck path.
+	if !dls.item.entry.IsNZB() {
+		return
+	}
+	// Fire at most once per session.
+	if !dls.playbackEscalated.CompareAndSwap(false, true) {
+		return
+	}
+
+	entryName := dls.item.entry.Name
+	filename := dls.item.filename
+	mgr := dls.manager
+
+	dls.item.logger.Warn().
+		Err(cause).
+		Str("entry", entryName).
+		Str("file", filename).
+		Msg("Playback read hit a missing article; escalating to repair recheck")
+
+	go func() {
+		// Detached from the read context (which is about to be cancelled by
+		// the tripped breaker) but bounded so a stuck probe can't leak.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		// Force a small deep-verify on the confirming recheck: the read just
+		// failed with a real 430, but a STAT-only re-probe could report the
+		// article present (some providers keep the overview entry alive after
+		// the body is purged). A BODY sample confirms the breakage the way the
+		// read saw it. Use the configured deep-verify percent, or a minimal
+		// fallback so verification still happens when none is set.
+		deepPercent := config.Get().Usenet.DeepVerifySamplePercent
+		if deepPercent <= 0 {
+			deepPercent = 1
+		}
+		// Scope: "series" repairs the played entry first (so it's watchable
+		// soonest), then deep-rechecks the rest of the series/movie in the
+		// background. Anything else (default "entry") repairs only the played
+		// file.
+		seriesScope := strings.EqualFold(config.Get().Repair.RepairOnPlaybackScope, "series")
+		if _, err := mgr.Repair().RepairPlaybackFailure(ctx, entryName, &deepPercent, seriesScope); err != nil {
+			dls.item.cache.logger.Debug().
+				Err(err).
+				Str("entry", entryName).
+				Msg("Playback-failure repair recheck not started")
+		}
+	}()
+}
+
 // resetCircuitLocked resets the circuit breaker after successful download. Caller must hold dls.mu.
 func (dls *Downloaders) resetCircuitLocked() {
 	if !dls.circuitOpen.Load() {
@@ -812,6 +893,7 @@ func (dls *Downloaders) checkIdleTimeout() bool {
 	dls.errorCount = 0
 	dls.lastErr = nil
 	dls.resetCircuitLocked()
+	dls.playbackEscalated.Store(false)
 
 	return true
 }
@@ -874,6 +956,7 @@ func (dls *Downloaders) StopAll() {
 		dls.errorCount = 0
 		dls.lastErr = nil
 		dls.resetCircuitLocked()
+		dls.playbackEscalated.Store(false)
 	}
 	dls.stopping = false
 	dls.mu.Unlock()
@@ -1193,6 +1276,15 @@ func (dl *downloader) streamChunk(start, end int64) (int64, error) {
 			dl.offset = end
 			dl.mu.Unlock()
 			return writer.written, nil
+		}
+		// The stream produced no data. If the usenet layer recorded a
+		// permanent cause for this file (e.g. article-not-found because every
+		// segment's body is missing), surface that typed error so countErrors
+		// fast-trips the breaker and the playback-repair escalation fires.
+		// Without this the generic error below loses the 430 classification and
+		// the file silently fails to play and fails to repair.
+		if cause := dl.dls.manager.StreamFailureCause(dl.dls.item.entry, dl.dls.item.filename); cause != nil {
+			return writer.written, cause
 		}
 		return writer.written, errors.New("stream produced no data")
 	}

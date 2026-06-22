@@ -49,7 +49,19 @@ type Usenet struct {
 	// Availability check sampling
 	AvailabilitySamplePercent       int    `json:"availability_sample_percent,omitempty"`        // Percentage of segments to check during repair (1-100, default: 10)
 	ImportAvailabilitySamplePercent int    `json:"import_availability_sample_percent,omitempty"` // Percentage of segments to check when adding an NZB (1-100, default: 1)
-	DiskBufferPath                  string `json:"disk_buffer_path,omitempty"`                   // Path for disk buffer storage (empty = main_path/usenet/streams)
+	// DeepVerifySamplePercent, when > 0, makes the repair availability check
+	// fetch (and discard) the BODY of this percentage of segments in addition
+	// to the STAT-based sample. STAT only confirms an article's header entry
+	// exists; some providers keep that alive after the body has been purged or
+	// taken down, returning 223 on STAT but 430 on BODY. Those files pass a
+	// STAT sample at any percent yet fail every playback read. A BODY sample
+	// catches them. This transfers real data (roughly this percent of the
+	// file's bytes per verified file), so keep it small — 1 is a sensible
+	// starting point and reliably catches wholesale-dead files. The scheduled
+	// sweep only deep-verifies when Repair.DeepVerifySweep is also on; manual
+	// rechecks can request it per-call. 0 (default) disables deep verify.
+	DeepVerifySamplePercent int    `json:"deep_verify_sample_percent,omitempty"`
+	DiskBufferPath          string `json:"disk_buffer_path,omitempty"` // Path for disk buffer storage (empty = main_path/usenet/streams)
 
 	// BufferMemory caps the total RAM the usenet streaming buffers hold across
 	// all open streams, e.g. "512MB". Per-stream buffers stay generous for
@@ -115,6 +127,13 @@ func (c *Config) updateUsenetConfig() {
 		c.Usenet.ImportAvailabilitySamplePercent = 1
 	} else if c.Usenet.ImportAvailabilitySamplePercent > 100 {
 		c.Usenet.ImportAvailabilitySamplePercent = 100
+	}
+	// DeepVerifySamplePercent: 0 = disabled (default). Only clamp the upper
+	// bound; a negative value is treated as disabled.
+	if c.Usenet.DeepVerifySamplePercent < 0 {
+		c.Usenet.DeepVerifySamplePercent = 0
+	} else if c.Usenet.DeepVerifySamplePercent > 100 {
+		c.Usenet.DeepVerifySamplePercent = 100
 	}
 
 	if c.Usenet.DiskBufferPath == "" {
@@ -200,6 +219,11 @@ func (c *Config) applyUsenetEnvVars() {
 	if availabilitySample := getEnv("USENET__IMPORT_AVAILABILITY_SAMPLE_PERCENT"); availabilitySample != "" {
 		if v, err := strconv.Atoi(availabilitySample); err == nil {
 			c.Usenet.ImportAvailabilitySamplePercent = v
+		}
+	}
+	if deepVerify := getEnv("USENET__DEEP_VERIFY_SAMPLE_PERCENT"); deepVerify != "" {
+		if v, err := strconv.Atoi(deepVerify); err == nil {
+			c.Usenet.DeepVerifySamplePercent = v
 		}
 	}
 

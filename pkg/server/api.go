@@ -782,6 +782,13 @@ func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 		Arr     string `json:"arr"`
 		MediaID string `json:"media_id"`
 		Fix     bool   `json:"fix"`
+		// DeepVerify, when true, forces a deep-verify BODY check for this
+		// recheck (catches "STAT-alive, BODY-dead" files a normal STAT probe
+		// misses). DeepVerifyPercent optionally sets the sample percent; when
+		// omitted/<=0 it falls back to the configured deep_verify_sample_percent,
+		// or 1 if that is also unset.
+		DeepVerify        bool `json:"deep_verify"`
+		DeepVerifyPercent int  `json:"deep_verify_percent"`
 	}
 	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -796,7 +803,19 @@ func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Fix)
+	var deepVerifyPercent *int
+	if req.DeepVerify {
+		p := req.DeepVerifyPercent
+		if p <= 0 {
+			if cfgP := config.Get().Usenet.DeepVerifySamplePercent; cfgP > 0 {
+				p = cfgP
+			} else {
+				p = 1
+			}
+		}
+		deepVerifyPercent = &p
+	}
+	run, err := svc.RecheckMediaWithOptions(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Fix, deepVerifyPercent)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {

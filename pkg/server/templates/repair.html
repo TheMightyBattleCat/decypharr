@@ -100,17 +100,22 @@
                         <option value="">Auto-detect</option>
                     </select>
                 </div>
-                <div class="form-control md:col-span-5">
+                <div class="form-control md:col-span-4">
                     <label class="label py-1" for="recheckMediaId">
                         <span class="label-text font-medium">Media id</span>
                     </label>
                     <input type="text" class="input input-bordered" id="recheckMediaId"
                            placeholder="e.g. 12345" required>
                 </div>
-                <div class="form-control md:col-span-2">
+                <div class="form-control md:col-span-3">
                     <label class="label cursor-pointer justify-start gap-2 py-1">
                         <input type="checkbox" class="checkbox checkbox-primary" id="recheckFix">
                         <span class="label-text">Auto-repair</span>
+                    </label>
+                    <label class="label cursor-pointer justify-start gap-2 py-1"
+                           title="Download a small sample of segment bodies, not just header STATs. Catches files a provider reports as present but whose data is gone. Uses more bandwidth.">
+                        <input type="checkbox" class="checkbox checkbox-primary" id="recheckDeepVerify">
+                        <span class="label-text">Deep verify</span>
                     </label>
                 </div>
                 <div class="md:col-span-2">
