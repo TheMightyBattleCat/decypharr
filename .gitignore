@@ -22,3 +22,4 @@ node_modules/
 .venv/
 .stignore
 .stfolder/**
+decypharr-deep-verify.patch
