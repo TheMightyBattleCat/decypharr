@@ -848,7 +848,23 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	state, err := svc.RecheckEntry(s.manager.Context(), name, fix)
+	// Optional deep_verify_percent override. Without it, a manual recheck uses
+	// the configured behavior, which deep-verifies only when the scheduled
+	// deep-verify sweep is enabled and otherwise falls back to a STAT-only
+	// availability check (0% body sampling). A STAT check cannot detect an
+	// article whose body transfers but is dead/undecodable, so a file that
+	// won't play can still report healthy. Passing e.g. ?deep_verify_percent=100
+	// forces a full decode-verify of this entry on demand.
+	var deepVerifyPercent *int
+	if v := r.URL.Query().Get("deep_verify_percent"); v != "" {
+		p, err := strconv.Atoi(v)
+		if err != nil || p < 0 || p > 100 {
+			http.Error(w, "deep_verify_percent must be an integer between 0 and 100", http.StatusBadRequest)
+			return
+		}
+		deepVerifyPercent = &p
+	}
+	state, err := svc.RecheckEntryWithOptions(s.manager.Context(), name, fix, deepVerifyPercent)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

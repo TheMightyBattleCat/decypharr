@@ -1028,13 +1028,21 @@ func (c *Client) VerifySegmentBody(ctx context.Context, messageID string) error 
 		return errors.New("nntp client is closed")
 	}
 	return c.ExecuteWithFailover(ctx, func(conn *Connection) error {
-		// Issue a real BODY fetch — the same command the streaming reader uses
-		// — so deep verify hits exactly what playback hits. A HEAD/STAT-style
-		// check is NOT sufficient: STAT-alive/BODY-dead articles return 223 to
-		// STAT and to a header fetch, but 430 to BODY. We must fetch the body
-		// to detect them. The bytes are discarded; we only care that the full
-		// body transfers without an article-not-found / transfer error.
-		_, err := conn.GetBody(messageID)
+		// Fetch AND yEnc-DECODE the body — the same operation the streaming
+		// reader (and ffprobe/playback) performs — not just a raw BODY drain.
+		// This matters because there are three distinct article states:
+		//   1. STAT-alive / BODY-dead: 430 on BODY. Caught by any BODY fetch.
+		//   2. BODY transfers but yEnc payload is corrupt/truncated: the raw
+		//      BODY (GetBody) succeeds, but the yEnc DECODE fails — exactly
+		//      what breaks playback (and shows up as a garbage container
+		//      duration, e.g. an 11-hour runtime). GetBody-based verify reports
+		//      these as healthy; GetDecodedBody does not.
+		//   3. Fully healthy: decodes cleanly.
+		// Using GetDecodedBody makes deep verify agree with what playback
+		// actually sees, closing the gap where decode-dead files passed
+		// verification. Decoded bytes are discarded; only the decode result
+		// (article-not-found / transfer / decode error) matters.
+		_, err := conn.GetDecodedBody(messageID)
 		return err
 	})
 }

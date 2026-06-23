@@ -740,14 +740,17 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	}
 
 	// Clear the EpisodeFile/MovieFile rows first so the upcoming re-search isn't
-	// rejected by upgrade-only quality logic.
+	// rejected by upgrade-only quality logic. A delete failure is NOT fatal to
+	// the repair: the captured FileId can be stale (a prior repair cycle for
+	// this same entry already replaced the file, so this ID no longer exists
+	// and Sonarr 500s on the bulk delete). When that happens the row we wanted
+	// gone is effectively gone anyway, and — more importantly — we must still
+	// blocklist + re-search so the Arr fetches a fresh copy. Aborting here was
+	// the cause of the playback-repair churn loop: delete fails → return →
+	// nothing re-searched → file stays broken → next playback 430 repeats.
 	if err := a.DeleteFiles(ctx, files); err != nil {
-		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: DeleteFiles failed")
-		statsMu.Lock()
-		run.Stats.RepairFailed += len(files)
-		r.saveRun(run)
-		statsMu.Unlock()
-		return false
+		r.logger.Warn().Err(err).Str("arr", a.Name).
+			Msg("Repair: DeleteFiles failed (continuing to blocklist + re-search anyway)")
 	}
 
 	// Blocklist each unique grab. Errors here are non-fatal: a missing blocklist
@@ -1373,6 +1376,35 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	if entryName == "" {
 		return errors.New("entry name is empty")
 	}
+
+	// Manager-level per-entry cooldown. This must be checked here (not only in
+	// the per-file Downloaders) because a repair recreates the CacheItem and
+	// its Downloaders, resetting that object's own cooldown — so a still-dead
+	// re-grab would otherwise re-escalate immediately. Claim the slot before
+	// doing any work so concurrent callers for the same entry collapse to one.
+	//
+	// The key is normalized (see normalizeCooldownKey) so it matches across the
+	// casing/punctuation variants the same episode's releases use, which lets
+	// the import-failure path (ClearPlaybackRepairCooldown) release it the
+	// instant a re-grabbed replacement is rejected as body-dead — so the next
+	// playback can immediately try the next candidate instead of waiting out
+	// the timer.
+	cooldownKey := normalizeCooldownKey(entryName)
+	r.playbackRepairMu.Lock()
+	if r.lastPlaybackRepair == nil {
+		r.lastPlaybackRepair = make(map[string]time.Time)
+	}
+	if last, ok := r.lastPlaybackRepair[cooldownKey]; ok && time.Since(last) < playbackRepairCooldown {
+		r.playbackRepairMu.Unlock()
+		r.logger.Debug().
+			Str("entry", entryName).
+			Dur("since_last", time.Since(last)).
+			Msg("playback repair: skipped, entry within cooldown")
+		return nil
+	}
+	r.lastPlaybackRepair[cooldownKey] = time.Now()
+	r.playbackRepairMu.Unlock()
+
 	item, err := r.manager.GetEntryItem(entryName)
 	if err != nil || item == nil {
 		return fmt.Errorf("entry %q not found", entryName)
@@ -1436,6 +1468,45 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	var statsMu sync.Mutex
 	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h)
 	return nil
+}
+
+// normalizeCooldownKey reduces an entry/release name to lowercase alphanumerics
+// so the same episode's differently-formatted releases collapse to one key
+// (e.g. "Bosch.S05E07.The.Wisdom...REAL.REPACK...1-NTb" and
+// "bosch.s05e07.the.wisdom...real.repack...ntb" map identically). This lets the
+// playback-repair cooldown set in RepairPlaybackFileNow be matched and released
+// by the import-failure path even though the re-grabbed release name differs in
+// casing/punctuation from the originally-broken entry name.
+func normalizeCooldownKey(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// ClearPlaybackRepairCooldown releases the playback-repair cooldown for an entry
+// so the next playback failure can immediately trigger the next repair attempt.
+// It is called when a re-grabbed replacement is rejected (e.g. body-dead at
+// import): that release is already blocklisted, so there is no reason to make
+// the user wait out the cooldown before the next candidate is tried. Matching is
+// by normalized key, so it works despite the re-grab's release name differing
+// from the original broken entry's name. Safe to call with names that were never
+// in cooldown (no-op).
+func (r *Repair) ClearPlaybackRepairCooldown(name string) {
+	if name == "" {
+		return
+	}
+	key := normalizeCooldownKey(name)
+	r.playbackRepairMu.Lock()
+	defer r.playbackRepairMu.Unlock()
+	if _, ok := r.lastPlaybackRepair[key]; ok {
+		delete(r.lastPlaybackRepair, key)
+		r.logger.Debug().Str("entry", name).Msg("playback repair: cooldown cleared after failed re-grab")
+	}
 }
 
 func (r *Repair) RepairPlaybackFailure(ctx context.Context, entryName string, deepVerifyPercent *int, seriesScope bool) (*storage.EntryHealth, error) {

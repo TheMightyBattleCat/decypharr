@@ -856,7 +856,12 @@ func (p *NZBParser) bodySampleValidate(ctx context.Context, group *FileGroup) er
 				return
 			}
 			err := p.manager.ExecuteWithFailover(sampleCtx, func(conn *nntp.Connection) error {
-				_, e := conn.GetBody(id)
+				// Decode, don't just drain: a release whose articles transfer
+				// but won't yEnc-decode is dead for playback even though a raw
+				// BODY fetch succeeds. GetDecodedBody runs the same decode the
+				// streaming reader does, so such releases are rejected at grab
+				// time instead of importing and failing on playback.
+				_, e := conn.GetDecodedBody(id)
 				return e
 			})
 			if err == nil {
