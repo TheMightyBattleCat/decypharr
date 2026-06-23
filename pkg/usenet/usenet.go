@@ -623,6 +623,8 @@ func (u *Usenet) deepVerifyFile(ctx context.Context, file *storage.NZBFile, perc
 	var mu sync.Mutex
 	var missing int
 	var connErrors int
+	var okCount int
+	var sampleErr string
 
 	for _, msgID := range messageIDs {
 		msgID := msgID
@@ -632,6 +634,9 @@ func (u *Usenet) deepVerifyFile(ctx context.Context, file *storage.NZBFile, perc
 			}
 			err := u.nntp.VerifySegmentBody(gctx, msgID)
 			if err == nil {
+				mu.Lock()
+				okCount++
+				mu.Unlock()
 				return nil
 			}
 			if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
@@ -647,11 +652,24 @@ func (u *Usenet) deepVerifyFile(ctx context.Context, file *storage.NZBFile, perc
 			// don't condemn (matches the STAT path's treatment).
 			mu.Lock()
 			connErrors++
+			if sampleErr == "" {
+				sampleErr = err.Error()
+			}
 			mu.Unlock()
 			return nil
 		})
 	}
 	_ = g.Wait()
+
+	u.logger.Debug().
+		Str("file", file.Name).
+		Int("total_segments", len(file.Segments)).
+		Int("sampled", len(messageIDs)).
+		Int("ok", okCount).
+		Int("missing", missing).
+		Int("conn_errors", connErrors).
+		Str("sample_err", sampleErr).
+		Msg("deepVerify outcome")
 
 	if missing > 0 {
 		u.logger.Warn().

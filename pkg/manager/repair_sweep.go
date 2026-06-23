@@ -394,7 +394,6 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	file := item.Files[name]
 	res := fileResult{name: name}
 
-
 	if file == nil || file.InfoHash == "" {
 		res.reason = "missing_infohash"
 		return res
@@ -1358,6 +1357,87 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 // background deep recheck + repair of the rest of the same series/movie, kicked
 // off only after the played entry's own repair pass completes. deepVerifyPercent
 // is applied to every recheck so breakage is confirmed via BODY, not STAT.
+// RepairPlaybackFileNow repairs a file that just failed playback WITHOUT
+// re-probing it. The triggering read already hit a hard article-not-found
+// (BODY 430) — that is definitive proof the body is missing, so a confirming
+// BODY re-probe is redundant and, worse, unreliable: the sampler may not hit
+// the exact dead segments the sequential read did, rolling the file up as
+// "healthy" and suppressing the repair (which is exactly what was observed).
+// We trust the read. This resolves the file's Arr mapping (no probe) and goes
+// straight to delete + blocklist + re-search for the single played entry.
+//
+// The optional series-scope recheck is intentionally NOT part of this path; it
+// is a separate, slower, best-effort pass the caller may run afterward. The
+// played file is repaired first and immediately so it can be re-acquired ASAP.
+func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName string) error {
+	if entryName == "" {
+		return errors.New("entry name is empty")
+	}
+	item, err := r.manager.GetEntryItem(entryName)
+	if err != nil || item == nil {
+		return fmt.Errorf("entry %q not found", entryName)
+	}
+
+	// Detach from the caller's (short-lived) context: the escalation cancels
+	// its context as soon as this returns, and the Arr delete/search calls must
+	// outlive that.
+	runCtx := r.parentCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+
+	// Resolve which Arr owns this entry and the per-file Arr identifiers needed
+	// to delete + re-search. This is the same lookup the probe uses, minus any
+	// BODY verification.
+	c := &candidate{name: entryName, item: item}
+	r.attachArrContext(runCtx, c)
+	if len(c.contentMap) == 0 || c.arrName == "" {
+		return fmt.Errorf("no Arr owns entry %q; cannot re-acquire", entryName)
+	}
+
+	// Build the broken-file set. Scope to the single file that failed when we
+	// can match it; otherwise fall back to every Arr-known file in the entry
+	// (a single-file movie entry, or a filename we couldn't line up).
+	h := &storage.EntryHealth{EntryName: entryName, Status: storage.HealthBroken}
+	matched := false
+	for name, cf := range c.contentMap {
+		if fileName != "" && name != fileName && filepath.Base(name) != filepath.Base(fileName) {
+			continue
+		}
+		matched = true
+		bf := storage.BrokenFile{
+			EntryName:  entryName,
+			FileName:   name,
+			Protocol:   config.ProtocolNZB,
+			Reason:     "playback body missing (430)",
+			ArrName:    c.arrName,
+			ArrKind:    c.arrKind,
+			MediaID:    cf.Id,
+			EpisodeID:  cf.EpisodeId,
+			ArrFileID:  cf.FileId,
+			TargetPath: cf.TargetPath,
+			SourcePath: cf.Path,
+			Size:       cf.Size,
+		}
+		h.BrokenFiles = append(h.BrokenFiles, bf)
+	}
+	if !matched {
+		return fmt.Errorf("file %q not found among Arr-known files for entry %q", fileName, entryName)
+	}
+	h.BrokenCount = len(h.BrokenFiles)
+
+	r.logger.Info().
+		Str("entry", entryName).
+		Str("file", fileName).
+		Int("files_to_repair", h.BrokenCount).
+		Msg("Repair: playback failure — deleting + re-searching without re-probe")
+
+	pseudo := &storage.RepairRun{ID: "playback-" + entryName, Stats: storage.RepairRunStats{}}
+	var statsMu sync.Mutex
+	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h)
+	return nil
+}
+
 func (r *Repair) RepairPlaybackFailure(ctx context.Context, entryName string, deepVerifyPercent *int, seriesScope bool) (*storage.EntryHealth, error) {
 	var onComplete func(final *storage.EntryHealth)
 	if seriesScope {
@@ -1405,7 +1485,20 @@ func (r *Repair) recheckEntryWithCallback(ctx context.Context, entryName string,
 	}
 	h, _ := r.manager.storage.GetEntryHealth(entryName)
 	if h != nil && h.ActiveRunID != "" {
-		return nil, fmt.Errorf("entry is being probed by run %s", h.ActiveRunID)
+		// A non-empty ActiveRunID normally means a probe is genuinely in
+		// flight. But if a previous probe goroutine died before clearing it
+		// (e.g. a crash, or an earlier bug that cancelled its context), the
+		// stale ID would block this entry from EVER being re-probed. Treat an
+		// ActiveRunID whose health record hasn't been touched in
+		// staleActiveRunAfter as abandoned and proceed, reclaiming the entry.
+		if h.UpdatedAt.IsZero() || time.Since(h.UpdatedAt) < staleActiveRunAfter {
+			return nil, fmt.Errorf("entry is being probed by run %s", h.ActiveRunID)
+		}
+		r.logger.Warn().
+			Str("entry", entryName).
+			Str("stale_run", h.ActiveRunID).
+			Dur("age", time.Since(h.UpdatedAt)).
+			Msg("reclaiming entry from abandoned recheck run")
 	}
 
 	item, err := r.manager.GetEntryItem(entryName)
@@ -1429,11 +1522,35 @@ func (r *Repair) recheckEntryWithCallback(ctx context.Context, entryName string,
 	r.runWG.Add(1)
 	go func() {
 		defer r.runWG.Done()
+		r.logger.Debug().Str("entry", entryName).Str("run", runID).Bool("fix", fix).Msg("recheck goroutine entered")
+		defer func() {
+			if rec := recover(); rec != nil {
+				r.logger.Error().Interface("panic", rec).Str("entry", entryName).Msg("recheck goroutine PANICKED")
+			}
+		}()
+		// Safety net: whatever happens in the probe (early return, panic
+		// recovery upstream, context death), make sure the entry's ActiveRunID
+		// is cleared on exit so a future recheck is never permanently blocked
+		// by a stale "in progress" marker. probeEntry clears it on the happy
+		// path too; this just guarantees it.
+		defer func() {
+			if cur, _ := r.manager.storage.GetEntryHealth(entryName); cur != nil && cur.ActiveRunID == runID {
+				cur.ActiveRunID = ""
+				cur.UpdatedAt = time.Now()
+				r.saveHealth(cur)
+			}
+		}()
 		if fix {
 			r.attachArrContext(runCtx, c)
 		}
 		heal := newHealCache()
 		final := r.probeEntry(runCtx, runID, c, heal, RepairRunOptions{DeepVerifyPercent: deepVerifyPercent, ProtocolScope: protocolScope}, fix)
+		r.logger.Debug().
+			Str("entry", entryName).
+			Str("final_status", string(final.Status)).
+			Int("broken_count", final.BrokenCount).
+			Bool("fix", fix).
+			Msg("recheck probeEntry returned")
 		if fix && final.Status == storage.HealthBroken {
 			pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
 			var statsMu sync.Mutex

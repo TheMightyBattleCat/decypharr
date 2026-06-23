@@ -68,6 +68,13 @@ const (
 	// repairStopFinalRepairTimeout bounds the Arr delete + re-search pass run
 	// when StopSchedule fires with StopAction=repair.
 	repairStopFinalRepairTimeout = 5 * time.Minute
+	// staleActiveRunAfter is how long an entry's ActiveRunID may sit without
+	// its health record being updated before a new recheck treats it as
+	// abandoned (the previous probe goroutine died without clearing it) and
+	// reclaims the entry. Longer than any real probe takes, short enough that
+	// a poisoned entry recovers on the next attempt rather than being blocked
+	// forever.
+	staleActiveRunAfter = 15 * time.Minute
 )
 
 // Repair is the health-check / auto-repair service. One instance per Manager.

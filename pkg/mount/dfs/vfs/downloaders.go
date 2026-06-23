@@ -96,11 +96,25 @@ type Downloaders struct {
 	circuitOpen   atomic.Bool  // True when circuit is "open" (blocking all requests)
 	circuitOpenAt atomic.Int64 // Unix nano timestamp when circuit opened
 
-	// playbackEscalated ensures the repair-on-playback-failure escalation
-	// fires at most once per Downloaders session. It is reset alongside the
-	// error budget whenever a session is torn down (StopAll / idle timeout),
-	// so a fresh playback can escalate again if the file is still broken.
-	playbackEscalated atomic.Bool
+	// missingArticleCount tracks how many distinct article-not-found (BODY
+	// 430) errors this session has seen. Repair-on-playback-failure escalates
+	// once this crosses playbackEscalateThreshold, so a couple of transient
+	// 430s don't trigger a repair but a genuinely body-dead file (which
+	// produces a flood of them) reliably does.
+	missingArticleCount int
+
+	// lastPlaybackEscalateAt is the Unix-nano time of the most recent
+	// repair-on-playback-failure escalation for this session. A single broken
+	// playback produces a burst of article-not-found errors across many
+	// prefetch segments; without throttling, each one would trigger a repair.
+	// Instead of a one-shot latch (which suppressed re-escalation for the whole
+	// session, so a file that failed once never re-escalated on a later play),
+	// escalations are gated by a cooldown: the first failure escalates, then
+	// further failures are suppressed only for playbackEscalateCooldown. Once
+	// the cooldown lapses, a subsequent playback that still hits a dead body
+	// escalates again — so detection is reliable per playback attempt, not
+	// once per session.
+	lastPlaybackEscalateAt atomic.Int64
 }
 
 // ensureStreamTracked makes sure the active stream is registered when reads begin.
@@ -347,6 +361,21 @@ const (
 	// atom / MKV cues near EOF). For sequential playback this only matters at
 	// the very end, where read-ahead is clipped anyway — negligible cost.
 	probeTailZone = 64 * 1024 * 1024
+
+	// playbackEscalateThreshold is how many article-not-found (BODY 430)
+	// errors a playback must hit before repair-on-playback-failure escalates.
+	// A genuinely body-dead file produces far more than this almost
+	// immediately; the threshold just filters out one or two isolated 430s
+	// that might resolve on retry/failover.
+	playbackEscalateThreshold = 5
+
+	// playbackEscalateCooldown throttles repair-on-playback-failure
+	// escalations. The first qualifying failure escalates; further failures
+	// within this window are suppressed so a single broken playback's burst of
+	// 430s triggers one repair, not many. After the window, a playback that
+	// still hits a dead body escalates again — escalation is reliable per
+	// playback attempt, not once per session.
+	playbackEscalateCooldown = 2 * time.Minute
 )
 
 // isProbeRead reports whether a read looks like a media-probe access pattern
@@ -565,6 +594,7 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 	if err == nil && n > 0 {
 		dls.errorCount = 0
 		dls.lastErr = nil
+		dls.missingArticleCount = 0
 		// Success resets circuit breaker
 		dls.resetCircuitLocked()
 		return
@@ -592,8 +622,16 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 			// (so it streams briefly and looks healthy on disk) but the body is
 			// gone. Escalate to a confirming single-entry recheck so the file
 			// is re-probed and, if genuinely broken, deleted + re-searched.
-			// Escalate on either classification: the cause may arrive wrapped
-			// as a permanent customerror rather than a bare nntp error.
+			//
+			// This fires on the FIRST such error rather than after a count:
+			// the line above trips the circuit breaker immediately
+			// (errorCount = maxErrorCount), which blocks every subsequent
+			// downloader, so countErrors never sees a second one. A threshold
+			// here would therefore never be reached. Escalation's own cooldown
+			// (in escalatePlaybackFailure) prevents repeated repairs from a
+			// single broken playback. Escalate on either classification: the
+			// cause may arrive wrapped as a permanent customerror rather than a
+			// bare nntp error.
 			dls.escalatePlaybackFailure(err)
 		}
 		// Trip circuit breaker when max errors reached
@@ -776,24 +814,57 @@ func (dls *Downloaders) openCircuitLocked() {
 // cannot cause a wrongful delete.
 //
 // Fire-and-forget on its own goroutine and context: countErrors runs under
-// dls.mu on the read hot path, and RecheckEntry must not block it. Guarded so
-// it runs at most once per session.
+// dls.mu on the read hot path, and RecheckEntry must not block it. Throttled
+// by playbackEscalateCooldown so a single broken playback's burst of failures
+// triggers one repair, while a later playback that still fails re-escalates.
 func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 	cfg := config.Get().Repair
 	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
+		dls.item.cache.logger.Debug().
+			Bool("enabled", cfg.Enabled).Bool("auto_repair", cfg.AutoRepair).
+			Bool("on_playback", cfg.RepairOnPlaybackFailure).
+			Msg("escalate bail: config gate")
 		return
 	}
 	if dls.manager == nil || dls.item == nil || dls.item.entry == nil {
+		dls.item.cache.logger.Debug().
+			Bool("mgr_nil", dls.manager == nil).
+			Bool("item_nil", dls.item == nil).
+			Bool("entry_nil", dls.item == nil || dls.item.entry == nil).
+			Msg("escalate bail: nil")
 		return
 	}
 	// Only NZB entries are repaired through the usenet recheck path.
 	if !dls.item.entry.IsNZB() {
+		dls.item.cache.logger.Debug().
+			Str("protocol", string(dls.item.entry.Protocol)).
+			Str("entry", dls.item.entry.Name).
+			Msg("escalate bail: not NZB")
 		return
 	}
-	// Fire at most once per session.
-	if !dls.playbackEscalated.CompareAndSwap(false, true) {
+	// Throttle: escalate at most once per playbackEscalateCooldown so a single
+	// broken playback's burst of 430s triggers one repair, while a later
+	// playback that still fails re-escalates once the cooldown lapses.
+	now := time.Now().UnixNano()
+	last := dls.lastPlaybackEscalateAt.Load()
+	if last != 0 && now-last < int64(playbackEscalateCooldown) {
+		dls.item.cache.logger.Debug().
+			Str("entry", dls.item.entry.Name).
+			Dur("since_last", time.Duration(now-last)).
+			Msg("escalate bail: cooldown")
 		return
 	}
+	// Claim the slot. CompareAndSwap guards against concurrent prefetch
+	// failures racing here; only the winner escalates.
+	if !dls.lastPlaybackEscalateAt.CompareAndSwap(last, now) {
+		dls.item.cache.logger.Debug().
+			Str("entry", dls.item.entry.Name).
+			Msg("escalate bail: lost CAS race")
+		return
+	}
+	dls.item.cache.logger.Debug().
+		Str("entry", dls.item.entry.Name).
+		Msg("escalate: passed all guards, proceeding")
 
 	entryName := dls.item.entry.Name
 	filename := dls.item.filename
@@ -806,6 +877,15 @@ func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 		Msg("Playback read hit a missing article; escalating to repair recheck")
 
 	go func() {
+		dls.item.cache.logger.Debug().Str("entry", entryName).Msg("escalation goroutine entered")
+		defer func() {
+			if rec := recover(); rec != nil {
+				dls.item.cache.logger.Error().
+					Interface("panic", rec).
+					Str("entry", entryName).
+					Msg("escalation goroutine PANICKED")
+			}
+		}()
 		// Detached from the read context (which is about to be cancelled by
 		// the tripped breaker) but bounded so a stuck probe can't leak.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -820,16 +900,27 @@ func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 		if deepPercent <= 0 {
 			deepPercent = 1
 		}
-		// Scope: "series" repairs the played entry first (so it's watchable
-		// soonest), then deep-rechecks the rest of the series/movie in the
-		// background. Anything else (default "entry") repairs only the played
-		// file.
-		seriesScope := strings.EqualFold(config.Get().Repair.RepairOnPlaybackScope, "series")
-		if _, err := mgr.Repair().RepairPlaybackFailure(ctx, entryName, &deepPercent, seriesScope); err != nil {
+		// The read that triggered this already hit a hard 430 — the body IS
+		// missing. Repair the played file immediately and WITHOUT a confirming
+		// re-probe (a BODY re-sample can miss the exact dead segments and
+		// wrongly report healthy, suppressing the repair). This deletes the
+		// file and asks the Arr to re-acquire it right away.
+		if err := mgr.Repair().RepairPlaybackFileNow(ctx, entryName, filename); err != nil {
 			dls.item.cache.logger.Debug().
 				Err(err).
 				Str("entry", entryName).
-				Msg("Playback-failure repair recheck not started")
+				Msg("Playback-failure immediate repair failed")
+		} else {
+			dls.item.cache.logger.Debug().
+				Str("entry", entryName).
+				Msg("Playback-failure immediate repair done")
+		}
+		// Optional, separate, best-effort: if scope is "series", deep-recheck
+		// the rest of the title in the background AFTER the played file has
+		// been handled above. This is additive and must never gate or delay
+		// the immediate repair.
+		if strings.EqualFold(config.Get().Repair.RepairOnPlaybackScope, "series") {
+			mgr.Repair().RecheckSeriesForEntry(context.Background(), entryName, true, &deepPercent)
 		}
 	}()
 }
@@ -892,8 +983,9 @@ func (dls *Downloaders) checkIdleTimeout() bool {
 	// breaker the next time the user starts playback.
 	dls.errorCount = 0
 	dls.lastErr = nil
+	dls.missingArticleCount = 0
 	dls.resetCircuitLocked()
-	dls.playbackEscalated.Store(false)
+	dls.lastPlaybackEscalateAt.Store(0)
 
 	return true
 }
@@ -955,8 +1047,9 @@ func (dls *Downloaders) StopAll() {
 		// the current session must not poison resumed playback.
 		dls.errorCount = 0
 		dls.lastErr = nil
+		dls.missingArticleCount = 0
 		dls.resetCircuitLocked()
-		dls.playbackEscalated.Store(false)
+		dls.lastPlaybackEscalateAt.Store(0)
 	}
 	dls.stopping = false
 	dls.mu.Unlock()

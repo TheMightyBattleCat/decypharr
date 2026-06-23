@@ -8,11 +8,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Tensai75/nzbparser"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -751,6 +753,132 @@ func (p *NZBParser) enrichGroupWithFileInfo(ctx context.Context, group *FileGrou
 		fileSize:     fileSize,
 		lastFileSize: lastFileSize,
 		segmentSize:  segmentSize,
+	}
+
+	// Header validation (above) only proves the first/last article HEADERS are
+	// retrievable. Providers routinely keep an article's header alive (so STAT
+	// and a header fetch succeed) long after its BODY has been purged — the
+	// classic "STAT-alive, BODY-dead" state. A release in that state imports as
+	// healthy here, then 430s on the very first playback read and has to be
+	// repaired + re-grabbed after the fact. To stop dead releases entering the
+	// library at all, sample real BODIES across the whole group and reject the
+	// import if any sampled body is permanently missing. The triggering Arr
+	// then blocklists this grab and immediately searches for the next release.
+	if err := p.bodySampleValidate(ctx, group); err != nil {
+		return err
+	}
+	return nil
+}
+
+// bodySampleValidate fetches a gap-capped sample of real article BODIES across
+// every file in the group and returns an error if any sampled body is
+// permanently missing (article-not-found / 430). This is the body-level
+// counterpart to the header checks in enrichGroupWithFileInfo: a header fetch
+// (GetHeaderPrefix) only confirms the article still exists in the provider's
+// overview, whereas GetBody confirms the payload is actually retrievable —
+// which is what playback needs. The stride is capped so any contiguous run of
+// purged segments longer than the cap is guaranteed to be hit.
+func (p *NZBParser) bodySampleValidate(ctx context.Context, group *FileGroup) error {
+	// Collect every segment message-id across all files in the group, in order.
+	var ids []string
+	for _, f := range group.Files {
+		for _, s := range f.Segments {
+			if s.Id != "" {
+				ids = append(ids, s.Id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Gap-capped uniform sample: at least ceil(total/importBodyMaxStride)
+	// evenly spaced points, always including the first and last, so a dead run
+	// longer than importBodyMaxStride cannot be stepped over.
+	//
+	// Stride 32 (vs the read-time deep-verify's tighter 8) keeps import cost
+	// ~4x lower — each sampled body is a full article fetch (~hundreds of MB
+	// total for a movie), so this matters — while still guaranteeing any
+	// contiguous purge longer than 32 segments is hit. Observed body-dead
+	// releases purge in runs of 90+ contiguous segments, well above this, so
+	// the wider stride still catches them. Anything smaller that slips through
+	// is caught later by the playback-failure repair.
+	const importBodyMaxStride = 32
+	total := len(ids)
+	targetCount := (total + importBodyMaxStride - 1) / importBodyMaxStride
+	if targetCount < 1 {
+		targetCount = 1
+	}
+
+	seen := make(map[int]struct{}, targetCount+2)
+	var sampleIdx []int
+	add := func(i int) {
+		if i < 0 || i >= total {
+			return
+		}
+		if _, ok := seen[i]; ok {
+			return
+		}
+		seen[i] = struct{}{}
+		sampleIdx = append(sampleIdx, i)
+	}
+	add(0)
+	add(total - 1)
+	if targetCount > 1 {
+		step := float64(total-1) / float64(targetCount-1)
+		for i := 0; i < targetCount; i++ {
+			add(int(step * float64(i)))
+		}
+	}
+
+	// Fetch bodies concurrently; cancel the rest as soon as one is found
+	// permanently missing (one dead body is enough to reject the release).
+	sampleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	limit := p.maxConcurrent
+	if limit <= 0 {
+		limit = 4
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var missingID string
+
+	for _, idx := range sampleIdx {
+		id := ids[idx]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if sampleCtx.Err() != nil {
+				return
+			}
+			err := p.manager.ExecuteWithFailover(sampleCtx, func(conn *nntp.Connection) error {
+				_, e := conn.GetBody(id)
+				return e
+			})
+			if err == nil {
+				return
+			}
+			// Only a definitively-missing body condemns the release. Transient
+			// connection errors are ignored here (the read path retries those);
+			// we do not want a momentary provider hiccup to reject a good grab.
+			if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
+				mu.Lock()
+				if missingID == "" {
+					missingID = id
+				}
+				mu.Unlock()
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if missingID != "" {
+		return fmt.Errorf("body sample failed: segment %s missing (article-not-found); release is body-dead", missingID)
 	}
 	return nil
 }
