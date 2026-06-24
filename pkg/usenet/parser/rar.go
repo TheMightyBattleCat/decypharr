@@ -515,28 +515,39 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 					maxNum = e.num
 				}
 			}
-			// Full set should span exactly len(entries) consecutive values. With
-			// one missing, span = len(entries) means the hole sits inside
-			// [minNum..maxNum]; span = len(entries)-1 means the hole is the next
-			// value after maxNum (or before minNum). Find the unique missing.
+			// The numbered volumes should form a contiguous run. The single
+			// unnumbered volume is the one hole. There are two cases:
+			//
+			//  1. Interior gap: some value strictly inside [minNum..maxNum] is
+			//     missing. That value is unambiguously the hole.
+			//
+			//  2. No interior gap: [minNum..maxNum] is fully present, so the
+			//     numbered run is already complete and the hole is at a
+			//     BOUNDARY (either minNum-1 or maxNum+1). In RAR multi-volume
+			//     archives the FIRST volume (the base archive) is the one whose
+			//     main header commonly lacks the volume-number field, while the
+			//     continuation volumes carry an incrementing number. So when the
+			//     run is complete, the unnumbered volume belongs at minNum-1
+			//     (before the run), NOT maxNum+1. Placing it after the run
+			//     rotates the true first volume to the end and corrupts assembly.
 			missing := -1
-			missingCount := 0
-			// Candidate span covering all entries.
-			lo := minNum
-			hi := minNum + len(entries) - 1
-			// If maxNum exceeds hi, the numbered values aren't contiguous enough.
-			if maxNum > hi {
-				// Try treating the span as [maxNum-len+1 .. maxNum].
-				lo = maxNum - len(entries) + 1
-				hi = maxNum
-			}
-			for v := lo; v <= hi; v++ {
+			interiorMissing := -1
+			interiorCount := 0
+			for v := minNum; v <= maxNum; v++ {
 				if !present[v] {
-					missing = v
-					missingCount++
+					interiorMissing = v
+					interiorCount++
 				}
 			}
-			if missingCount == 1 {
+			if interiorCount == 1 {
+				// Case 1: unique interior hole.
+				missing = interiorMissing
+			} else if interiorCount == 0 {
+				// Case 2: complete run → hole is the base volume, before the run.
+				missing = minNum - 1
+			}
+			// (interiorCount > 1 leaves missing = -1 → cannot place uniquely.)
+			if missing >= 0 {
 				// Assign the inferred number to the single unnumbered volume.
 				for i := range entries {
 					if !entries[i].hasNum {
