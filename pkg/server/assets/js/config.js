@@ -165,6 +165,7 @@ class ConfigManager {
         if ($('repair.strategy')) $('repair.strategy').value = repair.strategy || 'per_entry';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
+        if ($('repair.ffprobe_check')) $('repair.ffprobe_check').checked = !!repair.ffprobe_check;
     }
 
     collectRepairConfig() {
@@ -183,6 +184,7 @@ class ConfigManager {
             strategy: $('repair.strategy')?.value || 'per_entry',
             auto_repair: $('repair.auto_repair')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
+            ffprobe_check: $('repair.ffprobe_check')?.checked || false,
             arrs,
         };
     }
