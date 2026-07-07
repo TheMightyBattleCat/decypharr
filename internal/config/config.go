@@ -198,15 +198,27 @@ type RepairConfig struct {
 	NNTPConnectionPercent int          `json:"nntp_connection_percent,omitempty"`
 	Strategy              string       `json:"strategy,omitempty"`
 	RecheckInterval       string       `json:"recheck_interval,omitempty"`
-	Arrs                  []string     `json:"arrs,omitempty"`
-	AutoRepair            bool         `json:"auto_repair,omitempty"`
-	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
+	// FFProbeCheck, when true, additionally validates each file the sweep's STAT probe called
+	// healthy by running ffprobe against the local WebDAV endpoint. Catches files whose article
+	// headers still exist but whose assembled stream is unplayable: purged bodies, mis-assembled
+	// containers with bogus durations, and files with no decodable video/audio streams. Requires
+	// the ffprobe binary on PATH (or FFProbePath) and WebDAV enabled. Default off - it reads real
+	// bytes per file, so sweeps take longer and use provider bandwidth.
+	FFProbeCheck bool `json:"ffprobe_check,omitempty"`
+	// FFProbeTimeout bounds a single ffprobe invocation (e.g. "90s"). Default 90s.
+	FFProbeTimeout string `json:"ffprobe_timeout,omitempty"`
+	// FFProbePath overrides the ffprobe binary location. Default: find "ffprobe" on PATH.
+	FFProbePath   string   `json:"ffprobe_path,omitempty"`
+	Arrs          []string `json:"arrs,omitempty"`
+	AutoRepair    bool     `json:"auto_repair,omitempty"`
+	SkipNZBRepair bool     `json:"skip_nzb_repair,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair
+		!r.AutoRepair && !r.SkipNZBRepair &&
+		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == ""
 }
 
 type Config struct {
