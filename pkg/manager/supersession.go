@@ -15,39 +15,107 @@ import (
 // supersessionResult is the outcome of comparing one broken entry's
 // BrokenFiles against the current Arr reference set.
 type supersessionResult struct {
-	// entryReferenced is true when at least one file of this entry (broken or
-	// not) is still mapped back to it by some Arr. It gates entry deletion:
-	// an entry that's still in active use for other files (a season pack
-	// where only some episodes were individually re-grabbed) must never be
-	// deleted, even once its own broken list empties out.
+	// entryReferenced gates entry deletion: true when at least one of THIS
+	// broken entry's own InfoHashes (from h.BrokenFiles) still backs some
+	// file slot currently served under this Name - i.e. this entry's own
+	// content, broken or not, is still in active use somewhere (a season
+	// pack where only some episodes were individually re-grabbed). This is
+	// deliberately InfoHash-aware, not just "is this Name referenced by
+	// anything": a Name-only check would also come back true whenever a
+	// healthy DUPLICATE entry (different InfoHash, same Name) has taken over
+	// every file slot, permanently blocking cleanup of the broken one even
+	// though none of ITS content is served anymore.
 	entryReferenced bool
-	// stillBroken are the BrokenFiles that remain genuinely broken: either an
-	// Arr still references them, or there's no Arr context to judge them by
-	// at all (managed-source files, or files no Arr ever owned), in which
-	// case they're always kept rather than guessed at.
+	// referencedHashes are every InfoHash currently backing any file slot
+	// under this entry Name (the values of refs[EntryName]), independent of
+	// which entry - broken or healthy - they belong to. Passed to
+	// deleteSupersededEntry as a do-not-touch set so a "safe to delete"
+	// verdict for the broken duplicate can never end up deleting a healthy
+	// sibling duplicate instead (see deleteSupersededEntry for the residual
+	// limitation this doesn't fully close).
+	referencedHashes map[string]struct{}
+	// stillBroken are the BrokenFiles that remain genuinely broken: the
+	// current merged slot for that file name either isn't referenced by any
+	// Arr at all, or is referenced but still backed by this same InfoHash.
 	stillBroken []storage.BrokenFile
-	// superseded are the BrokenFiles an Arr no longer references - the Arr
-	// has already replaced them with a working copy elsewhere.
+	// superseded are the BrokenFiles whose current merged slot is either
+	// unreferenced, or referenced but now backed by a DIFFERENT InfoHash -
+	// i.e. the Arr (or the storage-layer merge, for a same-name duplicate)
+	// has already moved on to a working copy.
 	superseded []storage.BrokenFile
 }
 
 // classifySupersession decides, per broken file, whether it's still needed
-// or was replaced. A file with no Arr context (ArrName/ArrFileID empty - a
-// managed-source entry, or one no Arr ever owned) can never be judged
-// superseded and is always kept.
-func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]struct{}) supersessionResult {
+// or was replaced.
+//
+// Referencedness is judged purely from the reference set (which Arr paths
+// resolve to which entry+file+InfoHash right now) - NOT from whether the
+// BrokenFile row itself happens to carry ArrName/ArrFileID. Those fields are
+// only ever populated when the specific probe pass that produced this
+// BrokenFile had Arr context attached (an arr-source sweep, RecheckMedia, or
+// RecheckEntry called with fix=true); a plain magnifier recheck (fix=false)
+// or a managed-source sweep never attaches it, which previously meant such a
+// BrokenFile could never be judged superseded no matter what the reference
+// set said. A file whose current entry Name has no Arr reference at all is
+// exactly as "superseded" whether or not this particular probe happened to
+// capture Arr metadata for it.
+//
+// One consequence: a purely managed-source entry that no configured Arr has
+// ever referenced now also reads as "superseded" (there is nothing to compare
+// it against), and becomes eligible for clearing/deletion the same as a
+// genuine Arr replacement would. buildArrReferencedSet refuses to run at all
+// when there are zero eligible Arrs, to prevent that from cascading into
+// clearing every broken entry on a pure-managed, no-Arr install; it does NOT
+// protect a mixed install's manually-added, non-Arr-tracked downloads that
+// coexist alongside Arr-managed ones - those are treated as superseded too.
+func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]string) supersessionResult {
 	entryRefs := refs[h.EntryName]
-	res := supersessionResult{entryReferenced: len(entryRefs) > 0}
+
+	referencedHashes := make(map[string]struct{}, len(entryRefs))
+	for _, hash := range entryRefs {
+		if hash != "" {
+			referencedHashes[hash] = struct{}{}
+		}
+	}
+
+	brokenHashes := make(map[string]struct{})
 	for _, bf := range h.BrokenFiles {
-		if bf.ArrName == "" || bf.ArrFileID == 0 {
-			res.stillBroken = append(res.stillBroken, bf)
-			continue
+		if bf.InfoHash != "" {
+			brokenHashes[bf.InfoHash] = struct{}{}
 		}
-		if _, ok := entryRefs[bf.FileName]; ok {
-			res.stillBroken = append(res.stillBroken, bf)
-			continue
+	}
+	entryReferenced := false
+	for hash := range brokenHashes {
+		if _, ok := referencedHashes[hash]; ok {
+			entryReferenced = true
+			break
 		}
-		res.superseded = append(res.superseded, bf)
+	}
+	if len(brokenHashes) == 0 {
+		// No InfoHash recorded on any broken file to check (shouldn't
+		// normally happen - brokenFiles() always tries to set one). Fall
+		// back to the coarser "is this Name referenced by anything at all"
+		// so a data gap never reads as "safe to delete".
+		entryReferenced = len(entryRefs) > 0
+	}
+
+	res := supersessionResult{entryReferenced: entryReferenced, referencedHashes: referencedHashes}
+	for _, bf := range h.BrokenFiles {
+		hash, ok := entryRefs[bf.FileName]
+		switch {
+		case !ok:
+			res.superseded = append(res.superseded, bf)
+		case bf.InfoHash == "" || hash == bf.InfoHash:
+			// Referenced, and still backed by this same broken copy (or we
+			// have no InfoHash on file to prove otherwise) - genuinely still
+			// broken.
+			res.stillBroken = append(res.stillBroken, bf)
+		default:
+			// Referenced, but the slot is now backed by a different
+			// InfoHash - a healthy duplicate has already taken over this
+			// exact (Name, FileName) pair.
+			res.superseded = append(res.superseded, bf)
+		}
 	}
 	return res
 }
@@ -60,10 +128,11 @@ func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]str
 //
 // Deleting the underlying entry from decypharr (cleanupEntry) is strictly
 // narrower than clearing the health record: it only ever happens when
-// res.entryReferenced is also false, i.e. nothing about this entry - broken
-// or otherwise - is in use anymore. The season-pack case (some other file in
-// the same entry is still referenced) always survives with its broken list
-// merely trimmed or cleared, never deleted.
+// res.entryReferenced is also false, i.e. none of THIS entry's own InfoHashes
+// are backing anything currently served under this Name. The season-pack
+// case (some other file backed by the same InfoHash is still referenced)
+// always survives with its broken list merely trimmed or cleared, never
+// deleted.
 func (r *Repair) applySupersession(h *storage.EntryHealth, res supersessionResult, cleanupEntry bool) (cleared bool, err error) {
 	if len(res.superseded) == 0 {
 		return false, nil
@@ -77,7 +146,7 @@ func (r *Repair) applySupersession(h *storage.EntryHealth, res supersessionResul
 			Msg("Repair: superseded by replacement; removed from broken list")
 
 		if cleanupEntry && !res.entryReferenced {
-			r.deleteSupersededEntry(h.EntryName)
+			r.deleteSupersededEntry(h.EntryName, res.referencedHashes)
 		}
 		return true, nil
 	}
@@ -94,22 +163,39 @@ func (r *Repair) applySupersession(h *storage.EntryHealth, res supersessionResul
 	return false, nil
 }
 
-// deleteSupersededEntry removes the underlying entry once nothing about it
-// is referenced by any Arr anymore. Mirrors the identifier + call pattern
-// finalizeEntryRepair uses to delete a fully-broken entry after a successful
-// re-search: DeleteEntry is keyed by infohash, and a single entry folder can
-// span more than one (a merged candidate), so every distinct infohash across
-// the entry's files is deleted.
-func (r *Repair) deleteSupersededEntry(entryName string) {
+// deleteSupersededEntry removes the underlying entry once none of its own
+// InfoHashes are referenced by any Arr anymore. Mirrors the identifier + call
+// pattern finalizeEntryRepair uses to delete a fully-broken entry after a
+// successful re-search: DeleteEntry is keyed by infohash, and a single entry
+// folder can span more than one (a merged candidate), so every distinct
+// infohash across the entry's files is a deletion candidate - except any
+// hash in exclude, which some file under this Name is still actively serving
+// (a healthy duplicate) and must never be touched.
+//
+// KNOWN LIMITATION (not fixed here, tracked separately): this only ever sees
+// InfoHashes still present in the CURRENT merged EntryItem returned by
+// GetEntryItem, which is itself a per-filename "newest AddedOn wins" merge
+// across every raw Entry row sharing this Name (storage.updateEntryItem).
+// Once a duplicate's files have all been evicted from that merge by a newer
+// sibling, its original Entry row becomes permanently unreachable from here
+// and is never cleaned up - a pre-existing storage leak, not something this
+// change introduces or resolves. The exclude set above only prevents this
+// function from deleting the WRONG (still-live) entry; it cannot make it find
+// the already-shadowed one.
+func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]struct{}) {
 	item, err := r.manager.GetEntryItem(entryName)
 	if err != nil || item == nil {
 		return
 	}
 	hashes := make(map[string]struct{})
 	for _, f := range item.Files {
-		if f != nil && f.InfoHash != "" {
-			hashes[f.InfoHash] = struct{}{}
+		if f == nil || f.InfoHash == "" {
+			continue
 		}
+		if _, keep := exclude[f.InfoHash]; keep {
+			continue
+		}
+		hashes[f.InfoHash] = struct{}{}
 	}
 	for hash := range hashes {
 		if err := r.manager.DeleteEntry(hash, true); err != nil {
@@ -120,30 +206,43 @@ func (r *Repair) deleteSupersededEntry(entryName string) {
 	}
 }
 
-// buildArrReferencedSet maps entry-folder name -> the set of file names
-// within it that some currently-eligible Arr still references, using the
-// exact same GetMedia + symlink-target resolution enumerateArrCandidates
-// already relies on (collectArrMediaCandidates / collectArrFiles). This
-// deliberately never invents a second path-resolution implementation that
-// could silently disagree with the sweep's.
+// buildArrReferencedSet maps entry-folder name -> file name -> the InfoHash
+// currently backing that file slot, using the exact same GetMedia +
+// symlink-target resolution enumerateArrCandidates already relies on
+// (collectArrMediaCandidates / collectArrFiles), reading the InfoHash off the
+// same *storage.EntryItem collectArrMediaCandidates already loads via
+// GetEntryItem. This deliberately never invents a second path-resolution
+// implementation that could silently disagree with the sweep's.
+//
+// The InfoHash (not just presence of the file name) is what lets
+// classifySupersession tell apart "this Arr path resolves to a name/file this
+// broken copy still owns" from "this Arr path resolves to the same name/file,
+// but a healthy DUPLICATE entry has since taken over that slot" - the latter
+// is the same-release-name duplicate case, where the Arr's reference never
+// moves (same folder, same final filename) even though the specific broken
+// copy behind it has already been superseded by a different InfoHash.
 //
 // It queries every eligible Arr regardless of cfg.Repair.Arrs scoping: "does
 // any Arr still use this file" is independent of which Arrs a scheduled
 // sweep happens to be scoped to check, and narrowing to that scope could
 // make a file merely excluded from the sweep's Arr filter look superseded.
 //
-// Any per-Arr fetch or resolution failure aborts the whole build and returns
-// an error - callers must treat that as "couldn't determine anything" and
-// leave the broken list untouched. Silently skipping a failed Arr (the way
-// enumerateArrCandidates does for sweep enumeration) would risk treating
-// real breakage as superseded during that Arr's outage.
-func (r *Repair) buildArrReferencedSet(ctx context.Context) (map[string]map[string]struct{}, error) {
+// Returns an error - never an empty-but-successful map - when there are zero
+// eligible Arrs, on top of the existing per-Arr fetch/resolution failure
+// case. Both must abort the whole build: since classifySupersession no longer
+// requires a BrokenFile to carry ArrName/ArrFileID (see classifySupersession),
+// an empty reference set now reads as "nothing about this entry is
+// referenced", which for a real Arr outage - or an install with zero Arrs
+// configured - would otherwise mean every broken entry in the system looks
+// superseded at once. Callers must treat any error here as "couldn't
+// determine anything" and leave the broken list untouched.
+func (r *Repair) buildArrReferencedSet(ctx context.Context) (map[string]map[string]string, error) {
 	arrs := r.eligibleArrs(nil)
-	out := make(map[string]map[string]struct{})
 	if len(arrs) == 0 {
-		return out, nil
+		return nil, fmt.Errorf("no eligible arrs configured")
 	}
 
+	out := make(map[string]map[string]string)
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	for _, a := range arrs {
@@ -156,11 +255,17 @@ func (r *Repair) buildArrReferencedSet(ctx context.Context) (map[string]map[stri
 			for name, c := range sub {
 				files, ok := out[name]
 				if !ok {
-					files = make(map[string]struct{}, len(c.contentMap))
+					files = make(map[string]string, len(c.contentMap))
 					out[name] = files
 				}
 				for fileName := range c.contentMap {
-					files[fileName] = struct{}{}
+					var infoHash string
+					if c.item != nil {
+						if f, ok := c.item.Files[fileName]; ok && f != nil {
+							infoHash = f.InfoHash
+						}
+					}
+					files[fileName] = infoHash
 				}
 			}
 			mu.Unlock()
@@ -200,8 +305,13 @@ func excludeFilesFromItem(item *storage.EntryItem, exclude map[string]struct{}) 
 // left untouched here - the sweep's normal probe pass re-derives their
 // broken-file list from scratch regardless.
 //
-// The Arr round trip in buildArrReferencedSet is skipped entirely when
-// nothing in this batch is even a broken, Arr-linked candidate. On a
+// Every broken candidate in the batch is considered, not just ones whose
+// BrokenFiles happen to carry ArrName/ArrFileID: classifySupersession judges
+// referencedness from the reference set alone (see its docstring), so a
+// managed-source sweep's own broken files - which never carry Arr metadata,
+// since managed candidates never resolve Arr context at all - are exactly as
+// eligible as ones that do. The Arr round trip in buildArrReferencedSet is
+// still skipped entirely when nothing in this batch is broken at all. On a
 // reference-set failure, candidates are returned unmodified - the sweep
 // proceeds exactly as it would without this check.
 func (r *Repair) dropSupersededCandidates(ctx context.Context, in map[string]*candidate, log zerolog.Logger) map[string]*candidate {
@@ -215,16 +325,7 @@ func (r *Repair) dropSupersededCandidates(ctx context.Context, in map[string]*ca
 		if err != nil || h == nil || h.Status != storage.HealthBroken || len(h.BrokenFiles) == 0 {
 			continue
 		}
-		hasArrFile := false
-		for _, bf := range h.BrokenFiles {
-			if bf.ArrName != "" && bf.ArrFileID != 0 {
-				hasArrFile = true
-				break
-			}
-		}
-		if hasArrFile {
-			pendings = append(pendings, pending{name: name, h: h})
-		}
+		pendings = append(pendings, pending{name: name, h: h})
 	}
 	if len(pendings) == 0 {
 		return in
