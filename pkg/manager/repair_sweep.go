@@ -109,6 +109,16 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	candidates = nil
 	protocolScope := r.effectiveProtocolScope(opts)
 	due = r.filterCandidatesByProtocol(due, protocolScope)
+
+	// Arr-source sweeps only ever enumerate entries an Arr currently
+	// references, so an already-superseded entry never reaches this point.
+	// Managed-source sweeps enumerate every entry in storage regardless, so a
+	// broken entry the Arrs have since replaced can otherwise sit here being
+	// re-probed (and re-confirmed broken) forever; drop those before probing.
+	if cfg.Source == config.RepairSourceManaged {
+		due = r.dropSupersededCandidates(ctx, due, log)
+	}
+
 	run.Stats.Candidates = len(due)
 	run.Stats.SkippedFresh = skipped
 
@@ -1068,6 +1078,10 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			r.mu.Unlock()
 			cancel()
 		}()
+		// Drop or trim any candidate the Arrs no longer reference before
+		// acting on it - "Fix" must never blocklist or re-search on behalf
+		// of a file the Arr already replaced with a working copy.
+		r.filterSupersededHealths(runCtx, healths)
 		r.repairBroken(runCtx, run, healths)
 		if runCtx.Err() != nil {
 			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
@@ -1227,6 +1241,36 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		ctx = r.parentCtx
 	}
 	r.runWG.Go(func() {
+		// Supersession check: a broken entry whose files no Arr references
+		// anymore was already replaced elsewhere - probing it just
+		// re-confirms "broken" for a release the library stopped using
+		// weeks ago. A file an Arr individually re-grabbed out of an
+		// otherwise still-active entry (season-pack case) is dropped from
+		// the broken list and excluded from this probe so the probe pass
+		// doesn't immediately re-add it.
+		if existing, _ := r.manager.storage.GetEntryHealth(entryName); existing != nil &&
+			existing.Status == storage.HealthBroken && len(existing.BrokenFiles) > 0 {
+			refs, err := r.buildArrReferencedSet(ctx)
+			if err != nil {
+				r.logger.Warn().Err(err).Str("entry", entryName).Msg("Recheck: failed to build Arr reference set; probing normally")
+			} else if res := classifySupersession(existing, refs); len(res.superseded) > 0 {
+				exclude := make(map[string]struct{}, len(res.superseded))
+				for _, bf := range res.superseded {
+					exclude[bf.FileName] = struct{}{}
+				}
+				cleared, aerr := r.applySupersession(existing, res, r.cfg().CleanupSuperseded)
+				if aerr != nil {
+					r.logger.Warn().Err(aerr).Str("entry", entryName).Msg("Recheck: failed to apply supersession")
+				} else if cleared {
+					// Every broken file (or the whole entry) was superseded -
+					// don't probe the dead release's own articles at all.
+					return
+				} else {
+					c.item = excludeFilesFromItem(c.item, exclude)
+				}
+			}
+		}
+
 		if fix {
 			r.attachArrContext(ctx, c)
 		}
@@ -1241,7 +1285,8 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 	})
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The
-	// real EntryHealth in storage is updated by probeEntry shortly after.
+	// real EntryHealth in storage is updated by probeEntry shortly after -
+	// or, if the entry turns out to be fully superseded, cleared instead.
 	if h == nil {
 		h = &storage.EntryHealth{EntryName: entryName}
 	}
