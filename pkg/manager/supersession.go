@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -101,23 +102,78 @@ func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]str
 
 	res := supersessionResult{entryReferenced: entryReferenced, referencedHashes: referencedHashes}
 	for _, bf := range h.BrokenFiles {
-		hash, ok := entryRefs[bf.FileName]
-		switch {
-		case !ok:
+		if fileSuperseded(refs, h.EntryName, bf.FileName, bf.InfoHash) {
 			res.superseded = append(res.superseded, bf)
-		case bf.InfoHash == "" || hash == bf.InfoHash:
-			// Referenced, and still backed by this same broken copy (or we
-			// have no InfoHash on file to prove otherwise) - genuinely still
-			// broken.
+		} else {
 			res.stillBroken = append(res.stillBroken, bf)
-		default:
-			// Referenced, but the slot is now backed by a different
-			// InfoHash - a healthy duplicate has already taken over this
-			// exact (Name, FileName) pair.
-			res.superseded = append(res.superseded, bf)
 		}
 	}
 	return res
+}
+
+// fileSuperseded reports whether refs shows the (entryName, fileName) slot as
+// already replaced: either nothing currently references it, or something
+// does but the slot is backed by a different InfoHash than infoHash (a
+// healthy duplicate has taken over it). This is the single source of truth
+// for "is this specific file superseded," shared by classifySupersession
+// (whole-entry, from a BrokenFile row) and filterSupersededFiles (per-file,
+// during a probe pass) so the two can never disagree.
+//
+// infoHash == "" can only ever prove "unreferenced" - it can never disprove
+// a match against a referenced slot's hash, so a referenced slot with no
+// known InfoHash to compare against is never treated as superseded. Any
+// ambiguity resolves to "not superseded."
+func fileSuperseded(refs map[string]map[string]string, entryName, fileName, infoHash string) bool {
+	hash, ok := refs[entryName][fileName]
+	if !ok {
+		return true
+	}
+	if infoHash == "" {
+		return false
+	}
+	return hash != infoHash
+}
+
+// supersessionContext carries the per-run Arr reference set (nil when
+// unavailable this run - build failed, zero eligible Arrs, or the caller
+// never built one) down through the probe path alongside the existing
+// candidate/opts threading, plus a shared counter for how many files this
+// run skipped as already-superseded. Safe for concurrent use: probeEntry
+// runs for many entries in parallel, each incrementing the same counter.
+type supersessionContext struct {
+	refs    map[string]map[string]string
+	skipped atomic.Int64
+}
+
+// filterSupersededFiles drops any name from names whose (entry, file) slot
+// the reference set shows as already superseded - unreferenced, or
+// referenced but now backed by a different InfoHash (a healthy duplicate
+// serves it instead). Applied once, before any probing of this entry's
+// files, so a season pack's individually-replaced episodes are never
+// re-probed (and never re-added to BrokenFiles) sweep after sweep: no probe
+// happens for them at all, base STAT check or otherwise, and one DEBUG line
+// is logged per skip.
+//
+// sc == nil or sc.refs == nil means no reference set was available this run
+// - names is returned unfiltered. Never skip a file on missing information.
+func (r *Repair) filterSupersededFiles(item *storage.EntryItem, names []string, sc *supersessionContext) []string {
+	if sc == nil || sc.refs == nil || item == nil {
+		return names
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		var infoHash string
+		if file := item.Files[name]; file != nil {
+			infoHash = file.InfoHash
+		}
+		if fileSuperseded(sc.refs, item.Name, name, infoHash) {
+			sc.skipped.Add(1)
+			r.logger.Debug().Str("entry", item.Name).Str("file", name).Msg("Repair: skipping superseded file")
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 // applySupersession persists the outcome of classifySupersession for one
@@ -302,57 +358,45 @@ func excludeFilesFromItem(item *storage.EntryItem, exclude map[string]struct{}) 
 // their files anymore), clearing their records instead of spending a probe
 // re-confirming "broken" on a release the library already replaced.
 // Candidates that are healthy, unchecked, or only partially superseded are
-// left untouched here - the sweep's normal probe pass re-derives their
-// broken-file list from scratch regardless.
+// left untouched here - the sweep's normal probe pass, with its own per-file
+// supersession filter (filterSupersededFiles), handles the rest.
+//
+// refs is the reference set the caller already built once for this run (see
+// executeSweep) - this function does no Arr round trip of its own. refs ==
+// nil (build failed, or zero eligible Arrs) leaves candidates untouched
+// entirely: the sweep proceeds exactly as it would without this check.
 //
 // Every broken candidate in the batch is considered, not just ones whose
 // BrokenFiles happen to carry ArrName/ArrFileID: classifySupersession judges
 // referencedness from the reference set alone (see its docstring), so a
 // managed-source sweep's own broken files - which never carry Arr metadata,
 // since managed candidates never resolve Arr context at all - are exactly as
-// eligible as ones that do. The Arr round trip in buildArrReferencedSet is
-// still skipped entirely when nothing in this batch is broken at all. On a
-// reference-set failure, candidates are returned unmodified - the sweep
-// proceeds exactly as it would without this check.
-func (r *Repair) dropSupersededCandidates(ctx context.Context, in map[string]*candidate, log zerolog.Logger) map[string]*candidate {
-	type pending struct {
-		name string
-		h    *storage.EntryHealth
-	}
-	var pendings []pending
-	for name := range in {
-		h, err := r.manager.storage.GetEntryHealth(name)
-		if err != nil || h == nil || h.Status != storage.HealthBroken || len(h.BrokenFiles) == 0 {
-			continue
-		}
-		pendings = append(pendings, pending{name: name, h: h})
-	}
-	if len(pendings) == 0 {
-		return in
-	}
-
-	refs, err := r.buildArrReferencedSet(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Sweep: failed to build Arr reference set for supersession check; probing all candidates")
+// eligible as ones that do.
+func (r *Repair) dropSupersededCandidates(in map[string]*candidate, refs map[string]map[string]string, log zerolog.Logger) map[string]*candidate {
+	if refs == nil {
 		return in
 	}
 
 	cleanup := r.cfg().CleanupSuperseded
 	dropped := 0
-	for _, p := range pendings {
-		res := classifySupersession(p.h, refs)
+	for name := range in {
+		h, err := r.manager.storage.GetEntryHealth(name)
+		if err != nil || h == nil || h.Status != storage.HealthBroken || len(h.BrokenFiles) == 0 {
+			continue
+		}
+		res := classifySupersession(h, refs)
 		if len(res.superseded) == 0 || len(res.stillBroken) > 0 {
 			// Not superseded, or only partially - the normal probe pass
 			// re-derives this entry's broken files from scratch either way.
 			continue
 		}
-		cleared, aerr := r.applySupersession(p.h, res, cleanup)
+		cleared, aerr := r.applySupersession(h, res, cleanup)
 		if aerr != nil {
-			log.Warn().Err(aerr).Str("entry", p.name).Msg("Sweep: failed to apply supersession")
+			log.Warn().Err(aerr).Str("entry", name).Msg("Sweep: failed to apply supersession")
 			continue
 		}
 		if cleared {
-			delete(in, p.name)
+			delete(in, name)
 			dropped++
 		}
 	}
