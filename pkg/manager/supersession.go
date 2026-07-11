@@ -292,10 +292,27 @@ func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]stru
 // configured - would otherwise mean every broken entry in the system looks
 // superseded at once. Callers must treat any error here as "couldn't
 // determine anything" and leave the broken list untouched.
-func (r *Repair) buildArrReferencedSet(ctx context.Context) (map[string]map[string]string, error) {
+// onArrDone, if given, is called once per Arr as its fetch completes -
+// done is the count of Arrs finished so far (including this one), total is
+// len(arrs), and name is the Arr that just finished. Arrs are fetched
+// concurrently, so this reports completion order, not a sequential "current
+// Arr"; existing callers that don't need progress just omit it.
+func (r *Repair) buildArrReferencedSet(ctx context.Context, onArrDone ...func(done, total int, name string)) (map[string]map[string]string, error) {
 	arrs := r.eligibleArrs(nil)
 	if len(arrs) == 0 {
 		return nil, fmt.Errorf("no eligible arrs configured")
+	}
+
+	total := len(arrs)
+	var done atomic.Int32
+	notify := func(name string) {
+		if len(onArrDone) == 0 {
+			return
+		}
+		d := int(done.Add(1))
+		for _, cb := range onArrDone {
+			cb(d, total, name)
+		}
 	}
 
 	out := make(map[string]map[string]string)
@@ -325,6 +342,7 @@ func (r *Repair) buildArrReferencedSet(ctx context.Context) (map[string]map[stri
 				}
 			}
 			mu.Unlock()
+			notify(a.Name)
 			return nil
 		})
 	}

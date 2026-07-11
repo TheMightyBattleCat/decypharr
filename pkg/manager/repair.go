@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -73,7 +74,6 @@ const (
 	// a typical import attempt while still letting a genuinely-still-broken file
 	// advance to the next release quickly.
 	playbackRepairCooldown = 2 * time.Minute
-
 	// repairStopFinalRepairTimeout bounds the Arr delete + re-search pass run
 	// when StopSchedule fires and auto-repair is enabled.
 	repairStopFinalRepairTimeout = 5 * time.Minute
@@ -103,6 +103,11 @@ type Repair struct {
 	// churn. Guarded by playbackRepairMu.
 	playbackRepairMu   sync.Mutex
 	lastPlaybackRepair map[string]time.Time
+
+	// staleNZBProgress is a live snapshot of an in-progress stale-NZB
+	// preview or cleanup pass, polled by the modal's progress endpoint. See
+	// stale_nzb_progress.go.
+	staleNZBProgress atomic.Pointer[StaleNZBProgress]
 }
 
 // NewRepair builds the repair service for the given manager. Call
