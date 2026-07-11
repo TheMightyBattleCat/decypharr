@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -71,6 +72,11 @@ type Repair struct {
 	cancelRun   context.CancelFunc
 	scheduled   bool
 	runWG       sync.WaitGroup
+
+	// staleNZBProgress is a live snapshot of an in-progress stale-NZB
+	// preview or cleanup pass, polled by the modal's progress endpoint. See
+	// stale_nzb_progress.go.
+	staleNZBProgress atomic.Pointer[StaleNZBProgress]
 }
 
 // NewRepair builds the repair service for the given manager. Call
