@@ -751,6 +751,12 @@ func (s *Server) handleListEntryHealth(w http.ResponseWriter, r *http.Request) {
 		if statusFilter != "" && string(state.Status) != statusFilter {
 			return nil
 		}
+		// A health record's backing entry can be deleted through a path that
+		// leaves the record itself behind (see Manager.EntryNameHasBackingEntry) -
+		// never show a record for something that no longer exists.
+		if !s.manager.EntryNameHasBackingEntry(state.EntryName) {
+			return nil
+		}
 		out = append(out, state)
 		return nil
 	})
