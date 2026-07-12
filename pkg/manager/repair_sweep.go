@@ -723,6 +723,17 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		}
 	}
 
+	// Repaired counts entries, not files, to match Broken/Probed/Healthy's
+	// granularity - a season pack with three broken episodes that all get
+	// blocklisted + re-searched is one repaired entry, not three, exactly
+	// like it's one broken entry above, not three.
+	if len(succeeded) > 0 {
+		statsMu.Lock()
+		run.Stats.Repaired++
+		r.saveRun(run)
+		statsMu.Unlock()
+	}
+
 	r.finalizeEntryRepair(name, h, succeeded)
 }
 
@@ -800,8 +811,11 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 		}
 	}
 
+	// Repaired itself is incremented by the caller (healBrokenEntry), once per
+	// entry rather than once per file here - this save just keeps live
+	// progress (Probed/Broken/etc., already mutated elsewhere under statsMu)
+	// visible to a concurrent poller mid-run.
 	statsMu.Lock()
-	run.Stats.Repaired += len(files)
 	r.saveRun(run)
 	statsMu.Unlock()
 	return true
@@ -837,6 +851,19 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 	if !shouldDelete {
 		h.LastRepairAt = now
 		r.saveHealth(h)
+		// A partial repair (some but not all of the entry's files were broken,
+		// or a full delete wasn't safe - e.g. a missing Arr file ID) still
+		// blocklisted + re-searched whatever succeeded above, and that heal
+		// action deserves a log line just as much as a full deletion does -
+		// otherwise it's a Repaired count with no corresponding evidence of
+		// what actually happened.
+		if len(succeeded) > 0 {
+			r.logger.Info().
+				Str("entry", name).
+				Int("broken_files", h.BrokenCount).
+				Int("total_files", h.FileCount).
+				Msg("Repair: partially repaired entry - blocklisted + re-searched broken files, entry kept")
+		}
 		return
 	}
 
