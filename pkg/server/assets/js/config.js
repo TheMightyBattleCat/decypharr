@@ -1270,6 +1270,7 @@ class ConfigManager {
             const quotaPeriodInput = getField('quota_period');
             const quotaResetDayInput = getField('quota_reset_day');
             const quotaResetHourInput = getField('quota_reset_hour');
+            const reserveInput = getField('reserve');
 
             const provider = {
                 host: hostInput.value,
@@ -1288,7 +1289,9 @@ class ConfigManager {
                 quota: quotaInput ? quotaInput.value.trim() : '',
                 quota_period: quotaPeriodInput ? quotaPeriodInput.value : 'week',
                 quota_reset_day: quotaResetDayInput ? (parseInt(quotaResetDayInput.value) || 0) : 0,
-                quota_reset_hour: quotaResetHourInput ? (parseInt(quotaResetHourInput.value) || 0) : 0
+                quota_reset_hour: quotaResetHourInput ? (parseInt(quotaResetHourInput.value) || 0) : 0,
+                // Reserve held back for fills only; blank = 10% of cap (server-side default).
+                reserve: reserveInput ? reserveInput.value.trim() : ''
             };
 
             if (provider.host && provider.username && provider.password) {
@@ -1966,6 +1969,16 @@ class ConfigManager {
                                id="usenet_provider_${index}_quota"
                                placeholder="e.g. 500GB (empty = unlimited)">
                         <span class="text-sm opacity-70">Data cap per period. Empty or 0 = unlimited.</span>
+                    </div>
+                    <div>
+                        <label class="label" for="usenet_provider_${index}_reserve">
+                            <span class="font-medium">Reserve (fills)</span>
+                        </label>
+                        <input type="text" class="input w-full"
+                               name="usenet.providers[${index}].reserve"
+                               id="usenet_provider_${index}_reserve"
+                               placeholder="blank = 10% of cap">
+                        <span class="text-sm opacity-70">Held back for fills only. Once you've used the cap minus this reserve, the server drops to a fill/backup role for the rest of the period; blank defaults to 10% of the cap.</span>
                     </div>
                     <div>
                         <label class="label" for="usenet_provider_${index}_quota_period">

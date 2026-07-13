@@ -42,6 +42,12 @@ type UsenetProvider struct {
 	// QuotaResetHour is the hour of day (0..23, server local time) the period
 	// rolls over. Default 0 (midnight).
 	QuotaResetHour int `json:"quota_reset_hour,omitempty"`
+	// Reserve is a tail of the Quota held back for fills only, as a human size
+	// (e.g. "500GB"). Once (Quota - Reserve) is used the provider stops leading
+	// bulk and drops to a fill/backup role for the rest of the period, so its
+	// reserve is spent only completing segments the other primaries can't
+	// provide. Blank defaults to 10% of Quota.
+	Reserve string `json:"reserve,omitempty"`
 }
 
 // Usenet configuration for usenet streaming and downloading

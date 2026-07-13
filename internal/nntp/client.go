@@ -517,19 +517,45 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	// slices on the common path: when a pool has a free slot, the first scan
 	// returns immediately. A slice is only needed for the uncommon all-busy
 	// fallback that races across providers.
-	useBackups := true
+	// Effective serving tiers (recomputed each call from live quota state):
+	//   lead  = primary below its soft threshold â carries bulk load
+	//   fill  = configured backup, OR a primary in its reserve band â used only
+	//           to fill segments the leads can't provide (article-not-found /
+	//           connection error), drawing a capped primary's held-back reserve
+	//   blocked = at/over hard quota â never used
+	//
+	// Bulk draws from the lead tier. The fill tier is consulted only when leads
+	// EXIST but are all excluded for this segment. If no lead exists at all
+	// (every primary at/over its soft cap), bulk fails here rather than spilling
+	// onto reserves or metered backups â reserves are a cushion for the normal
+	// case (one server capped, others still leading), not a way to keep
+	// streaming when every primary is maxed.
+	leadExists := false
+	leadUsable := false
 	for _, p := range c.providers {
-		if !p.Backup && !exclusions.excludes(p) && !c.providerBlocked(p) {
-			useBackups = false
+		if c.providerTier(p) != tierLead {
+			continue
+		}
+		leadExists = true
+		if !exclusions.excludes(p) {
+			leadUsable = true
 			break
 		}
 	}
 
+	target := tierLead
+	if !leadUsable {
+		if !leadExists {
+			return nil, config.UsenetProvider{}, errors.New("no eligible providers available")
+		}
+		target = tierFill
+	}
+
 	// Phase 1: Non-blocking scan - try to get a free slot from any provider
-	// within the current tier.
+	// within the target tier.
 	eligibleCount := 0
 	for _, provider := range c.providers {
-		if provider.Backup != useBackups || exclusions.excludes(provider) || c.providerBlocked(provider) {
+		if c.providerTier(provider) != target || exclusions.excludes(provider) {
 			continue
 		}
 		eligibleCount++
@@ -554,12 +580,12 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 		return nil, config.UsenetProvider{}, errors.New("no eligible providers available")
 	}
 
-	// Phase 2: All providers in this tier busy - race for first available
-	// slot in the tier. When the primary tier is in use this is the wait
-	// that lets a backup remain idle rather than getting roped in.
+	// Phase 2: All providers in the target tier busy - race for first available
+	// slot in the tier. When the lead tier is in use this is the wait that lets
+	// the fill tier remain idle rather than getting roped in.
 	eligible := make([]config.UsenetProvider, 0, eligibleCount)
 	for _, provider := range c.providers {
-		if provider.Backup == useBackups && !exclusions.excludes(provider) && !c.providerBlocked(provider) {
+		if c.providerTier(provider) == target && !exclusions.excludes(provider) {
 			eligible = append(eligible, provider)
 		}
 	}
@@ -991,8 +1017,11 @@ func (c *Client) Stats() map[string]any {
 			if bw, ok := c.bw.Snapshot(p.Host); ok {
 				providerInfo["bytes_used"] = bw.BytesUsed
 				providerInfo["quota_bytes"] = bw.QuotaBytes
+				providerInfo["reserve_bytes"] = bw.ReserveBytes
+				providerInfo["soft_threshold"] = bw.SoftThreshold
 				providerInfo["quota_period"] = bw.Period
 				providerInfo["quota_exceeded"] = bw.Exceeded
+				providerInfo["fill_only"] = bw.FillOnly
 				if !bw.ResetAt.IsZero() {
 					providerInfo["quota_reset_at"] = bw.ResetAt.Format("2006-01-02T15:04:05Z07:00")
 				}
