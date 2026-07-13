@@ -1190,6 +1190,36 @@
                                     </div>
                                 </div>
                                 <div id="speed-result-${provider.host.replace(/\./g, '-')}" class="text-xs mt-1"></div>
+                                ${(() => {
+                                    const used = provider.bytes_used || 0;
+                                    const q = provider.quota_bytes || 0;
+                                    if (!q && !used) return '';
+                                    if (!q) {
+                                        return `<div class="mt-1 text-xs text-base-content/60">${window.decypharrUtils.formatBytes(used)} downloaded this period</div>`;
+                                    }
+                                    const pct = Math.min(100, (used / q) * 100);
+                                    const exceeded = provider.quota_exceeded;
+                                    const barColor = exceeded ? 'bg-error' : (pct >= 80 ? 'bg-warning' : 'bg-success');
+                                    let resetStr = '';
+                                    if (provider.quota_reset_at) {
+                                        const ms = new Date(provider.quota_reset_at) - new Date();
+                                        if (ms > 0) {
+                                            const h = Math.floor(ms / 3600000);
+                                            const d = Math.floor(h / 24);
+                                            resetStr = d >= 1 ? `resets in ${d}d ${h % 24}h` : `resets in ${h}h`;
+                                        }
+                                    }
+                                    return `
+                                        <div class="mt-1">
+                                            <div class="flex justify-between items-center text-xs">
+                                                <span class="${exceeded ? 'text-error font-medium' : 'text-base-content/70'}">${window.decypharrUtils.formatBytes(used)} / ${window.decypharrUtils.formatBytes(q)}${exceeded ? ' <span class="badge badge-error badge-xs ml-1">Limit reached</span>' : ''}</span>
+                                                <span class="text-base-content/50">${resetStr}</span>
+                                            </div>
+                                            <div class="w-full bg-base-300 rounded-full h-1.5 mt-1 overflow-hidden">
+                                                <div class="h-full ${barColor} transition-all duration-300" style="width: ${pct}%"></div>
+                                            </div>
+                                        </div>`;
+                                })()}
                             </div>
                         </div>
                     `;
