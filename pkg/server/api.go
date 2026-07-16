@@ -520,11 +520,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Preserve fields that shouldn't be overwritten by frontend
 	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
-	// The frontend config form doesn't include use_auth or enable_webdav_auth,
-	// so they would be zero-valued (false) in the decoded payload. Preserve
-	// them from the live config so auth isn't silently disabled on every save.
+	// The frontend config form doesn't include use_auth, enable_webdav_auth,
+	// or webhook_token, so they would be zero-valued in the decoded payload.
+	// Preserve them from the live config so auth and Arr webhook
+	// authentication aren't silently disabled on every save.
 	newConfig.UseAuth = currentConfig.UseAuth
 	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
+	newConfig.WebhookToken = currentConfig.WebhookToken
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
