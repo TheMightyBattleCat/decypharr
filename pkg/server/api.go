@@ -520,6 +520,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Preserve fields that shouldn't be overwritten by frontend
 	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
+	// The frontend settings form doesn't include webhook_token, so it would
+	// be zero-valued (empty) in the decoded payload. Preserve it from the
+	// live config the same way Auth is preserved above, so saving any other
+	// setting doesn't silently disable Arr webhook authentication.
+	newConfig.WebhookToken = currentConfig.WebhookToken
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
