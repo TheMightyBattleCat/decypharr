@@ -70,6 +70,11 @@ type Manager struct {
 	downloader *Downloader
 	usenet     *usenet.Usenet
 
+	// arrLibraryMap records where each downloaded file was linked into the
+	// library, so an Arr delete/upgrade webhook reporting only the renamed
+	// library file name can still be traced back to its entry.
+	arrLibraryMap *arrLibraryMap
+
 	// Debrid speed test results storage
 	debridSpeedTestResults *xsync.Map[string, debridTypes.SpeedTestResult]
 
@@ -193,6 +198,7 @@ func (m *Manager) init() {
 	m.scheduler = scheduler
 	m.cetScheduler = cetScheduler
 	m.migrator = NewMigrator(m.storage)
+	m.arrLibraryMap = newArrLibraryMap(m.logger)
 	m.downloader = NewDownloadManager(m)
 
 	// Initialize HTTP pool for streaming
@@ -619,6 +625,8 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
 	}
+	// Entry is gone for good - forget any library paths recorded for it.
+	m.arrLibraryMap.removeEntry(torr.Name)
 	// Refresh entry cache
 	m.RefreshEntries(true)
 	return nil

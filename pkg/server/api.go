@@ -525,6 +525,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// them from the live config so auth isn't silently disabled on every save.
 	newConfig.UseAuth = currentConfig.UseAuth
 	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
+	// The frontend settings form doesn't include webhook_token, so it would
+	// be zero-valued (empty) in the decoded payload. Preserve it from the
+	// live config the same way Auth is preserved above, so saving any other
+	// setting doesn't silently disable Arr webhook authentication.
+	newConfig.WebhookToken = currentConfig.WebhookToken
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
