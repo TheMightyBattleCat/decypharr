@@ -232,6 +232,12 @@ type RepairConfig struct {
 	// grabs another - corrupt downloads never enter the library. Adds seconds and real reads per
 	// import; requires the ffprobe binary and WebDAV. Default off.
 	FFProbeOnImport bool `json:"ffprobe_on_import,omitempty"`
+
+	// CleanupSuperseded, when true, also DELETES a broken entry from decypharr (not just from the
+	// broken list) once no Sonarr/Radarr references any of its files anymore - i.e. the library
+	// has already replaced it with a working copy. Off by default: clearing the broken list is
+	// always done, but removing the underlying entry is opt-in.
+	CleanupSuperseded bool `json:"cleanup_superseded,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
@@ -239,7 +245,8 @@ func (r RepairConfig) IsZero() bool {
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair &&
 		!r.RepairOnPlaybackFailure && r.StopSchedule == "" &&
-		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport
+		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
+		!r.CleanupSuperseded
 }
 
 type Config struct {
