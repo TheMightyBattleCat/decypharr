@@ -131,6 +131,9 @@ class ConfigManager {
         // Load API token info
         this.populateAPIToken(config);
 
+        // Load Arr webhook token info
+        this.renderWebhookToken(config.webhook_token || '', config.app_url || '');
+
         // Load notifications config
         this.populateNotificationSettings(config.notifications);
 
@@ -1610,6 +1613,42 @@ class ConfigManager {
         const usernameField = document.getElementById('auth-username');
         if (usernameField && config.auth_username) {
             usernameField.value = config.auth_username;
+        }
+    }
+
+    // Toggles between the "no token yet" empty state and the token/URL
+    // display, and composes the URL to paste into Sonarr/Radarr. When
+    // app_url isn't set, falls back to the address this page was loaded
+    // from (same fallback used for the magnet link handler registration)
+    // with an explicit note, rather than guessing at a reachable host.
+    renderWebhookToken(token, appUrl) {
+        const emptyState = document.getElementById('webhookTokenEmpty');
+        const configuredState = document.getElementById('webhookTokenConfigured');
+        const tokenDisplay = document.getElementById('webhook-token-display');
+        const urlDisplay = document.getElementById('webhook-url-display');
+        const urlNote = document.getElementById('webhook-url-note');
+
+        if (!emptyState || !configuredState) return;
+
+        if (!token) {
+            emptyState.classList.remove('hidden');
+            configuredState.classList.add('hidden');
+            return;
+        }
+
+        emptyState.classList.add('hidden');
+        configuredState.classList.remove('hidden');
+        tokenDisplay.value = token;
+
+        const path = `webhooks/arr?token=${encodeURIComponent(token)}`;
+        if (appUrl) {
+            urlDisplay.value = window.decypharrUtils.joinURL(appUrl, path);
+            urlNote.textContent = 'Paste this directly into Sonarr/Radarr as a Webhook connection.';
+        } else {
+            urlDisplay.value = `${window.location.origin}${window.urlBase}${path}`;
+            urlNote.textContent = 'No Application URL is set, so this uses the address you\'re ' +
+                'currently browsing from. If Sonarr/Radarr reach this server through a different ' +
+                'host or port, replace it with that host before pasting.';
         }
     }
 
