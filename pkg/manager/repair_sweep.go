@@ -113,7 +113,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	run.Stats.Candidates = len(due)
 	run.Stats.SkippedFresh = skipped
 
-	// Resolve auto-repair once: when off, the sweep is a pure health check —
+	// Resolve auto-repair once: when off, the repair sweep is a pure health check —
 	// it probes and records broken state but attempts no debrid re-insert and
 	// no Arr delete/re-search.
 	autoRepair := cfg.AutoRepair
