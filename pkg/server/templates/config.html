@@ -637,11 +637,13 @@
                                     <i class="bi bi-webhook mr-2 text-warning"></i>Arr Webhook
                                 </h3>
                                 <p class="text-sm opacity-70 mt-1 max-w-4xl">
-                                    Sonarr and Radarr can notify decypharr the moment a file is deleted or
-                                    replaced by an upgrade, instead of waiting for the next scheduled cleanup.
-                                    Paste the URL below into a Webhook connection in Sonarr or Radarr
+                                    Sonarr and Radarr can notify decypharr the moment a usenet download is
+                                    deleted or replaced by an upgrade, instead of waiting for the next cleanup
+                                    pass. Paste the URL below into a Webhook connection in Sonarr or Radarr
                                     (Settings &rarr; Connect) to enable it - this is entirely optional, and
-                                    the scheduled cleanup keeps running as a backstop either way.
+                                    cleanup (whether it runs on schedule or you trigger it manually via
+                                    the Repair page) keeps working as a backstop either way. Only
+                                    usenet downloads are affected; torrent downloads are untouched.
                                 </p>
                             </div>
 
