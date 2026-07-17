@@ -447,3 +447,14 @@ func (c *Client) providerTier(p config.UsenetProvider) serveTier {
 		return tierLead
 	}
 }
+
+// tierLabel is the stats-API string for a serveTier: "primary" while a
+// provider is leading bulk, "backup" once it's fills-only (reserve band) or
+// blocked (over its hard cap) - from the UI's perspective both mean bulk
+// sourcing has moved off it, so they're shown identically.
+func tierLabel(t serveTier) string {
+	if t == tierLead {
+		return "primary"
+	}
+	return "backup"
+}

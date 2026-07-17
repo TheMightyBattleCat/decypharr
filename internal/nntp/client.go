@@ -999,6 +999,9 @@ func (c *Client) Stats() map[string]any {
 			"active":          active,
 			"idle":            idle,
 			"ssl":             p.SSL,
+			// Computed live (not cached) so a soft-threshold demotion or a
+			// calendar-aligned quota reset is reflected on the very next poll.
+			"tier": tierLabel(c.providerTier(p)),
 		}
 
 		// Add speed test result if available
