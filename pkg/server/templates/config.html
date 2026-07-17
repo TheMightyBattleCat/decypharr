@@ -630,6 +630,69 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="rounded-box border border-base-300 bg-base-200/30 p-4 space-y-4">
+                            <div>
+                                <h3 class="text-lg font-semibold flex items-center">
+                                    <i class="bi bi-webhook mr-2 text-warning"></i>Arr Webhook
+                                </h3>
+                                <p class="text-sm opacity-70 mt-1 max-w-4xl">
+                                    Sonarr and Radarr can notify decypharr the moment a file is deleted or
+                                    replaced by an upgrade, instead of waiting for the next scheduled cleanup.
+                                    Paste the URL below into a Webhook connection in Sonarr or Radarr
+                                    (Settings &rarr; Connect) to enable it - this is entirely optional, and
+                                    the scheduled cleanup keeps running as a backstop either way.
+                                </p>
+                            </div>
+
+                            <div id="webhookTokenEmpty" class="hidden">
+                                <button type="button" id="generate-webhook-token-btn" class="btn btn-primary"
+                                        onclick="refreshWebhookToken();">
+                                    <i class="bi bi-key mr-2"></i>Generate Token
+                                </button>
+                                <p class="text-sm opacity-70 mt-2">No webhook token has been generated yet.
+                                    Generate one to get the URL to paste into Sonarr/Radarr.</p>
+                            </div>
+
+                            <div id="webhookTokenConfigured" class="hidden space-y-4">
+                                <div>
+                                    <label class="label">
+                                        <span class="font-medium">Webhook Token</span>
+                                    </label>
+                                    <div class="join w-full">
+                                        <input type="text" id="webhook-token-display"
+                                               class="input join-item flex-1 font-mono"
+                                               placeholder="No token generated" readonly>
+                                        <button type="button" id="copy-webhook-token-btn"
+                                                class="btn btn-outline join-item" onclick="copyWebhookToken();">
+                                            <i class="bi bi-copy"></i>
+                                        </button>
+                                        <button type="button" id="refresh-webhook-token-btn"
+                                                class="btn btn-outline btn-secondary join-item"
+                                                onclick="refreshWebhookToken();">
+                                            <i class="bi bi-arrow-clockwise"></i>
+                                        </button>
+                                    </div>
+                                    <span class="text-sm opacity-70">Regenerating invalidates the URL already
+                                        pasted into Sonarr/Radarr - you'll need to update it there too.</span>
+                                </div>
+
+                                <div>
+                                    <label class="label">
+                                        <span class="font-medium">Webhook URL</span>
+                                    </label>
+                                    <div class="join w-full">
+                                        <input type="text" id="webhook-url-display"
+                                               class="input join-item flex-1 font-mono" readonly>
+                                        <button type="button" id="copy-webhook-url-btn"
+                                                class="btn btn-outline join-item" onclick="copyWebhookUrl();">
+                                            <i class="bi bi-copy"></i>
+                                        </button>
+                                    </div>
+                                    <span id="webhook-url-note" class="text-sm opacity-70"></span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1719,6 +1782,71 @@
         } catch (error) {
             console.error('Failed to copy token:', error);
             window.decypharrUtils.createToast('Failed to copy token to clipboard', 'error');
+        }
+    }
+
+    // Arr Webhook Token Management Functions
+    async function refreshWebhookToken() {
+        const emptyState = document.getElementById('webhookTokenEmpty');
+        const generateBtn = document.getElementById('generate-webhook-token-btn');
+        const refreshBtn = document.getElementById('refresh-webhook-token-btn');
+        const activeBtn = (emptyState && !emptyState.classList.contains('hidden')) ? generateBtn : refreshBtn;
+
+        window.decypharrUtils.setButtonLoading(activeBtn, true);
+
+        try {
+            const response = await window.decypharrUtils.fetcher('/api/webhook-token/refresh', {
+                method: 'POST'
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to refresh webhook token');
+            }
+
+            const data = await response.json();
+            const appUrl = document.getElementById('appUrl')?.value || '';
+            window.configManager.renderWebhookToken(data.token, appUrl);
+            window.decypharrUtils.createToast(data.message || 'Webhook token refreshed successfully', 'success');
+
+        } catch (error) {
+            console.error('Error refreshing webhook token:', error);
+            window.decypharrUtils.createToast('Failed to refresh webhook token: ' + error.message, 'error');
+        } finally {
+            window.decypharrUtils.setButtonLoading(activeBtn, false);
+        }
+    }
+
+    async function copyWebhookToken() {
+        const tokenDisplay = document.getElementById('webhook-token-display');
+        const token = tokenDisplay.value;
+
+        if (!token) {
+            window.decypharrUtils.createToast('No token to copy. Generate one first.', 'warning');
+            return;
+        }
+
+        try {
+            await window.decypharrUtils.copyToClipboard(token);
+        } catch (error) {
+            console.error('Failed to copy webhook token:', error);
+            window.decypharrUtils.createToast('Failed to copy token to clipboard', 'error');
+        }
+    }
+
+    async function copyWebhookUrl() {
+        const urlDisplay = document.getElementById('webhook-url-display');
+        const url = urlDisplay.value;
+
+        if (!url) {
+            window.decypharrUtils.createToast('No URL to copy. Generate a token first.', 'warning');
+            return;
+        }
+
+        try {
+            await window.decypharrUtils.copyToClipboard(url);
+        } catch (error) {
+            console.error('Failed to copy webhook URL:', error);
+            window.decypharrUtils.createToast('Failed to copy URL to clipboard', 'error');
         }
     }
 

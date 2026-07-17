@@ -99,6 +99,7 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/mount/cache/purge", s.handlePurgeMountCache)
 			r.Post("/refresh-token", s.handleRefreshAPIToken)
 			r.Post("/update-auth", s.handleUpdateAuth)
+			r.Post("/webhook-token/refresh", s.handleRefreshWebhookToken)
 		})
 	})
 

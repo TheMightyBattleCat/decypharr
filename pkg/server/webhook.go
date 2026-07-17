@@ -8,6 +8,7 @@ import (
 
 	json "github.com/bytedance/sonic"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
@@ -120,6 +121,44 @@ func (p *arrWebhookPayload) file() *arrWebhookFile {
 // configured - not at startup, since config can change without a restart via
 // /api/config, and re-checking here always reflects the current value.
 var arrWebhookWarnedUnauthenticated bool
+
+// handleRefreshWebhookToken generates a new Arr webhook token and saves it,
+// for the settings page's Generate/Refresh Token action.
+func (s *Server) handleRefreshWebhookToken(w http.ResponseWriter, _ *http.Request) {
+	token, err := s.refreshWebhookToken()
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to refresh Arr webhook token")
+		http.Error(w, "Failed to refresh token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	utils.JSONResponse(w, map[string]any{
+		"token":   token,
+		"message": "Webhook token refreshed successfully",
+	}, http.StatusOK)
+}
+
+// refreshWebhookToken generates a new Arr webhook token and saves it.
+// Unlike the API token (stored in a separate auth file), WebhookToken lives
+// directly on the main Config struct, so this loads the live config, sets
+// only the token field, and saves immediately - deliberately not routing
+// through handleUpdateConfig's whole-config decode/save path, which would
+// reintroduce the same round-trip risk this field was already preserved
+// against.
+func (s *Server) refreshWebhookToken() (string, error) {
+	token, err := s.generateAPIToken()
+	if err != nil {
+		return "", err
+	}
+
+	cfg := config.Get()
+	cfg.WebhookToken = token
+	if err := cfg.Save(); err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
 
 // handleArrWebhook handles Sonarr/Radarr's built-in Webhook notification.
 // When a file is deleted or replaced by an upgrade, the matching usenet
