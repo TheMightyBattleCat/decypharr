@@ -662,17 +662,54 @@ class DecypharrUtils {
         };
     }
 
-    // Copy to clipboard utility
+    // Copy to clipboard utility. navigator.clipboard only exists in secure
+    // contexts (HTTPS or localhost) - on a plain-HTTP, non-localhost
+    // deployment it's undefined entirely, so this always falls back to the
+    // execCommand approach there rather than throwing.
     async copyToClipboard(text) {
-        try {
-            await navigator.clipboard.writeText(text);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try {
+                await navigator.clipboard.writeText(text);
+                this.createToast('Copied to clipboard', 'success');
+                return true;
+            } catch (error) {
+                console.warn('navigator.clipboard.writeText failed, falling back:', error);
+            }
+        }
+
+        if (this.copyViaExecCommand(text)) {
             this.createToast('Copied to clipboard', 'success');
             return true;
-        } catch (error) {
-            console.error('Failed to copy to clipboard:', error);
-            this.createToast('Failed to copy to clipboard', 'error');
-            return false;
         }
+
+        console.error('Failed to copy to clipboard');
+        this.createToast('Failed to copy to clipboard', 'error');
+        return false;
+    }
+
+    // Fallback for when navigator.clipboard is unavailable or rejects:
+    // document.execCommand('copy') is deprecated but still broadly
+    // supported and doesn't require a secure context - it copies from a
+    // hidden, off-screen, focused+selected textarea.
+    copyViaExecCommand(text) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-9999px';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+
+        let succeeded = false;
+        try {
+            succeeded = document.execCommand('copy');
+        } catch (error) {
+            succeeded = false;
+        }
+
+        document.body.removeChild(textarea);
+        return succeeded;
     }
 
     // Validate URL
