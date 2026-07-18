@@ -191,13 +191,18 @@ const (
 // When Enabled is true, a recurring sweep runs on Schedule and visits only
 // entries that are unhealthy, dirty, or older than RecheckInterval.
 type RepairConfig struct {
-	Enabled               bool         `json:"enabled,omitempty"`
-	Source                RepairSource `json:"source,omitempty"`
-	Schedule              string       `json:"schedule,omitempty"`
-	Workers               int          `json:"workers,omitempty"`
-	NNTPConnectionPercent int          `json:"nntp_connection_percent,omitempty"`
-	Strategy              string       `json:"strategy,omitempty"`
-	RecheckInterval       string       `json:"recheck_interval,omitempty"`
+	Enabled  bool         `json:"enabled,omitempty"`
+	Source   RepairSource `json:"source,omitempty"`
+	Schedule string       `json:"schedule,omitempty"`
+	Workers  int          `json:"workers,omitempty"`
+	// CleanupSuperseded, when true, also DELETES a broken entry from decypharr (not just from the
+	// broken list) once no Sonarr/Radarr references any of its files anymore - i.e. the library
+	// has already replaced it with a working copy. Off by default: clearing the broken list is
+	// always done, but removing the underlying entry is opt-in.
+	CleanupSuperseded     bool   `json:"cleanup_superseded,omitempty"`
+	NNTPConnectionPercent int    `json:"nntp_connection_percent,omitempty"`
+	Strategy              string `json:"strategy,omitempty"`
+	RecheckInterval       string `json:"recheck_interval,omitempty"`
 	// FFProbeCheck, when true, additionally validates each file the sweep's STAT probe called
 	// healthy by running ffprobe against the local WebDAV endpoint. Catches files whose article
 	// headers still exist but whose assembled stream is unplayable: purged bodies, mis-assembled
@@ -238,7 +243,8 @@ func (r RepairConfig) IsZero() bool {
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
-		!r.RepairOnPlaybackFailure && r.StopSchedule == ""
+		!r.RepairOnPlaybackFailure && r.StopSchedule == "" &&
+		!r.CleanupSuperseded
 }
 
 type Config struct {
