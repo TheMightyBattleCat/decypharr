@@ -191,22 +191,27 @@ const (
 // When Enabled is true, a recurring sweep runs on Schedule and visits only
 // entries that are unhealthy, dirty, or older than RecheckInterval.
 type RepairConfig struct {
-	Enabled               bool         `json:"enabled,omitempty"`
-	Source                RepairSource `json:"source,omitempty"`
-	Schedule              string       `json:"schedule,omitempty"`
-	Workers               int          `json:"workers,omitempty"`
-	NNTPConnectionPercent int          `json:"nntp_connection_percent,omitempty"`
-	Strategy              string       `json:"strategy,omitempty"`
-	RecheckInterval       string       `json:"recheck_interval,omitempty"`
-	Arrs                  []string     `json:"arrs,omitempty"`
-	AutoRepair            bool         `json:"auto_repair,omitempty"`
+	Enabled bool         `json:"enabled,omitempty"`
+	Source  RepairSource `json:"source,omitempty"`
+	Schedule string      `json:"schedule,omitempty"`
+	Workers  int         `json:"workers,omitempty"`
+	// CleanupSuperseded, when true, also DELETES a broken entry from decypharr (not just from the
+	// broken list) once no Sonarr/Radarr references any of its files anymore - i.e. the library
+	// has already replaced it with a working copy. Off by default: clearing the broken list is
+	// always done, but removing the underlying entry is opt-in.
+	CleanupSuperseded     bool     `json:"cleanup_superseded,omitempty"`
+	NNTPConnectionPercent int      `json:"nntp_connection_percent,omitempty"`
+	Strategy              string   `json:"strategy,omitempty"`
+	RecheckInterval       string   `json:"recheck_interval,omitempty"`
+	Arrs                  []string `json:"arrs,omitempty"`
+	AutoRepair            bool     `json:"auto_repair,omitempty"`
 
 	// RepairOnPlaybackFailure, when true, escalates a streaming read that fails with a
 	// permanent NNTP article-not-found (430) into an immediate delete + re-search for the
 	// played file. Requires Enabled and AutoRepair to also be set. Only fires for reads
 	// through the built-in DFS mount — rclone/WebDAV playback does not trigger it.
-	RepairOnPlaybackFailure bool         `json:"repair_on_playback_failure,omitempty"`
-	SkipNZBRepair           bool         `json:"skip_nzb_repair,omitempty"`
+	RepairOnPlaybackFailure bool `json:"repair_on_playback_failure,omitempty"`
+	SkipNZBRepair           bool `json:"skip_nzb_repair,omitempty"`
 
 	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
 	// (same formats as Schedule: clock time, cron expression, or duration).
@@ -241,7 +246,8 @@ func (r RepairConfig) IsZero() bool {
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" &&
 		!r.RepairOnPlaybackFailure &&
-		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport
+		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
+		!r.CleanupSuperseded
 }
 
 type Config struct {
