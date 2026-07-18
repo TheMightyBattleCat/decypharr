@@ -224,7 +224,8 @@ type RepairConfig struct {
 	AutoRepair      bool     `json:"auto_repair,omitempty"`
 	// RepairOnPlaybackFailure, when true, escalates a streaming read that fails with a
 	// permanent NNTP article-not-found (430) into an immediate delete + re-search for the
-	// played file. Requires Enabled and AutoRepair to also be set.
+	// played file. Requires Enabled and AutoRepair to also be set. Only fires for reads
+	// through the built-in DFS mount — rclone/WebDAV playback does not trigger it.
 	RepairOnPlaybackFailure bool `json:"repair_on_playback_failure,omitempty"`
 	SkipNZBRepair           bool `json:"skip_nzb_repair,omitempty"`
 

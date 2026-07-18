@@ -1510,7 +1510,10 @@
                             <label class="label cursor-pointer justify-start gap-3">
                                 <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
                                        id="repair.repair_on_playback_failure" name="repair.repair_on_playback_failure">
-                                <span class="label-text font-medium">Auto-repair on playback failure (430)</span>
+                                <div>
+                                    <span class="label-text font-medium">Auto-repair on playback failure (NNTP 430, DFS only)</span>
+                                    <div class="label-text-alt">Triggers when a DFS read hits an expired article (NNTP 430). Only works with the built-in DFS mount — rclone/WebDAV playback won't trigger it.</div>
+                                </div>
                             </label>
                             <label class="label cursor-pointer justify-start gap-3">
                                 <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
