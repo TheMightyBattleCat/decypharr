@@ -167,6 +167,8 @@ class ConfigManager {
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.repair_on_playback_failure')) $('repair.repair_on_playback_failure').checked = !!repair.repair_on_playback_failure;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
+        if ($('repair.ffprobe_check')) $('repair.ffprobe_check').checked = !!repair.ffprobe_check;
+        if ($('repair.ffprobe_on_import')) $('repair.ffprobe_on_import').checked = !!repair.ffprobe_on_import;
     }
 
     collectRepairConfig() {
@@ -187,6 +189,8 @@ class ConfigManager {
             auto_repair: $('repair.auto_repair')?.checked || false,
             repair_on_playback_failure: $('repair.repair_on_playback_failure')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
+            ffprobe_check: $('repair.ffprobe_check')?.checked || false,
+            ffprobe_on_import: $('repair.ffprobe_on_import')?.checked || false,
             arrs,
         };
     }

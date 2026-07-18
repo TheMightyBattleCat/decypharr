@@ -198,20 +198,37 @@ type RepairConfig struct {
 	NNTPConnectionPercent int          `json:"nntp_connection_percent,omitempty"`
 	Strategy              string       `json:"strategy,omitempty"`
 	RecheckInterval       string       `json:"recheck_interval,omitempty"`
-	Arrs                  []string     `json:"arrs,omitempty"`
-	AutoRepair            bool         `json:"auto_repair,omitempty"`
+	// FFProbeCheck, when true, additionally validates each file the sweep's STAT probe called
+	// healthy by running ffprobe against the local WebDAV endpoint. Catches files whose article
+	// headers still exist but whose assembled stream is unplayable: purged bodies, mis-assembled
+	// containers with bogus durations, and files with no decodable video/audio streams. Requires
+	// the ffprobe binary on PATH (or FFProbePath) and WebDAV enabled. Default off - it reads real
+	// bytes per file, so sweeps take longer and use provider bandwidth.
+	FFProbeCheck bool `json:"ffprobe_check,omitempty"`
+	// FFProbeTimeout bounds a single ffprobe invocation (e.g. "90s"). Default 90s.
+	FFProbeTimeout string `json:"ffprobe_timeout,omitempty"`
+	// FFProbePath overrides the ffprobe binary location. Default: find "ffprobe" on PATH.
+	FFProbePath string `json:"ffprobe_path,omitempty"`
+	// FFProbeOnImport, when true, validates each newly imported download with ffprobe (same checks
+	// as FFProbeCheck, minus the runtime comparison) BEFORE it is reported complete to
+	// Sonarr/Radarr. A file that fails twice is rejected, so the Arr blocklists the release and
+	// grabs another - corrupt downloads never enter the library. Adds seconds and real reads per
+	// import; requires the ffprobe binary and WebDAV. Default off.
+	FFProbeOnImport bool     `json:"ffprobe_on_import,omitempty"`
+	Arrs            []string `json:"arrs,omitempty"`
+	AutoRepair      bool     `json:"auto_repair,omitempty"`
 	// RepairOnPlaybackFailure, when true, escalates a streaming read that fails with a
 	// permanent NNTP article-not-found (430) into an immediate delete + re-search for the
 	// played file. Requires Enabled and AutoRepair to also be set.
 	RepairOnPlaybackFailure bool `json:"repair_on_playback_failure,omitempty"`
 	SkipNZBRepair           bool `json:"skip_nzb_repair,omitempty"`
 
-	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
+	// StopSchedule, when set, stops an in-progress sweep at this time/interval
 	// (same formats as Schedule: clock time, cron expression, or duration).
-	// A repair sweep still running when StopSchedule fires is cancelled before it
+	// A sweep still running when StopSchedule fires is cancelled before it
 	// finishes enumerating/probing every candidate. Empty disables the stop
-	// schedule entirely - the repair sweep always runs to completion. When a stop
-	// fires mid-repair-sweep, AutoRepair decides what happens to whatever was
+	// schedule entirely - the sweep always runs to completion. When a stop
+	// fires mid-sweep, AutoRepair decides what happens to whatever was
 	// already found broken: repaired if true, left alone if false.
 	StopSchedule string `json:"stop_schedule,omitempty"`
 }
@@ -220,6 +237,7 @@ func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair &&
+		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
 		!r.RepairOnPlaybackFailure && r.StopSchedule == ""
 }
 
