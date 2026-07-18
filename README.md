@@ -9,6 +9,24 @@
 Decypharr provides a unified interface for Sonarr, Radarr, and other *Arr applications to access Debrid providers and
 Usenet streaming.
 
+## What this branch adds
+
+This branch (`usenet-improvements`) is rebuilt from upstream's `beta` and layers the
+following fixes and features on top of it. It gets rebuilt from upstream beta again
+whenever upstream makes a major change, so commit hashes on this branch itself are
+not stable references - the branch names and commit hashes below are, and this table
+is kept up to date as the branch is rebuilt.
+
+| Feature | Source |
+|---|---|
+| Fix obfuscated multi-volume RAR assembly order | `fix/obfuscated-rar-volume-order` @ `66a770b` |
+| Auto-repair on playback failure (NNTP 430, DFS only) | `feature/NNTP-430-auto-repair` @ `61a5dc3` |
+| ffprobe validation at sweep and import | `feature/ffprobe-sweep-check` @ `9bc4503` |
+| Superseded/broken entry cleanup + stale NZB button (also folds in orphaned-record filtering) | `feature/superseded-broken-cleanup` @ `25bec66` |
+| Per-provider bandwidth monitoring and quotas | `feature/usenet-bandwidth-monitor` @ `a665011` |
+
+Optional stop schedule for repair sweeps was merged upstream directly (beta `d9713b8`, #349) and is no longer a fork-only layer.
+
 ## Features
 
 - Mock Qbittorent and Sabnzbd API that supports the Arrs (Sonarr, Radarr, Lidarr etc)
