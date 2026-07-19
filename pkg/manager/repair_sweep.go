@@ -474,10 +474,35 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
 		res.broken = true
 		res.reason = "usenet_segment_missing"
+		r.recordDeadSegments(ctx, entry, name)
 	} else {
 		res.reason = "usenet_probe_error"
 	}
 	return res
+}
+
+// recordDeadSegments re-probes name for the specific segments confirmed
+// missing (CheckFile above only reports pass/fail) and persists them to the
+// overlay store, so the reader's padding policy and any future PAR2 repair
+// pass see this damage without needing to rediscover it themselves. This is
+// bookkeeping only in this commit - the sweep's own repair decision below is
+// unchanged; a later commit gates it on the resulting verdict plus PAR2
+// availability, falling back to today's legacy repair otherwise.
+func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, name string) {
+	if r.manager.usenet == nil {
+		return
+	}
+	missing, err := r.manager.usenet.CheckFileDetailed(ctx, entry.InfoHash, name)
+	if err != nil || len(missing) == 0 {
+		return
+	}
+	for _, seg := range missing {
+		if err := r.manager.usenet.RecordOverlayDead(entry.InfoHash, name, seg.Index, seg.MessageID, seg.Bytes); err != nil {
+			r.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", name).Int("segment", seg.Index).Msg("Repair: failed to record dead segment in overlay")
+		}
+	}
+	verdict := r.manager.usenet.OverlayVerdict(entry.InfoHash, name)
+	r.logger.Debug().Str("entry", entry.Name).Str("file", name).Int("missing_segments", len(missing)).Str("verdict", string(verdict)).Msg("Repair: recorded dead segments from sweep probe")
 }
 
 func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {
@@ -1514,8 +1539,8 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 
 // normalizeCooldownKey reduces an entry/release name to lowercase alphanumerics
 // so the same episode's differently-formatted releases collapse to one key
-// (e.g. "Bosch.S05E07.The.Wisdom...REAL.REPACK...1-NTb" and
-// "bosch.s05e07.the.wisdom...real.repack...ntb" map identically). This lets the
+// (e.g. "Grant.S05E07.The.Wisdom...REAL.REPACK...1-NTb" and
+// "grant.s05e07.the.wisdom...real.repack...ntb" map identically). This lets the
 // playback-repair cooldown set in RepairPlaybackFileNow be matched and released
 // by the import-failure path even though the re-grabbed release name differs in
 // casing/punctuation from the originally-broken entry name.

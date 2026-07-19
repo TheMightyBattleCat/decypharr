@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
 // SegmentMeta holds metadata for a single Usenet segment.
@@ -119,6 +120,16 @@ type Config struct {
 
 	// RetryDelay is the delay between retry attempts (default: 1s).
 	RetryDelay time.Duration
+
+	// Overlay is the playback-padding/PAR2-patch store handle for the file
+	// being read. Nil disables both patch-serving and padding for this
+	// reader, leaving a confirmed-missing segment's error to propagate
+	// exactly as it did before the overlay feature existed.
+	Overlay *overlay.Handle
+
+	// OverlayFile is the logical filename this reader serves, used as the
+	// overlay manifest key. Only meaningful when Overlay is non-nil.
+	OverlayFile string
 }
 
 // DefaultConfig returns a ReaderConfig with sensible defaults.
@@ -194,6 +205,16 @@ func WithPrefetchAhead(n int) Option {
 func WithDownloadTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.DownloadTimeout = d
+	}
+}
+
+// WithOverlay wires the playback-padding/PAR2-patch store handle into the
+// reader, keyed by the logical filename it serves. Omit this option (or pass
+// a nil handle) to leave the reader's fetch-failure behavior unchanged.
+func WithOverlay(handle *overlay.Handle, file string) Option {
+	return func(c *Config) {
+		c.Overlay = handle
+		c.OverlayFile = file
 	}
 }
 

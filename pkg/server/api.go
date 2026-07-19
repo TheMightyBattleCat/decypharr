@@ -525,6 +525,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// them from the live config so auth isn't silently disabled on every save.
 	newConfig.UseAuth = currentConfig.UseAuth
 	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
+	// The general settings form has no fields for these two Repair toggles
+	// (they're only ever set via the dedicated repair-config endpoint), so
+	// they'd decode to nil/"unset" here and get silently reset to their
+	// unset-defaults-true value on every unrelated settings save - the same
+	// class of bug that used to silently wipe the Arr webhook token.
+	newConfig.Repair.PlaybackPadding = currentConfig.Repair.PlaybackPadding
+	newConfig.Repair.Par2Repair = currentConfig.Repair.Par2Repair
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
