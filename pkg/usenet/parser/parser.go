@@ -148,6 +148,14 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		return nil, nil, fmt.Errorf("no valid file groups found in NZB")
 	}
 
+	// Retain PAR2 files (parsed but otherwise discarded above) and the exact
+	// as-posted segment layout of every other posted file, purely for PAR2
+	// repair - see storage.NZB.Par2Files/Par2Source. Computed directly from
+	// the flat, pre-grouping raw.Files list so it's independent of whatever
+	// RAR/7z/zip grouping and extraction decides to do with these files
+	// afterwards.
+	nzb.Par2Files, nzb.Par2Source = p.buildPar2Refs(raw.Files)
+
 	// Stat the first segment to confirm connectivity
 	checked := false
 	for _, group := range fileGroups {
@@ -226,6 +234,43 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 		return nil, fmt.Errorf("no valid files found in NZB after processing")
 	}
 	return nzb, nil
+}
+
+// buildPar2Refs derives storage.NZB's Par2Files and Par2Source from the raw,
+// pre-grouping/pre-extraction NZB file list: every PAR2 file becomes a
+// Par2FileRef, and every other (non-empty-segment) posted file becomes a
+// PostedFileRef in its exact as-posted segment order. Segments are sorted by
+// their NZB part Number defensively, since Par2Source's whole purpose -
+// mapping a dead article to a byte range via cumulative segment bytes -
+// depends on that order being correct.
+func (p *NZBParser) buildPar2Refs(files nzbparser.NzbFiles) ([]storage.Par2FileRef, []storage.PostedFileRef) {
+	var par2Files []storage.Par2FileRef
+	var source []storage.PostedFileRef
+
+	for _, file := range files {
+		if len(file.Segments) == 0 {
+			continue
+		}
+		segs := make(nzbparser.NzbSegments, len(file.Segments))
+		copy(segs, file.Segments)
+		sort.Sort(segs)
+
+		refs := make([]storage.Par2SegmentRef, len(segs))
+		for i, seg := range segs {
+			refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: int64(seg.Bytes)}
+		}
+
+		if p.detectFileType(file.Filename) == storage.NZBFileTypePar2 {
+			par2Files = append(par2Files, storage.Par2FileRef{
+				Name: file.Filename, Size: file.Bytes, Segments: refs,
+			})
+			continue
+		}
+		source = append(source, storage.PostedFileRef{
+			Name: file.Filename, Size: file.Bytes, Segments: refs,
+		})
+	}
+	return par2Files, source
 }
 
 func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) map[string]*FileGroup {
