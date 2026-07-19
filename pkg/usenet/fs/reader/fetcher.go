@@ -3,13 +3,47 @@ package reader
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
+
+// forceMissingMessageIDs is a one-time (per process), test-only set of
+// message IDs the fetch layer treats as permanently missing (as if every
+// provider had returned 430), without ever attempting a real NNTP fetch.
+// Populated once at startup from DECYPHARR_FORCE_MISSING_SEGMENTS
+// (comma-separated message IDs); empty/unset in production, so this is a
+// no-op there. Lets E2E tests exercise padding/PAR2 repair deterministically
+// instead of depending on an actually-broken article somewhere upstream.
+var forceMissingMessageIDs = sync.OnceValue(func() map[string]struct{} {
+	raw := os.Getenv("DECYPHARR_FORCE_MISSING_SEGMENTS")
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	set := make(map[string]struct{})
+	for _, id := range strings.Split(raw, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+})
+
+func isForcedMissing(messageID string) bool {
+	set := forceMissingMessageIDs()
+	if len(set) == 0 {
+		return false
+	}
+	_, ok := set[messageID]
+	return ok
+}
 
 // SegmentFetcher handles downloading segments from NNTP with deduplication and retry.
 //
@@ -202,50 +236,60 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// ExecuteWithFailover already retries per provider and across providers —
-	// a single call is sufficient.  An outer retry loop would multiply the
-	// total attempts by retries×providers, leading to very long failure times.
-	err := sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
-		stopCancel := context.AfterFunc(downloadCtx, func() {
-			_ = conn.Close()
-		})
-		defer stopCancel()
+	// Test hook (DECYPHARR_FORCE_MISSING_SEGMENTS): treat this article as
+	// permanently missing without ever touching the network, so E2E tests can
+	// exercise padding/PAR2 repair deterministically. Synthesizes exactly the
+	// error a real all-providers 430 would produce, so it goes through the
+	// identical handling below.
+	var err error
+	if isForcedMissing(messageID) {
+		err = &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "forced missing (DECYPHARR_FORCE_MISSING_SEGMENTS)"}
+	} else {
+		// ExecuteWithFailover already retries per provider and across providers —
+		// a single call is sufficient.  An outer retry loop would multiply the
+		// total attempts by retries×providers, leading to very long failure times.
+		err = sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
+			stopCancel := context.AfterFunc(downloadCtx, func() {
+				_ = conn.Close()
+			})
+			defer stopCancel()
 
-		// Get the segment writer for the disk cache.
-		writer := sf.cache.StreamWriter(segIdx)
-		if writer == nil {
-			return ErrCacheClosed
-		}
+			// Get the segment writer for the disk cache.
+			writer := sf.cache.StreamWriter(segIdx)
+			if writer == nil {
+				return ErrCacheClosed
+			}
 
-		// Stream the decoded body into the chosen tier.
-		n, err := conn.StreamBody(messageID, writer)
-		if err != nil {
-			writer.Discard()
+			// Stream the decoded body into the chosen tier.
+			n, err := conn.StreamBody(messageID, writer)
+			if err != nil {
+				writer.Discard()
+				if ctxErr := downloadCtx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				return err
+			}
 			if ctxErr := downloadCtx.Err(); ctxErr != nil {
+				writer.Discard()
 				return ctxErr
 			}
-			return err
-		}
-		if ctxErr := downloadCtx.Err(); ctxErr != nil {
-			writer.Discard()
-			return ctxErr
-		}
 
-		// Treat zero-byte articles as missing — the article exists on the
-		// server but its body is empty/corrupted after yEnc decoding.
-		if n == 0 {
-			writer.Discard()
-			return &nntp.Error{
-				Type:    nntp.ErrorTypeArticleNotFound,
-				Message: "article produced no data after decoding",
+			// Treat zero-byte articles as missing — the article exists on the
+			// server but its body is empty/corrupted after yEnc decoding.
+			if n == 0 {
+				writer.Discard()
+				return &nntp.Error{
+					Type:    nntp.ErrorTypeArticleNotFound,
+					Message: "article produced no data after decoding",
+				}
 			}
-		}
 
-		// Commit (updates cache state to StateOnDisk).
-		writer.Finalize()
+			// Commit (updates cache state to StateOnDisk).
+			writer.Finalize()
 
-		return nil
-	})
+			return nil
+		})
+	}
 
 	if err != nil {
 		sf.stats.DownloadErrors.Add(1)
@@ -253,12 +297,74 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			sf.cache.ReleaseFetching(segIdx)
 			return err
 		}
+
+		// The article is confirmed gone across every provider (or the test
+		// hook says so). Before giving up, check whether the overlay already
+		// has real bytes for it (PAR2 already repaired this segment in a
+		// prior pass) or whether the padding policy allows serving zeros for
+		// it instead of failing the read. Both paths write the segment's
+		// bytes straight into the cache via the exact same Put the rest of
+		// the fetch path uses, so nothing downstream (reader, downloaders.go
+		// circuit breaker, escalation) needs to know padding/patching ever
+		// happened — the segment is just OnDisk.
+		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) {
+			if sf.handleConfirmedMissing(segIdx, messageID) {
+				sf.stats.Downloads.Add(1)
+				return nil
+			}
+		}
+
 		sf.cache.MarkFailed(segIdx, err)
 		return err
 	}
 
 	sf.stats.Downloads.Add(1)
 	return nil
+}
+
+// handleConfirmedMissing consults the overlay for a segment whose article
+// fetch has permanently failed across every provider. Returns true if it
+// wrote replacement bytes into the cache (patch or pad), in which case the
+// caller treats the fetch as a success; false means the overlay declined
+// (FAIL verdict, or an I/O error saving overlay state) and the original
+// article-not-found error should propagate exactly as it did before this
+// feature existed.
+func (sf *SegmentFetcher) handleConfirmedMissing(segIdx int, messageID string) bool {
+	overlayHandle := sf.config.Overlay
+	file := sf.config.OverlayFile
+
+	if patch, ok := overlayHandle.PatchBytes(file, segIdx); ok {
+		if err := sf.cache.Put(segIdx, patch); err != nil {
+			sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
+			return false
+		}
+		return true
+	}
+
+	logicalLen := sf.cache.SegmentDataSize(segIdx)
+	if logicalLen <= 0 {
+		return false
+	}
+
+	decision, _ := overlayHandle.Decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize())
+	if decision != overlay.DecisionPad {
+		return false
+	}
+
+	if overlayHandle.ShouldLogPad(file, segIdx) {
+		sf.logger.Info().
+			Str("entry", overlayHandle.NzbID()).
+			Str("file", file).
+			Int("segment", segIdx).
+			Msg("segment padded")
+	}
+	overlayHandle.EnqueueRepair()
+
+	if err := sf.cache.Put(segIdx, make([]byte, logicalLen)); err != nil {
+		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write zero-fill padding into cache")
+		return false
+	}
+	return true
 }
 
 func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {

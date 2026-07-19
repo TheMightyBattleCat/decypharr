@@ -21,6 +21,8 @@ import (
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
+	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 )
@@ -63,6 +65,12 @@ type fsEntry struct {
 	readerErr     error                   // Error from reader creation (if any)
 	refCount      atomic.Int32
 	lastAccessed  atomic.Int64 // Unix timestamp
+
+	// overlayOpts wires the playback-padding/PAR2-patch store into the
+	// single-volume reader (see getOrCreateReader). Built once at createEntry
+	// time, when the owning nzbID and logical filename are known; nil when
+	// overlay support is disabled (e.g. no usable overlay store).
+	overlayOpts []reader.Option
 }
 
 // fsEntryTombstone marks an entry claimed for teardown. Once refCount holds
@@ -109,7 +117,7 @@ func (fe *fsEntry) getOrCreateReader() (fs.PrefetchableReaderAt, int64, error) {
 
 		// Single volume optimization - skip multi-volume overhead
 		if len(fe.volumes) == 1 {
-			readerAt, size, cleanup, err = fe.fs.CreateReaderAtForVolume(fe.volumes[0])
+			readerAt, size, cleanup, err = fe.fs.CreateReaderAtForVolume(fe.volumes[0], fe.overlayOpts...)
 		} else {
 			// Multi-volume case - need to create reader differently
 			// For now, fall back to io.ReaderAt (no prefetch for multi-volume)
@@ -219,6 +227,11 @@ type Usenet struct {
 	prefetchSize             int64       // Streaming prefetch size in bytes
 	failedFiles              *xsync.Map[string, error]
 
+	// overlay is the playback-padding/PAR2-patch store. Nil only if it failed
+	// to initialize (e.g. an unwritable data dir) - streaming then behaves
+	// exactly as it did before the overlay feature existed.
+	overlay *overlay.Store
+
 	fs *xsync.Map[string, *fsEntry]
 }
 
@@ -283,6 +296,16 @@ func New() (*Usenet, error) {
 		prefetchSize = 16 * 1024 * 1024 // Default to 16MB
 	}
 
+	// Rooted next to the stored-NZB records directory (nzbStorage.MetaDir,
+	// i.e. .../usenet/meta), not under the DFS cache - the cache gets cleared
+	// routinely and would silently forget every dead-segment/patch record.
+	overlayRoot := filepath.Join(config.GetMainPath(), "usenet", "overlay")
+	overlayStore, err := overlay.NewStore(overlayRoot, logger.New("usenet-overlay"))
+	if err != nil {
+		_logger.Warn().Err(err).Msg("Failed to initialize playback-padding overlay store; padding and PAR2 repair are disabled for this run")
+		overlayStore = nil
+	}
+
 	u := &Usenet{
 		nzbStorage:               nzbStorage,
 		nntp:                     client,
@@ -293,6 +316,7 @@ func New() (*Usenet, error) {
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
+		overlay:                  overlayStore,
 	}
 
 	// clean streams dir
@@ -326,9 +350,15 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}
 
+	var overlayOpts []reader.Option
+	if u.overlay != nil && file.NzbID != "" && config.Get().Repair.PlaybackPaddingEnabled() {
+		overlayOpts = []reader.Option{reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name)}
+	}
+
 	return &fsEntry{
-		fs:      usenetFS,
-		volumes: volumes,
+		fs:          usenetFS,
+		volumes:     volumes,
+		overlayOpts: overlayOpts,
 	}, nil
 }
 
@@ -586,6 +616,85 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
 	return u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
+}
+
+// RecordOverlayDead records a confirmed-dead segment against the overlay
+// store for nzoID/filename. No-op (nil error) if the overlay store failed to
+// initialize. Exposed so the repair sweep can persist damage it discovers
+// without importing pkg/usenet/overlay directly.
+func (u *Usenet) RecordOverlayDead(nzoID, filename string, segIndex int, msgID string, bytes int64) error {
+	if u.overlay == nil {
+		return nil
+	}
+	return u.overlay.RecordDead(nzoID, filename, segIndex, msgID, bytes)
+}
+
+// OverlayVerdict returns the overlay store's current damage verdict for
+// nzoID/filename ("clean" if the overlay store is unavailable or the file has
+// no recorded damage).
+func (u *Usenet) OverlayVerdict(nzoID, filename string) overlay.Verdict {
+	if u.overlay == nil {
+		return overlay.VerdictClean
+	}
+	return u.overlay.Verdict(nzoID, filename)
+}
+
+// MissingSegment identifies one confirmed-missing article found during a
+// CheckFileDetailed probe, in enough detail to record against the overlay
+// store (pkg/usenet/overlay.Store.RecordDead).
+type MissingSegment struct {
+	Index     int
+	MessageID string
+	Bytes     int64
+}
+
+// CheckFileDetailed is CheckFile plus the specific segments found
+// definitively missing, for callers (the repair sweep) that need to persist
+// that damage to the overlay store rather than just learn pass/fail. Unlike
+// CheckFile's zero-alloc sampled-ids fast path, this decodes the file's full
+// segment list so each sampled miss can be matched back to its index and
+// byte length - acceptable here since it only runs from the repair sweep,
+// not the streaming hot path.
+func (u *Usenet) CheckFileDetailed(ctx context.Context, nzoID, filename string) (missing []MissingSegment, err error) {
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load NZB: %w", err)
+	}
+	file := nzb.GetFileByName(filename)
+	if file == nil || len(file.Segments) == 0 {
+		return nil, fmt.Errorf("file has no Segments: %s", filename)
+	}
+
+	samplePercent := config.Get().Usenet.AvailabilitySamplePercent
+	idx := sampleIndices(len(file.Segments), samplePercent)
+	if len(idx) == 0 {
+		return nil, nil
+	}
+	messageIDs := make([]string, len(idx))
+	for i, j := range idx {
+		messageIDs[i] = file.Segments[j].MessageID
+	}
+
+	result, batchErr := u.nntp.BatchStat(ctx, messageIDs)
+	if batchErr != nil {
+		u.logger.Warn().Err(batchErr).Str("file", filename).Msg("Non-fatal error during detailed availability check, ignoring")
+		return nil, nil
+	}
+
+	for i, r := range result.Results {
+		if r.Available {
+			continue
+		}
+		// Only a genuine article-not-found counts as confirmed-missing;
+		// connection/protocol errors mean we couldn't check, not that the
+		// article is gone.
+		if r.Error != nil && !nntp.IsArticleNotFoundError(r.Error) {
+			continue
+		}
+		seg := file.Segments[idx[i]]
+		missing = append(missing, MissingSegment{Index: idx[i], MessageID: messageIDs[i], Bytes: seg.Bytes})
+	}
+	return missing, nil
 }
 
 // checkAvailability batch-STATs the given sampled message ids. The NNTP client
@@ -1132,6 +1241,16 @@ func (u *Usenet) Delete(nzoID string) error {
 	// Delete from file-based storage
 	if err := u.nzbStorage.DeleteNZB(nzoID); err != nil {
 		return fmt.Errorf("failed to delete NZB from storage: %w", err)
+	}
+
+	// Drop any recorded dead-segment/patch state for this NZB. Keyed by
+	// nzbID (unique) rather than name, avoiding the name-twin hazard the DFS
+	// cache has. Best-effort: an overlay cleanup failure shouldn't fail the
+	// whole deletion, since the NZB record itself is already gone.
+	if u.overlay != nil {
+		if err := u.overlay.DeleteEntry(nzoID); err != nil {
+			u.logger.Warn().Err(err).Str("nzb_id", nzoID).Msg("Failed to delete overlay entry")
+		}
 	}
 	return nil
 }

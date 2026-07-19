@@ -239,6 +239,23 @@ type RepairConfig struct {
 	// grabs another - corrupt downloads never enter the library. Adds seconds and real reads per
 	// import; requires the ffprobe binary and WebDAV. Default off.
 	FFProbeOnImport bool `json:"ffprobe_on_import,omitempty"`
+
+	// PlaybackPadding, when enabled, serves zero-filled data for a Usenet segment
+	// confirmed missing (430 across every provider) instead of stalling/killing
+	// playback, bounded by a strict per-file cap - see pkg/usenet/overlay. Also
+	// gates patch-serving (PAR2-repaired bytes), since both share the same
+	// reader hook. Off entirely (both this and Par2Repair false) is
+	// byte-identical to pre-overlay behavior. *bool so an existing config.json
+	// predating this field (nil, "unset") defaults to true on load - same
+	// pattern as Mount.Rclone.AsyncRead - while an explicit false is never
+	// silently flipped back.
+	PlaybackPadding *bool `json:"playback_padding,omitempty"`
+
+	// Par2Repair, when enabled, lets the background repair worker reconstruct
+	// confirmed-dead segments' true bytes from PAR2 recovery data instead of
+	// falling straight to the legacy re-grab. Defaults true when unset, same
+	// convention as PlaybackPadding.
+	Par2Repair *bool `json:"par2_repair,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
@@ -247,7 +264,20 @@ func (r RepairConfig) IsZero() bool {
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" &&
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
-		!r.CleanupSuperseded
+		!r.CleanupSuperseded &&
+		r.PlaybackPadding == nil && r.Par2Repair == nil
+}
+
+// PlaybackPaddingEnabled reports whether playback padding is active,
+// defaulting to true when unset (see PlaybackPadding's doc comment).
+func (r RepairConfig) PlaybackPaddingEnabled() bool {
+	return r.PlaybackPadding == nil || *r.PlaybackPadding
+}
+
+// Par2RepairEnabled reports whether PAR2 repair is active, defaulting to true
+// when unset (see Par2Repair's doc comment).
+func (r RepairConfig) Par2RepairEnabled() bool {
+	return r.Par2Repair == nil || *r.Par2Repair
 }
 
 type Config struct {
@@ -702,6 +732,18 @@ func (c *Config) applyRepairDefaults() {
 
 	if c.Repair.NNTPConnectionPercent == 0 {
 		c.Repair.NNTPConnectionPercent = 20
+	}
+
+	// Materialize the "default true when unset" pointers so config.json
+	// explicitly records the effective value from the first save onward -
+	// same convention as Mount.Rclone.AsyncRead.
+	if c.Repair.PlaybackPadding == nil {
+		v := true
+		c.Repair.PlaybackPadding = &v
+	}
+	if c.Repair.Par2Repair == nil {
+		v := true
+		c.Repair.Par2Repair = &v
 	}
 }
 

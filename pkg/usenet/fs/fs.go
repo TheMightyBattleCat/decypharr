@@ -178,17 +178,21 @@ func (f *FS) CreateReaderAt() (io.ReaderAt, int64, func(), error) {
 // CreateReaderAtForVolume creates a reader for a single volume directly.
 // This is an optimization for the common streaming case where there's only one volume.
 // Returns PrefetchableReaderAt so callers can trigger prefetch before starting reads.
-func (f *FS) CreateReaderAtForVolume(vol *types.Volume) (PrefetchableReaderAt, int64, func(), error) {
+// opts is passed straight through to reader.NewStreamingReader(WithEncryption) -
+// e.g. reader.WithOverlay, for callers that know the volume's owning nzbID and
+// logical filename (only the direct-playback path in pkg/usenet does; internal
+// archive-volume reads inside pkg/usenet/fs do not, so they pass none).
+func (f *FS) CreateReaderAtForVolume(vol *types.Volume, opts ...reader.Option) (PrefetchableReaderAt, int64, func(), error) {
 	if vol == nil || len(vol.Segments) == 0 {
 		return nil, 0, nil, fmt.Errorf("no segments in volume")
 	}
 
-	return f.createNewReaderForVolume(vol)
+	return f.createNewReaderForVolume(vol, opts...)
 }
 
 // createNewReaderForVolume uses the new reader.StreamingReader with Pin/Unpin pattern.
 // This fixes the "chunk does not exist" race condition.
-func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, int64, func(), error) {
+func (f *FS) createNewReaderForVolume(vol *types.Volume, extraOpts ...reader.Option) (PrefetchableReaderAt, int64, func(), error) {
 	cfg := config.Get()
 
 	// Convert segments to new reader format
@@ -210,26 +214,28 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	var streamReader *reader.StreamingReader
 	var err error
 
+	opts := []reader.Option{
+		reader.WithMaxDisk(readerConfig.MaxDisk),
+		reader.WithMaxConnections(readerConfig.MaxConnections),
+		reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+		reader.WithDiskPath(readerConfig.DiskPath),
+	}
+	opts = append(opts, extraOpts...)
+
 	if encConfig.Enabled {
 		streamReader, err = reader.NewStreamingReaderWithEncryption(
 			f.ctx,
 			f.client,
 			segments,
 			encConfig,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
-			reader.WithMaxConnections(readerConfig.MaxConnections),
-			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
-			reader.WithDiskPath(readerConfig.DiskPath),
+			opts...,
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
 			f.ctx,
 			f.client,
 			segments,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
-			reader.WithMaxConnections(readerConfig.MaxConnections),
-			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
-			reader.WithDiskPath(readerConfig.DiskPath),
+			opts...,
 		)
 	}
 
