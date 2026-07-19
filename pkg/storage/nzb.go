@@ -42,7 +42,54 @@ type NZB struct {
 	Storage        string    `json:"storage" msgpack:"storage"`
 	FailMessage    string    `json:"fail_message,omitempty" msgpack:"fail_message,omitempty"`
 	Password       string    `json:"password,omitempty" msgpack:"password,omitempty"`
+
+	// Par2Files retains the release's PAR2 index/recovery-volume files
+	// (parsed but otherwise discarded before this field existed) purely for
+	// PAR2 repair - see pkg/usenet/par2. Never exposed as mount entries.
+	Par2Files []Par2FileRef `json:"par2_files,omitempty" msgpack:"par2_files,omitempty"`
+
+	// Par2Source records, for every posted file in the release (the RAR
+	// volumes etc.), its exact as-posted segment layout. This is essential:
+	// Files above are EXTRACTED entries whose segment StartOffset/EndOffset
+	// live in extracted-output space, but PAR2 recovery data protects the
+	// POSTED files - repair needs this un-extracted layout so a dead
+	// article's cumulative segment bytes give its byte range within the
+	// posted file PAR2 actually covers.
+	Par2Source []PostedFileRef `json:"par2_source,omitempty" msgpack:"par2_source,omitempty"`
 }
+
+// Par2SegmentRef is one posted article's message ID and raw decoded byte
+// length. Deliberately not a full NZBSegment: StartOffset/EndOffset and
+// SegmentDataStart only make sense in extracted-output space, which neither
+// a PAR2 file nor a posted-file byte range is - a Par2SegmentRef's position
+// within its owning file is implicit (its index / the cumulative Bytes of
+// the ones before it), not stored per-segment.
+type Par2SegmentRef struct {
+	MessageID string `json:"message_id" msgpack:"message_id"`
+	Bytes     int64  `json:"bytes" msgpack:"bytes"`
+}
+
+// Par2FileRef is one retained PAR2 file (the index file or a recovery
+// volume) from the release.
+type Par2FileRef struct {
+	Name     string            `json:"name" msgpack:"name"`
+	Size     int64             `json:"size" msgpack:"size"`
+	Segments []Par2SegmentRef  `json:"segments" msgpack:"segments"`
+}
+
+// PostedFileRef is one posted (pre-extraction) file from the release exactly
+// as it exists on the news server - e.g. one RAR volume - in upload order.
+type PostedFileRef struct {
+	Name     string            `json:"name" msgpack:"name"`
+	Size     int64             `json:"size" msgpack:"size"`
+	Segments []Par2SegmentRef  `json:"segments" msgpack:"segments"`
+}
+
+// Par2Fields lets the on-disk codec (pkg/usenet/nzbcodec.go) encode
+// Par2FileRef and PostedFileRef through one generic function despite being
+// distinct types with an identical shape.
+func (f Par2FileRef) Par2Fields() (string, int64, []Par2SegmentRef)   { return f.Name, f.Size, f.Segments }
+func (f PostedFileRef) Par2Fields() (string, int64, []Par2SegmentRef) { return f.Name, f.Size, f.Segments }
 
 // NZBFile represents a grouped file with its Segments
 type NZBFile struct {

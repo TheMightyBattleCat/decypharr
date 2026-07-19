@@ -248,7 +248,38 @@ func encodeHeader(nzb *storage.NZB) []byte {
 		w.boolean(f.IsEncrypted)
 		w.uvarint(uint64(len(f.Segments)))
 	}
+
+	// PAR2 fields, appended after the original v2 layout: an old blob simply
+	// ends here, so decodeHeader's r.pos < len(buf) check after the file loop
+	// is what tells old (no PAR2 data) and new blobs apart on decode.
+	writePar2FileRefs(w, nzb.Par2Files)
+	writePar2FileRefs(w, nzb.Par2Source)
+
 	return w.buf
+}
+
+// writePar2FileRefs encodes a []storage.Par2FileRef or []storage.PostedFileRef
+// (both share the same {Name, Size, Segments} shape) via the Par2FileRefLike
+// accessor, avoiding a duplicate encoder per concrete type.
+func writePar2FileRefs[T par2FileRefLike](w *byteWriter, files []T) {
+	w.uvarint(uint64(len(files)))
+	for _, f := range files {
+		name, size, segs := f.Par2Fields()
+		w.str(name)
+		w.varint(size)
+		w.uvarint(uint64(len(segs)))
+		for _, seg := range segs {
+			w.str(seg.MessageID)
+			w.varint(seg.Bytes)
+		}
+	}
+}
+
+// par2FileRefLike lets writePar2FileRefs encode storage.Par2FileRef and
+// storage.PostedFileRef through one generic function despite being distinct
+// types with an identical shape.
+type par2FileRefLike interface {
+	Par2Fields() (name string, size int64, segments []storage.Par2SegmentRef)
 }
 
 // encodeSegments produces two buffers: segMeta (columnar numeric + group data
@@ -543,7 +574,87 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 		}
 		counts[i] = int(c)
 	}
+
+	// PAR2 fields were added after the original v2 layout: a header blob
+	// written before this change ends exactly here, so their absence (rather
+	// than a version byte) is what identifies a record that predates them -
+	// Par2Files/Par2Source are simply left nil, and the repair job's lazy
+	// backfill helper re-derives them from the stored original .nzb on disk.
+	if r.pos < len(buf) {
+		if nzb.Par2Files, err = readPar2FileRefs(r); err != nil {
+			return nil, nil, err
+		}
+		if nzb.Par2Source, err = readPostedFileRefs(r); err != nil {
+			return nil, nil, err
+		}
+	}
 	return nzb, counts, nil
+}
+
+func readPar2FileRefs(r *byteReader) ([]storage.Par2FileRef, error) {
+	n, err := r.uvarint()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	out := make([]storage.Par2FileRef, n)
+	for i := range out {
+		if out[i].Name, err = r.strCopy(); err != nil {
+			return nil, err
+		}
+		if out[i].Size, err = r.varint(); err != nil {
+			return nil, err
+		}
+		if out[i].Segments, err = readPar2Segments(r); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func readPostedFileRefs(r *byteReader) ([]storage.PostedFileRef, error) {
+	n, err := r.uvarint()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	out := make([]storage.PostedFileRef, n)
+	for i := range out {
+		if out[i].Name, err = r.strCopy(); err != nil {
+			return nil, err
+		}
+		if out[i].Size, err = r.varint(); err != nil {
+			return nil, err
+		}
+		if out[i].Segments, err = readPar2Segments(r); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func readPar2Segments(r *byteReader) ([]storage.Par2SegmentRef, error) {
+	n, err := r.uvarint()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	out := make([]storage.Par2SegmentRef, n)
+	for i := range out {
+		if out[i].MessageID, err = r.strCopy(); err != nil {
+			return nil, err
+		}
+		if out[i].Bytes, err = r.varint(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // decodeSegments fills nzb.Files[*].Segments from the columnar segMeta and the

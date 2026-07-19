@@ -1219,6 +1219,55 @@ func (u *Usenet) markAsFailed(nzb *storage.NZB, err error) error {
 	return nil
 }
 
+// BackfillPar2Refs re-derives Par2Files/Par2Source for an NZB record whose
+// stored meta blob predates those fields, by re-parsing the raw .nzb source
+// file on disk (nzb.Path - see pkg/manager/stale_nzb.go for this location
+// convention). Intended to be called lazily by the PAR2 repair job, right
+// before it would otherwise report "par2 repair unavailable" for an entry
+// that simply hasn't been re-parsed since PAR2 retention shipped.
+//
+// This only succeeds while the source file is still present. markAsCompleted
+// deletes it once an NZB finishes downloading - the parsed .meta blob is the
+// only artifact normal streaming/repair ever needed before this feature
+// existed - so in practice this backfill only has something to work with for
+// an entry that is still mid-processing or that failed before completing.
+// A completed entry from before PAR2 retention shipped has no raw NZB left
+// to re-derive from; it simply never gets PAR2 repair and falls straight to
+// the legacy re-grab path, exactly like "no par2 available" does for any
+// other entry.
+func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return fmt.Errorf("failed to load NZB: %w", err)
+	}
+	if len(nzb.Par2Files) > 0 || len(nzb.Par2Source) > 0 {
+		return nil
+	}
+	if nzb.Path == "" {
+		return fmt.Errorf("source NZB file is no longer on disk; cannot backfill PAR2 refs for %s", nzoID)
+	}
+	content, err := os.ReadFile(nzb.Path)
+	if err != nil {
+		return fmt.Errorf("failed to read source NZB file: %w", err)
+	}
+
+	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "par2-backfill").Logger())
+	reparsed, _, err := prs.Parse(ctx, nzb.Name, content)
+	if err != nil {
+		return fmt.Errorf("failed to re-parse source NZB file: %w", err)
+	}
+	if len(reparsed.Par2Files) == 0 && len(reparsed.Par2Source) == 0 {
+		return fmt.Errorf("re-parsed NZB has no PAR2/source file data for %s", nzoID)
+	}
+
+	nzb.Par2Files = reparsed.Par2Files
+	nzb.Par2Source = reparsed.Par2Source
+	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+		return fmt.Errorf("failed to save backfilled PAR2 refs: %w", err)
+	}
+	return nil
+}
+
 func (u *Usenet) Delete(nzoID string) error {
 	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
 	if err != nil {
