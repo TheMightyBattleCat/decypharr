@@ -1,0 +1,649 @@
+// The PAR2 repair worker reconstructs confirmed-dead Usenet articles (see
+// pkg/usenet/overlay) using PAR2 recovery data instead of falling straight to
+// a delete + re-search. It is a manager-level background service: one job at
+// a time (the pass reads a meaningful fraction of a release over NNTP, so
+// running several concurrently would just contend with itself), deduped by
+// nzbID, and gated by the repair sweep's Schedule/StopSchedule window (see
+// Repair.repairWindowOpen) - the same bandwidth-heavy-work-hours reasoning
+// StopSchedule already applies to sweeps.
+//
+// Escalation ordering end to end: a padded segment enqueues here; on success
+// the segment is patched and padding for it stops on the next read. On any
+// failure - no PAR2 data, too much damage, a fetch or verification failure -
+// the job hands the entry to the existing playback-repair path
+// (Repair.RepairPlaybackFileNow), exactly the delete + re-search a live 430
+// would have triggered if padding didn't exist. With config.Repair.Par2Repair
+// disabled this worker never does anything but fall through to that same
+// legacy path; with PlaybackPadding also disabled, EnqueueRepair is never
+// even called (see pkg/usenet/fs/reader), so the whole feature is inert.
+package manager
+
+import (
+	"context"
+	"crypto/md5"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
+	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
+)
+
+const (
+	// par2QueueDepth bounds how many distinct NZBs can be waiting for a PAR2
+	// pass at once. Generous: entries are deduped, so this is a ceiling on
+	// distinct broken entries queued at the same moment, not on throughput.
+	par2QueueDepth = 256
+
+	// par2RetryInterval is how often a job deferred by a closed repair
+	// window (see Repair.repairWindowOpen) is reconsidered.
+	par2RetryInterval = time.Minute
+
+	// par2JobTimeout bounds one NZB's whole PAR2 pass (index fetch through
+	// verification), so a stalled provider can't wedge the worker forever.
+	par2JobTimeout = 20 * time.Minute
+
+	// par2ArticleFetchTimeout bounds a single article fetch within a job.
+	par2ArticleFetchTimeout = 60 * time.Second
+
+	// md5_16kSize is the PAR2-defined sample size for tie-breaking a
+	// posted-file/FileDesc length match.
+	md5_16kSize = 16384
+)
+
+// articleFetchFunc downloads and yEnc-decodes a single NNTP article. Narrowed
+// from *usenet.Usenet to just this one method so the byte-range-fetching
+// helpers below (postedFileFetcher, fetchWholePar2File, computeMD5_16k) can
+// be exercised with a fake in tests, without needing a real, provider-backed
+// Usenet client.
+type articleFetchFunc func(ctx context.Context, messageID string) ([]byte, error)
+
+// par2VolPattern matches par2cmdline's recovery-volume naming convention,
+// "<base>.volSTART+COUNT.par2" (case-insensitive) - e.g. "release.vol3+2.par2"
+// holds COUNT recovery slices starting at exponent START. This lets the job
+// compute how many recovery slices are available, and which files are
+// smallest, from filenames alone, with no need to fetch anything first.
+var par2VolPattern = regexp.MustCompile(`(?i)\.vol(\d+)\+(\d+)\.par2$`)
+
+// Par2Repair is the manager-level PAR2 repair worker.
+type Par2Repair struct {
+	manager *Manager
+	repair  *Repair
+	logger  zerolog.Logger
+
+	mu     sync.Mutex
+	queued map[string]struct{}
+	queue  chan string
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// NewPar2Repair builds the worker. Call Start to begin processing.
+func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
+	return &Par2Repair{
+		manager: m,
+		repair:  repair,
+		logger:  logger.New("par2-repair"),
+		queued:  make(map[string]struct{}),
+		queue:   make(chan string, par2QueueDepth),
+	}
+}
+
+// Start begins the worker's single processing goroutine.
+func (p *Par2Repair) Start(ctx context.Context) {
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.wg.Add(1)
+	go p.loop()
+}
+
+// Stop cancels any in-flight job and waits for the worker goroutine to exit.
+func (p *Par2Repair) Stop() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+}
+
+// Enqueue schedules nzbID for a PAR2 repair pass. Deduped: a burst of padded
+// segments across one playback session collapses to a single pass. Safe to
+// call from any goroutine (this is exactly what overlay.Handle.EnqueueRepair
+// does, from inside the reader's fetch path).
+func (p *Par2Repair) Enqueue(nzbID string) {
+	if p == nil || nzbID == "" {
+		return
+	}
+	p.mu.Lock()
+	if _, dup := p.queued[nzbID]; dup {
+		p.mu.Unlock()
+		return
+	}
+	p.queued[nzbID] = struct{}{}
+	p.mu.Unlock()
+
+	select {
+	case p.queue <- nzbID:
+	default:
+		p.logger.Warn().Str("entry", nzbID).Msg("par2 repair queue full; dropping request")
+		p.mu.Lock()
+		delete(p.queued, nzbID)
+		p.mu.Unlock()
+	}
+}
+
+func (p *Par2Repair) loop() {
+	defer p.wg.Done()
+
+	var pending []string
+	ticker := time.NewTicker(par2RetryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case nzbID := <-p.queue:
+			p.mu.Lock()
+			delete(p.queued, nzbID)
+			p.mu.Unlock()
+			if p.readyToRun() {
+				p.runJob(nzbID)
+			} else {
+				pending = append(pending, nzbID)
+			}
+		case <-ticker.C:
+			if len(pending) == 0 || !p.readyToRun() {
+				continue
+			}
+			todo := pending
+			pending = nil
+			for _, id := range todo {
+				if p.ctx.Err() != nil {
+					return
+				}
+				p.runJob(id)
+			}
+		}
+	}
+}
+
+func (p *Par2Repair) readyToRun() bool {
+	return config.Get().Repair.Par2RepairEnabled() && p.repair.repairWindowOpen()
+}
+
+// runJob runs one NZB's PAR2 repair pass end to end. Every exit path either
+// leaves the overlay state as-is (nothing to do, or a genuine "can't tell
+// yet" error worth retrying later) or falls through to the legacy repair
+// path - it never partially patches and calls it done.
+func (p *Par2Repair) runJob(nzbID string) {
+	start := time.Now()
+	if p.manager.usenet == nil {
+		return
+	}
+
+	entryName := nzbID
+	if entry, err := p.manager.GetEntry(nzbID); err == nil && entry != nil {
+		entryName = entry.Name
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, par2JobTimeout)
+	defer cancel()
+
+	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil || len(pending) == 0 {
+		return
+	}
+	deadSegments := 0
+	for _, segs := range pending {
+		deadSegments += len(segs)
+	}
+	p.logger.Info().Str("entry", entryName).Int("dead_segments", deadSegments).Msg("par2 repair queued")
+
+	if err := p.runRepair(ctx, nzbID, entryName, pending); err != nil {
+		p.logger.Info().Err(err).Str("entry", entryName).Msg("par2 repair unavailable")
+		p.fallbackToLegacy(entryName, pending)
+		return
+	}
+
+	p.logger.Info().
+		Str("entry", entryName).
+		Int("segments_patched", deadSegments).
+		Dur("duration", time.Since(start)).
+		Msg("par2 repair completed")
+}
+
+// runRepair does the actual work; every error return means "PAR2 couldn't
+// handle this," triggering the legacy fallback in the caller. It never
+// returns a nil error after only partially patching pending's segments.
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment) error {
+	u := p.manager.usenet
+
+	nzb, err := u.GetNZB(nzbID)
+	if err != nil {
+		return fmt.Errorf("load NZB record: %w", err)
+	}
+	if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
+		if err := u.BackfillPar2Refs(ctx, nzbID); err != nil {
+			return fmt.Errorf("no PAR2 data and backfill failed: %w", err)
+		}
+		nzb, err = u.GetNZB(nzbID)
+		if err != nil {
+			return fmt.Errorf("reload NZB record after backfill: %w", err)
+		}
+		if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
+			return fmt.Errorf("no PAR2 data available")
+		}
+	}
+
+	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
+	var available uint32
+	for _, v := range vols {
+		available += v.count
+	}
+
+	// A rough, name-only upper bound on how many damaged slices we could
+	// possibly need (actual count depends on slice size, known only once the
+	// index is parsed) - catch the hopeless case before fetching anything.
+	if available == 0 {
+		return fmt.Errorf("no PAR2 recovery volumes retained")
+	}
+
+	// Fetch every index (non-volume) file, plus enough of the smallest
+	// recovery volumes to plausibly cover every dead segment - "fully
+	// reading the small vols is acceptable v1" per the design; we don't
+	// attempt to skip individual articles within a volume file.
+	var sources []par2.Source
+	for _, f := range indexFiles {
+		data, err := fetchWholePar2File(ctx, u.FetchArticle, f)
+		if err != nil {
+			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", f.Name).Msg("par2: index file fetch failed; relying on volume-embedded metadata")
+			continue
+		}
+		sources = append(sources, par2.Source{Name: f.Name, Data: data})
+	}
+
+	needed := estimateNeededSlices(pending)
+	var fetchedSlices uint32
+	for _, v := range vols {
+		if fetchedSlices >= needed {
+			break
+		}
+		data, err := fetchWholePar2File(ctx, u.FetchArticle, v.ref)
+		if err != nil {
+			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
+			continue
+		}
+		sources = append(sources, par2.Source{Name: v.ref.Name, Data: data})
+		fetchedSlices += v.count
+	}
+	if len(sources) == 0 {
+		return fmt.Errorf("failed to fetch any PAR2 file")
+	}
+
+	idx, err := par2.ParseIndex(sources)
+	if err != nil {
+		return fmt.Errorf("parse PAR2 index: %w", err)
+	}
+
+	// Match every posted file in the release (not just the ones with dead
+	// segments - intact slices needed for the streaming pass can belong to
+	// ANY file in the recovery set) to its PAR2 FileID.
+	posted := make([]par2.PostedFile, len(nzb.Par2Source))
+	for i, f := range nzb.Par2Source {
+		f := f
+		posted[i] = par2.PostedFile{
+			Name:   f.Name,
+			Length: f.Size,
+			MD5_16k: func() ([16]byte, error) {
+				return computeMD5_16k(ctx, u.FetchArticle, f)
+			},
+		}
+	}
+	matches, err := par2.MatchFiles(idx, posted)
+	if err != nil {
+		return fmt.Errorf("match posted files: %w", err)
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("no posted file matched the PAR2 recovery set")
+	}
+
+	fetchers := make(map[[16]byte]*postedFileFetcher, len(matches))
+	msgIDRange := make(map[string]postedRange)
+	for _, m := range matches {
+		file := nzb.Par2Source[m.PostedIndex]
+		f := newPostedFileFetcher(ctx, u.FetchArticle, file)
+		fetchers[m.FileID] = f
+		var off int64
+		for _, seg := range file.Segments {
+			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: off, end: off + seg.Bytes}
+			off += seg.Bytes
+		}
+	}
+
+	// Map every dead segment (by message ID - NOT by the logical/extracted
+	// filename padding recorded it under, which may be an extracted-archive
+	// member with no posted-file identity of its own) to its damaged slice
+	// set within the posted file PAR2 actually protects.
+	damagedSet := make(map[int64]struct{})
+	type deadRef struct {
+		file string
+		seg  overlay.DeadSegment
+		rng  postedRange
+	}
+	var deadRefs []deadRef
+	for file, segs := range pending {
+		for _, seg := range segs {
+			rng, ok := msgIDRange[seg.MessageID]
+			if !ok {
+				return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file)
+			}
+			slices, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
+			if err != nil {
+				return fmt.Errorf("map dead segment %s to slices: %w", seg.MessageID, err)
+			}
+			for _, s := range slices {
+				damagedSet[s] = struct{}{}
+			}
+			deadRefs = append(deadRefs, deadRef{file: file, seg: seg, rng: rng})
+		}
+	}
+
+	damaged := make([]int64, 0, len(damagedSet))
+	for s := range damagedSet {
+		damaged = append(damaged, s)
+	}
+	sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
+
+	k := len(damaged)
+	if k == 0 {
+		return fmt.Errorf("no damaged slices resolved (nothing to repair)")
+	}
+	if k > par2.MaxRepairSlices {
+		return fmt.Errorf("%d damaged slices exceeds the %d repair cap", k, par2.MaxRepairSlices)
+	}
+	if k > len(idx.Recovery) {
+		return fmt.Errorf("%d damaged slices but only %d recovery slices fetched/available", k, len(idx.Recovery))
+	}
+
+	recovery := make([]par2.RecoverySlice, k)
+	for i, ref := range idx.Recovery[:k] {
+		src := sources[ref.Source].Data
+		if ref.Offset+ref.Length > int64(len(src)) {
+			return fmt.Errorf("recovery slice %d out of range in %s", i, sources[ref.Source].Name)
+		}
+		recovery[i] = par2.RecoverySlice{
+			Exponent: ref.Exponent,
+			Data:     src[ref.Offset : ref.Offset+ref.Length],
+		}
+	}
+
+	sliceSource := &jobSliceSource{idx: idx, fetchers: fetchers}
+	repaired, err := par2.Repair(idx, damaged, recovery, sliceSource)
+	if err != nil {
+		return fmt.Errorf("repair: %w", err)
+	}
+
+	repairedByIndex := make(map[int64][]byte, len(repaired))
+	for _, rs := range repaired {
+		repairedByIndex[rs.Index] = rs.Data
+	}
+
+	for _, dr := range deadRefs {
+		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, dr.rng.start, dr.rng.end)
+		if err != nil {
+			return fmt.Errorf("extract repaired bytes for %s: %w", dr.seg.MessageID, err)
+		}
+		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
+			return fmt.Errorf("write patch for %s segment %d: %w", dr.file, dr.seg.Index, err)
+		}
+	}
+	return nil
+}
+
+// fallbackToLegacy hands every file with pending dead segments to the
+// existing playback-repair path (delete + re-search), exactly what a live
+// 430 would have triggered without padding - gated by the same config flags
+// escalatePlaybackFailure checks, since this is standing in for that exact
+// escalation having fired.
+func (p *Par2Repair) fallbackToLegacy(entryName string, pending map[string][]overlay.DeadSegment) {
+	cfg := config.Get().Repair
+	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	for file := range pending {
+		if err := p.repair.RepairPlaybackFileNow(ctx, entryName, file); err != nil {
+			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", file).Msg("par2 repair failed; legacy fallback also failed")
+		}
+	}
+}
+
+// estimateNeededSlices is a cheap upper bound (one slice per dead segment)
+// used only to decide when we've fetched "probably enough" recovery volumes
+// before parsing the index - the real, exact k is computed from the parsed
+// index afterward.
+func estimateNeededSlices(pending map[string][]overlay.DeadSegment) uint32 {
+	var n uint32
+	for _, segs := range pending {
+		n += uint32(len(segs))
+	}
+	return n
+}
+
+type par2Volume struct {
+	ref   storage.Par2FileRef
+	start uint32
+	count uint32
+}
+
+// censusPar2Volumes splits files into recovery volumes (name-parsed for
+// their exponent range, per par2VolPattern) and everything else (the index
+// file(s)), with volumes sorted smallest-file-first - "recovery census from
+// vol{X}+{Y} names" without fetching anything.
+func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFiles []storage.Par2FileRef) {
+	for _, f := range files {
+		m := par2VolPattern.FindStringSubmatch(f.Name)
+		if m == nil {
+			indexFiles = append(indexFiles, f)
+			continue
+		}
+		start, errS := strconv.ParseUint(m[1], 10, 32)
+		count, errC := strconv.ParseUint(m[2], 10, 32)
+		if errS != nil || errC != nil {
+			indexFiles = append(indexFiles, f)
+			continue
+		}
+		vols = append(vols, par2Volume{ref: f, start: uint32(start), count: uint32(count)})
+	}
+	sort.Slice(vols, func(i, j int) bool { return vols[i].ref.Size < vols[j].ref.Size })
+	return vols, indexFiles
+}
+
+// fetchWholePar2File downloads and concatenates every segment of a retained
+// PAR2 file (index or recovery volume). PAR2 files are posted directly (not
+// extracted from an archive), so their segments concatenate straight into
+// the file's real bytes with no trimming.
+func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.Par2FileRef) ([]byte, error) {
+	out := make([]byte, 0, f.Size)
+	for _, seg := range f.Segments {
+		fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
+		data, err := fetch(fetchCtx, seg.MessageID)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("fetch %s: %w", seg.MessageID, err)
+		}
+		out = append(out, data...)
+	}
+	return out, nil
+}
+
+// computeMD5_16k fetches just enough leading segments of a posted file to
+// hash its first 16KB (or the whole file, if shorter) - MatchFiles only
+// calls this for a file whose length ties with another candidate.
+func computeMD5_16k(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
+	fetcher := newPostedFileFetcher(ctx, fetch, f)
+	n := int64(md5_16kSize)
+	if f.Size < n {
+		n = f.Size
+	}
+	data, err := fetcher.ReadRange(0, n)
+	if err != nil {
+		return [16]byte{}, err
+	}
+	return md5.Sum(data), nil
+}
+
+type postedRange struct {
+	fileID     [16]byte
+	start, end int64
+}
+
+// postedFileFetcher serves arbitrary byte ranges of one posted file over
+// NNTP, fetching only the segments actually overlapped and caching the most
+// recently fetched one - sequential slice reads during the streaming repair
+// pass repeatedly hit the same or the next segment.
+type postedFileFetcher struct {
+	ctx    context.Context
+	fetch  articleFetchFunc
+	length int64
+	segs   []storage.Par2SegmentRef
+	base   []int64 // base[i] = starting byte offset of segs[i] within the file
+
+	cacheIdx  int
+	cacheData []byte
+}
+
+func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) *postedFileFetcher {
+	base := make([]int64, len(f.Segments))
+	var off int64
+	for i, s := range f.Segments {
+		base[i] = off
+		off += s.Bytes
+	}
+	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: f.Size, segs: f.Segments, base: base, cacheIdx: -1}
+}
+
+func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
+	lo, hi := 0, len(f.base)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if f.base[mid]+f.segs[mid].Bytes <= offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo >= len(f.segs) {
+		return 0, fmt.Errorf("offset %d beyond the file's %d segments", offset, len(f.segs))
+	}
+	return lo, nil
+}
+
+func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
+	if f.cacheIdx == idx {
+		return f.cacheData, nil
+	}
+	fetchCtx, cancel := context.WithTimeout(f.ctx, par2ArticleFetchTimeout)
+	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	f.cacheIdx = idx
+	f.cacheData = data
+	return data, nil
+}
+
+// ReadRange returns exactly length bytes starting at start, zero-padded past
+// the file's real length (the PAR2 final-slice padding convention).
+func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
+	out := make([]byte, length)
+	pos := start
+	written := int64(0)
+	for written < length {
+		if pos >= f.length {
+			break
+		}
+		segIdx, err := f.segmentFor(pos)
+		if err != nil {
+			return nil, err
+		}
+		data, err := f.segmentData(segIdx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch segment %d: %w", segIdx, err)
+		}
+		withinSeg := pos - f.base[segIdx]
+		avail := int64(len(data)) - withinSeg
+		if avail <= 0 {
+			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
+		}
+		// Never copy past the file's real length, even mid-segment: a
+		// segment's decoded size can legitimately exceed what's left of the
+		// file (the final segment of a file whose length isn't a multiple of
+		// its segment size) - anything beyond f.length must stay the
+		// zero-padding out sets it to, not real bytes from past EOF.
+		n := min(avail, length-written, f.length-pos)
+		copy(out[written:written+n], data[withinSeg:withinSeg+n])
+		written += n
+		pos += n
+	}
+	return out, nil
+}
+
+// jobSliceSource adapts per-posted-file fetchers into the single
+// par2.SliceSource the streaming repair pass reads intact slices from.
+type jobSliceSource struct {
+	idx      *par2.Index
+	fetchers map[[16]byte]*postedFileFetcher
+}
+
+func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
+	fileID, local, err := s.idx.SliceLocation(globalIdx)
+	if err != nil {
+		return nil, err
+	}
+	f, ok := s.fetchers[fileID]
+	if !ok {
+		return nil, fmt.Errorf("no posted-file fetcher for file %x", fileID)
+	}
+	return f.ReadRange(local*s.idx.SliceSize, s.idx.SliceSize)
+}
+
+// extractPostedRange cuts [start, end) of posted file fileID out of the
+// repaired slices map (global slice index -> exactly SliceSize bytes),
+// concatenating across a multi-slice range. A dead article's posted-file
+// range is always fully covered by the damaged slice set computed for it, so
+// every slice this touches is guaranteed present in repairedByIndex.
+func extractPostedRange(idx *par2.Index, repairedByIndex map[int64][]byte, fileID [16]byte, start, end int64) ([]byte, error) {
+	base, err := idx.SliceBase(fileID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, end-start)
+	pos := start
+	for pos < end {
+		local := pos / idx.SliceSize
+		global := base + local
+		sliceData, ok := repairedByIndex[global]
+		if !ok {
+			return nil, fmt.Errorf("slice %d was not reconstructed", global)
+		}
+		withinSlice := pos - local*idx.SliceSize
+		avail := idx.SliceSize - withinSlice
+		need := end - pos
+		n := min(avail, need)
+		copy(out[pos-start:pos-start+n], sliceData[withinSlice:withinSlice+n])
+		pos += n
+	}
+	return out, nil
+}

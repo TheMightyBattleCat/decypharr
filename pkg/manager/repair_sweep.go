@@ -23,6 +23,7 @@ import (
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
 // candidate is the unit of work for a sweep. One per entry-folder.
@@ -472,29 +473,66 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		return res
 	}
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
+		verdict := r.recordDeadSegments(ctx, entry, name)
+		if r.queueForPar2Repair(entry, name, verdict) {
+			// Damage is within the padding caps and PAR2 data is retained -
+			// hand it to the PAR2 worker instead of the legacy re-grab path.
+			// Deliberately NOT marking res.broken: this file should neither
+			// show up in this run's BrokenFiles (which would re-grab it
+			// immediately) nor count as healthy - "unknown/pending" is the
+			// correct rollup while the PAR2 pass is outstanding. Everything
+			// else (verdict failed, PAR2 disabled/unavailable, or no
+			// verdict at all because the detail probe itself failed) falls
+			// through to exactly today's path below.
+			res.reason = "usenet_segment_missing_par2_queued"
+			return res
+		}
 		res.broken = true
 		res.reason = "usenet_segment_missing"
-		r.recordDeadSegments(ctx, entry, name)
 	} else {
 		res.reason = "usenet_probe_error"
 	}
 	return res
 }
 
+// queueForPar2Repair reports whether name should be handed to the PAR2
+// worker instead of this sweep's legacy re-grab path: the overlay verdict is
+// degraded (damage within the padding caps - a failed verdict means it's
+// beyond them, or not a paddable container, either way not PAR2's call to
+// make), PAR2 repair is enabled, a worker is actually running, and PAR2 data
+// is retained for this NZB. Any one of those being false means "exactly
+// today's path" - the whole point of this gate is that everything else about
+// the sweep is unchanged.
+func (r *Repair) queueForPar2Repair(entry *storage.Entry, name string, verdict overlay.Verdict) bool {
+	if verdict != overlay.VerdictDegraded {
+		return false
+	}
+	if !config.Get().Repair.Par2RepairEnabled() {
+		return false
+	}
+	if r.manager.par2Repair == nil || r.manager.usenet == nil {
+		return false
+	}
+	if !r.manager.usenet.HasPar2Data(entry.InfoHash) {
+		return false
+	}
+	r.manager.par2Repair.Enqueue(entry.InfoHash)
+	return true
+}
+
 // recordDeadSegments re-probes name for the specific segments confirmed
 // missing (CheckFile above only reports pass/fail) and persists them to the
-// overlay store, so the reader's padding policy and any future PAR2 repair
-// pass see this damage without needing to rediscover it themselves. This is
-// bookkeeping only in this commit - the sweep's own repair decision below is
-// unchanged; a later commit gates it on the resulting verdict plus PAR2
-// availability, falling back to today's legacy repair otherwise.
-func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, name string) {
+// overlay store, so the reader's padding policy and the PAR2 repair worker
+// see this damage without needing to rediscover it themselves. Returns the
+// resulting verdict (VerdictClean if the detail probe itself failed or found
+// nothing - callers must not queue PAR2 repair on that).
+func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, name string) overlay.Verdict {
 	if r.manager.usenet == nil {
-		return
+		return overlay.VerdictClean
 	}
 	missing, err := r.manager.usenet.CheckFileDetailed(ctx, entry.InfoHash, name)
 	if err != nil || len(missing) == 0 {
-		return
+		return overlay.VerdictClean
 	}
 	for _, seg := range missing {
 		if err := r.manager.usenet.RecordOverlayDead(entry.InfoHash, name, seg.Index, seg.MessageID, seg.Bytes); err != nil {
@@ -503,6 +541,7 @@ func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, n
 	}
 	verdict := r.manager.usenet.OverlayVerdict(entry.InfoHash, name)
 	r.logger.Debug().Str("entry", entry.Name).Str("file", name).Int("missing_segments", len(missing)).Str("verdict", string(verdict)).Msg("Repair: recorded dead segments from sweep probe")
+	return verdict
 }
 
 func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {

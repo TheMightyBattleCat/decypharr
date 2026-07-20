@@ -35,6 +35,7 @@ type Manager struct {
 	storage      *storage.Storage
 	migrator     *Migrator
 	repair       *Repair
+	par2Repair   *Par2Repair
 	clients      *xsync.Map[string, debrid.Client]
 	arr          *arr.Storage
 	logger       zerolog.Logger
@@ -243,6 +244,15 @@ func (m *Manager) init() {
 
 	// Initialize repair service. It registers with the scheduler in StartWorker.
 	m.repair = NewRepair(m)
+
+	// Initialize the PAR2 repair worker and wire it as the overlay store's
+	// repair-enqueue callback, so a padded segment (pkg/usenet/fs/reader)
+	// queues a PAR2 pass without the reader/overlay packages needing to know
+	// this worker exists.
+	m.par2Repair = NewPar2Repair(m, m.repair)
+	if m.usenet != nil {
+		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.Enqueue)
+	}
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
@@ -474,6 +484,12 @@ func (m *Manager) Stop() error {
 	if m.jobQueue != nil {
 		m.logger.Info().Msg("Closing active download queue")
 		m.jobQueue.Close()
+	}
+
+	// Stop the PAR2 repair worker before closing usenet - it makes NNTP
+	// calls through m.usenet and must not be mid-fetch when the client closes.
+	if m.par2Repair != nil {
+		m.par2Repair.Stop()
 	}
 
 	// Close usenet connection manager if active

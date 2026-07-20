@@ -244,6 +244,13 @@ func (idx *Index) SliceBase(fileID [16]byte) (int64, error) {
 	return 0, fmt.Errorf("par2: file %x is not in the recovery set", fileID)
 }
 
+// SliceLocation returns the FileID and within-file slice number a global
+// slice index belongs to. Exported for callers (e.g. the repair job) that
+// need to resolve a damaged/intact slice back to its owning posted file.
+func (idx *Index) SliceLocation(globalIdx int64) (fileID [16]byte, local int64, err error) {
+	return idx.sliceLocation(globalIdx)
+}
+
 // sliceLocation returns the FileID and within-file slice number a global
 // slice index belongs to.
 func (idx *Index) sliceLocation(globalIdx int64) (fileID [16]byte, local int64, err error) {

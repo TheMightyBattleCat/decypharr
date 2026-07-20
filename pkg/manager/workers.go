@@ -199,6 +199,13 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		}
 	}
 
+	// Start the PAR2 repair worker. Always started (it's a no-op consumer
+	// otherwise): whether it does anything is gated live per-job by
+	// config.Repair.Par2RepairEnabled, not by whether it was started.
+	if m.par2Repair != nil {
+		m.par2Repair.Start(ctx)
+	}
+
 	// Start the scheduler
 	m.scheduler.Start()
 	m.cetScheduler.Start()

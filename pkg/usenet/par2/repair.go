@@ -5,6 +5,12 @@ import (
 	"fmt"
 )
 
+// MaxRepairSlices is the exported form of maxRepairSlices, for callers that
+// want to fail before fetching any recovery data when they already know a
+// damaged set is too large (e.g. against a vol-filename-derived recovery
+// census).
+const MaxRepairSlices = maxRepairSlices
+
 const (
 	// maxRepairSlices caps how many damaged slices a single Repair call will
 	// attempt to reconstruct: k damaged slices need a k×k GF(2^16) matrix
