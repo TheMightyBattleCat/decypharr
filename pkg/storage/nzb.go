@@ -72,24 +72,28 @@ type Par2SegmentRef struct {
 // Par2FileRef is one retained PAR2 file (the index file or a recovery
 // volume) from the release.
 type Par2FileRef struct {
-	Name     string            `json:"name" msgpack:"name"`
-	Size     int64             `json:"size" msgpack:"size"`
-	Segments []Par2SegmentRef  `json:"segments" msgpack:"segments"`
+	Name     string           `json:"name" msgpack:"name"`
+	Size     int64            `json:"size" msgpack:"size"`
+	Segments []Par2SegmentRef `json:"segments" msgpack:"segments"`
 }
 
 // PostedFileRef is one posted (pre-extraction) file from the release exactly
 // as it exists on the news server - e.g. one RAR volume - in upload order.
 type PostedFileRef struct {
-	Name     string            `json:"name" msgpack:"name"`
-	Size     int64             `json:"size" msgpack:"size"`
-	Segments []Par2SegmentRef  `json:"segments" msgpack:"segments"`
+	Name     string           `json:"name" msgpack:"name"`
+	Size     int64            `json:"size" msgpack:"size"`
+	Segments []Par2SegmentRef `json:"segments" msgpack:"segments"`
 }
 
 // Par2Fields lets the on-disk codec (pkg/usenet/nzbcodec.go) encode
 // Par2FileRef and PostedFileRef through one generic function despite being
 // distinct types with an identical shape.
-func (f Par2FileRef) Par2Fields() (string, int64, []Par2SegmentRef)   { return f.Name, f.Size, f.Segments }
-func (f PostedFileRef) Par2Fields() (string, int64, []Par2SegmentRef) { return f.Name, f.Size, f.Segments }
+func (f Par2FileRef) Par2Fields() (string, int64, []Par2SegmentRef) {
+	return f.Name, f.Size, f.Segments
+}
+func (f PostedFileRef) Par2Fields() (string, int64, []Par2SegmentRef) {
+	return f.Name, f.Size, f.Segments
+}
 
 // NZBFile represents a grouped file with its Segments
 type NZBFile struct {
