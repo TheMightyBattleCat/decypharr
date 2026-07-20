@@ -66,12 +66,20 @@ const (
 // Usenet client.
 type articleFetchFunc func(ctx context.Context, messageID string) ([]byte, error)
 
-// par2VolPattern matches par2cmdline's recovery-volume naming convention,
-// "<base>.volSTART+COUNT.par2" (case-insensitive) - e.g. "release.vol3+2.par2"
-// holds COUNT recovery slices starting at exponent START. This lets the job
-// compute how many recovery slices are available, and which files are
-// smallest, from filenames alone, with no need to fetch anything first.
-var par2VolPattern = regexp.MustCompile(`(?i)\.vol(\d+)\+(\d+)\.par2$`)
+// par2VolPattern matches both real-world PAR2 recovery-volume naming
+// conventions (case-insensitive): par2cmdline's "<base>.volSTART+COUNT.par2"
+// (e.g. "release.vol3+2.par2" holds 2 recovery slices starting at exponent
+// 3) and MultiPar/par2j's "<base>.volSTART-END.par2" using a hyphen instead
+// of a plus, with an inclusive end index rather than a count (e.g.
+// "release.vol3-4.par2" holds 2 slices, exponents 3 and 4) - found live
+// against a real MultiPar-created Usenet release during validation, where
+// treating "-" as a plus-equivalent undercounted by one per file and, worse,
+// a naive "+"-only regex didn't match these filenames at all, computing zero
+// available recovery volumes for a release that was fully PAR2-protected.
+// This lets the job compute how many recovery slices are available, and
+// which files are smallest, from filenames alone, with no need to fetch
+// anything first; see censusPar2Volumes for the count math per separator.
+var par2VolPattern = regexp.MustCompile(`(?i)\.vol(\d+)([+-])(\d+)\.par2$`)
 
 // Par2Repair is the manager-level PAR2 repair worker.
 type Par2Repair struct {
@@ -447,9 +455,10 @@ type par2Volume struct {
 }
 
 // censusPar2Volumes splits files into recovery volumes (name-parsed for
-// their exponent range, per par2VolPattern) and everything else (the index
-// file(s)), with volumes sorted smallest-file-first - "recovery census from
-// vol{X}+{Y} names" without fetching anything.
+// their exponent range, per par2VolPattern - both the par2cmdline "+count"
+// and MultiPar/par2j "-end" naming conventions) and everything else (the
+// index file(s)), with volumes sorted smallest-file-first - a recovery
+// census from filenames alone, without fetching anything.
 func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFiles []storage.Par2FileRef) {
 	for _, f := range files {
 		m := par2VolPattern.FindStringSubmatch(f.Name)
@@ -458,8 +467,25 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 			continue
 		}
 		start, errS := strconv.ParseUint(m[1], 10, 32)
-		count, errC := strconv.ParseUint(m[2], 10, 32)
-		if errS != nil || errC != nil {
+		second, errN := strconv.ParseUint(m[3], 10, 32)
+		if errS != nil || errN != nil {
+			indexFiles = append(indexFiles, f)
+			continue
+		}
+		// "+": second is a slice COUNT (par2cmdline). "-": second is an
+		// INCLUSIVE END index (MultiPar/par2j) - count = end - start + 1.
+		var count uint64
+		switch m[2] {
+		case "+":
+			count = second
+		default: // "-"
+			if second < start {
+				indexFiles = append(indexFiles, f)
+				continue
+			}
+			count = second - start + 1
+		}
+		if count == 0 {
 			indexFiles = append(indexFiles, f)
 			continue
 		}
