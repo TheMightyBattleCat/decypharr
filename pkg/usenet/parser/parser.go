@@ -154,7 +154,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	// the flat, pre-grouping raw.Files list so it's independent of whatever
 	// RAR/7z/zip grouping and extraction decides to do with these files
 	// afterwards.
-	nzb.Par2Files, nzb.Par2Source = p.buildPar2Refs(raw.Files)
+	nzb.Par2Files, nzb.Par2Source = p.buildPar2Refs(ctx, raw.Files)
 
 	// Stat the first segment to confirm connectivity
 	checked := false
@@ -243,34 +243,144 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 // their NZB part Number defensively, since Par2Source's whole purpose -
 // mapping a dead article to a byte range via cumulative segment bytes -
 // depends on that order being correct.
-func (p *NZBParser) buildPar2Refs(files nzbparser.NzbFiles) ([]storage.Par2FileRef, []storage.PostedFileRef) {
-	var par2Files []storage.Par2FileRef
-	var source []storage.PostedFileRef
+func (p *NZBParser) buildPar2Refs(ctx context.Context, files nzbparser.NzbFiles) ([]storage.Par2FileRef, []storage.PostedFileRef) {
+	return buildPar2RefsWithFetch(ctx, p.logger, p.maxConcurrent, files, p.detectFileType, p.fetchYencHeader)
+}
 
+// buildPar2RefsWithFetch is buildPar2Refs with its yEnc header fetch and file
+// type classification injected, so it can be exercised with fakes in tests.
+func buildPar2RefsWithFetch(
+	ctx context.Context,
+	logger zerolog.Logger,
+	maxConcurrent int,
+	files nzbparser.NzbFiles,
+	detectFileType func(string) storage.NZBFileType,
+	fetch yencHeaderFetchFunc,
+) ([]storage.Par2FileRef, []storage.PostedFileRef) {
+	type built struct {
+		name     string
+		size     int64
+		segments []storage.Par2SegmentRef
+		isPar2   bool
+	}
+
+	var eligible []nzbparser.NzbFile
 	for _, file := range files {
-		if len(file.Segments) == 0 {
-			continue
+		if len(file.Segments) > 0 {
+			eligible = append(eligible, file)
 		}
+	}
+
+	mapper := iter.Mapper[nzbparser.NzbFile, *built]{MaxGoroutines: maxConcurrent}
+	results := mapper.Map(eligible, func(file *nzbparser.NzbFile) *built {
 		segs := make(nzbparser.NzbSegments, len(file.Segments))
 		copy(segs, file.Segments)
 		sort.Sort(segs)
 
-		refs := make([]storage.Par2SegmentRef, len(segs))
-		for i, seg := range segs {
-			refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: int64(seg.Bytes)}
+		refs, size := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
+		return &built{
+			name:     file.Filename,
+			size:     size,
+			segments: refs,
+			isPar2:   detectFileType(file.Filename) == storage.NZBFileTypePar2,
 		}
+	})
 
-		if p.detectFileType(file.Filename) == storage.NZBFileTypePar2 {
-			par2Files = append(par2Files, storage.Par2FileRef{
-				Name: file.Filename, Size: file.Bytes, Segments: refs,
-			})
+	var par2Files []storage.Par2FileRef
+	var source []storage.PostedFileRef
+	for _, b := range results {
+		if b.isPar2 {
+			par2Files = append(par2Files, storage.Par2FileRef{Name: b.name, Size: b.size, Segments: b.segments})
 			continue
 		}
-		source = append(source, storage.PostedFileRef{
-			Name: file.Filename, Size: file.Bytes, Segments: refs,
-		})
+		source = append(source, storage.PostedFileRef{Name: b.name, Size: b.size, Segments: b.segments})
 	}
 	return par2Files, source
+}
+
+// yencHeaderFetchFunc fetches yEnc header metadata for one article. Narrowed
+// from *nntp.Client to just this one operation so realPar2SegmentRefs can be
+// exercised with a fake in tests, without a real, provider-backed client.
+type yencHeaderFetchFunc func(ctx context.Context, messageID string) (*nntp.YencMetadata, error)
+
+func (p *NZBParser) fetchYencHeader(ctx context.Context, messageID string) (*nntp.YencMetadata, error) {
+	var data *nntp.YencMetadata
+	err := p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		d, e := conn.GetHeaderPrefix(messageID, metadataOnly)
+		data = d
+		return e
+	})
+	return data, err
+}
+
+// realPar2SegmentRefs computes a posted file's real decoded per-segment byte
+// lengths and total size, the same way processMediaFile/getNZBSegments do for
+// files that actually get mounted - NOT from the NZB XML's bytes attribute,
+// which is the yEnc-ENCODED wire size (posted-article size, inflated by yEnc
+// escaping overhead) and essentially never equals the real decoded length
+// PAR2's FileDesc.Length records. Found live: using the XML bytes attribute
+// directly made every Par2Source length mismatch its true PAR2 FileDesc
+// counterpart, so MatchFiles never found a single match on real data.
+//
+// One real network round trip (a header-only yEnc fetch of the first
+// segment) is enough: a multipart yEnc header always carries the whole
+// file's true decoded size ("size="), and this segment's own decoded length
+// ("end"-"begin"+1) stands in for every other non-final segment's length -
+// upload tooling always encodes same-file segments to a uniform byte budget.
+// On fetch failure (or any inconsistency the same threshold check
+// processFileGroup's last-segment fallback uses), falls back to the
+// XML-declared bytes scaled by the same ~3% yEnc-overhead estimate used
+// there - approximate, but PAR2 support for this one file is best-effort
+// bookkeeping, not something worth failing the whole NZB parse over.
+func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) ([]storage.Par2SegmentRef, int64) {
+	fallback := func() ([]storage.Par2SegmentRef, int64) {
+		refs := make([]storage.Par2SegmentRef, len(segs))
+		var total int64
+		for i, seg := range segs {
+			b := int64(float64(seg.Bytes) * 0.97)
+			refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
+			total += b
+		}
+		return refs, total
+	}
+
+	yencData, err := fetch(ctx, segs[0].Id)
+	if err != nil || yencData == nil || yencData.Size <= 0 {
+		logger.Warn().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
+		return fallback()
+	}
+
+	fileSize := yencData.Size
+	segmentSize := yencData.End - yencData.Begin + 1
+	if segmentSize <= 0 {
+		return fallback()
+	}
+
+	n := len(segs)
+	fullSegsSize := segmentSize * int64(n-1)
+	expectedTotal := fullSegsSize + segmentSize
+	diff := fileSize - expectedTotal
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > (segmentSize*3)/2 {
+		// The header's declared total is inconsistent with this segment
+		// count/size (e.g. a mixed-subject group false match) - don't trust
+		// derived per-segment math against it.
+		return fallback()
+	}
+
+	refs := make([]storage.Par2SegmentRef, n)
+	var total int64
+	for i, seg := range segs {
+		b := segmentSize
+		if i == n-1 {
+			b = fileSize - fullSegsSize
+		}
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
+		total += b
+	}
+	return refs, total
 }
 
 func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) map[string]*FileGroup {
