@@ -219,6 +219,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume, extraOpts ...reader.Opt
 		reader.WithMaxConnections(readerConfig.MaxConnections),
 		reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 		reader.WithDiskPath(readerConfig.DiskPath),
+		reader.WithLogger(f.logger),
 	}
 	opts = append(opts, extraOpts...)
 

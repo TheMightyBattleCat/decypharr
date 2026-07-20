@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
@@ -130,6 +132,16 @@ type Config struct {
 	// OverlayFile is the logical filename this reader serves, used as the
 	// overlay manifest key. Only meaningful when Overlay is non-nil.
 	OverlayFile string
+
+	// Logger receives every log call made inside this package (segment
+	// padded, re-fetch-after-wedge, buffer discard failures, etc). Found
+	// live: NewStreamingReader previously always used zerolog.Nop() here -
+	// "use logger from config if available" was the comment, but no caller
+	// ever had a way to actually provide one, so every log line in this
+	// whole package (not just padding's) was silently discarded. Defaults to
+	// a no-op logger (see DefaultConfig) so a caller that doesn't set it via
+	// WithLogger behaves exactly as before.
+	Logger zerolog.Logger
 }
 
 // DefaultConfig returns a ReaderConfig with sensible defaults.
@@ -141,6 +153,7 @@ func DefaultConfig() Config {
 		DownloadTimeout: 60 * time.Second,
 		MaxRetries:      3,
 		RetryDelay:      time.Second,
+		Logger:          zerolog.Nop(),
 	}
 }
 
@@ -215,6 +228,14 @@ func WithOverlay(handle *overlay.Handle, file string) Option {
 	return func(c *Config) {
 		c.Overlay = handle
 		c.OverlayFile = file
+	}
+}
+
+// WithLogger sets the logger every log call inside this package uses.
+// Omitting this option leaves logging a no-op (see DefaultConfig).
+func WithLogger(logger zerolog.Logger) Option {
+	return func(c *Config) {
+		c.Logger = logger
 	}
 }
 
