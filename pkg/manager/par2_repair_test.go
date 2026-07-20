@@ -45,6 +45,52 @@ func TestCensusPar2Volumes(t *testing.T) {
 	}
 }
 
+// TestCensusPar2VolumesHyphenConvention covers MultiPar/par2j's
+// "volSTART-END" (inclusive end, not a count) naming - found live against a
+// real Usenet release during validation. A naive "+"-only regex fails to
+// match these at all, silently reporting zero recovery volumes available
+// for a release that is fully PAR2-protected.
+func TestCensusPar2VolumesHyphenConvention(t *testing.T) {
+	files := []storage.Par2FileRef{
+		{Name: "release.par2", Size: 4854},               // index file, no vol pattern
+		{Name: "release.vol00-01.par2", Size: 34622143},  // start=0, end=1 -> count=2
+		{Name: "release.vol01-03.par2", Size: 69241648},  // start=1, end=3 -> count=3
+		{Name: "release.VOL03-07.PAR2", Size: 138482016}, // start=3, end=7 -> count=5, case-insensitive
+	}
+
+	vols, indexFiles := censusPar2Volumes(files)
+
+	if len(vols) != 3 {
+		t.Fatalf("censusPar2Volumes found %d vols, want 3: %+v", len(vols), vols)
+	}
+	if len(indexFiles) != 1 || indexFiles[0].Name != "release.par2" {
+		t.Fatalf("indexFiles = %+v, want just release.par2", indexFiles)
+	}
+
+	byName := make(map[string]par2Volume, len(vols))
+	for _, v := range vols {
+		byName[v.ref.Name] = v
+	}
+
+	cases := []struct {
+		name         string
+		start, count uint32
+	}{
+		{"release.vol00-01.par2", 0, 2},
+		{"release.vol01-03.par2", 1, 3},
+		{"release.VOL03-07.PAR2", 3, 5},
+	}
+	for _, c := range cases {
+		v, ok := byName[c.name]
+		if !ok {
+			t.Fatalf("censusPar2Volumes did not classify %q as a volume", c.name)
+		}
+		if v.start != c.start || v.count != c.count {
+			t.Errorf("%s: start/count = %d/%d, want %d/%d", c.name, v.start, v.count, c.start, c.count)
+		}
+	}
+}
+
 // fakeFetcher returns fixed bytes per message ID and counts how many times
 // each ID was actually fetched, so tests can assert on caching behavior.
 type fakeFetcher struct {
