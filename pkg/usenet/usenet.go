@@ -1,6 +1,7 @@
 package usenet
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -639,6 +640,57 @@ func (u *Usenet) OverlayVerdict(nzoID, filename string) overlay.Verdict {
 	return u.overlay.Verdict(nzoID, filename)
 }
 
+// OverlayPendingRepair returns every file of nzoID with at least one
+// non-patched dead segment recorded in the overlay store, keyed by logical
+// filename. Empty (nil error) if the overlay store is unavailable or nothing
+// is pending.
+func (u *Usenet) OverlayPendingRepair(nzoID string) (map[string][]overlay.DeadSegment, error) {
+	if u.overlay == nil {
+		return nil, nil
+	}
+	return u.overlay.PendingRepair(nzoID)
+}
+
+// OverlayWritePatch stores repaired bytes for one segment and marks it
+// patched - see overlay.Store.WritePatch.
+func (u *Usenet) OverlayWritePatch(nzoID, filename string, segIndex int, data []byte) error {
+	if u.overlay == nil {
+		return fmt.Errorf("overlay store unavailable")
+	}
+	return u.overlay.WritePatch(nzoID, filename, segIndex, data)
+}
+
+// SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
+// pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
+// be notified without the overlay/reader packages needing to know it exists.
+func (u *Usenet) SetOverlayRepairEnqueuer(fn func(nzbID string)) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetRepairEnqueuer(fn)
+}
+
+// FetchArticle downloads and yEnc-decodes a single NNTP article, returning
+// its full decoded body. Goes through the same client (and thus the same
+// bandwidth accounting and provider tiering/failover) as normal streaming
+// reads. Intended for cold, one-off reads (PAR2 index/recovery data, MD5-16k
+// probes) - NOT the hot streaming path, which uses the cached/pooled
+// SegmentFetcher instead.
+func (u *Usenet) FetchArticle(ctx context.Context, messageID string) ([]byte, error) {
+	var buf bytes.Buffer
+	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		buf.Reset()
+		_, err := conn.StreamBody(messageID, &buf)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
+}
+
 // MissingSegment identifies one confirmed-missing article found during a
 // CheckFileDetailed probe, in enough detail to record against the overlay
 // store (pkg/usenet/overlay.Store.RecordDead).
@@ -1083,6 +1135,19 @@ func (u *Usenet) GetNZBHeader(id string) (*storage.NZB, error) {
 // ForEachNZB iterates over all NZBs
 func (u *Usenet) ForEachNZB(fn func(*storage.NZB) error) error {
 	return u.nzbStorage.ForEachNZB(fn)
+}
+
+// HasPar2Data reports whether nzoID's stored record already has retained
+// PAR2 file references (Par2Files/Par2Source - see storage.NZB), via the
+// cheap header-only decode. Does not attempt a backfill for a record that
+// predates those fields - that's the PAR2 repair job's job, lazily, only
+// once it actually needs them.
+func (u *Usenet) HasPar2Data(nzoID string) bool {
+	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
+	if err != nil || nzb == nil {
+		return false
+	}
+	return len(nzb.Par2Files) > 0
 }
 
 // NZBStorage returns the underlying NZB storage

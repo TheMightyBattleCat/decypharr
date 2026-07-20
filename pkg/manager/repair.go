@@ -392,6 +392,62 @@ func (r *Repair) Status() RepairStatus {
 	return st
 }
 
+// repairWindowOpen reports whether bandwidth-heavy repair-adjacent work
+// (currently: the PAR2 repair worker) is allowed to run right now, reusing
+// the repair sweep's Schedule/StopSchedule pair as a recurring time window
+// rather than a one-shot "stop the active sweep" trigger:
+//
+//   - No StopSchedule configured (or repair not enabled/scheduled at all):
+//     always open - there's no window to respect.
+//   - Otherwise, open exactly when the StopSchedule job's next fire is
+//     sooner than the main Schedule job's next fire - i.e. we're past a
+//     Schedule fire and haven't yet hit the following Stop, the same
+//     "currently inside the sweep's allowed span" state StopSchedule's
+//     existing single-active-run behavior encodes, just evaluated without
+//     requiring a run to actually be in flight.
+//
+// This is a heuristic over two independently-evaluated cron/interval
+// schedules, not a rigorous interval-membership test - it assumes the usual
+// "Schedule opens a maintenance window, StopSchedule closes it" shape and
+// can misjudge more exotic (e.g. sub-minute, or non-recurring) schedule
+// combinations. Good enough for gating a background worker that would
+// otherwise just wait for the next tick anyway.
+func (r *Repair) repairWindowOpen() bool {
+	cfg := r.cfg()
+	if strings.TrimSpace(cfg.StopSchedule) == "" {
+		return true
+	}
+
+	r.mu.Lock()
+	scheduled := r.scheduled
+	stopScheduled := r.stopScheduled
+	r.mu.Unlock()
+	if !scheduled || !stopScheduled {
+		return true
+	}
+
+	var nextMain, nextStop time.Time
+	var haveMain, haveStop bool
+	for _, j := range r.scheduler.Jobs() {
+		for _, tag := range j.Tags() {
+			switch tag {
+			case repairSchedulerTag:
+				if next, err := j.NextRun(); err == nil {
+					nextMain, haveMain = next, true
+				}
+			case repairStopSchedulerTag:
+				if next, err := j.NextRun(); err == nil {
+					nextStop, haveStop = next, true
+				}
+			}
+		}
+	}
+	if !haveMain || !haveStop {
+		return true
+	}
+	return nextStop.Before(nextMain)
+}
+
 func (r *Repair) nextScheduledRun() *time.Time {
 	if !r.scheduled {
 		return nil

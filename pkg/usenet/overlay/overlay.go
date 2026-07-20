@@ -326,7 +326,7 @@ func writeFileAtomic(dir, finalPath string, data []byte) error {
 func fileEntryLocked(m *Manifest, file string) *FileEntry {
 	fe := m.Files[file]
 	if fe == nil {
-		fe = &FileEntry{}
+		fe = &FileEntry{Verdict: VerdictClean}
 		m.Files[file] = fe
 	}
 	return fe
@@ -447,6 +447,36 @@ func (s *Store) Verdict(nzbID, file string) Verdict {
 		return VerdictClean
 	}
 	return fe.Verdict
+}
+
+// PendingRepair returns, for every file in nzbID's manifest with at least
+// one non-patched (dead or padded) segment, that file's dead segments -
+// patched ones are excluded, since they're already fixed. Returns an empty
+// map (not an error) if nzbID has no manifest yet or nothing pending. Used
+// by the PAR2 repair job to discover what needs reconstructing without
+// having observed every RecordDead/Decide call itself.
+func (s *Store) PendingRepair(nzbID string) (map[string][]DeadSegment, error) {
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	m, err := s.loadManifestLocked(nzbID)
+	mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][]DeadSegment)
+	for file, fe := range m.Files {
+		var pending []DeadSegment
+		for _, d := range fe.DeadSegments {
+			if d.Status != StatusPatched {
+				pending = append(pending, d)
+			}
+		}
+		if len(pending) > 0 {
+			out[file] = pending
+		}
+	}
+	return out, nil
 }
 
 // DeleteEntry removes nzbID's entire overlay directory (manifest + every
