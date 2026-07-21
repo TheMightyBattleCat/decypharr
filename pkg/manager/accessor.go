@@ -64,6 +64,12 @@ func (m *Manager) Usenet() *usenet.Usenet {
 	return m.usenet
 }
 
+// Par2Repair returns the PAR2 repair worker. May be nil if the usenet client
+// failed to initialize.
+func (m *Manager) Par2Repair() *Par2Repair {
+	return m.par2Repair
+}
+
 // GetDebridSpeedTestResult returns stored speed test result for a specific debrid provider
 func (m *Manager) GetDebridSpeedTestResult(provider string) (debridTypes.SpeedTestResult, bool) {
 	return m.debridSpeedTestResults.Load(provider)

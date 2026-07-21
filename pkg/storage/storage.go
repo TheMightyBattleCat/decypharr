@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs"}
+var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "par2_repair_attempts"}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -26,6 +26,7 @@ type Storage struct {
 	entryItems  *hybrid.Store
 	repairState *hybrid.Store
 	repairRuns  *hybrid.Store
+	par2Repairs *hybrid.Store
 	dir         string
 	logger      zerolog.Logger
 
@@ -33,9 +34,6 @@ type Storage struct {
 	healthCounts        map[HealthStatus]int
 	healthCountsBuiltAt time.Time
 }
-
-
-
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
 	items := make(map[string]*hybrid.Store)
@@ -95,6 +93,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 		entryItems:  itemStores["items"],
 		repairState: itemStores["repair_state"],
 		repairRuns:  itemStores["repair_runs"],
+		par2Repairs: itemStores["par2_repair_attempts"],
 		dir:         dbPath,
 		logger:      log,
 	}
@@ -110,7 +109,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns}
+	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs}
 	for _, store := range stores {
 		if store == nil {
 			continue
@@ -128,7 +127,7 @@ func (s *Storage) Close() error {
 // DiskSize returns the total on-disk size of all stores (O(1), no filesystem walk).
 func (s *Storage) DiskSize() int64 {
 	var size int64
-	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns} {
+	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs} {
 		if store != nil {
 			size += store.DiskSize()
 		}
@@ -170,6 +169,7 @@ func (s *Storage) copyFrom(other *Storage) error {
 		{"items", other.entryItems, s.entryItems},
 		{"repair_state", other.repairState, s.repairState},
 		{"repair_runs", other.repairRuns, s.repairRuns},
+		{"par2_repair_attempts", other.par2Repairs, s.par2Repairs},
 	}
 
 	for _, p := range pairs {

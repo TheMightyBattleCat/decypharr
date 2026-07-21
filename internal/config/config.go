@@ -247,10 +247,10 @@ func clampFloat(v, lo, hi float64) float64 {
 // When Enabled is true, a recurring sweep runs on Schedule and visits only
 // entries that are unhealthy, dirty, or older than RecheckInterval.
 type RepairConfig struct {
-	Enabled bool         `json:"enabled,omitempty"`
-	Source  RepairSource `json:"source,omitempty"`
-	Schedule string      `json:"schedule,omitempty"`
-	Workers  int         `json:"workers,omitempty"`
+	Enabled  bool         `json:"enabled,omitempty"`
+	Source   RepairSource `json:"source,omitempty"`
+	Schedule string       `json:"schedule,omitempty"`
+	Workers  int          `json:"workers,omitempty"`
 	// CleanupSuperseded, when true, also DELETES a broken entry from decypharr (not just from the
 	// broken list) once no Sonarr/Radarr references any of its files anymore - i.e. the library
 	// has already replaced it with a working copy. Off by default: clearing the broken list is

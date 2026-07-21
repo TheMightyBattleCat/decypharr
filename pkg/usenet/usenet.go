@@ -663,6 +663,42 @@ func (u *Usenet) OverlayWritePatch(nzoID, filename string, segIndex int, data []
 	return u.overlay.WritePatch(nzoID, filename, segIndex, data)
 }
 
+// OverlayListNZBIDs returns every nzbID with recorded overlay state. Empty
+// (nil error) if the overlay store is unavailable.
+func (u *Usenet) OverlayListNZBIDs() ([]string, error) {
+	if u.overlay == nil {
+		return nil, nil
+	}
+	return u.overlay.ListNZBIDs()
+}
+
+// OverlayManifest returns nzoID's full overlay manifest - see
+// overlay.Store.GetManifest.
+func (u *Usenet) OverlayManifest(nzoID string) (*overlay.Manifest, error) {
+	if u.overlay == nil {
+		return nil, fmt.Errorf("overlay store unavailable")
+	}
+	return u.overlay.GetManifest(nzoID)
+}
+
+// OverlayDiskUsage returns nzoID's real on-disk overlay byte totals - see
+// overlay.Store.DiskUsage.
+func (u *Usenet) OverlayDiskUsage(nzoID string) (patchBytes, manifestBytes int64, err error) {
+	if u.overlay == nil {
+		return 0, 0, nil
+	}
+	return u.overlay.DiskUsage(nzoID)
+}
+
+// OverlayFilePatchBytes returns the real on-disk size of every patch blob
+// written for file's patched segments - see overlay.Store.FilePatchBytes.
+func (u *Usenet) OverlayFilePatchBytes(nzoID, filename string, fe *overlay.FileEntry) int64 {
+	if u.overlay == nil {
+		return 0
+	}
+	return u.overlay.FilePatchBytes(nzoID, filename, fe)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.
