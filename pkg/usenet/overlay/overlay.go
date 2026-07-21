@@ -95,8 +95,22 @@ type Store struct {
 	loggedPads sync.Map // map[string]struct{}
 
 	// repairEnqueue is set by the manager-level PAR2 worker (commit 4); nil
-	// until then, in which case EnqueueRepair is a no-op.
-	repairEnqueue atomic.Pointer[func(nzbID string)]
+	// until then, in which case EnqueueRepair is a no-op. Receives the
+	// entry's current total (non-patched) dead-segment count alongside
+	// nzbID, so an automatic-trigger gate (e.g. a minimum-damage threshold)
+	// can decide without a second lookup.
+	repairEnqueue atomic.Pointer[func(nzbID string, deadSegments int)]
+
+	// failedNotify is set by the manager-level owner to be told whenever a
+	// file's verdict transitions to failed (i.e. needs re-grab) - nil until
+	// then, in which case the transition is silently dropped, exactly as it
+	// was before notifications existed for this.
+	failedNotify atomic.Pointer[func(nzbID, file string)]
+
+	// policy holds the current padding caps. nil until SetPolicy is called,
+	// in which case Policy() falls back to DefaultPolicy() - the original,
+	// pre-configurable behavior.
+	policy atomic.Pointer[Policy]
 }
 
 // NewStore creates (if needed) the overlay root directory and returns a Store
@@ -117,7 +131,7 @@ func NewStore(root string, logger zerolog.Logger) (*Store, error) {
 
 // SetRepairEnqueuer installs the callback EnqueueRepair invokes after a
 // segment is padded. fn may be nil to disable enqueuing.
-func (s *Store) SetRepairEnqueuer(fn func(nzbID string)) {
+func (s *Store) SetRepairEnqueuer(fn func(nzbID string, deadSegments int)) {
 	if s == nil {
 		return
 	}
@@ -132,9 +146,61 @@ func (s *Store) enqueueRepair(nzbID string) {
 	if s == nil {
 		return
 	}
-	if p := s.repairEnqueue.Load(); p != nil && *p != nil {
-		(*p)(nzbID)
+	p := s.repairEnqueue.Load()
+	if p == nil || *p == nil {
+		return
 	}
+	deadSegments := 0
+	if pending, err := s.PendingRepair(nzbID); err == nil {
+		for _, segs := range pending {
+			deadSegments += len(segs)
+		}
+	}
+	(*p)(nzbID, deadSegments)
+}
+
+// SetFailedNotifier installs the callback invoked whenever a file's verdict
+// freshly transitions to failed (see Decide). fn may be nil to disable it.
+func (s *Store) SetFailedNotifier(fn func(nzbID, file string)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.failedNotify.Store(nil)
+		return
+	}
+	s.failedNotify.Store(&fn)
+}
+
+func (s *Store) notifyFailed(nzbID, file string) {
+	if s == nil {
+		return
+	}
+	if p := s.failedNotify.Load(); p != nil && *p != nil {
+		(*p)(nzbID, file)
+	}
+}
+
+// SetPolicy installs the padding caps Decide consults. Call it once at
+// startup and again whenever the source config changes live - Decide never
+// re-derives or re-clamps these values itself.
+func (s *Store) SetPolicy(p Policy) {
+	if s == nil {
+		return
+	}
+	s.policy.Store(&p)
+}
+
+// Policy returns the currently installed padding caps, or DefaultPolicy() if
+// SetPolicy was never called.
+func (s *Store) Policy() Policy {
+	if s == nil {
+		return DefaultPolicy()
+	}
+	if p := s.policy.Load(); p != nil {
+		return *p
+	}
+	return DefaultPolicy()
 }
 
 // Handle binds a Store to one nzbID, for the common case of a reader/sweep

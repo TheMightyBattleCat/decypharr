@@ -525,13 +525,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// them from the live config so auth isn't silently disabled on every save.
 	newConfig.UseAuth = currentConfig.UseAuth
 	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
-	// The general settings form has no fields for these two Repair toggles
-	// (they're only ever set via the dedicated repair-config endpoint), so
-	// they'd decode to nil/"unset" here and get silently reset to their
-	// unset-defaults-true value on every unrelated settings save - the same
-	// class of bug that used to silently wipe the Arr webhook token.
+	// The general settings form has no fields for these Repair knobs (they're
+	// only ever set via the dedicated repair-config / overlay endpoints), so
+	// they'd decode to zero-valued/"unset" here and get silently reset to
+	// their defaults on every unrelated settings save - the same class of bug
+	// that used to silently wipe the Arr webhook token.
 	newConfig.Repair.PlaybackPadding = currentConfig.Repair.PlaybackPadding
 	newConfig.Repair.Par2Repair = currentConfig.Repair.Par2Repair
+	newConfig.Repair.PadMaxRunSegments = currentConfig.Repair.PadMaxRunSegments
+	newConfig.Repair.PadMaxTotalSegments = currentConfig.Repair.PadMaxTotalSegments
+	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio
+	newConfig.Repair.Par2RepairMode = currentConfig.Repair.Par2RepairMode
+	newConfig.Repair.Par2RepairMinSegments = currentConfig.Repair.Par2RepairMinSegments
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
@@ -605,6 +610,12 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 	}
 	if req.NNTPConnectionPercent < 0 || req.NNTPConnectionPercent > 100 {
 		http.Error(w, "Invalid nntp_connection_percent (must be between 0 and 100)", http.StatusBadRequest)
+		return
+	}
+	switch req.Par2RepairMode {
+	case "", config.Par2RepairModeAutoAll, config.Par2RepairModeAutoThreshold, config.Par2RepairModeManual:
+	default:
+		http.Error(w, "Invalid par2_repair_mode (must be 'auto_all', 'auto_threshold', or 'manual')", http.StatusBadRequest)
 		return
 	}
 

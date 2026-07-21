@@ -503,11 +503,18 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 // is retained for this NZB. Any one of those being false means "exactly
 // today's path" - the whole point of this gate is that everything else about
 // the sweep is unchanged.
+//
+// Par2RepairMode further narrows this: "manual" defers to the legacy path
+// exactly as if PAR2 repair were disabled (returns false), while
+// "auto_threshold" claims the file (returns true, so it's neither re-grabbed
+// nor counted broken) but only actually enqueues once the file's dead segment
+// count reaches Par2RepairMinSegments - below that it's left padded.
 func (r *Repair) queueForPar2Repair(entry *storage.Entry, name string, verdict overlay.Verdict) bool {
 	if verdict != overlay.VerdictDegraded {
 		return false
 	}
-	if !config.Get().Repair.Par2RepairEnabled() {
+	cfg := config.Get().Repair
+	if !cfg.Par2RepairEnabled() {
 		return false
 	}
 	if r.manager.par2Repair == nil || r.manager.usenet == nil {
@@ -515,6 +522,18 @@ func (r *Repair) queueForPar2Repair(entry *storage.Entry, name string, verdict o
 	}
 	if !r.manager.usenet.HasPar2Data(entry.InfoHash) {
 		return false
+	}
+	if cfg.Par2RepairMode == config.Par2RepairModeManual {
+		return false
+	}
+	if cfg.Par2RepairMode == config.Par2RepairModeAutoThreshold {
+		deadSegments := 0
+		if pending, err := r.manager.usenet.OverlayPendingRepair(entry.InfoHash); err == nil {
+			deadSegments = len(pending[name])
+		}
+		if deadSegments < cfg.Par2RepairMinSegments {
+			return true
+		}
 	}
 	r.manager.par2Repair.Enqueue(entry.InfoHash)
 	return true

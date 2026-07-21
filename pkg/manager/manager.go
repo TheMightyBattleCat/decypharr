@@ -248,10 +248,11 @@ func (m *Manager) init() {
 	// Initialize the PAR2 repair worker and wire it as the overlay store's
 	// repair-enqueue callback, so a padded segment (pkg/usenet/fs/reader)
 	// queues a PAR2 pass without the reader/overlay packages needing to know
-	// this worker exists.
+	// this worker exists. Gated by config.Repair.Par2RepairMode - see
+	// Par2Repair.AutoEnqueue.
 	m.par2Repair = NewPar2Repair(m, m.repair)
 	if m.usenet != nil {
-		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.Enqueue)
+		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
 	}
 
 	// Initialize the unified active-download queue after all processors exist.

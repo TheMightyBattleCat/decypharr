@@ -187,6 +187,62 @@ const (
 	RepairSourceManaged RepairSource = "managed"
 )
 
+// Par2RepairMode selects when the PAR2 repair worker is auto-enqueued (the
+// reader padding a segment, or the repair sweep finding one) versus only
+// ever run by an explicit GUI action. See RepairConfig.Par2RepairMode.
+type Par2RepairMode string
+
+const (
+	// Par2RepairModeAutoAll queues a PAR2 pass for every degraded file, same
+	// as this feature's original (non-configurable) behavior. Default.
+	Par2RepairModeAutoAll Par2RepairMode = "auto_all"
+	// Par2RepairModeAutoThreshold only auto-queues once a file's dead
+	// (non-patched) segment count reaches Par2RepairMinSegments - damage
+	// below that is left padded rather than spending provider bandwidth on
+	// a PAR2 pass.
+	Par2RepairModeAutoThreshold Par2RepairMode = "auto_threshold"
+	// Par2RepairModeManual never auto-queues; a PAR2 pass only ever runs
+	// from an explicit GUI "repair now" action.
+	Par2RepairModeManual Par2RepairMode = "manual"
+)
+
+// Padding-cap defaults and clamp ranges. The 0.10 byte-ratio ceiling is
+// deliberate: above it, padding starts masking genuinely-broken files
+// instead of smoothing over a few missing articles - see
+// RepairConfig.PadMaxByteRatio.
+const (
+	defaultPadMaxRunSegments   = 4
+	minPadMaxRunSegments       = 1
+	maxPadMaxRunSegments       = 16
+	defaultPadMaxTotalSegments = 64
+	minPadMaxTotalSegments     = 1
+	maxPadMaxTotalSegments     = 512
+	defaultPadMaxByteRatio     = 0.02
+	minPadMaxByteRatio         = 0.001
+	maxPadMaxByteRatio         = 0.10
+	defaultPar2RepairMinSegs   = 1
+)
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clampFloat(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // RepairConfig is the single, global configuration for the health checker.
 // When Enabled is true, a recurring sweep runs on Schedule and visits only
 // entries that are unhealthy, dirty, or older than RecheckInterval.
@@ -256,6 +312,30 @@ type RepairConfig struct {
 	// falling straight to the legacy re-grab. Defaults true when unset, same
 	// convention as PlaybackPadding.
 	Par2Repair *bool `json:"par2_repair,omitempty"`
+
+	// PadMaxRunSegments, PadMaxTotalSegments, and PadMaxByteRatio are the
+	// playback-padding caps (see pkg/usenet/overlay.Policy) - the longest
+	// contiguous run of dead segments, the most dead segments total, and the
+	// largest fraction of a file's bytes that may be padded before it's
+	// failed outright rather than served with zero-filled gaps. Clamped on
+	// every config load/save (1-16, 1-512, 0.001-0.10 respectively); zero
+	// means unset and falls back to the default. These are read once per
+	// Store (and refreshed live on config change), never re-clamped on the
+	// reader's per-segment hot path.
+	PadMaxRunSegments   int     `json:"pad_max_run_segments,omitempty"`
+	PadMaxTotalSegments int     `json:"pad_max_total_segments,omitempty"`
+	PadMaxByteRatio     float64 `json:"pad_max_byte_ratio,omitempty"`
+
+	// Par2RepairMode controls when the PAR2 repair worker is auto-enqueued;
+	// see Par2RepairMode's doc comment for the three values. Empty means
+	// unset and falls back to Par2RepairModeAutoAll.
+	Par2RepairMode Par2RepairMode `json:"par2_repair_mode,omitempty"`
+
+	// Par2RepairMinSegments is the minimum dead (non-patched) segment count
+	// a file must reach before Par2RepairModeAutoThreshold auto-queues a
+	// PAR2 pass for it; ignored in every other mode. Zero means unset and
+	// falls back to 1.
+	Par2RepairMinSegments int `json:"par2_repair_min_segments,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
@@ -265,7 +345,9 @@ func (r RepairConfig) IsZero() bool {
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
 		!r.CleanupSuperseded &&
-		r.PlaybackPadding == nil && r.Par2Repair == nil
+		r.PlaybackPadding == nil && r.Par2Repair == nil &&
+		r.PadMaxRunSegments == 0 && r.PadMaxTotalSegments == 0 && r.PadMaxByteRatio == 0 &&
+		r.Par2RepairMode == "" && r.Par2RepairMinSegments == 0
 }
 
 // PlaybackPaddingEnabled reports whether playback padding is active,
@@ -744,6 +826,32 @@ func (c *Config) applyRepairDefaults() {
 	if c.Repair.Par2Repair == nil {
 		v := true
 		c.Repair.Par2Repair = &v
+	}
+
+	if c.Repair.PadMaxRunSegments == 0 {
+		c.Repair.PadMaxRunSegments = defaultPadMaxRunSegments
+	}
+	c.Repair.PadMaxRunSegments = clampInt(c.Repair.PadMaxRunSegments, minPadMaxRunSegments, maxPadMaxRunSegments)
+
+	if c.Repair.PadMaxTotalSegments == 0 {
+		c.Repair.PadMaxTotalSegments = defaultPadMaxTotalSegments
+	}
+	c.Repair.PadMaxTotalSegments = clampInt(c.Repair.PadMaxTotalSegments, minPadMaxTotalSegments, maxPadMaxTotalSegments)
+
+	if c.Repair.PadMaxByteRatio == 0 {
+		c.Repair.PadMaxByteRatio = defaultPadMaxByteRatio
+	}
+	c.Repair.PadMaxByteRatio = clampFloat(c.Repair.PadMaxByteRatio, minPadMaxByteRatio, maxPadMaxByteRatio)
+
+	switch c.Repair.Par2RepairMode {
+	case Par2RepairModeAutoAll, Par2RepairModeAutoThreshold, Par2RepairModeManual:
+		// already valid
+	default:
+		c.Repair.Par2RepairMode = Par2RepairModeAutoAll
+	}
+
+	if c.Repair.Par2RepairMinSegments <= 0 {
+		c.Repair.Par2RepairMinSegments = defaultPar2RepairMinSegs
 	}
 }
 

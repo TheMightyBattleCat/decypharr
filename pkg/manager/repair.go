@@ -275,6 +275,13 @@ func (r *Repair) Stop() {
 // ApplyConfig reconciles the scheduler with the latest repair config. Called
 // after /api/repair/config is updated.
 func (r *Repair) ApplyConfig() error {
+	if r.manager.usenet != nil {
+		// Padding caps (PadMaxRunSegments/PadMaxTotalSegments/PadMaxByteRatio)
+		// live on the overlay store, not the scheduler - refresh them here so
+		// a saved change applies without a restart, same as everything else
+		// ApplyConfig reconciles.
+		r.manager.usenet.ApplyOverlayPolicy()
+	}
 	r.Stop()
 	return r.Start(r.parentCtx)
 }
