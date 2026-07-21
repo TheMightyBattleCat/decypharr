@@ -7,8 +7,12 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
+	"strings"
+
+	json "github.com/bytedance/sonic"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/sirrobot01/decypharr/internal/utils"
@@ -336,4 +340,163 @@ func (s *Server) handleClearPar2RepairHistory(w http.ResponseWriter, r *http.Req
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// overlayFileRequest is the common body shape for every overlay action
+// handler below: which file, in which entry, to act on.
+type overlayFileRequest struct {
+	Entry string `json:"entry"`
+	File  string `json:"file"`
+}
+
+func decodeOverlayFileRequest(r *http.Request) (overlayFileRequest, error) {
+	var req overlayFileRequest
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		return req, err
+	}
+	req.Entry = strings.TrimSpace(req.Entry)
+	req.File = strings.TrimSpace(req.File)
+	return req, nil
+}
+
+// resolveOverlayEntry looks up the storage.Entry backing (entry, file) -
+// same resolution GetEntryByName already provides elsewhere - so every
+// action handler below can key overlay/PAR2 calls off entry.InfoHash (the
+// nzbID overlay state is stored under) from the entry/file names the GUI
+// shows.
+func (s *Server) resolveOverlayEntry(req overlayFileRequest) (*storage.Entry, error) {
+	if req.Entry == "" || req.File == "" {
+		return nil, fmt.Errorf("entry and file are required")
+	}
+	return s.manager.GetEntryByName(req.Entry, req.File)
+}
+
+// handleOverlayRepairNow enqueues an immediate PAR2 repair pass for one
+// file's entry, bypassing the repair sweep's StopSchedule window (a manual,
+// user-initiated repair runs now) but not any other gate - see
+// Par2Repair.RunNow.
+func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeOverlayFileRequest(r)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	par2Repair := s.manager.Par2Repair()
+	if par2Repair == nil {
+		http.Error(w, "PAR2 repair worker not available", http.StatusServiceUnavailable)
+		return
+	}
+	if repairable, reason := par2Repair.Availability(entry.InfoHash); !repairable {
+		utils.JSONResponse(w, map[string]any{"status": "unavailable", "reason": reason}, http.StatusOK)
+		return
+	}
+	if err := par2Repair.RunNow(entry.InfoHash); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	utils.JSONResponse(w, map[string]string{"status": "queued"}, http.StatusOK)
+}
+
+// handleOverlayVerify re-checks a patched file's bytes against the PAR2
+// FileDesc's whole-file MD5 for its posted file - see Par2Repair.Verify.
+func (s *Server) handleOverlayVerify(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeOverlayFileRequest(r)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	par2Repair := s.manager.Par2Repair()
+	if par2Repair == nil {
+		http.Error(w, "PAR2 repair worker not available", http.StatusServiceUnavailable)
+		return
+	}
+	pass, reason, err := par2Repair.Verify(r.Context(), entry.InfoHash, req.File)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"pass": pass, "reason": reason}, http.StatusOK)
+}
+
+// handleOverlayReclaim deletes a file's overlay patches + manifest record
+// (see overlay.Store.DeleteFile) WITHOUT re-searching - for reclaiming disk
+// on files that are fine now. Refuses while a PAR2 repair is in-flight for
+// the entry, so a running pass never has its target overlay state pulled out
+// from under it.
+func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeOverlayFileRequest(r)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	if par2Repair := s.manager.Par2Repair(); par2Repair != nil &&
+		(par2Repair.IsRunning(entry.InfoHash) || par2Repair.IsQueued(entry.InfoHash)) {
+		http.Error(w, "a par2 repair is in-flight for this entry", http.StatusConflict)
+		return
+	}
+
+	u := s.manager.Usenet()
+	if u == nil {
+		http.Error(w, "Usenet client not available", http.StatusServiceUnavailable)
+		return
+	}
+	if err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
+}
+
+// handleOverlayResearch is the "give up, get a clean copy" action: it clears
+// this file's overlay state, then blocklists the current release and
+// re-searches via the Arr so a non-broken copy replaces it - reusing the
+// EXACT blocklist+SearchMissing flow the repair sweep's playback-failure
+// path already uses (Repair.RepairPlaybackFileNow -> repairArrFiles), rather
+// than reimplementing any of it here.
+func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeOverlayFileRequest(r)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	if u := s.manager.Usenet(); u != nil {
+		if err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
+			s.logger.Warn().Err(err).Str("entry", req.Entry).Str("file", req.File).Msg("overlay research: failed to clear overlay state")
+		}
+	}
+
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	if err := svc.RepairPlaybackFileNow(s.manager.Context(), entry.Name, req.File); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	utils.JSONResponse(w, map[string]string{"status": "researching"}, http.StatusOK)
 }

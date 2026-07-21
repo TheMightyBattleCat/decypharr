@@ -699,6 +699,26 @@ func (u *Usenet) OverlayFilePatchBytes(nzoID, filename string, fe *overlay.FileE
 	return u.overlay.FilePatchBytes(nzoID, filename, fe)
 }
 
+// OverlayPatchBytes returns the recovered bytes for a patched segment, if
+// any - see overlay.Store.PatchBytes.
+func (u *Usenet) OverlayPatchBytes(nzoID, filename string, segIndex int) ([]byte, bool) {
+	if u.overlay == nil {
+		return nil, false
+	}
+	return u.overlay.PatchBytes(nzoID, filename, segIndex)
+}
+
+// OverlayDeleteFile removes filename's overlay record and patch blobs from
+// nzoID's manifest, without touching any other file - see
+// overlay.Store.DeleteFile. No-op (nil error) if the overlay store is
+// unavailable.
+func (u *Usenet) OverlayDeleteFile(nzoID, filename string) error {
+	if u.overlay == nil {
+		return nil
+	}
+	return u.overlay.DeleteFile(nzoID, filename)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.
