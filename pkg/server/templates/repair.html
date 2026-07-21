@@ -166,6 +166,248 @@
             </div>
         </div>
     </div>
+
+    <div class="divider text-sm opacity-60">Overlay / Padding</div>
+
+    <!-- Overlay summary strip -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <div class="flex flex-col lg:flex-row gap-4 lg:items-center lg:justify-between">
+                <div>
+                    <h2 class="card-title text-2xl">
+                        <i class="bi bi-layers-half mr-2 text-primary"></i>Overlay &amp; Padding
+                    </h2>
+                    <p class="text-sm opacity-70 mt-1">
+                        Playback padding and PAR2-repaired patch state - what damage is being masked, and what it's costing on disk.
+                    </p>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <button id="overlayRefreshBtn" class="btn btn-outline btn-sm">
+                        <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 mt-4">
+                <div class="stat bg-base-200 rounded-box p-3">
+                    <div class="stat-title text-xs">Clean</div>
+                    <div class="stat-value text-lg text-success" id="overlayCountClean">0</div>
+                </div>
+                <div class="stat bg-base-200 rounded-box p-3">
+                    <div class="stat-title text-xs">Degraded</div>
+                    <div class="stat-value text-lg text-warning" id="overlayCountDegraded">0</div>
+                </div>
+                <div class="stat bg-base-200 rounded-box p-3">
+                    <div class="stat-title text-xs">Failed</div>
+                    <div class="stat-value text-lg text-error" id="overlayCountFailed">0</div>
+                </div>
+            </div>
+
+            <div class="divider my-2"></div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="stat bg-primary/10 rounded-box p-4">
+                    <div class="stat-figure text-primary"><i class="bi bi-hdd-stack text-2xl"></i></div>
+                    <div class="stat-title">Patch bytes on disk</div>
+                    <div class="stat-value text-primary" id="overlayPatchBytes">-</div>
+                    <div class="stat-desc">PAR2-repaired segment data</div>
+                </div>
+                <div class="stat bg-secondary/10 rounded-box p-4">
+                    <div class="stat-figure text-secondary"><i class="bi bi-file-earmark-binary text-2xl"></i></div>
+                    <div class="stat-title">PAR2 metadata retained</div>
+                    <div class="stat-value text-secondary" id="overlayPar2MetaBytes">-</div>
+                    <div class="stat-desc">Recovery/index files + posted-file layout</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Overlay config -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <h3 class="card-title text-xl">
+                <i class="bi bi-sliders mr-2 text-primary"></i>Padding &amp; PAR2 repair policy
+            </h3>
+            <p class="text-sm opacity-70 mt-1">
+                Caps on how much damage playback padding may mask, and when the PAR2 repair worker auto-queues a pass.
+            </p>
+
+            <form id="overlayConfigForm" class="mt-4 space-y-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                        <span>
+                            <span class="block font-medium">Playback padding</span>
+                            <span class="block text-xs opacity-70">Zero-fill a confirmed-dead segment instead of stalling/killing playback.</span>
+                        </span>
+                        <input type="checkbox" class="toggle toggle-primary" id="overlayPlaybackPadding">
+                    </label>
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                        <span>
+                            <span class="block font-medium">PAR2 repair</span>
+                            <span class="block text-xs opacity-70">Reconstruct dead segments' true bytes from PAR2 recovery data.</span>
+                        </span>
+                        <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
+                    </label>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div class="form-control">
+                        <label class="label py-1" for="overlayPadMaxRun">
+                            <span class="label-text font-medium">Max run segments</span>
+                        </label>
+                        <input type="number" class="input input-bordered" id="overlayPadMaxRun" min="1" max="16" step="1">
+                        <span class="label-text-alt opacity-60 mt-1">1-16. Longest run of consecutive dead segments still paddable.</span>
+                    </div>
+                    <div class="form-control">
+                        <label class="label py-1" for="overlayPadMaxTotal">
+                            <span class="label-text font-medium">Max total segments</span>
+                        </label>
+                        <input type="number" class="input input-bordered" id="overlayPadMaxTotal" min="1" max="512" step="1">
+                        <span class="label-text-alt opacity-60 mt-1">1-512. Most dead segments a file may accumulate before it's failed outright.</span>
+                    </div>
+                    <div class="form-control">
+                        <label class="label py-1" for="overlayPadMaxRatio">
+                            <span class="label-text font-medium">Max byte ratio</span>
+                        </label>
+                        <input type="number" class="input input-bordered" id="overlayPadMaxRatio" min="0.001" max="0.1" step="0.001">
+                        <span class="label-text-alt opacity-60 mt-1">0.001-0.10 (fraction of file size).</span>
+                    </div>
+                </div>
+                <div role="alert" class="alert alert-warning text-sm py-2">
+                    <i class="bi bi-exclamation-triangle"></i>
+                    <span>Above ~10% padding masks genuinely-broken files - the byte-ratio cap is hard-limited to 0.10.</span>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div class="form-control">
+                        <label class="label py-1" for="overlayPar2Mode">
+                            <span class="label-text font-medium">PAR2 auto-repair trigger</span>
+                        </label>
+                        <select class="select select-bordered" id="overlayPar2Mode">
+                            <option value="auto_all">Auto - repair every degraded file</option>
+                            <option value="auto_threshold">Auto - only above a damage threshold</option>
+                            <option value="manual">Manual only - never auto-queue</option>
+                        </select>
+                    </div>
+                    <div class="form-control">
+                        <label class="label py-1" for="overlayPar2MinSegments">
+                            <span class="label-text font-medium">Threshold (min dead segments)</span>
+                        </label>
+                        <input type="number" class="input input-bordered" id="overlayPar2MinSegments" min="1" step="1">
+                        <span class="label-text-alt opacity-60 mt-1">Only used in "auto - only above a threshold" mode.</span>
+                    </div>
+                </div>
+
+                <div class="flex justify-end">
+                    <button type="submit" class="btn btn-primary" id="overlayConfigSaveBtn">
+                        <i class="bi bi-save mr-1"></i>Save
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Overlay files -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-header">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 p-6 border-b border-base-200">
+                <h3 class="card-title text-xl">
+                    <i class="bi bi-file-earmark-break mr-2"></i>Overlay files
+                </h3>
+                <div class="flex gap-2">
+                    <button id="overlayFilesRefreshBtn" class="btn btn-outline btn-sm">
+                        <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div id="overlayBulkBar" class="px-6 py-3 border-b border-base-200 bg-base-200/40 hidden">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                    <span class="text-sm font-medium"><span id="overlaySelectedCount">0</span> selected</span>
+                    <div class="flex flex-wrap gap-2">
+                        <button id="overlayBulkResearchBtn" class="btn btn-sm btn-error btn-outline"
+                                title="Delete overlay state, blocklist, and re-search every selected failed file">
+                            <i class="bi bi-arrow-repeat mr-1"></i>Re-search all failed
+                        </button>
+                        <button id="overlayBulkReclaimBtn" class="btn btn-sm btn-warning btn-outline"
+                                title="Delete overlay patches/manifest for every selected clean-verdict file">
+                            <i class="bi bi-recycle mr-1"></i>Reclaim all clean-verdict metadata
+                        </button>
+                        <button id="overlayClearSelectionBtn" class="btn btn-sm btn-ghost">
+                            <i class="bi bi-x-lg"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="table table-hover">
+                    <thead class="bg-base-200">
+                    <tr>
+                        <th class="w-8">
+                            <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" id="overlaySelectAllCheckbox">
+                        </th>
+                        <th>Entry / File</th>
+                        <th>Verdict</th>
+                        <th>Segments</th>
+                        <th>Damage</th>
+                        <th>Repairable</th>
+                        <th>Repair status</th>
+                        <th class="text-right">Disk</th>
+                        <th class="text-right">Actions</th>
+                    </tr>
+                    </thead>
+                    <tbody id="overlayFilesTableBody"></tbody>
+                </table>
+                <div id="overlayFilesEmpty" class="text-center py-12 hidden text-base-content/70">
+                    <i class="bi bi-check2-circle text-3xl block mb-2 text-success"></i>
+                    No overlay damage recorded.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PAR2 repair history -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-header">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 p-6 border-b border-base-200">
+                <h3 class="card-title text-xl">
+                    <i class="bi bi-clock-history mr-2"></i>PAR2 repair history
+                </h3>
+                <div class="flex gap-2">
+                    <button id="overlayClearHistoryBtn" class="btn btn-error btn-sm btn-outline">
+                        <i class="bi bi-trash mr-1"></i>Clear history
+                    </button>
+                    <button id="overlayRefreshHistoryBtn" class="btn btn-outline btn-sm">
+                        <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div class="overflow-x-auto">
+                <table class="table table-hover">
+                    <thead class="bg-base-200">
+                    <tr>
+                        <th>Started</th>
+                        <th>Entry</th>
+                        <th>Outcome</th>
+                        <th>Read</th>
+                        <th>Slices</th>
+                        <th>Patched</th>
+                        <th>Duration</th>
+                        <th>Fail reason</th>
+                    </tr>
+                    </thead>
+                    <tbody id="overlayHistoryTableBody"></tbody>
+                </table>
+                <div id="overlayHistoryEmpty" class="text-center py-12 hidden text-base-content/70">
+                    <i class="bi bi-clipboard-x text-3xl block mb-2"></i>
+                    No PAR2 repair attempts yet.
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Run options modal -->

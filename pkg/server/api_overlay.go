@@ -20,12 +20,13 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
-// OverlaySegmentRun is one contiguous run of damaged (dead or padded, i.e.
-// non-patched) segment indices, for rendering a damage sparkline without the
-// client needing to walk every individual segment.
+// OverlaySegmentRun is one contiguous run of same-status segment indices
+// (dead, padded, or patched), for rendering a segment-state sparkline
+// without the client needing to walk every individual segment.
 type OverlaySegmentRun struct {
-	Start int `json:"start"`
-	End   int `json:"end"` // inclusive
+	Start  int    `json:"start"`
+	End    int    `json:"end"`    // inclusive
+	Status string `json:"status"` // dead | padded | patched
 }
 
 // OverlayRepairStatus is a file's current PAR2-repair pipeline status, as
@@ -67,23 +68,25 @@ type OverlayFile struct {
 	PatchBytes    int64 `json:"patch_bytes"`
 	Par2MetaBytes int64 `json:"par2_metadata_bytes"`
 
-	DamageRuns []OverlaySegmentRun `json:"damage_runs,omitempty"`
+	// SegmentRuns covers every recorded segment (dead, padded, AND patched -
+	// unlike DeadSegments/PaddedSegments/PatchedSegments' plain counts, this
+	// carries position), for a client-side sparkline over the segment space.
+	SegmentRuns []OverlaySegmentRun `json:"segment_runs,omitempty"`
 }
 
-// damageSegmentRuns collapses segments (sorted by Index, per
-// overlay.Store's sortDeadSegments invariant) into contiguous runs,
-// excluding already-patched ones - those are fixed, not damage.
-func damageSegmentRuns(segments []overlay.DeadSegment) []OverlaySegmentRun {
+// segmentRuns collapses segments (sorted by Index, per overlay.Store's
+// sortDeadSegments invariant) into contiguous same-status runs - a status
+// change (even between adjacent indices) starts a new run, so a sparkline
+// can color dead/padded/patched distinctly.
+func segmentRuns(segments []overlay.DeadSegment) []OverlaySegmentRun {
 	var runs []OverlaySegmentRun
 	for _, d := range segments {
-		if d.Status == overlay.StatusPatched {
-			continue
-		}
-		if n := len(runs); n > 0 && runs[n-1].End == d.Index-1 {
+		status := string(d.Status)
+		if n := len(runs); n > 0 && runs[n-1].Status == status && runs[n-1].End == d.Index-1 {
 			runs[n-1].End = d.Index
 			continue
 		}
-		runs = append(runs, OverlaySegmentRun{Start: d.Index, End: d.Index})
+		runs = append(runs, OverlaySegmentRun{Start: d.Index, End: d.Index, Status: status})
 	}
 	return runs
 }
@@ -187,7 +190,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 			if fileSize > 0 {
 				of.DamageByteRatio = float64(damageBytes) / float64(fileSize)
 			}
-			of.DamageRuns = damageSegmentRuns(fe.DeadSegments)
+			of.SegmentRuns = segmentRuns(fe.DeadSegments)
 			of.PatchBytes = u.OverlayFilePatchBytes(nzbID, file, fe)
 			of.Par2MetaBytes = metaBytes
 

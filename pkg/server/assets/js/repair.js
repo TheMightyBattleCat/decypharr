@@ -11,6 +11,10 @@ class RepairManager {
         this.brokenState = {items: [], page: 1, pageSize: 25};
         this.repairConfig = {};
         this.latestStatus = {};
+        this.overlayFiles = [];
+        this.overlaySelected = new Set();
+        this.overlayDiskUsage = {};
+        this.overlayHistory = [];
         this.bind();
         this.loadAll();
     }
@@ -38,10 +42,35 @@ class RepairManager {
             e.preventDefault();
             this.recheckMedia();
         });
+
+        // Overlay / Padding
+        $('overlayRefreshBtn')?.addEventListener('click', () => this.loadOverlayAll());
+        $('overlayFilesRefreshBtn')?.addEventListener('click', () => this.loadOverlayFiles());
+        $('overlayRefreshHistoryBtn')?.addEventListener('click', () => this.loadOverlayHistory());
+        $('overlayClearHistoryBtn')?.addEventListener('click', () => this.clearOverlayHistory());
+        $('overlayConfigForm')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.saveOverlayConfig();
+        });
+        $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
+        $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
+        this.bindOverlayConfirmButton(
+            $('overlayBulkResearchBtn'),
+            () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
+            'research',
+            (items) => this.runOverlayBulkResearch(items),
+        );
+        this.bindOverlayConfirmButton(
+            $('overlayBulkReclaimBtn'),
+            () => this.overlaySelectedFiles().filter((f) => f.verdict === 'clean'),
+            'reclaim',
+            (items) => this.runOverlayBulkReclaim(items),
+        );
     }
 
     async loadAll() {
-        await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs()]);
+        await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll()]);
+        this.populateOverlayConfigForm();
     }
 
     async loadRepairConfig() {
@@ -792,6 +821,501 @@ class RepairManager {
         if (typeof window.toast === 'function') return window.toast(message, type);
         if (typeof window.showToast === 'function') return window.showToast(message, type);
         console.log(`[${type}]`, message);
+    }
+
+    // ---- Overlay / Padding -------------------------------------------------
+
+    async loadOverlayAll() {
+        await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayHistory()]);
+    }
+
+    overlayKey(f) {
+        return `${f.entry}::${f.file}`;
+    }
+
+    async parseJSONSafe(res) {
+        const text = await res.text();
+        try {
+            return text ? JSON.parse(text) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    async loadOverlayFiles() {
+        try {
+            this.overlayFiles = await this.fetchJSON(`${this.api}/overlay/files`) || [];
+        } catch (e) {
+            console.error('Failed to load overlay files', e);
+            this.overlayFiles = [];
+        }
+        // Selection can only ever reference files still in the list.
+        const known = new Set(this.overlayFiles.map((f) => this.overlayKey(f)));
+        for (const key of [...this.overlaySelected]) {
+            if (!known.has(key)) this.overlaySelected.delete(key);
+        }
+        this.renderOverlaySummaryCounts();
+        this.renderOverlayFiles();
+    }
+
+    async loadOverlayDiskUsage() {
+        try {
+            this.overlayDiskUsage = await this.fetchJSON(`${this.api}/overlay/disk-usage`) || {};
+        } catch (e) {
+            console.error('Failed to load overlay disk usage', e);
+            this.overlayDiskUsage = {};
+        }
+        this.renderOverlayDiskUsage();
+    }
+
+    async loadOverlayHistory() {
+        try {
+            this.overlayHistory = await this.fetchJSON(`${this.api}/overlay/repair-history`) || [];
+        } catch (e) {
+            console.error('Failed to load par2 repair history', e);
+            this.overlayHistory = [];
+        }
+        this.renderOverlayHistory();
+    }
+
+    renderOverlaySummaryCounts() {
+        const counts = {clean: 0, degraded: 0, failed: 0};
+        for (const f of this.overlayFiles) {
+            if (counts[f.verdict] !== undefined) counts[f.verdict]++;
+        }
+        const clean = document.getElementById('overlayCountClean');
+        const degraded = document.getElementById('overlayCountDegraded');
+        const failed = document.getElementById('overlayCountFailed');
+        if (clean) clean.textContent = counts.clean;
+        if (degraded) degraded.textContent = counts.degraded;
+        if (failed) failed.textContent = counts.failed;
+    }
+
+    renderOverlayDiskUsage() {
+        const d = this.overlayDiskUsage || {};
+        const patch = document.getElementById('overlayPatchBytes');
+        const meta = document.getElementById('overlayPar2MetaBytes');
+        if (patch) patch.textContent = this.formatBytes(d.total_patch_bytes || 0);
+        if (meta) meta.textContent = this.formatBytes(d.total_par2_metadata_bytes || 0);
+    }
+
+    renderOverlaySparkline(runs, total) {
+        if (!total || total <= 0 || !runs || !runs.length) {
+            return '<span class="opacity-40 text-xs">-</span>';
+        }
+        const colors = {dead: 'bg-error', padded: 'bg-warning', patched: 'bg-success'};
+        const bars = runs.map((r) => {
+            const width = Math.max(((r.end - r.start + 1) / total) * 100, 0.8);
+            const left = (r.start / total) * 100;
+            const cls = colors[r.status] || 'bg-base-300';
+            return `<div class="absolute top-0 bottom-0 ${cls}" style="left:${left}%;width:${width}%" title="${this.escapeAttr(r.status)} ${r.start}-${r.end}"></div>`;
+        }).join('');
+        return `<div class="relative w-24 h-3 bg-base-300/40 rounded overflow-hidden">${bars}</div>`;
+    }
+
+    overlayVerdictBadge(v) {
+        const cls = {clean: 'badge-success', degraded: 'badge-warning', failed: 'badge-error'}[v] || 'badge-ghost';
+        return `<span class="badge ${cls} badge-sm">${this.escape(v || 'unknown')}</span>`;
+    }
+
+    overlayRepairableBadge(f) {
+        const pending = (f.dead_segments || 0) + (f.padded_segments || 0) > 0;
+        if (!pending) return '<span class="badge badge-ghost badge-sm">n/a</span>';
+        if (f.repairable) return '<span class="badge badge-success badge-sm" title="PAR2 repair is available">repairable</span>';
+        const reason = f.not_repairable_reason || '';
+        if (/recovery slice/i.test(reason)) {
+            return `<span class="badge badge-warning badge-sm" title="${this.escapeAttr(reason)}">insufficient recovery</span>`;
+        }
+        return `<span class="badge badge-ghost badge-sm" title="${this.escapeAttr(reason)}">no par2</span>`;
+    }
+
+    overlayRepairStatusBadge(f) {
+        const cls = {
+            none: 'badge-ghost',
+            queued: 'badge-info',
+            running: 'badge-info',
+            completed: 'badge-success',
+            failed: 'badge-error',
+            unavailable: 'badge-ghost',
+        }[f.repair_status] || 'badge-ghost';
+        const label = (f.repair_status || 'none').replace(/_/g, ' ');
+        return `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(f.repair_status_reason || '')}">${this.escape(label)}</span>`;
+    }
+
+    renderOverlayFiles() {
+        const tbody = document.getElementById('overlayFilesTableBody');
+        const empty = document.getElementById('overlayFilesEmpty');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+
+        const files = this.overlayFiles || [];
+        if (!files.length) {
+            empty?.classList.remove('hidden');
+            this.updateOverlayBulkBar();
+            return;
+        }
+        empty?.classList.add('hidden');
+
+        for (const f of files) {
+            const key = this.overlayKey(f);
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td onclick="event.stopPropagation();">
+                    <input type="checkbox" class="checkbox checkbox-sm checkbox-primary overlay-row-checkbox"
+                           data-key="${this.escapeAttr(key)}" ${this.overlaySelected.has(key) ? 'checked' : ''}>
+                </td>
+                <td>
+                    <div class="font-mono text-xs break-all">${this.escape(f.file)}</div>
+                    <div class="text-[10px] opacity-60 break-all">${this.escape(f.entry)}</div>
+                </td>
+                <td>${this.overlayVerdictBadge(f.verdict)}</td>
+                <td class="text-xs whitespace-nowrap">
+                    <span class="text-error" title="dead">D:${f.dead_segments || 0}</span>
+                    <span class="text-warning ml-1" title="padded">P:${f.padded_segments || 0}</span>
+                    <span class="text-success ml-1" title="patched">F:${f.patched_segments || 0}</span>
+                </td>
+                <td>
+                    ${this.renderOverlaySparkline(f.segment_runs, f.total_segments)}
+                    <div class="text-[10px] opacity-60 mt-1">${((f.damage_byte_ratio || 0) * 100).toFixed(2)}%</div>
+                </td>
+                <td>${this.overlayRepairableBadge(f)}</td>
+                <td>${this.overlayRepairStatusBadge(f)}</td>
+                <td class="text-right text-xs whitespace-nowrap">
+                    <div>${this.formatBytes(f.patch_bytes || 0)} patch</div>
+                    <div class="opacity-60">${this.formatBytes(f.par2_metadata_bytes || 0)} par2</div>
+                </td>
+                <td class="text-right whitespace-nowrap">
+                    <button class="btn btn-xs btn-outline" data-action="repair-now" ${!f.repairable ? 'disabled' : ''}
+                            title="${this.escapeAttr(f.repairable ? 'Run a PAR2 repair pass now' : (f.not_repairable_reason || 'Not repairable'))}"
+                            aria-label="Repair now">
+                        <i class="bi bi-tools"></i>
+                    </button>
+                    <button class="btn btn-xs btn-outline" data-action="verify" ${f.patched_segments ? '' : 'disabled'}
+                            title="Verify patched bytes against PAR2's whole-file MD5" aria-label="Verify">
+                        <i class="bi bi-shield-check"></i>
+                    </button>
+                    <button class="btn btn-xs btn-warning btn-outline" data-action="reclaim"
+                            title="Delete overlay patches/manifest for this file" aria-label="Reclaim metadata">
+                        <i class="bi bi-recycle"></i>
+                    </button>
+                    <button class="btn btn-xs btn-error btn-outline" data-action="research"
+                            title="Delete overlay state, blocklist, and re-search via the Arr" aria-label="Delete and re-search">
+                        <i class="bi bi-arrow-repeat"></i>
+                    </button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+
+            tr.querySelector('.overlay-row-checkbox')?.addEventListener('change', (e) => {
+                this.toggleOverlayRowSelect(key, e.target.checked);
+            });
+            tr.querySelector('[data-action="repair-now"]')?.addEventListener('click', () => this.overlayRepairNow(f));
+            tr.querySelector('[data-action="verify"]')?.addEventListener('click', () => this.overlayVerify(f));
+            tr.querySelector('[data-action="reclaim"]')?.addEventListener('click', () => this.overlayReclaim(f));
+            tr.querySelector('[data-action="research"]')?.addEventListener('click', () => this.overlayResearch(f));
+        }
+        this.updateOverlayBulkBar();
+    }
+
+    async overlayRepairNow(f) {
+        try {
+            const res = await fetch(`${this.api}/overlay/repair-now`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({entry: f.entry, file: f.file}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            if (data && data.status === 'unavailable') {
+                window.createToast(`Not repairable: ${data.reason || 'unavailable'}`, 'warning');
+            } else {
+                window.createToast(`PAR2 repair queued for ${f.file}`, 'success');
+            }
+            setTimeout(() => this.loadOverlayFiles(), 1000);
+        } catch (e) {
+            window.createToast(`Repair now failed: ${e.message}`, 'error');
+        }
+    }
+
+    async overlayVerify(f) {
+        try {
+            const res = await fetch(`${this.api}/overlay/verify`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({entry: f.entry, file: f.file}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            if (data && data.pass) {
+                window.createToast(`Verify passed: ${f.file} matches PAR2's whole-file MD5`, 'success');
+            } else {
+                window.createToast(`Verify FAILED for ${f.file}: ${(data && data.reason) || 'MD5 mismatch'}`, 'error');
+            }
+        } catch (e) {
+            window.createToast(`Verify failed: ${e.message}`, 'error');
+        }
+    }
+
+    async overlayReclaim(f) {
+        if (!confirm(`Reclaim overlay metadata for "${f.file}"?\n\nThis deletes its stored patches/manifest. Repair state can be rediscovered on the next playback or sweep.`)) return;
+        try {
+            const res = await fetch(`${this.api}/overlay/reclaim`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({entry: f.entry, file: f.file}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            window.createToast(`Reclaimed overlay metadata for ${f.file}`, 'success');
+            this.overlaySelected.delete(this.overlayKey(f));
+            await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
+        } catch (e) {
+            window.createToast(`Reclaim failed: ${e.message}`, 'error');
+        }
+    }
+
+    async overlayResearch(f) {
+        if (!confirm(`This BLOCKLISTS "${f.entry}" and triggers a re-search via its Arr, discarding this release entirely. This cannot be undone.\n\nContinue?`)) return;
+        try {
+            const res = await fetch(`${this.api}/overlay/research`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({entry: f.entry, file: f.file}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            window.createToast(`Blocklisted and re-searching for ${f.entry}`, 'success');
+            this.overlaySelected.delete(this.overlayKey(f));
+            await this.loadOverlayFiles();
+        } catch (e) {
+            window.createToast(`Research failed: ${e.message}`, 'error');
+        }
+    }
+
+    toggleOverlaySelectAll(checked) {
+        this.overlaySelected.clear();
+        if (checked) {
+            for (const f of this.overlayFiles) this.overlaySelected.add(this.overlayKey(f));
+        }
+        this.renderOverlayFiles();
+    }
+
+    toggleOverlayRowSelect(key, checked) {
+        if (checked) this.overlaySelected.add(key); else this.overlaySelected.delete(key);
+        const all = document.getElementById('overlaySelectAllCheckbox');
+        if (all) {
+            all.checked = this.overlayFiles.length > 0 && this.overlaySelected.size === this.overlayFiles.length;
+            all.indeterminate = this.overlaySelected.size > 0 && this.overlaySelected.size < this.overlayFiles.length;
+        }
+        this.updateOverlayBulkBar();
+    }
+
+    clearOverlaySelection() {
+        this.overlaySelected.clear();
+        const all = document.getElementById('overlaySelectAllCheckbox');
+        if (all) {
+            all.checked = false;
+            all.indeterminate = false;
+        }
+        this.renderOverlayFiles();
+    }
+
+    overlaySelectedFiles() {
+        return this.overlayFiles.filter((f) => this.overlaySelected.has(this.overlayKey(f)));
+    }
+
+    updateOverlayBulkBar() {
+        const bar = document.getElementById('overlayBulkBar');
+        const count = document.getElementById('overlaySelectedCount');
+        if (count) count.textContent = this.overlaySelected.size;
+        if (bar) bar.classList.toggle('hidden', this.overlaySelected.size === 0);
+
+        const failedSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'failed');
+        const cleanSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'clean');
+
+        const researchBtn = document.getElementById('overlayBulkResearchBtn');
+        if (researchBtn && researchBtn.dataset.confirming !== 'true') {
+            researchBtn.disabled = failedSelected.length === 0;
+            researchBtn.innerHTML = `<i class="bi bi-arrow-repeat mr-1"></i>Re-search all failed (${failedSelected.length})`;
+        }
+        const reclaimBtn = document.getElementById('overlayBulkReclaimBtn');
+        if (reclaimBtn && reclaimBtn.dataset.confirming !== 'true') {
+            reclaimBtn.disabled = cleanSelected.length === 0;
+            reclaimBtn.innerHTML = `<i class="bi bi-recycle mr-1"></i>Reclaim all clean-verdict metadata (${cleanSelected.length})`;
+        }
+    }
+
+    // bindOverlayConfirmButton wires a cheap two-step confirm onto btn,
+    // mirroring browse.js's stale-NZB delete buttons: the first click swaps
+    // the label to "Really <action> N?"; a second click within the window
+    // runs onConfirm. itemsFn is called fresh on each click so the count
+    // always reflects the current selection.
+    bindOverlayConfirmButton(btn, itemsFn, actionLabel, onConfirm) {
+        if (!btn) return;
+        btn.addEventListener('click', () => {
+            const items = itemsFn();
+            if (!items.length) {
+                window.createToast('Nothing to do', 'warning');
+                return;
+            }
+            if (btn.dataset.confirming === 'true') {
+                btn.dataset.confirming = '';
+                onConfirm(items);
+                return;
+            }
+            btn.dataset.confirming = 'true';
+            btn.dataset.originalHtml = btn.innerHTML;
+            btn.textContent = `Really ${actionLabel} ${items.length}?`;
+            setTimeout(() => {
+                if (btn.dataset.confirming === 'true') {
+                    btn.dataset.confirming = '';
+                    if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
+                }
+            }, 4000);
+        });
+    }
+
+    async runOverlayBulkResearch(items) {
+        window.createToast(`Re-searching ${items.length} file(s)…`, 'info');
+        let ok = 0, fail = 0;
+        for (const f of items) {
+            try {
+                const res = await fetch(`${this.api}/overlay/research`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({entry: f.entry, file: f.file}),
+                });
+                if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+                ok++;
+                this.overlaySelected.delete(this.overlayKey(f));
+            } catch (e) {
+                fail++;
+                console.error('Bulk research failed for', f.file, e);
+            }
+        }
+        window.createToast(`Re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
+        await this.loadOverlayFiles();
+    }
+
+    async runOverlayBulkReclaim(items) {
+        window.createToast(`Reclaiming ${items.length} file(s)…`, 'info');
+        let ok = 0, fail = 0;
+        for (const f of items) {
+            try {
+                const res = await fetch(`${this.api}/overlay/reclaim`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({entry: f.entry, file: f.file}),
+                });
+                if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+                ok++;
+                this.overlaySelected.delete(this.overlayKey(f));
+            } catch (e) {
+                fail++;
+                console.error('Bulk reclaim failed for', f.file, e);
+            }
+        }
+        window.createToast(`Reclaim: ${ok} done, ${fail} failed`, fail ? 'warning' : 'success');
+        await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
+    }
+
+    renderOverlayHistory() {
+        const tbody = document.getElementById('overlayHistoryTableBody');
+        const empty = document.getElementById('overlayHistoryEmpty');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+
+        const runs = this.overlayHistory || [];
+        if (!runs.length) {
+            empty?.classList.remove('hidden');
+            return;
+        }
+        empty?.classList.add('hidden');
+
+        for (const run of runs) {
+            const tr = document.createElement('tr');
+            const started = run.started_at ? new Date(run.started_at) : null;
+            const durationMs = (run.duration || 0) / 1e6; // Go time.Duration is nanoseconds
+            tr.innerHTML = `
+                <td class="font-mono text-sm">${started ? started.toLocaleString() : '-'}</td>
+                <td class="text-xs break-all">${this.escape(run.entry_name || run.nzb_id || '-')}</td>
+                <td>${this.overlayOutcomeBadge(run.outcome, run.crc_canary)}</td>
+                <td class="text-xs">${this.formatBytes(run.read_bytes || 0)}</td>
+                <td class="text-xs">${run.slices_repaired ?? '-'}</td>
+                <td class="text-xs">${run.segments_patched ?? '-'}</td>
+                <td class="text-xs">${this.formatDuration(durationMs)}</td>
+                <td class="text-xs text-error">${this.escape(run.fail_reason || '')}</td>
+            `;
+            tbody.appendChild(tr);
+        }
+    }
+
+    overlayOutcomeBadge(outcome, canary) {
+        const cls = {completed: 'badge-success', failed: 'badge-error', unavailable: 'badge-ghost'}[outcome] || 'badge-ghost';
+        const canaryTag = canary
+            ? ' <span class="badge badge-error badge-xs ml-1" title="Checksum verification failed - reconstructed/intact data did not match its recorded MD5/CRC32">CRC</span>'
+            : '';
+        return `<span class="badge ${cls} badge-sm">${this.escape(outcome || 'unknown')}</span>${canaryTag}`;
+    }
+
+    async clearOverlayHistory() {
+        if (!confirm('Clear all PAR2 repair history?')) return;
+        try {
+            const res = await fetch(`${this.api}/overlay/repair-history`, {method: 'DELETE'});
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            await this.loadOverlayHistory();
+        } catch (e) {
+            window.createToast(`Clear failed: ${e.message}`, 'error');
+        }
+    }
+
+    populateOverlayConfigForm() {
+        const c = this.repairConfig || {};
+        const $ = (id) => document.getElementById(id);
+        if ($('overlayPlaybackPadding')) $('overlayPlaybackPadding').checked = c.playback_padding !== false;
+        if ($('overlayPar2Repair')) $('overlayPar2Repair').checked = c.par2_repair !== false;
+        if ($('overlayPadMaxRun')) $('overlayPadMaxRun').value = c.pad_max_run_segments || 4;
+        if ($('overlayPadMaxTotal')) $('overlayPadMaxTotal').value = c.pad_max_total_segments || 64;
+        if ($('overlayPadMaxRatio')) $('overlayPadMaxRatio').value = c.pad_max_byte_ratio || 0.02;
+        if ($('overlayPar2Mode')) $('overlayPar2Mode').value = c.par2_repair_mode || 'auto_all';
+        if ($('overlayPar2MinSegments')) $('overlayPar2MinSegments').value = c.par2_repair_min_segments || 1;
+    }
+
+    async saveOverlayConfig() {
+        const $ = (id) => document.getElementById(id);
+        const btn = $('overlayConfigSaveBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const payload = {
+                ...this.repairConfig,
+                playback_padding: !!$('overlayPlaybackPadding')?.checked,
+                par2_repair: !!$('overlayPar2Repair')?.checked,
+                pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
+                pad_max_total_segments: parseInt($('overlayPadMaxTotal')?.value, 10) || 0,
+                pad_max_byte_ratio: parseFloat($('overlayPadMaxRatio')?.value) || 0,
+                par2_repair_mode: $('overlayPar2Mode')?.value || 'auto_all',
+                par2_repair_min_segments: parseInt($('overlayPar2MinSegments')?.value, 10) || 0,
+            };
+            const res = await fetch(`${this.api}/repair/config`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const text = await res.text();
+            let data = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch { /* leave null */
+            }
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+            this.repairConfig = data || payload;
+            this.populateOverlayConfigForm();
+            window.createToast('Overlay/PAR2 config saved', 'success');
+        } catch (e) {
+            window.createToast(`Save failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
     }
 }
 
