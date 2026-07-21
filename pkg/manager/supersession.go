@@ -111,6 +111,19 @@ func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]str
 	return res
 }
 
+// BuildArrReferencedSet is the exported form of buildArrReferencedSet, for
+// callers outside the manager package (the overlay management API) that need
+// to judge whether a specific (entry, file) slot is still Arr-owned without
+// duplicating buildArrReferencedSet/fileSuperseded's resolution logic.
+func (r *Repair) BuildArrReferencedSet(ctx context.Context) (map[string]map[string]string, error) {
+	return r.buildArrReferencedSet(ctx)
+}
+
+// FileSuperseded is the exported form of fileSuperseded.
+func FileSuperseded(refs map[string]map[string]string, entryName, fileName, infoHash string) bool {
+	return fileSuperseded(refs, entryName, fileName, infoHash)
+}
+
 // fileSuperseded reports whether refs shows the (entryName, fileName) slot as
 // already replaced: either nothing currently references it, or something
 // does but the slot is backed by a different InfoHash than infoHash (a

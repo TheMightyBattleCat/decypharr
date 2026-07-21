@@ -719,6 +719,18 @@ func (u *Usenet) OverlayDeleteFile(nzoID, filename string) error {
 	return u.overlay.DeleteFile(nzoID, filename)
 }
 
+// OverlayDeleteEntry removes nzoID's entire overlay state (every file's
+// manifest record and patch blobs) - see overlay.Store.DeleteEntry. No-op
+// (nil error) if the overlay store is unavailable. Used by the overlay
+// management API's orphan GC when nzoID's backing entry no longer exists at
+// all, as opposed to OverlayDeleteFile's narrower per-file scope.
+func (u *Usenet) OverlayDeleteEntry(nzoID string) error {
+	if u.overlay == nil {
+		return nil
+	}
+	return u.overlay.DeleteEntry(nzoID)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.

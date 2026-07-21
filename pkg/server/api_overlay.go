@@ -7,6 +7,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
@@ -109,8 +111,45 @@ func par2MetadataBytes(nzb *storage.NZB) int64 {
 	return total
 }
 
+// overlayArrRefs builds the Arr reference set used to tell a current overlay
+// record apart from an orphan (see overlayFileIsOrphan) - best-effort: nil
+// means it couldn't be built this call (Arr outage, zero eligible Arrs, no
+// repair service), in which case every orphan check below is skipped rather
+// than guessed at, exactly like ClearSuperseded's own callers already treat
+// a failed reference-set build.
+func (s *Server) overlayArrRefs(ctx context.Context) map[string]map[string]string {
+	svc := s.manager.Repair()
+	if svc == nil {
+		return nil
+	}
+	refs, err := svc.BuildArrReferencedSet(ctx)
+	if err != nil {
+		s.logger.Debug().Err(err).Msg("overlay: failed to build Arr reference set; skipping orphan filter")
+		return nil
+	}
+	return refs
+}
+
+// overlayFileIsOrphan reports whether (entryName, file)'s overlay record no
+// longer corresponds to the file's current, Arr-owned copy: either nothing
+// references that slot anymore, or something does but it's now backed by a
+// DIFFERENT nzbID (a re-grabbed twin) - see manager.FileSuperseded, the same
+// primitive the supersession/stale-NZB cleanup already use. refs == nil (no
+// reference set available this call) always reports false: never guess an
+// overlay record is an orphan without a reference set to check it against.
+func overlayFileIsOrphan(refs map[string]map[string]string, entryName, file, nzbID string) bool {
+	if refs == nil {
+		return false
+	}
+	return manager.FileSuperseded(refs, entryName, file, nzbID)
+}
+
 // handleListOverlayFiles returns every file with recorded overlay state
-// (dead segments and/or patches), across every entry.
+// (dead segments and/or patches), across every entry - excluding records
+// whose entry no longer exists, or whose specific file slot has been
+// superseded by a re-grabbed twin (see overlayFileIsOrphan). Those are
+// "ghosts" of a repair or supersession that already happened; use
+// handleOverlayGCOrphans to reap the backlog already on disk.
 func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) {
 	u := s.manager.Usenet()
 	out := make([]OverlayFile, 0)
@@ -126,6 +165,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 	}
 
 	par2Repair := s.manager.Par2Repair()
+	refs := s.overlayArrRefs(r.Context())
 
 	for _, nzbID := range nzbIDs {
 		// An entry can be deleted while its overlay state lingers on disk
@@ -157,6 +197,9 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 
 		for file, fe := range manifest.Files {
 			if fe == nil {
+				continue
+			}
+			if overlayFileIsOrphan(refs, entry.Name, file, nzbID) {
 				continue
 			}
 			of := OverlayFile{
@@ -502,4 +545,76 @@ func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.JSONResponse(w, map[string]string{"status": "researching"}, http.StatusOK)
+}
+
+// OverlayGCResult summarizes one handleOverlayGCOrphans pass.
+type OverlayGCResult struct {
+	Checked        int  `json:"checked"`         // overlay file records examined, across every entry
+	DeletedEntries int  `json:"deleted_entries"` // whole nzbIDs removed (backing entry no longer exists)
+	DeletedFiles   int  `json:"deleted_files"`   // individual file records removed (superseded by a re-grabbed twin, or unreferenced)
+	RefsAvailable  bool `json:"refs_available"`  // whether the Arr reference set was available this pass - false means only the "entry gone entirely" check ran
+}
+
+// handleOverlayGCOrphans deletes every overlay record that no longer
+// corresponds to a live, Arr-owned file - the same two checks
+// handleListOverlayFiles already applies to hide them, applied here to
+// actually reclaim the backlog already on disk from before that filter
+// existed: overlay.DeleteEntry for a whole nzbID whose backing entry is gone
+// entirely, overlay.DeleteFile for an individual file superseded by a
+// re-grabbed twin under the same (entry, file) slot. A manual "clean up
+// ghosts" action - never runs automatically.
+func (s *Server) handleOverlayGCOrphans(w http.ResponseWriter, r *http.Request) {
+	result := OverlayGCResult{}
+	u := s.manager.Usenet()
+	if u == nil {
+		utils.JSONResponse(w, result, http.StatusOK)
+		return
+	}
+
+	nzbIDs, err := u.OverlayListNZBIDs()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	refs := s.overlayArrRefs(r.Context())
+	result.RefsAvailable = refs != nil
+
+	for _, nzbID := range nzbIDs {
+		entry, err := s.manager.GetEntry(nzbID)
+		if err != nil || entry == nil {
+			if manifest, merr := u.OverlayManifest(nzbID); merr == nil && manifest != nil {
+				result.Checked += len(manifest.Files)
+			} else {
+				result.Checked++
+			}
+			if derr := u.OverlayDeleteEntry(nzbID); derr != nil {
+				s.logger.Warn().Err(derr).Str("nzb_id", nzbID).Msg("overlay gc: failed to delete orphaned entry")
+				continue
+			}
+			result.DeletedEntries++
+			continue
+		}
+
+		if refs == nil {
+			continue
+		}
+		manifest, err := u.OverlayManifest(nzbID)
+		if err != nil || manifest == nil {
+			continue
+		}
+		for file := range manifest.Files {
+			result.Checked++
+			if !overlayFileIsOrphan(refs, entry.Name, file, nzbID) {
+				continue
+			}
+			if derr := u.OverlayDeleteFile(nzbID, file); derr != nil {
+				s.logger.Warn().Err(derr).Str("entry", entry.Name).Str("file", file).Msg("overlay gc: failed to delete orphaned file record")
+				continue
+			}
+			result.DeletedFiles++
+		}
+	}
+
+	utils.JSONResponse(w, result, http.StatusOK)
 }
