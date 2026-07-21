@@ -655,6 +655,45 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	return nil
 }
 
+// DeleteFile removes file's overlay record (dead segments + verdict) from
+// nzbID's manifest and every patch blob written for it, without touching any
+// other file recorded against the same nzbID. If file was the manifest's
+// only entry, the whole directory is removed (equivalent to DeleteEntry).
+// Used by the overlay management API's "reclaim disk" action, which must not
+// discard a sibling file's still-live damage record just because one file in
+// the release is fine now.
+func (s *Store) DeleteFile(nzbID, file string) error {
+	if s == nil {
+		return nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return err
+	}
+	fe, ok := m.Files[file]
+	if !ok {
+		return nil
+	}
+	for _, d := range fe.DeadSegments {
+		if d.Status == StatusPatched {
+			_ = os.Remove(s.patchPath(nzbID, file, d.Index))
+		}
+	}
+	delete(m.Files, file)
+
+	if len(m.Files) == 0 {
+		if err := os.RemoveAll(s.entryDir(nzbID)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("overlay: delete file (last in entry): %w", err)
+		}
+		return nil
+	}
+	return s.saveManifestLocked(nzbID, m)
+}
+
 // ShouldLogPad reports whether this is the first time (this process) that
 // (nzbID, file, segIndex) has been padded, atomically marking it logged.
 func (s *Store) ShouldLogPad(nzbID, file string, segIndex int) bool {

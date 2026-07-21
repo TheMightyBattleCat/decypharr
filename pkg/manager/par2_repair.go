@@ -211,6 +211,49 @@ func (p *Par2Repair) Enqueue(nzbID string) {
 	}
 }
 
+// RunNow immediately starts a PAR2 repair pass for nzbID from an explicit,
+// user-initiated GUI action. Unlike Enqueue (which lands in loop's normal
+// queue), it does NOT wait for the repair sweep's StopSchedule window - a
+// schedule that limits automatic, bandwidth-heavy background work has no
+// bearing on something the user explicitly asked to run right now. It still
+// goes through the same NNTP connection pool and bandwidth accounting as
+// every other fetch - there is no unthrottled fast path. Returns an error if
+// PAR2 repair is disabled outright, or if a pass for this nzbID is already
+// queued/deferred/running.
+func (p *Par2Repair) RunNow(nzbID string) error {
+	if p == nil || nzbID == "" {
+		return fmt.Errorf("nzbID is required")
+	}
+	if !config.Get().Repair.Par2RepairEnabled() {
+		return fmt.Errorf("par2 repair is disabled")
+	}
+	if p.IsRunning(nzbID) {
+		return fmt.Errorf("par2 repair already running for this entry")
+	}
+
+	p.mu.Lock()
+	_, dupQueued := p.queued[nzbID]
+	_, dupDeferred := p.deferred[nzbID]
+	if dupQueued || dupDeferred {
+		p.mu.Unlock()
+		return fmt.Errorf("par2 repair already queued for this entry")
+	}
+	p.queued[nzbID] = struct{}{}
+	p.mu.Unlock()
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer func() {
+			p.mu.Lock()
+			delete(p.queued, nzbID)
+			p.mu.Unlock()
+		}()
+		p.runJob(nzbID)
+	}()
+	return nil
+}
+
 // Availability reports whether nzbID's pending overlay damage looks
 // repairable via PAR2 WITHOUT fetching any article data: PAR2 metadata
 // (posted-file layout and retained recovery/index files) is present, and the
@@ -259,6 +302,130 @@ func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string)
 		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
 	}
 	return true, ""
+}
+
+// postedLayoutMatches reports whether posted and nzbFile are the same
+// physical posting: identical segment count, in order, with identical
+// message IDs. True only for a file posted directly (not extracted from an
+// archive) - see Verify.
+func postedLayoutMatches(posted storage.PostedFileRef, nzbFile *storage.NZBFile) bool {
+	if nzbFile == nil || len(posted.Segments) != len(nzbFile.Segments) {
+		return false
+	}
+	for i := range posted.Segments {
+		if posted.Segments[i].MessageID != nzbFile.Segments[i].MessageID {
+			return false
+		}
+	}
+	return true
+}
+
+// Verify re-checks file's bytes against the PAR2 FileDesc's whole-file MD5
+// for its matched posted file, proving a past repair was byte-exact. It
+// reassembles the posted file from overlay patches (for segments PAR2
+// already repaired) and fresh NNTP fetches (for everything else), then
+// hashes the result - a real, end-to-end check, not a re-read of what
+// par2.Repair already verified at write time.
+//
+// Only supported for a file posted directly (not extracted from an
+// archive): PAR2 protects the POSTED file, and overlay patches are stored
+// as final, POST-extraction bytes (see overlay.Store.WritePatch) - for an
+// extracted archive member those are not the same bytes as the posted
+// article, so there is no way to reassemble a verifiable posted-file byte
+// stream from them. ok=false with a non-empty reason (nil error) covers
+// that and every other "can't verify" case that isn't itself a fetch/parse
+// failure.
+func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool, reason string, err error) {
+	if p == nil || p.manager.usenet == nil {
+		return false, "", fmt.Errorf("usenet client not configured")
+	}
+	u := p.manager.usenet
+
+	nzb, err := u.GetNZB(nzbID)
+	if err != nil {
+		return false, "", fmt.Errorf("load NZB record: %w", err)
+	}
+	nzbFile := nzb.GetFileByName(file)
+	if nzbFile == nil {
+		return false, "", fmt.Errorf("file %q not found in entry", file)
+	}
+	if len(nzb.Par2Files) == 0 {
+		return false, "no par2 metadata retained for this release", nil
+	}
+
+	var posted *storage.PostedFileRef
+	for i := range nzb.Par2Source {
+		if postedLayoutMatches(nzb.Par2Source[i], nzbFile) {
+			posted = &nzb.Par2Source[i]
+			break
+		}
+	}
+	if posted == nil {
+		return false, "file is extracted from an archive - par2 protects the posted archive volume, not this member, so its bytes can't be verified from patches", nil
+	}
+
+	_, indexFiles := censusPar2Volumes(nzb.Par2Files)
+	if len(indexFiles) == 0 {
+		return false, "no par2 index file retained for this release", nil
+	}
+	var sources []par2.Source
+	for _, f := range indexFiles {
+		data, ferr := fetchWholePar2File(ctx, u.FetchArticle, f)
+		if ferr != nil {
+			p.logger.Debug().Err(ferr).Str("entry", nzbID).Str("file", f.Name).Msg("par2 verify: index file fetch failed")
+			continue
+		}
+		sources = append(sources, par2.Source{Name: f.Name, Data: data})
+	}
+	if len(sources) == 0 {
+		return false, "", fmt.Errorf("failed to fetch any par2 index file")
+	}
+	idx, err := par2.ParseIndex(sources)
+	if err != nil {
+		return false, "", fmt.Errorf("parse par2 index: %w", err)
+	}
+
+	postedRef := *posted
+	postedFiles := []par2.PostedFile{{
+		Name:   postedRef.Name,
+		Length: postedRef.Size,
+		MD5_16k: func() ([16]byte, error) {
+			return computeMD5_16k(ctx, u.FetchArticle, postedRef)
+		},
+	}}
+	matches, err := par2.MatchFiles(idx, postedFiles)
+	if err != nil {
+		return false, "", fmt.Errorf("match posted file against par2 index: %w", err)
+	}
+	if len(matches) == 0 {
+		return false, "posted file did not match any par2 FileDesc", nil
+	}
+	fd, ok := idx.Files[matches[0].FileID]
+	if !ok {
+		return false, "", fmt.Errorf("no FileDesc for matched posted file")
+	}
+
+	h := md5.New()
+	for i, seg := range nzbFile.Segments {
+		if data, ok := u.OverlayPatchBytes(nzbID, file, i); ok {
+			h.Write(data)
+			continue
+		}
+		fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
+		data, ferr := u.FetchArticle(fetchCtx, seg.MessageID)
+		cancel()
+		if ferr != nil {
+			return false, "", fmt.Errorf("fetch segment %d: %w", i, ferr)
+		}
+		h.Write(data)
+	}
+
+	var sum [16]byte
+	copy(sum[:], h.Sum(nil))
+	if sum != fd.FileMD5 {
+		return false, "whole-file MD5 mismatch", nil
+	}
+	return true, "", nil
 }
 
 func (p *Par2Repair) loop() {
