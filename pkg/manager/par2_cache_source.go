@@ -123,6 +123,7 @@ type cacheSlicedSource struct {
 	byMessageID map[string][]cacheMapEntry
 	deadRanges  map[string][]outputByteRange
 	cacheBytes  *int64
+	progress    *par2JobProgressState // nil-safe; live cache_bytes for the progress API
 }
 
 // readCached returns exactly n bytes if [dataStart, dataStart+n) of
@@ -153,6 +154,7 @@ func (s *cacheSlicedSource) readCached(messageID string, dataStart, n int64) ([]
 		if s.cacheBytes != nil {
 			atomic.AddInt64(s.cacheBytes, n)
 		}
+		s.progress.AddCacheBytes(n)
 		return buf, true
 	}
 	return nil, false

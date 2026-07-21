@@ -544,6 +544,39 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 	utils.JSONResponse(w, map[string]string{"status": "queued"}, http.StatusOK)
 }
 
+// handleOverlayRepairProgress returns live, in-memory progress for the most
+// recent PAR2 repair pass this process has run (or is running) for a file's
+// entry - phase, recovery/intact-slice counts, cache vs. usenet bytes
+// fetched, and the last error, if any. See manager.Par2Repair.Progress /
+// par2JobProgressState. Distinct from repair-history: this is a live,
+// per-second view of an IN-FLIGHT job, gone on process restart, whereas
+// repair-history is the persisted, terminal-outcome record. GET with query
+// params (not the shared overlayFileRequest JSON body decoder) since this is
+// a pure read with no body.
+func (s *Server) handleOverlayRepairProgress(w http.ResponseWriter, r *http.Request) {
+	req := overlayFileRequest{
+		Entry: strings.TrimSpace(r.URL.Query().Get("entry")),
+		File:  strings.TrimSpace(r.URL.Query().Get("file")),
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	par2Repair := s.manager.Par2Repair()
+	if par2Repair == nil {
+		http.Error(w, "PAR2 repair worker not available", http.StatusServiceUnavailable)
+		return
+	}
+	progress, ok := par2Repair.Progress(entry.InfoHash)
+	if !ok {
+		utils.JSONResponse(w, map[string]any{"status": "no_job"}, http.StatusOK)
+		return
+	}
+	utils.JSONResponse(w, progress, http.StatusOK)
+}
+
 // handleOverlayVerify re-checks a patched file's bytes against the PAR2
 // FileDesc's whole-file MD5 for its posted file - see Par2Repair.Verify.
 func (s *Server) handleOverlayVerify(w http.ResponseWriter, r *http.Request) {
