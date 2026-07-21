@@ -683,29 +683,33 @@ type OverlayGCResult struct {
 	RefsAvailable  bool `json:"refs_available"`  // whether the Arr reference set was available this pass - false means only the "entry gone entirely" check ran
 }
 
-// handleOverlayGCOrphans deletes every overlay record that no longer
-// corresponds to a live, Arr-owned file - the same two checks
-// handleListOverlayFiles already applies to hide them, applied here to
-// actually reclaim the backlog already on disk from before that filter
-// existed: overlay.DeleteEntry for a whole nzbID whose backing entry is gone
-// entirely, overlay.DeleteFile for an individual file superseded by a
-// re-grabbed twin under the same (entry, file) slot. A manual "clean up
-// ghosts" action - never runs automatically.
-func (s *Server) handleOverlayGCOrphans(w http.ResponseWriter, r *http.Request) {
+// OverlayOrphanCount is a cheap, non-destructive preview of what
+// handleOverlayGCOrphans would reap, so the GUI can decide whether to show
+// its "clean up" button at all without committing to running it.
+type OverlayOrphanCount struct {
+	Checked       int  `json:"checked"`
+	OrphanEntries int  `json:"orphan_entries"`
+	OrphanFiles   int  `json:"orphan_files"`
+	RefsAvailable bool `json:"refs_available"`
+}
+
+// overlayOrphanScan walks every overlay record and either reaps (execute
+// true) or merely counts (execute false) whichever ones are orphaned - see
+// overlayFileIsOrphan. Shared by handleOverlayGCOrphans (the actual GC pass)
+// and handleOverlayOrphanCount (a read-only preview of the same walk).
+func (s *Server) overlayOrphanScan(ctx context.Context, execute bool) (OverlayGCResult, error) {
 	result := OverlayGCResult{}
 	u := s.manager.Usenet()
 	if u == nil {
-		utils.JSONResponse(w, result, http.StatusOK)
-		return
+		return result, nil
 	}
 
 	nzbIDs, err := u.OverlayListNZBIDs()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return result, err
 	}
 
-	refs := s.overlayArrRefs(r.Context())
+	refs := s.overlayArrRefs(ctx)
 	result.RefsAvailable = refs != nil
 
 	for _, nzbID := range nzbIDs {
@@ -716,9 +720,11 @@ func (s *Server) handleOverlayGCOrphans(w http.ResponseWriter, r *http.Request) 
 			} else {
 				result.Checked++
 			}
-			if derr := u.OverlayDeleteEntry(nzbID); derr != nil {
-				s.logger.Warn().Err(derr).Str("nzb_id", nzbID).Msg("overlay gc: failed to delete orphaned entry")
-				continue
+			if execute {
+				if derr := u.OverlayDeleteEntry(nzbID); derr != nil {
+					s.logger.Warn().Err(derr).Str("nzb_id", nzbID).Msg("overlay gc: failed to delete orphaned entry")
+					continue
+				}
 			}
 			result.DeletedEntries++
 			continue
@@ -736,13 +742,50 @@ func (s *Server) handleOverlayGCOrphans(w http.ResponseWriter, r *http.Request) 
 			if !overlayFileIsOrphan(refs, entry.Name, file, nzbID) {
 				continue
 			}
-			if derr := u.OverlayDeleteFile(nzbID, file); derr != nil {
-				s.logger.Warn().Err(derr).Str("entry", entry.Name).Str("file", file).Msg("overlay gc: failed to delete orphaned file record")
-				continue
+			if execute {
+				if derr := u.OverlayDeleteFile(nzbID, file); derr != nil {
+					s.logger.Warn().Err(derr).Str("entry", entry.Name).Str("file", file).Msg("overlay gc: failed to delete orphaned file record")
+					continue
+				}
 			}
 			result.DeletedFiles++
 		}
 	}
 
+	return result, nil
+}
+
+// handleOverlayGCOrphans deletes every overlay record that no longer
+// corresponds to a live, Arr-owned file - the same two checks
+// handleListOverlayFiles already applies to hide them, applied here to
+// actually reclaim the backlog already on disk from before that filter
+// existed: overlay.DeleteEntry for a whole nzbID whose backing entry is gone
+// entirely, overlay.DeleteFile for an individual file superseded by a
+// re-grabbed twin under the same (entry, file) slot. A manual "clean up
+// ghosts" action - never runs automatically.
+func (s *Server) handleOverlayGCOrphans(w http.ResponseWriter, r *http.Request) {
+	result, err := s.overlayOrphanScan(r.Context(), true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	utils.JSONResponse(w, result, http.StatusOK)
+}
+
+// handleOverlayOrphanCount is a read-only preview of handleOverlayGCOrphans:
+// how many orphaned records are sitting on disk right now, without deleting
+// anything. Lets the GUI show/hide its "clean up N orphaned records" button
+// without running the (mutating) GC pass just to find out.
+func (s *Server) handleOverlayOrphanCount(w http.ResponseWriter, r *http.Request) {
+	scan, err := s.overlayOrphanScan(r.Context(), false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, OverlayOrphanCount{
+		Checked:       scan.Checked,
+		OrphanEntries: scan.DeletedEntries,
+		OrphanFiles:   scan.DeletedFiles,
+		RefsAvailable: scan.RefsAvailable,
+	}, http.StatusOK)
 }
