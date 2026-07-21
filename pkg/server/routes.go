@@ -73,6 +73,7 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/overlay/repair-history/{id}", s.handleGetPar2RepairHistoryEntry)
 			r.Delete("/overlay/repair-history", s.handleClearPar2RepairHistory)
 			r.Post("/overlay/repair-now", s.handleOverlayRepairNow)
+			r.Get("/overlay/repair-progress", s.handleOverlayRepairProgress)
 			r.Post("/overlay/verify", s.handleOverlayVerify)
 			r.Post("/overlay/reclaim", s.handleOverlayReclaim)
 			r.Post("/overlay/research", s.handleOverlayResearch)

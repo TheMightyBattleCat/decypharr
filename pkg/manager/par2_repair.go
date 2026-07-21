@@ -113,9 +113,28 @@ type Par2Repair struct {
 	// IsRunning for the overlay management API's repair-status introspection.
 	active atomic.Pointer[string]
 
+	// progress holds live, per-nzbID job progress (phase, slice/byte
+	// counts) - see par2_progress.go. Updated frequently throughout
+	// runJob/runRepair so a stall is visible within seconds via Progress,
+	// not just at completion.
+	progress par2ProgressTracker
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// Progress returns nzbID's live (or most recently finished) PAR2 repair job
+// progress, if any job has run for it this process.
+func (p *Par2Repair) Progress(nzbID string) (Par2JobProgress, bool) {
+	if p == nil {
+		return Par2JobProgress{}, false
+	}
+	s, ok := p.progress.Get(nzbID)
+	if !ok {
+		return Par2JobProgress{}, false
+	}
+	return s.Snapshot(), true
 }
 
 // NewPar2Repair builds the worker. Call Start to begin processing.
@@ -127,6 +146,7 @@ func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 		queued:   make(map[string]struct{}),
 		deferred: make(map[string]struct{}),
 		queue:    make(chan string, par2QueueDepth),
+		progress: newPar2ProgressTracker(),
 	}
 }
 
@@ -498,7 +518,10 @@ func (p *Par2Repair) readyToRun() bool {
 // path - it never partially patches and calls it done.
 func (p *Par2Repair) runJob(nzbID string) {
 	start := time.Now()
+	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
 	if p.manager.usenet == nil {
+		progress.SetPhase(Par2PhaseFailed)
+		progress.SetLastError("usenet client not configured")
 		return
 	}
 
@@ -517,6 +540,8 @@ func (p *Par2Repair) runJob(nzbID string) {
 		// hammering it in the meantime).
 		terminalErr := fmt.Errorf("entry no longer exists")
 		p.logger.Info().Str("entry", nzbID).Msg("par2 repair: entry no longer exists; marking unrepairable")
+		progress.SetPhase(Par2PhaseFailed)
+		progress.SetLastError(terminalErr.Error())
 		p.recordAttempt(&storage.Par2RepairAttempt{
 			ID:         uuid.NewString(),
 			EntryName:  nzbID,
@@ -530,12 +555,14 @@ func (p *Par2Repair) runJob(nzbID string) {
 		return
 	}
 	entryName := entry.Name
+	progress.SetEntryName(entryName)
 
 	ctx, cancel := context.WithTimeout(p.ctx, par2JobTimeout)
 	defer cancel()
 
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
 	if err != nil || len(pending) == 0 {
+		progress.SetPhase(Par2PhaseCompleted) // nothing pending - not a failure, just nothing to do
 		return
 	}
 	deadSegments := 0
@@ -547,12 +574,14 @@ func (p *Par2Repair) runJob(nzbID string) {
 	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
 	var slicesRepaired int
-	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired); err != nil {
+	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, progress); err != nil {
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := classifyPar2Failure(err)
 		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Bool("terminal", class.terminal).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
 			Msg("par2 repair unavailable")
+		progress.SetPhase(Par2PhaseFailed)
+		progress.SetLastError(err.Error())
 		p.recordAttempt(&storage.Par2RepairAttempt{
 			ID:         uuid.NewString(),
 			EntryName:  entryName,
@@ -585,6 +614,7 @@ func (p *Par2Repair) runJob(nzbID string) {
 		Int64("cache_bytes", cacheBytes).
 		Int64("usenet_bytes", readBytes).
 		Msg("par2 repair completed")
+	progress.SetPhase(Par2PhaseCompleted)
 	p.recordAttempt(&storage.Par2RepairAttempt{
 		ID:              uuid.NewString(),
 		EntryName:       entryName,
@@ -647,8 +677,9 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int) error {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, progress *par2JobProgressState) error {
 	u := p.manager.usenet
+	progress.SetPhase(Par2PhaseFetchingRecovery)
 
 	// fetch wraps every article fetch this pass makes so runJob can report a
 	// real (not estimated) read_bytes total in the persisted attempt log -
@@ -656,7 +687,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
 		data, err := u.FetchArticle(fctx, messageID)
 		if err == nil && readBytes != nil {
-			atomic.AddInt64(readBytes, int64(len(data)))
+			n := int64(len(data))
+			atomic.AddInt64(readBytes, n)
+			progress.AddUsenetBytes(n)
 		}
 		return data, err
 	}
@@ -697,6 +730,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		byMessageID: buildCacheSegmentMap(nzb),
 		deadRanges:  buildDeadOutputRanges(nzb, pending),
 		cacheBytes:  cacheBytes,
+		progress:    progress,
 	}
 
 	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
@@ -730,6 +764,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	var fetchedSlices uint32
 	var nextVolIdx int
 	nextVolIdx, fetchedSlices, sources, _ = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, needed, sources, entryName, p.logger)
+	progress.SetRecoveryVolsFetched(nextVolIdx)
+	progress.SetRecoverySlices(int(fetchedSlices), int(needed))
 	if len(sources) == 0 {
 		return fmt.Errorf("failed to fetch any PAR2 file")
 	}
@@ -836,6 +872,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if uint32(k) > fetchedSlices {
 			var added int
 			nextVolIdx, fetchedSlices, sources, added = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, uint32(k), sources, entryName, p.logger)
+			progress.SetRecoveryVolsFetched(nextVolIdx)
+			progress.SetRecoverySlices(int(fetchedSlices), k)
 			if added > 0 {
 				idx, err = par2.ParseIndex(sources)
 				if err != nil {
@@ -886,7 +924,23 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// "stuck" forever - concurrency divides that cumulative latency by
 		// the connection limit instead.
 		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers}
-		sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), jobSource.ReadSlice)
+		progress.SetIntactTotal(len(intactOrder))
+		if len(intactOrder) == 0 {
+			progress.SetPhase(Par2PhaseSolving)
+		} else {
+			progress.SetPhase(Par2PhaseStreamingIntact)
+		}
+		var intactRead int64
+		intactTotal := int64(len(intactOrder))
+		trackedFetch := func(i int64) ([]byte, error) {
+			data, err := jobSource.ReadSlice(i)
+			progress.AddIntactRead(1)
+			if atomic.AddInt64(&intactRead, 1) == intactTotal {
+				progress.SetPhase(Par2PhaseSolving)
+			}
+			return data, err
+		}
+		sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
 		var repairErr error
 		repaired, repairErr = par2.Repair(idx, damaged, recovery, sliceSource)
 		if repairErr == nil {
@@ -914,6 +968,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if slicesRepaired != nil {
 		*slicesRepaired = len(repaired)
 	}
+	progress.SetPhase(Par2PhaseWriting)
 
 	repairedByIndex := make(map[int64][]byte, len(repaired))
 	for _, rs := range repaired {
