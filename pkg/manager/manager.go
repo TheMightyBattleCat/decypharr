@@ -699,6 +699,26 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 		go m.RemoveTorrentPlacements(torr)
 	}
 
+	// A usenet entry carries state m.storage.Delete knows nothing about: the
+	// NZB/meta files on disk, and the overlay package's dead-segment/patch
+	// record (pkg/usenet/overlay), both keyed by this exact infohash (=
+	// nzbID). Every caller of DeleteEntry - supersession cleanup
+	// (deleteSupersededEntry), a repair sweep's post-re-search finalize
+	// (finalizeEntryRepair, which is also what a 430 playback repair's
+	// RepairPlaybackFileNow drives via healBrokenEntry), and plain API
+	// deletion - must reap this too, or the old, now-replaced entry's
+	// overlay record lingers forever: it keeps showing as "damaged" in the
+	// overlay management list, and any later action against it (e.g.
+	// research) fails "no Arr owns entry" because the Arr has already moved
+	// on to the re-grabbed replacement's (different) nzbID. Best-effort: a
+	// failure here must never block deleting the entry record itself, since
+	// from the user's perspective the entry is already gone either way.
+	if torr.IsNZB() && m.usenet != nil {
+		if err := m.usenet.Delete(infohash); err != nil {
+			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete usenet/overlay state for entry")
+		}
+	}
+
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
 	}

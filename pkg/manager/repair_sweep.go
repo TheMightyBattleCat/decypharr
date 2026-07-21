@@ -1582,6 +1582,17 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 		return fmt.Errorf("file %q not found among Arr-known files for entry %q", fileName, entryName)
 	}
 	h.BrokenCount = len(h.BrokenFiles)
+	// FileCount is the entry's total tracked file count (matching probeEntry's
+	// h.FileCount = len(names)) - finalizeEntryRepair's shouldDelete check
+	// (BrokenCount == FileCount) is how it tells "this repair covered the
+	// entry's ENTIRE content, safe to delete the old entry now" apart from
+	// "only one episode of a season pack failed, the rest are untouched and
+	// must survive". Leaving this unset (zero) made shouldDelete permanently
+	// false here, so a 430 playback repair's blocklist+re-search never
+	// deleted the superseded entry - and, by extension via DeleteEntry, never
+	// reaped its overlay record either - even for the common single-file
+	// case where deletion is exactly correct.
+	h.FileCount = len(c.contentMap)
 
 	r.logger.Info().
 		Str("entry", entryName).
