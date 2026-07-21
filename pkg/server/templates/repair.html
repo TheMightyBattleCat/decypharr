@@ -208,15 +208,15 @@
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div class="stat bg-primary/10 rounded-box p-4">
                     <div class="stat-figure text-primary"><i class="bi bi-hdd-stack text-2xl"></i></div>
-                    <div class="stat-title">Patch bytes on disk</div>
-                    <div class="stat-value text-primary" id="overlayPatchBytes">-</div>
-                    <div class="stat-desc">PAR2-repaired segment data</div>
+                    <div class="stat-title">Overlay disk cost</div>
+                    <div class="stat-value text-primary" id="overlayDiskBytes">-</div>
+                    <div class="stat-desc">Real bytes on disk: patches + manifests + retained PAR2 metadata</div>
                 </div>
-                <div class="stat bg-secondary/10 rounded-box p-4">
-                    <div class="stat-figure text-secondary"><i class="bi bi-file-earmark-binary text-2xl"></i></div>
-                    <div class="stat-title">PAR2 metadata retained</div>
-                    <div class="stat-value text-secondary" id="overlayPar2MetaBytes">-</div>
-                    <div class="stat-desc">Recovery/index files + posted-file layout</div>
+                <div class="stat bg-base-200/60 rounded-box p-4 opacity-80">
+                    <div class="stat-figure text-base-content/50"><i class="bi bi-info-circle text-2xl"></i></div>
+                    <div class="stat-title">PAR2 coverage <span class="badge badge-ghost badge-xs align-middle">informational</span></div>
+                    <div class="stat-value text-base text-base-content/70" id="overlayProtectedBytes">-</div>
+                    <div class="stat-desc">Declared size of the release PAR2 protects on Usenet - NOT a disk cost</div>
                 </div>
             </div>
         </div>
@@ -315,6 +315,10 @@
                     <i class="bi bi-file-earmark-break mr-2"></i>Overlay files
                 </h3>
                 <div class="flex gap-2">
+                    <button id="overlayGCOrphansBtn" class="btn btn-warning btn-outline btn-sm hidden"
+                            title="Delete overlay records whose entry is gone or has been superseded by a re-grabbed twin">
+                        <i class="bi bi-trash3 mr-1"></i>Clean up <span id="overlayOrphanCount">0</span> orphaned records
+                    </button>
                     <button id="overlayFilesRefreshBtn" class="btn btn-outline btn-sm">
                         <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
                     </button>

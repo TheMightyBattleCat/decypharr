@@ -77,6 +77,7 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/overlay/verify", s.handleOverlayVerify)
 			r.Post("/overlay/reclaim", s.handleOverlayReclaim)
 			r.Post("/overlay/research", s.handleOverlayResearch)
+			r.Get("/overlay/gc-orphans/count", s.handleOverlayOrphanCount)
 			r.Post("/overlay/gc-orphans", s.handleOverlayGCOrphans)
 
 			// Torrent management

@@ -15,6 +15,11 @@ class RepairManager {
         this.overlaySelected = new Set();
         this.overlayDiskUsage = {};
         this.overlayHistory = [];
+        this.overlayOrphanCount = 0;
+        // Per-row live-progress poll timers, keyed by overlayKey() - see
+        // pollOverlayProgress. Cleared and rebuilt on every renderOverlayFiles
+        // pass so a stale row never keeps polling after the table's rebuilt.
+        this.overlayProgressTimers = new Map();
         this.bind();
         this.loadAll();
     }
@@ -54,6 +59,7 @@ class RepairManager {
         });
         $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
         $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
+        $('overlayGCOrphansBtn')?.addEventListener('click', () => this.handleOverlayGCOrphans());
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
             () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
@@ -826,7 +832,7 @@ class RepairManager {
     // ---- Overlay / Padding -------------------------------------------------
 
     async loadOverlayAll() {
-        await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayHistory()]);
+        await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayHistory(), this.loadOverlayOrphanCount()]);
     }
 
     overlayKey(f) {
@@ -878,6 +884,42 @@ class RepairManager {
         this.renderOverlayHistory();
     }
 
+    async loadOverlayOrphanCount() {
+        try {
+            const data = await this.fetchJSON(`${this.api}/overlay/gc-orphans/count`) || {};
+            this.overlayOrphanCount = (data.orphan_entries || 0) + (data.orphan_files || 0);
+        } catch (e) {
+            console.error('Failed to load overlay orphan count', e);
+            this.overlayOrphanCount = 0;
+        }
+        this.renderOverlayOrphanButton();
+    }
+
+    renderOverlayOrphanButton() {
+        const btn = document.getElementById('overlayGCOrphansBtn');
+        const count = document.getElementById('overlayOrphanCount');
+        if (count) count.textContent = this.overlayOrphanCount;
+        if (btn) btn.classList.toggle('hidden', this.overlayOrphanCount <= 0);
+    }
+
+    async handleOverlayGCOrphans() {
+        if (!confirm(`Clean up ${this.overlayOrphanCount} orphaned overlay record(s)?\n\nThese no longer correspond to a live, Arr-owned file (entry deleted or superseded by a re-grabbed twin) and are safe to remove.`)) return;
+        const btn = document.getElementById('overlayGCOrphansBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const res = await fetch(`${this.api}/overlay/gc-orphans`, {method: 'POST'});
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            const deleted = (data?.deleted_entries || 0) + (data?.deleted_files || 0);
+            window.createToast(`Cleaned up ${deleted} orphaned overlay record(s)`, 'success');
+            await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayOrphanCount()]);
+        } catch (e) {
+            window.createToast(`Cleanup failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
     renderOverlaySummaryCounts() {
         const counts = {clean: 0, degraded: 0, failed: 0};
         for (const f of this.overlayFiles) {
@@ -893,10 +935,13 @@ class RepairManager {
 
     renderOverlayDiskUsage() {
         const d = this.overlayDiskUsage || {};
-        const patch = document.getElementById('overlayPatchBytes');
-        const meta = document.getElementById('overlayPar2MetaBytes');
-        if (patch) patch.textContent = this.formatBytes(d.total_patch_bytes || 0);
-        if (meta) meta.textContent = this.formatBytes(d.total_par2_metadata_bytes || 0);
+        const disk = document.getElementById('overlayDiskBytes');
+        const protectedEl = document.getElementById('overlayProtectedBytes');
+        // total_overlay_disk_bytes is the true local cost (patches + manifests
+        // + retained PAR2 metadata); total_protected_release_bytes is only the
+        // declared size PAR2 protects on Usenet - never a disk figure.
+        if (disk) disk.textContent = this.formatBytes(d.total_overlay_disk_bytes || 0);
+        if (protectedEl) protectedEl.textContent = `PAR2 covers ${this.formatBytes(d.total_protected_release_bytes || 0)}`;
     }
 
     renderOverlaySparkline(runs, total) {
@@ -929,23 +974,156 @@ class RepairManager {
         return `<span class="badge badge-ghost badge-sm" title="${this.escapeAttr(reason)}">no par2</span>`;
     }
 
-    overlayRepairStatusBadge(f) {
+    // renderOverlayRepairStatusCell renders the full "Repair status" cell for
+    // one file: a live progress bar while running/queued (see
+    // pollOverlayProgress), or a terminal/transient-aware badge with the
+    // actual failure reason shown inline (never a bare "failed") once
+    // resolved. Terminal (unrepairable - automatic retries have stopped,
+    // manual repair-now only) is visually distinct from transient (failed,
+    // still backing off and will retry automatically).
+    renderOverlayRepairStatusCell(f, domId) {
+        if (f.repair_status === 'running' || f.repair_status === 'queued') {
+            const badge = f.repair_status === 'running'
+                ? '<span class="badge badge-info badge-sm">running</span>'
+                : '<span class="badge badge-ghost badge-sm">queued</span>';
+            return `<div class="min-w-[12rem]">${badge}<div id="${domId}" class="mt-1">${this.renderOverlayProgressBody(null)}</div></div>`;
+        }
+
+        if (f.repair_status === 'unrepairable') {
+            const reason = f.par2_last_error || f.repair_status_reason || 'retrying can\'t fix this';
+            return `
+                <div class="min-w-[10rem]">
+                    <span class="badge badge-error badge-sm" title="Automatic retries have stopped - manual repair-now only">unrepairable</span>
+                    <div class="text-[11px] text-error/90 mt-1 break-words">${this.escape(reason)}</div>
+                </div>`;
+        }
+
+        if (f.repair_status === 'failed') {
+            const reason = f.par2_last_error || f.repair_status_reason || 'unknown error';
+            const retry = f.par2_next_retry_at ? this.formatRetryAt(f.par2_next_retry_at) : null;
+            return `
+                <div class="min-w-[10rem]">
+                    <span class="badge badge-warning badge-sm" title="Transient failure - will back off and retry automatically">failed, retrying</span>
+                    <div class="text-[11px] text-warning/90 mt-1 break-words">${this.escape(reason)}</div>
+                    ${retry ? `<div class="text-[10px] opacity-60 mt-0.5">next retry ${this.escape(retry)}</div>` : ''}
+                </div>`;
+        }
+
         const cls = {
             none: 'badge-ghost',
-            queued: 'badge-info',
-            running: 'badge-info',
             completed: 'badge-success',
-            failed: 'badge-error',
             unavailable: 'badge-ghost',
         }[f.repair_status] || 'badge-ghost';
         const label = (f.repair_status || 'none').replace(/_/g, ' ');
         return `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(f.repair_status_reason || '')}">${this.escape(label)}</span>`;
     }
 
+    formatRetryAt(iso) {
+        const t = new Date(iso);
+        if (Number.isNaN(t.getTime())) return null;
+        const deltaMs = t.getTime() - Date.now();
+        if (deltaMs <= 0) return 'shortly';
+        return `in ${this.formatDuration(deltaMs)}`;
+    }
+
+    overlayPhaseLabel(phase) {
+        const labels = {
+            queued: 'Queued',
+            fetching_recovery: 'Fetching recovery vols',
+            streaming_intact: 'Streaming intact slices',
+            solving: 'Solving',
+            writing: 'Writing',
+            completed: 'Completed',
+            failed: 'Failed',
+        };
+        return labels[phase] || (phase || 'Unknown');
+    }
+
+    // renderOverlayProgressBody renders the live-progress body for one job:
+    // phase, slices-read/total, recovery-vols fetched/needed, bytes (cache
+    // vs usenet split once either is nonzero), and elapsed time. p === null
+    // is the initial "waiting for progress" placeholder shown before the
+    // first poll response lands.
+    renderOverlayProgressBody(p) {
+        if (!p || p.status === 'no_job') {
+            return '<div class="text-[11px] opacity-60">waiting for progress…</div>';
+        }
+        const intactTotal = p.intact_slices_total || 0;
+        const intactRead = p.intact_slices_read || 0;
+        const volsNeeded = p.recovery_slices_needed || 0;
+        const volsFetched = p.recovery_slices_fetched || 0;
+        let pct = null;
+        if (intactTotal > 0) pct = Math.min(100, Math.round((intactRead / intactTotal) * 100));
+        else if (volsNeeded > 0) pct = Math.min(100, Math.round((volsFetched / volsNeeded) * 100));
+
+        const elapsed = p.started_at ? this.formatDuration(Date.now() - new Date(p.started_at).getTime()) : '-';
+        const totalBytes = (p.cache_bytes || 0) + (p.usenet_bytes || 0);
+        const splitLine = (p.cache_bytes || p.usenet_bytes)
+            ? `<div class="opacity-70">${this.formatBytes(totalBytes)} <span class="opacity-60">(${this.formatBytes(p.cache_bytes || 0)} cache / ${this.formatBytes(p.usenet_bytes || 0)} usenet)</span></div>`
+            : '';
+
+        return `
+            <div class="text-[11px] space-y-0.5">
+                <div class="flex items-center gap-1 flex-wrap">
+                    <span class="badge badge-info badge-xs">${this.escape(this.overlayPhaseLabel(p.phase))}</span>
+                    <span class="opacity-60">${elapsed} elapsed</span>
+                </div>
+                <progress class="progress progress-info w-28 h-1.5" ${pct === null ? '' : `value="${pct}"`} max="100"></progress>
+                ${intactTotal ? `<div class="opacity-70">slices ${intactRead}/${intactTotal}</div>` : ''}
+                ${volsNeeded ? `<div class="opacity-70">recovery vols ${volsFetched}/${volsNeeded}</div>` : ''}
+                ${splitLine}
+                ${p.last_error ? `<div class="text-error/90">${this.escape(p.last_error)}</div>` : ''}
+            </div>`;
+    }
+
+    // pollOverlayProgress polls /overlay/repair-progress for one running or
+    // queued file every 2s and patches its progress cell in place (no full
+    // table re-render, so selection/scroll state survives). "no_job" (the
+    // worker hasn't actually started this job in-process yet - e.g. still
+    // queued behind another) is NOT a stop condition, just an empty
+    // placeholder - only an explicit completed/failed phase stops the poll,
+    // followed by one full loadOverlayFiles() so the row picks up its final
+    // repair_status/disk figures. key is overlayKey(f) (identifies the
+    // timer); domId is the row's generated progress-cell id (identifies
+    // where to render - see renderOverlayFiles).
+    pollOverlayProgress(f, key, domId) {
+        if (this.overlayProgressTimers.has(key)) return;
+
+        const tick = async () => {
+            let p = null;
+            try {
+                p = await this.fetchJSON(`${this.api}/overlay/repair-progress?entry=${encodeURIComponent(f.entry)}&file=${encodeURIComponent(f.file)}`);
+            } catch (e) {
+                console.error('Failed to poll overlay repair progress', e);
+                return;
+            }
+            const cell = document.getElementById(domId);
+            if (cell) cell.innerHTML = this.renderOverlayProgressBody(p);
+
+            if (p && (p.phase === 'completed' || p.phase === 'failed')) {
+                clearInterval(this.overlayProgressTimers.get(key));
+                this.overlayProgressTimers.delete(key);
+                this.loadOverlayFiles();
+            }
+        };
+
+        tick();
+        const id = setInterval(tick, 2000);
+        this.overlayProgressTimers.set(key, id);
+    }
+
+    stopAllOverlayProgressPolling() {
+        for (const id of this.overlayProgressTimers.values()) clearInterval(id);
+        this.overlayProgressTimers.clear();
+    }
+
     renderOverlayFiles() {
         const tbody = document.getElementById('overlayFilesTableBody');
         const empty = document.getElementById('overlayFilesEmpty');
         if (!tbody) return;
+        // Every row is about to be torn down and rebuilt - drop any live
+        // progress pollers pointed at the old DOM nodes before they're gone.
+        this.stopAllOverlayProgressPolling();
         tbody.innerHTML = '';
 
         const files = this.overlayFiles || [];
@@ -956,8 +1134,13 @@ class RepairManager {
         }
         empty?.classList.add('hidden');
 
-        for (const f of files) {
+        for (let i = 0; i < files.length; i++) {
+            const f = files[i];
             const key = this.overlayKey(f);
+            // A generated, always-DOM-safe id for this row's progress cell -
+            // entry/file names can contain characters (spaces, brackets, ...)
+            // that are unsafe to embed directly in an id attribute.
+            const progressDomId = `overlayProgress-row-${i}`;
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td onclick="event.stopPropagation();">
@@ -979,10 +1162,10 @@ class RepairManager {
                     <div class="text-[10px] opacity-60 mt-1">${((f.damage_byte_ratio || 0) * 100).toFixed(2)}%</div>
                 </td>
                 <td>${this.overlayRepairableBadge(f)}</td>
-                <td>${this.overlayRepairStatusBadge(f)}</td>
+                <td>${this.renderOverlayRepairStatusCell(f, progressDomId)}</td>
                 <td class="text-right text-xs whitespace-nowrap">
-                    <div>${this.formatBytes(f.patch_bytes || 0)} patch</div>
-                    <div class="opacity-60">${this.formatBytes(f.par2_metadata_bytes || 0)} par2</div>
+                    <div title="Real bytes on disk: patch + retained PAR2 metadata">${this.formatBytes(f.overlay_disk_bytes || 0)}</div>
+                    <div class="opacity-50" title="Informational only - declared size PAR2 protects on Usenet, not a disk cost">protects ${this.formatBytes(f.protected_release_bytes || 0)}</div>
                 </td>
                 <td class="text-right whitespace-nowrap">
                     <button class="btn btn-xs btn-outline" data-action="repair-now" ${!f.repairable ? 'disabled' : ''}
@@ -1013,6 +1196,10 @@ class RepairManager {
             tr.querySelector('[data-action="verify"]')?.addEventListener('click', () => this.overlayVerify(f));
             tr.querySelector('[data-action="reclaim"]')?.addEventListener('click', () => this.overlayReclaim(f));
             tr.querySelector('[data-action="research"]')?.addEventListener('click', () => this.overlayResearch(f));
+
+            if (f.repair_status === 'running' || f.repair_status === 'queued') {
+                this.pollOverlayProgress(f, key, progressDomId);
+            }
         }
         this.updateOverlayBulkBar();
     }
