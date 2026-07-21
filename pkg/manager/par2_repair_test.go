@@ -131,7 +131,7 @@ func TestPostedFileFetcherReadRangeSingleSegment(t *testing.T) {
 		Name: "f", Size: 1000,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 1000}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
 
 	got, err := pf.ReadRange(100, 200)
 	if err != nil {
@@ -159,7 +159,7 @@ func TestPostedFileFetcherReadRangeCrossesSegments(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
 
 	got, err := pf.ReadRange(90, 20) // 10 bytes from seg1, 10 from seg2
 	if err != nil {
@@ -187,7 +187,7 @@ func TestPostedFileFetcherReadRangeZeroPadsPastEOF(t *testing.T) {
 		Name: "f", Size: 90,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
 
 	got, err := pf.ReadRange(0, 100) // slice size 100, file only has 90 real bytes
 	if err != nil {
@@ -217,7 +217,7 @@ func TestPostedFileFetcherCachesLastSegment(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
 
 	// Read from seg1 three times in a row - should only fetch it once.
 	for i := 0; i < 3; i++ {
@@ -393,8 +393,8 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 	src := &jobSliceSource{
 		idx: idx,
 		fetchers: map[[16]byte]*postedFileFetcher{
-			fileA: newPostedFileFetcher(context.Background(), fetcherA.fetch, fileARef),
-			fileB: newPostedFileFetcher(context.Background(), fetcherB.fetch, fileBRef),
+			fileA: newPostedFileFetcher(context.Background(), fetcherA.fetch, fileARef, nil),
+			fileB: newPostedFileFetcher(context.Background(), fetcherB.fetch, fileBRef, nil),
 		},
 	}
 

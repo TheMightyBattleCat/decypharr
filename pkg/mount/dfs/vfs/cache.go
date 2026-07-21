@@ -210,6 +210,24 @@ func (c *Cache) GetItem(entryName, filename string, fileSize int64) (*CacheItem,
 	return item, nil
 }
 
+// PeekItem returns the already-open cache item for (entryName, filename), if
+// one exists right now, WITHOUT creating one - unlike GetItem, this never
+// allocates a new backing cache file or registers a new map entry. ok=false
+// means there is no live cache item for this key (never opened this
+// process, evicted, or claimed for teardown) - the caller has no cache
+// source to read from and must fall back to fetching the bytes itself.
+// Intended for a read-only consumer (the PAR2 repair pass) that wants to
+// reuse whatever is already cached without ever triggering a download of
+// its own.
+func (c *Cache) PeekItem(entryName, filename string) (*CacheItem, bool) {
+	key := buildCacheKey(entryName, filename)
+	item, ok := c.items.Load(key)
+	if !ok || item.isClaimed() {
+		return nil, false
+	}
+	return item, true
+}
+
 func (c *Cache) scanDiskCandidates() diskScanResult {
 	var result diskScanResult
 	topEntries, err := os.ReadDir(c.config.CacheDir)
@@ -1294,6 +1312,24 @@ func (item *CacheItem) HasRange(r ranges.Range) bool {
 	item.metaMu.RLock()
 	defer item.metaMu.RUnlock()
 	return item.info.Rs.Present(r)
+}
+
+// ReadCachedRange fills p from [off, off+len(p)) directly from the local
+// buffer/disk WITHOUT ever triggering a download - unlike ReadAtContext,
+// which downloads whatever's missing first. Returns false (p left
+// unmodified) if any byte in the range isn't already fully present; the
+// caller must source those bytes some other way. Safe to call concurrently
+// with normal reads/writes on this item - it neither advances the read
+// head nor affects eviction.
+func (item *CacheItem) ReadCachedRange(p []byte, off int64) bool {
+	if item.buf == nil || len(p) == 0 {
+		return false
+	}
+	if !item.HasRange(ranges.Range{Pos: off, Size: int64(len(p))}) {
+		return false
+	}
+	n, err := item.buf.ReadAt(p, off)
+	return err == nil && n == len(p)
 }
 
 // FindMissing returns portion of r not yet downloaded

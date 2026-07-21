@@ -217,6 +217,21 @@ func (m *Manager) PurgeCache() map[string]any {
 	return m.cache.PurgeCache()
 }
 
+// PeekCachedRange reads [off, off+len(p)) of filename's cache item under
+// entryName directly from local disk, if already fully cached - see
+// Cache.PeekItem / CacheItem.ReadCachedRange. Never creates a cache item or
+// triggers a download; false means there is nothing to read from here.
+func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int64) bool {
+	if m.cache == nil {
+		return false
+	}
+	item, ok := m.cache.PeekItem(entryName, filename)
+	if !ok {
+		return false
+	}
+	return item.ReadCachedRange(p, off)
+}
+
 func buildFileKey(parent, name string) string {
 	if parent == "" {
 		return name

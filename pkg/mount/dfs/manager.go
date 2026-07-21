@@ -139,6 +139,18 @@ func (m *Manager) PurgeCache() (map[string]any, error) {
 	return m.vfs.PurgeCache(), nil
 }
 
+// PeekCachedRange reads [off, off+len(p)) of filename's cache item under
+// entryName directly from local disk, if already fully cached - see
+// vfs.Manager.PeekCachedRange. Never creates a cache item or triggers a
+// download; false means there is nothing to read from here (no VFS mount,
+// or the range isn't fully cached).
+func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int64) bool {
+	if m.vfs == nil {
+		return false
+	}
+	return m.vfs.PeekCachedRange(entryName, filename, p, off)
+}
+
 func (m *Manager) Type() string {
 	return "dfs"
 }
