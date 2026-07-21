@@ -253,6 +253,7 @@ func (m *Manager) init() {
 	m.par2Repair = NewPar2Repair(m, m.repair)
 	if m.usenet != nil {
 		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
+		m.usenet.SetOverlayFailedNotifier(m.notifyOverlayFileFailed)
 	}
 
 	// Initialize the unified active-download queue after all processors exist.
@@ -729,4 +730,23 @@ func (m *Manager) SubmitJob(job *Job) error {
 		return fmt.Errorf("active download queue not initialized")
 	}
 	return m.jobQueue.Submit(job)
+}
+
+// notifyOverlayFileFailed is the overlay store's failed-verdict callback
+// (see Usenet.SetOverlayFailedNotifier) - fired whenever a file's damage
+// freshly exceeds the padding caps (or it isn't a paddable container),
+// meaning it now needs a re-grab rather than continuing to play degraded.
+func (m *Manager) notifyOverlayFileFailed(nzoID, file string) {
+	if m.Notifications == nil {
+		return
+	}
+	entryName := nzoID
+	if entry, err := m.GetEntry(nzoID); err == nil && entry != nil {
+		entryName = entry.Name
+	}
+	m.Notifications.Notify(notifications.Event{
+		Type:    config.EventOverlayFileFailed,
+		Status:  "warning",
+		Message: fmt.Sprintf("%q needs re-grab: %q exceeded the playback-padding damage caps", entryName, file),
+	})
 }

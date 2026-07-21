@@ -21,6 +21,7 @@ package manager
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -29,10 +30,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
@@ -508,8 +511,23 @@ func (p *Par2Repair) runJob(nzbID string) {
 	}
 	p.logger.Info().Str("entry", entryName).Int("dead_segments", deadSegments).Msg("par2 repair queued")
 
-	if err := p.runRepair(ctx, nzbID, entryName, pending); err != nil {
-		p.logger.Info().Err(err).Str("entry", entryName).Msg("par2 repair unavailable")
+	var readBytes int64
+	var slicesRepaired int
+	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &slicesRepaired); err != nil {
+		canary := errors.Is(err, par2.ErrChecksumMismatch)
+		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Msg("par2 repair unavailable")
+		p.recordAttempt(&storage.Par2RepairAttempt{
+			ID:         uuid.NewString(),
+			EntryName:  entryName,
+			NzbID:      nzbID,
+			StartedAt:  start,
+			Duration:   time.Since(start),
+			Outcome:    storage.Par2RepairOutcomeFailed,
+			ReadBytes:  readBytes,
+			FailReason: err.Error(),
+			CRCCanary:  canary,
+		})
+		p.notifyFailed(entryName, err, canary)
 		p.fallbackToLegacy(entryName, pending)
 		return
 	}
@@ -519,13 +537,80 @@ func (p *Par2Repair) runJob(nzbID string) {
 		Int("segments_patched", deadSegments).
 		Dur("duration", time.Since(start)).
 		Msg("par2 repair completed")
+	p.recordAttempt(&storage.Par2RepairAttempt{
+		ID:              uuid.NewString(),
+		EntryName:       entryName,
+		NzbID:           nzbID,
+		StartedAt:       start,
+		Duration:        time.Since(start),
+		Outcome:         storage.Par2RepairOutcomeCompleted,
+		ReadBytes:       readBytes,
+		SlicesRepaired:  slicesRepaired,
+		SegmentsPatched: deadSegments,
+	})
+	p.notifyCompleted(entryName, deadSegments, time.Since(start))
+}
+
+// recordAttempt persists a to the compact PAR2 repair-attempt history the
+// overlay management API exposes (see storage.Par2RepairAttempt). Best
+// effort: a storage failure here must never affect the repair pass itself,
+// so it's only logged.
+func (p *Par2Repair) recordAttempt(a *storage.Par2RepairAttempt) {
+	if err := p.manager.storage.SavePar2RepairAttempt(a); err != nil {
+		p.logger.Warn().Err(err).Str("entry", a.EntryName).Msg("failed to persist par2 repair attempt")
+	}
+}
+
+// notifyCompleted and notifyFailed fire the PAR2-specific notification
+// events (see config.EventPar2RepairComplete/EventPar2RepairFailed) - a
+// no-op if notifications aren't configured/enabled for these events.
+func (p *Par2Repair) notifyCompleted(entryName string, segmentsPatched int, dur time.Duration) {
+	if p.manager.Notifications == nil {
+		return
+	}
+	p.manager.Notifications.Notify(notifications.Event{
+		Type:    config.EventPar2RepairComplete,
+		Status:  "success",
+		Message: fmt.Sprintf("PAR2 repair completed for %q: %d segment(s) patched in %s", entryName, segmentsPatched, dur.Round(time.Second)),
+	})
+}
+
+// notifyFailed reports a failed PAR2 pass, flagging whether it was the CRC
+// canary (par2.ErrChecksumMismatch) - the important failure mode, since it
+// means reconstructed or trusted-intact data provably didn't match its
+// recorded checksum, not merely that recovery data was unavailable.
+func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
+	if p.manager.Notifications == nil {
+		return
+	}
+	msg := fmt.Sprintf("PAR2 repair failed for %q: %v", entryName, err)
+	if crcCanary {
+		msg += " (CRC canary: reconstructed or trusted-intact data failed checksum verification)"
+	}
+	p.manager.Notifications.Notify(notifications.Event{
+		Type:    config.EventPar2RepairFailed,
+		Status:  "error",
+		Message: msg,
+		Error:   err,
+	})
 }
 
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment) error {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes *int64, slicesRepaired *int) error {
 	u := p.manager.usenet
+
+	// fetch wraps every article fetch this pass makes so runJob can report a
+	// real (not estimated) read_bytes total in the persisted attempt log -
+	// used in place of u.FetchArticle everywhere below.
+	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
+		data, err := u.FetchArticle(fctx, messageID)
+		if err == nil && readBytes != nil {
+			atomic.AddInt64(readBytes, int64(len(data)))
+		}
+		return data, err
+	}
 
 	nzb, err := u.GetNZB(nzbID)
 	if err != nil {
@@ -563,7 +648,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// attempt to skip individual articles within a volume file.
 	var sources []par2.Source
 	for _, f := range indexFiles {
-		data, err := fetchWholePar2File(ctx, u.FetchArticle, f)
+		data, err := fetchWholePar2File(ctx, fetch, f)
 		if err != nil {
 			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", f.Name).Msg("par2: index file fetch failed; relying on volume-embedded metadata")
 			continue
@@ -577,7 +662,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if fetchedSlices >= needed {
 			break
 		}
-		data, err := fetchWholePar2File(ctx, u.FetchArticle, v.ref)
+		data, err := fetchWholePar2File(ctx, fetch, v.ref)
 		if err != nil {
 			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
 			continue
@@ -604,7 +689,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Name:   f.Name,
 			Length: f.Size,
 			MD5_16k: func() ([16]byte, error) {
-				return computeMD5_16k(ctx, u.FetchArticle, f)
+				return computeMD5_16k(ctx, fetch, f)
 			},
 		}
 	}
@@ -620,7 +705,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(ctx, u.FetchArticle, file)
+		f := newPostedFileFetcher(ctx, fetch, file)
 		fetchers[m.FileID] = f
 		var off int64
 		for _, seg := range file.Segments {
@@ -690,6 +775,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	repaired, err := par2.Repair(idx, damaged, recovery, sliceSource)
 	if err != nil {
 		return fmt.Errorf("repair: %w", err)
+	}
+	if slicesRepaired != nil {
+		*slicesRepaired = len(repaired)
 	}
 
 	repairedByIndex := make(map[int64][]byte, len(repaired))
