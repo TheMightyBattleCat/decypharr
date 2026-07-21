@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -90,6 +91,14 @@ type Par2Repair struct {
 	mu     sync.Mutex
 	queued map[string]struct{}
 	queue  chan string
+	// deferred holds nzbIDs dequeued from queue but not yet run because the
+	// repair window was closed (see readyToRun) - loop's local pending slice
+	// mirrors this set so IsQueued can see them too.
+	deferred map[string]struct{}
+
+	// active holds the nzbID of the in-flight job, nil when idle. Read by
+	// IsRunning for the overlay management API's repair-status introspection.
+	active atomic.Pointer[string]
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -99,11 +108,12 @@ type Par2Repair struct {
 // NewPar2Repair builds the worker. Call Start to begin processing.
 func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 	return &Par2Repair{
-		manager: m,
-		repair:  repair,
-		logger:  logger.New("par2-repair"),
-		queued:  make(map[string]struct{}),
-		queue:   make(chan string, par2QueueDepth),
+		manager:  m,
+		repair:   repair,
+		logger:   logger.New("par2-repair"),
+		queued:   make(map[string]struct{}),
+		deferred: make(map[string]struct{}),
+		queue:    make(chan string, par2QueueDepth),
 	}
 }
 
@@ -120,6 +130,30 @@ func (p *Par2Repair) Stop() {
 		p.cancel()
 	}
 	p.wg.Wait()
+}
+
+// IsQueued reports whether nzbID currently has a PAR2 pass waiting to run
+// (queued or deferred by a closed repair window).
+func (p *Par2Repair) IsQueued(nzbID string) bool {
+	if p == nil || nzbID == "" {
+		return false
+	}
+	p.mu.Lock()
+	_, q := p.queued[nzbID]
+	_, d := p.deferred[nzbID]
+	p.mu.Unlock()
+	return q || d
+}
+
+// IsRunning reports whether nzbID's PAR2 pass is the one currently executing.
+func (p *Par2Repair) IsRunning(nzbID string) bool {
+	if p == nil || nzbID == "" {
+		return false
+	}
+	if id := p.active.Load(); id != nil {
+		return *id == nzbID
+	}
+	return false
 }
 
 // AutoEnqueue is the automatic-trigger entry point - called from the reader's
@@ -177,6 +211,56 @@ func (p *Par2Repair) Enqueue(nzbID string) {
 	}
 }
 
+// Availability reports whether nzbID's pending overlay damage looks
+// repairable via PAR2 WITHOUT fetching any article data: PAR2 metadata
+// (posted-file layout and retained recovery/index files) is present, and the
+// filename-derived recovery-slice count covers a conservative upper bound on
+// the damaged slices (one per pending dead segment - see
+// estimateNeededSlices). A true result is not a guarantee - the exact
+// damaged-slice count is only known once the index is parsed - but a false
+// result means a repair pass would certainly fail, so it's safe to use for a
+// GUI's "repairable" hint without running one.
+func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string) {
+	if p == nil || p.manager.usenet == nil {
+		return false, "usenet client not configured"
+	}
+	if !config.Get().Repair.Par2RepairEnabled() {
+		return false, "par2 repair disabled"
+	}
+	nzb, err := p.manager.usenet.GetNZB(nzbID)
+	if err != nil {
+		return false, "nzb record not found"
+	}
+	if len(nzb.Par2Source) == 0 {
+		return false, "no posted-file layout retained for this release"
+	}
+	if len(nzb.Par2Files) == 0 {
+		return false, "no par2 metadata retained for this release"
+	}
+
+	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		return false, "failed to read overlay state"
+	}
+	needed := estimateNeededSlices(pending)
+	if needed == 0 {
+		return false, "no damage pending repair"
+	}
+	if needed > par2.MaxRepairSlices {
+		return false, fmt.Sprintf("%d damaged segments exceeds the %d-slice repair cap", needed, par2.MaxRepairSlices)
+	}
+
+	vols, _ := censusPar2Volumes(nzb.Par2Files)
+	var available uint32
+	for _, v := range vols {
+		available += v.count
+	}
+	if available < needed {
+		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
+	}
+	return true, ""
+}
+
 func (p *Par2Repair) loop() {
 	defer p.wg.Done()
 
@@ -195,6 +279,9 @@ func (p *Par2Repair) loop() {
 			if p.readyToRun() {
 				p.runJob(nzbID)
 			} else {
+				p.mu.Lock()
+				p.deferred[nzbID] = struct{}{}
+				p.mu.Unlock()
 				pending = append(pending, nzbID)
 			}
 		case <-ticker.C:
@@ -203,6 +290,11 @@ func (p *Par2Repair) loop() {
 			}
 			todo := pending
 			pending = nil
+			p.mu.Lock()
+			for _, id := range todo {
+				delete(p.deferred, id)
+			}
+			p.mu.Unlock()
 			for _, id := range todo {
 				if p.ctx.Err() != nil {
 					return
@@ -226,6 +318,10 @@ func (p *Par2Repair) runJob(nzbID string) {
 	if p.manager.usenet == nil {
 		return
 	}
+
+	id := nzbID
+	p.active.Store(&id)
+	defer p.active.Store(nil)
 
 	entryName := nzbID
 	if entry, err := p.manager.GetEntry(nzbID); err == nil && entry != nil {

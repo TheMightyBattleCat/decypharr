@@ -66,6 +66,13 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/repair/health/{name}", s.handleGetEntryHealth)
 			r.Post("/repair/health/{name}/check", s.handleRecheckEntry)
 
+			// Overlay management (playback padding / PAR2 patch state)
+			r.Get("/overlay/files", s.handleListOverlayFiles)
+			r.Get("/overlay/disk-usage", s.handleOverlayDiskUsage)
+			r.Get("/overlay/repair-history", s.handleListPar2RepairHistory)
+			r.Get("/overlay/repair-history/{id}", s.handleGetPar2RepairHistoryEntry)
+			r.Delete("/overlay/repair-history", s.handleClearPar2RepairHistory)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

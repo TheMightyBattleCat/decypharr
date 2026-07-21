@@ -545,6 +545,97 @@ func (s *Store) PendingRepair(nzbID string) (map[string][]DeadSegment, error) {
 	return out, nil
 }
 
+// ListNZBIDs returns every nzbID with a directory under the store root (i.e.
+// any recorded overlay state - dead segments and/or patches), unsorted.
+// Empty (nil error) if the root doesn't exist yet (nothing has ever been
+// recorded). Used by the overlay management API to enumerate every entry
+// with overlay state without the caller needing to already know which
+// entries have any.
+func (s *Store) ListNZBIDs() ([]string, error) {
+	if s == nil {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("overlay: list entries: %w", err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// GetManifest returns nzbID's full manifest (every file's dead segments and
+// verdict) - an empty one, not an error, if nzbID has no overlay state yet.
+// A public, locked wrapper around loadManifestLocked for read-only
+// introspection callers (the overlay management API) that need more than
+// PendingRepair's already-narrowed view.
+func (s *Store) GetManifest(nzbID string) (*Manifest, error) {
+	if s == nil {
+		return &Manifest{Version: manifestVersion, Files: make(map[string]*FileEntry)}, nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.loadManifestLocked(nzbID)
+}
+
+// DiskUsage returns nzbID's real on-disk byte totals: patchBytes sums every
+// patch_*.bin blob (PAR2-repaired segment data written by WritePatch), and
+// manifestBytes is the manifest.json file's own size. Both are 0 (nil error)
+// if nzbID has no overlay directory on disk.
+func (s *Store) DiskUsage(nzbID string) (patchBytes, manifestBytes int64, err error) {
+	if s == nil {
+		return 0, 0, nil
+	}
+	entries, err := os.ReadDir(s.entryDir(nzbID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("overlay: disk usage: %w", err)
+	}
+	for _, e := range entries {
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		switch {
+		case e.Name() == manifestFileName:
+			manifestBytes = info.Size()
+		case strings.HasPrefix(e.Name(), "patch_"):
+			patchBytes += info.Size()
+		}
+	}
+	return patchBytes, manifestBytes, nil
+}
+
+// FilePatchBytes returns the real on-disk size of every patch blob written
+// for file's patched segments, given its FileEntry (as returned by
+// GetManifest). Missing blobs (already reclaimed, or never flushed) are
+// skipped rather than erroring.
+func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
+	if s == nil || fe == nil {
+		return 0
+	}
+	var total int64
+	for _, d := range fe.DeadSegments {
+		if d.Status != StatusPatched {
+			continue
+		}
+		if info, err := os.Stat(s.patchPath(nzbID, file, d.Index)); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
 // DeleteEntry removes nzbID's entire overlay directory (manifest + every
 // patch blob). Called wherever a stored NZB record is torn down - keyed by
 // nzbID (unique), avoiding the name-twin hazard the DFS cache has.
