@@ -534,12 +534,15 @@ func (p *Par2Repair) runJob(nzbID string) {
 	}
 	p.logger.Info().Str("entry", entryName).Int("dead_segments", deadSegments).Msg("par2 repair queued")
 
-	var readBytes int64
+	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
+	var cacheBytes int64 // bytes sourced from the local DFS cache instead
 	var slicesRepaired int
-	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &slicesRepaired); err != nil {
+	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired); err != nil {
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := classifyPar2Failure(err)
-		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Bool("terminal", class.terminal).Msg("par2 repair unavailable")
+		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Bool("terminal", class.terminal).
+			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
+			Msg("par2 repair unavailable")
 		p.recordAttempt(&storage.Par2RepairAttempt{
 			ID:         uuid.NewString(),
 			EntryName:  entryName,
@@ -569,6 +572,8 @@ func (p *Par2Repair) runJob(nzbID string) {
 		Str("entry", entryName).
 		Int("segments_patched", deadSegments).
 		Dur("duration", time.Since(start)).
+		Int64("cache_bytes", cacheBytes).
+		Int64("usenet_bytes", readBytes).
 		Msg("par2 repair completed")
 	p.recordAttempt(&storage.Par2RepairAttempt{
 		ID:              uuid.NewString(),
@@ -632,7 +637,7 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes *int64, slicesRepaired *int) error {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int) error {
 	u := p.manager.usenet
 
 	// fetch wraps every article fetch this pass makes so runJob can report a
@@ -661,6 +666,27 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
 			return fmt.Errorf("no PAR2 data available")
 		}
+	}
+
+	// Source intact slices from the local DFS cache where already present,
+	// instead of always re-fetching them over NNTP: cacheSource is tried
+	// first for every posted-file byte range the streaming pass needs (see
+	// postedFileFetcher.ReadRange), falling straight through to fetch on any
+	// miss (no mount, no mapping for this article, the range overlaps a
+	// dead/padded segment, or it simply isn't cached right now). Nil-safe by
+	// construction: a failed type assertion (rclone mode, no mount, mount
+	// not ready) just means every ReadRange call behaves exactly as it did
+	// before cache-sourcing existed.
+	var cacheReader dfsCacheRangeReader
+	if mgr := p.manager.MountManager(); mgr != nil {
+		cacheReader, _ = mgr.(dfsCacheRangeReader)
+	}
+	cacheSource := &cacheSlicedSource{
+		reader:      cacheReader,
+		entryName:   entryName,
+		byMessageID: buildCacheSegmentMap(nzb),
+		deadRanges:  buildDeadOutputRanges(nzb, pending),
+		cacheBytes:  cacheBytes,
 	}
 
 	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
@@ -739,7 +765,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(ctx, fetch, file)
+		f := newPostedFileFetcher(ctx, fetch, file, cacheSource)
 		fetchers[m.FileID] = f
 		var off int64
 		for _, seg := range file.Segments {
@@ -931,7 +957,7 @@ func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.P
 // hash its first 16KB (or the whole file, if shorter) - MatchFiles only
 // calls this for a file whose length ties with another candidate.
 func computeMD5_16k(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
-	fetcher := newPostedFileFetcher(ctx, fetch, f)
+	fetcher := newPostedFileFetcher(ctx, fetch, f, nil)
 	n := int64(md5_16kSize)
 	if f.Size < n {
 		n = f.Size
@@ -959,18 +985,23 @@ type postedFileFetcher struct {
 	segs   []storage.Par2SegmentRef
 	base   []int64 // base[i] = starting byte offset of segs[i] within the file
 
+	// cacheSource, when non-nil, is tried before every Usenet fetch below -
+	// see cacheSlicedSource.readCached. Misses (no mapping, dead range, not
+	// cached) fall straight through to the existing fetch path unchanged.
+	cacheSource *cacheSlicedSource
+
 	cacheIdx  int
 	cacheData []byte
 }
 
-func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) *postedFileFetcher {
+func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource) *postedFileFetcher {
 	base := make([]int64, len(f.Segments))
 	var off int64
 	for i, s := range f.Segments {
 		base[i] = off
 		off += s.Bytes
 	}
-	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: f.Size, segs: f.Segments, base: base, cacheIdx: -1}
+	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: f.Size, segs: f.Segments, base: base, cacheSource: cacheSource, cacheIdx: -1}
 }
 
 func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
@@ -1018,21 +1049,40 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		data, err := f.segmentData(segIdx)
-		if err != nil {
-			return nil, fmt.Errorf("fetch segment %d: %w", segIdx, err)
-		}
 		withinSeg := pos - f.base[segIdx]
-		avail := int64(len(data)) - withinSeg
-		if avail <= 0 {
-			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
-		}
 		// Never copy past the file's real length, even mid-segment: a
 		// segment's decoded size can legitimately exceed what's left of the
 		// file (the final segment of a file whose length isn't a multiple of
 		// its segment size) - anything beyond f.length must stay the
-		// zero-padding out sets it to, not real bytes from past EOF.
-		n := min(avail, length-written, f.length-pos)
+		// zero-padding out sets it to, not real bytes from past EOF. Sized
+		// off the DECLARED segment length here (Par2SegmentRef.Bytes) so the
+		// cache-vs-fetch decision below can be made before ever fetching
+		// anything; the fetch path re-derives the same bound off the actual
+		// fetched length, exactly as before this cache-sourcing existed.
+		declaredAvail := f.segs[segIdx].Bytes - withinSeg
+		if declaredAvail <= 0 {
+			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
+		}
+		n := min(declaredAvail, length-written, f.length-pos)
+
+		if f.cacheSource != nil {
+			if cached, ok := f.cacheSource.readCached(f.segs[segIdx].MessageID, withinSeg, n); ok {
+				copy(out[written:written+n], cached)
+				written += n
+				pos += n
+				continue
+			}
+		}
+
+		data, err := f.segmentData(segIdx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch segment %d: %w", segIdx, err)
+		}
+		avail := int64(len(data)) - withinSeg
+		if avail <= 0 {
+			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
+		}
+		n = min(avail, length-written, f.length-pos)
 		copy(out[written:written+n], data[withinSeg:withinSeg+n])
 		written += n
 		pos += n
