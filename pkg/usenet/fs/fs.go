@@ -25,6 +25,11 @@ type PrefetchableReaderAt interface {
 	ReadAtContext(ctx context.Context, p []byte, off int64) (int, error)
 	// Prefetch triggers segment downloads for the given byte range without blocking.
 	Prefetch(ct context.Context, off, length int64)
+	// FetchRange aggressively, synchronously fetches every segment covering
+	// [off, off+length) at up to concurrency parallel fetches - a deliberate
+	// read-ahead burst, distinct from Prefetch's normal steady-state window.
+	// See reader.StreamingReader.FetchRange.
+	FetchRange(ctx context.Context, off, length int64, concurrency int) error
 }
 
 // FS implements fs.FS for RAR volumes backed by NNTP Segments

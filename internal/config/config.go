@@ -444,6 +444,10 @@ type Config struct {
 
 	Repair RepairConfig `json:"repair,omitzero"`
 
+	// Precache is proactive pre-caching/repair ahead of playback - see
+	// PrecacheConfig.
+	Precache PrecacheConfig `json:"precache,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }
@@ -824,6 +828,20 @@ func (c *Config) setDefaults() {
 	}
 
 	c.applyRepairDefaults()
+	c.applyPrecacheDefaults()
+}
+
+func (c *Config) applyPrecacheDefaults() {
+	if c.Precache.PrecacheReadAheadEnabled == nil {
+		v := true
+		c.Precache.PrecacheReadAheadEnabled = &v
+	}
+	if c.Precache.PrecacheThresholdPercent <= 0 {
+		c.Precache.PrecacheThresholdPercent = 10
+	}
+	if c.Precache.PrecacheReadAheadConcurrency <= 0 {
+		c.Precache.PrecacheReadAheadConcurrency = 12
+	}
 }
 
 func (c *Config) applyRepairDefaults() {
@@ -955,6 +973,7 @@ func clearHotFields(c *Config) {
 	c.Retries = 0
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
+	c.Precache = PrecacheConfig{}
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.

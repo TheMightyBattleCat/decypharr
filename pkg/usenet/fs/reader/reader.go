@@ -388,6 +388,89 @@ func (sr *StreamingReader) computeIVForOffset(ctx context.Context, offset int64)
 	return iv, nil
 }
 
+// FetchRange aggressively fetches every segment covering [off, off+length)
+// into the cache using up to concurrency parallel fetch goroutines - distinct
+// from (and typically much higher than) the reader's normal steady-state
+// prefetch pool sized by Config.MaxConnections. Intended for a deliberate
+// read-ahead burst (see pkg/manager.Precache), not the per-read sliding
+// prefetch window Prefetch/readAtPlain drive during ordinary streaming.
+//
+// Blocks until every segment in range has been attempted. An individual
+// segment's permanent failure (including a confirmed-missing article the
+// overlay padded, or recorded for later PAR2 repair - see
+// SegmentFetcher.handleConfirmedMissing) does not abort the rest of the
+// range; only ctx cancellation does, and is returned once every already-
+// in-flight fetch drains.
+func (sr *StreamingReader) FetchRange(ctx context.Context, off, length int64, concurrency int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sr.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off >= sr.totalSize || length <= 0 {
+		return nil
+	}
+	if off+length > sr.totalSize {
+		length = sr.totalSize - off
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	startSeg, endSeg := sr.cache.SegmentsForRange(off, length)
+
+	segCh := make(chan int)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for segIdx := range segCh {
+				err := sr.fetcher.Fetch(ctx, segIdx)
+				if err == nil {
+					continue
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = ctxErr
+					}
+					errMu.Unlock()
+				}
+				// Any other error (including permanent article-not-found)
+				// has already been recorded/padded by the normal fetch path
+				// where applicable; read-ahead keeps going for the rest of
+				// the range rather than aborting on one bad segment.
+			}
+		}()
+	}
+
+sendLoop:
+	for segIdx := startSeg; segIdx <= endSeg; segIdx++ {
+		select {
+		case segCh <- segIdx:
+		case <-ctx.Done():
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			errMu.Unlock()
+			break sendLoop
+		}
+	}
+	close(segCh)
+	wg.Wait()
+
+	return firstErr
+}
+
 // Prefetch triggers segment downloads for the given byte range without blocking.
 func (sr *StreamingReader) Prefetch(ctx context.Context, off, length int64) {
 	if sr.closed.Load() {

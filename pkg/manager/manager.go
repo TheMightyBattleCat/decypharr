@@ -36,6 +36,7 @@ type Manager struct {
 	migrator     *Migrator
 	repair       *Repair
 	par2Repair   *Par2Repair
+	precache     *Precache
 	clients      *xsync.Map[string, debrid.Client]
 	arr          *arr.Storage
 	logger       zerolog.Logger
@@ -255,6 +256,10 @@ func (m *Manager) init() {
 		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
 		m.usenet.SetOverlayFailedNotifier(m.notifyOverlayFileFailed)
 	}
+
+	// Initialize the read-ahead precache service (see precache.go). Depends
+	// on par2Repair/usenet already being set above.
+	m.precache = NewPrecache(m)
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
