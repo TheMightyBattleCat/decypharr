@@ -1229,6 +1229,16 @@ func (u *Usenet) GetNZB(id string) (*storage.NZB, error) {
 	return u.nzbStorage.GetNZB(id)
 }
 
+// ProcessingMaxConnections returns the configured connection/concurrency
+// bound for parsing and NZB-processing work (Download's fetch pool sizes
+// off this same value) - exposed so other packages that build their own
+// bounded concurrent fetch pool (e.g. the PAR2 repair worker's intact-slice
+// reader) use the identical, single-source-of-truth limit rather than a
+// second hardcoded or duplicated one.
+func (u *Usenet) ProcessingMaxConnections() int {
+	return u.processingMaxConnections
+}
+
 // GetNZBHeader returns NZB metadata without its segment map. Use this when only
 // scalar fields or the file list are needed (status, path, sizes); it avoids
 // decoding/allocating the multi-megabyte segment data.

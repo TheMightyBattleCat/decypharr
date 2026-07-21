@@ -831,7 +831,34 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
-	sliceSource := &jobSliceSource{idx: idx, fetchers: fetchers}
+	// intactOrder lists every slice par2.Repair's own streaming loop will
+	// call ReadSlice for, in the exact ascending order it calls them
+	// (idx.NumSlices() total, minus damaged) - the concurrent fetch pool
+	// below processes this same set in parallel, so ReadSlice never blocks
+	// on more than its own per-segment timeout once a result is actually
+	// needed.
+	damagedPos := make(map[int64]struct{}, len(damaged))
+	for _, d := range damaged {
+		damagedPos[d] = struct{}{}
+	}
+	intactOrder := make([]int64, 0, idx.NumSlices()-int64(len(damaged)))
+	for s := int64(0); s < idx.NumSlices(); s++ {
+		if _, isDamaged := damagedPos[s]; isDamaged {
+			continue
+		}
+		intactOrder = append(intactOrder, s)
+	}
+
+	// Fetch intact slices through the same bounded, concurrent pool model
+	// Download uses (pool.New().WithMaxGoroutines(ProcessingMaxConnections)),
+	// instead of one strictly-sequential fetch at a time: a release with
+	// thousands of segments previously meant thousands of sequential
+	// up-to-60s fetch attempts, whose cumulative worst case could exceed the
+	// whole job's deadline even with no single connection ever "stuck"
+	// forever - concurrency divides that cumulative latency by the
+	// connection limit instead.
+	jobSource := &jobSliceSource{idx: idx, fetchers: fetchers}
+	sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), jobSource.ReadSlice)
 	repaired, err := par2.Repair(idx, damaged, recovery, sliceSource)
 	if err != nil {
 		return fmt.Errorf("repair: %w", err)
@@ -990,6 +1017,17 @@ type postedFileFetcher struct {
 	// cached) fall straight through to the existing fetch path unchanged.
 	cacheSource *cacheSlicedSource
 
+	// cacheMu guards cacheIdx/cacheData - the concurrent intact-slice reader
+	// (concurrentSliceSource) can call ReadRange for different slices of the
+	// SAME posted file from multiple goroutines at once. The lock only ever
+	// wraps the cheap check/store of this single-entry cache, never the
+	// actual network fetch, so concurrent requests for DIFFERENT segments
+	// still proceed in parallel - they just both (correctly) miss this
+	// one-entry cache and fetch independently, exactly as if it weren't
+	// there. Sequential callers (computeMD5_16k, and this fetcher before
+	// concurrency existed) see identical behavior to before: an uncontended
+	// mutex is effectively free.
+	cacheMu   sync.Mutex
 	cacheIdx  int
 	cacheData []byte
 }
@@ -1021,17 +1059,30 @@ func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
 }
 
 func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
+	f.cacheMu.Lock()
 	if f.cacheIdx == idx {
-		return f.cacheData, nil
+		data := f.cacheData
+		f.cacheMu.Unlock()
+		return data, nil
 	}
+	f.cacheMu.Unlock()
+
+	// Per-segment timeout, independent of how many OTHER segments are being
+	// fetched concurrently right now: a single dead/stuck connection fails
+	// this one fetch in par2ArticleFetchTimeout, not the whole job's
+	// deadline. f.ctx (the job's own context, via par2JobTimeout) remains
+	// the backstop if it's already closer than that.
 	fetchCtx, cancel := context.WithTimeout(f.ctx, par2ArticleFetchTimeout)
 	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID)
 	cancel()
 	if err != nil {
 		return nil, err
 	}
+
+	f.cacheMu.Lock()
 	f.cacheIdx = idx
 	f.cacheData = data
+	f.cacheMu.Unlock()
 	return data, nil
 }
 
