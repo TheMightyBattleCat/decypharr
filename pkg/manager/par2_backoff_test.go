@@ -73,3 +73,10 @@ func TestClassifyPar2FailureUnknownDefaultsTransient(t *testing.T) {
 		t.Errorf("classifyPar2Failure(unrecognized error).terminal = true, want false (default to transient)")
 	}
 }
+
+func TestClassifyPar2FailureMoreDamageThanRecordedIsTerminal(t *testing.T) {
+	err := fmt.Errorf("more damage than recorded; 12 slices unrecoverable (recovery cap 64, 8 slices retained)")
+	if class := classifyPar2Failure(err); !class.terminal {
+		t.Errorf("classifyPar2Failure(more damage than recorded).terminal = false, want true")
+	}
+}
