@@ -122,10 +122,39 @@ func (p *Par2Repair) Stop() {
 	p.wg.Wait()
 }
 
+// AutoEnqueue is the automatic-trigger entry point - called from the reader's
+// padding path (via overlay.Store's repair-enqueue callback) and the repair
+// sweep, never from an explicit GUI action (see Enqueue for that). Gated by
+// config.Repair.Par2RepairMode:
+//   - Par2RepairModeManual: never queues, so the caller's damage stays
+//     exactly as PAR2-repair-disabled behavior left it (padded, or handed to
+//     the legacy re-grab path by the caller itself).
+//   - Par2RepairModeAutoThreshold: only queues once deadSegments reaches
+//     Par2RepairMinSegments; smaller damage is left padded rather than
+//     spending provider bandwidth on a PAR2 pass.
+//   - Par2RepairModeAutoAll (default): always queues, same as this feature's
+//     original (non-configurable) behavior.
+func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
+	if p == nil || nzbID == "" {
+		return
+	}
+	cfg := config.Get().Repair
+	switch cfg.Par2RepairMode {
+	case config.Par2RepairModeManual:
+		return
+	case config.Par2RepairModeAutoThreshold:
+		if deadSegments < cfg.Par2RepairMinSegments {
+			return
+		}
+	}
+	p.Enqueue(nzbID)
+}
+
 // Enqueue schedules nzbID for a PAR2 repair pass. Deduped: a burst of padded
 // segments across one playback session collapses to a single pass. Safe to
-// call from any goroutine (this is exactly what overlay.Handle.EnqueueRepair
-// does, from inside the reader's fetch path).
+// call from any goroutine. Unlike AutoEnqueue, this is never gated by
+// Par2RepairMode - it is the explicit-trigger primitive used by both
+// AutoEnqueue and the GUI's manual "repair now" action.
 func (p *Par2Repair) Enqueue(nzbID string) {
 	if p == nil || nzbID == "" {
 		return

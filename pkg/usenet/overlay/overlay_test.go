@@ -76,8 +76,9 @@ func TestDecideFailsBeyondRunCap(t *testing.T) {
 	const nzbID, file = "nzb-1", "movie.mkv"
 	const fileSize = int64(1_000_000_000)
 
-	// maxPadRunSegments consecutive dead segments should still pad...
-	for i := 0; i < maxPadRunSegments; i++ {
+	// DefaultPolicy().MaxRunSegments consecutive dead segments should still pad...
+	maxRun := DefaultPolicy().MaxRunSegments
+	for i := 0; i < maxRun; i++ {
 		decision, _ := s.Decide(nzbID, file, i, "<msg>", 1000, fileSize)
 		if decision != DecisionPad {
 			t.Fatalf("segment %d: Decide = %v, want DecisionPad", i, decision)
@@ -85,7 +86,7 @@ func TestDecideFailsBeyondRunCap(t *testing.T) {
 	}
 
 	// ...but one more, extending the same contiguous run, should fail.
-	decision, verdict := s.Decide(nzbID, file, maxPadRunSegments, "<msg>", 1000, fileSize)
+	decision, verdict := s.Decide(nzbID, file, maxRun, "<msg>", 1000, fileSize)
 	if decision != DecisionFail {
 		t.Fatalf("Decide = %v, want DecisionFail once the run exceeds the cap", decision)
 	}

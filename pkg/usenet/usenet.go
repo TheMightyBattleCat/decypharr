@@ -306,6 +306,9 @@ func New() (*Usenet, error) {
 		_logger.Warn().Err(err).Msg("Failed to initialize playback-padding overlay store; padding and PAR2 repair are disabled for this run")
 		overlayStore = nil
 	}
+	if overlayStore != nil {
+		overlayStore.SetPolicy(overlayPolicyFromConfig(cfg.Repair))
+	}
 
 	u := &Usenet{
 		nzbStorage:               nzbStorage,
@@ -663,11 +666,44 @@ func (u *Usenet) OverlayWritePatch(nzoID, filename string, segIndex int, data []
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.
-func (u *Usenet) SetOverlayRepairEnqueuer(fn func(nzbID string)) {
+func (u *Usenet) SetOverlayRepairEnqueuer(fn func(nzbID string, deadSegments int)) {
 	if u.overlay == nil {
 		return
 	}
 	u.overlay.SetRepairEnqueuer(fn)
+}
+
+// SetOverlayFailedNotifier installs the callback invoked whenever a file's
+// overlay verdict freshly transitions to failed (needs re-grab), so the
+// manager-level notifications service can be told without the overlay
+// package needing to know it exists.
+func (u *Usenet) SetOverlayFailedNotifier(fn func(nzoID, file string)) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetFailedNotifier(fn)
+}
+
+// overlayPolicyFromConfig derives the overlay padding-cap Policy from repair
+// config - already clamped by config's load/save path (see
+// RepairConfig.PadMaxRunSegments and friends), so this is a plain field copy.
+func overlayPolicyFromConfig(repair config.RepairConfig) overlay.Policy {
+	return overlay.Policy{
+		MaxRunSegments:   repair.PadMaxRunSegments,
+		MaxTotalSegments: repair.PadMaxTotalSegments,
+		MaxByteRatio:     repair.PadMaxByteRatio,
+	}
+}
+
+// ApplyOverlayPolicy re-reads the padding caps from the live config and
+// installs them on the overlay store. Called after the repair config is
+// updated live (see Repair.ApplyConfig) so a saved change applies without a
+// restart.
+func (u *Usenet) ApplyOverlayPolicy() {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetPolicy(overlayPolicyFromConfig(config.Get().Repair))
 }
 
 // FetchArticle downloads and yEnc-decodes a single NNTP article, returning

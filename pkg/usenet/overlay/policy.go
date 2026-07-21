@@ -2,25 +2,48 @@ package overlay
 
 import "sort"
 
-// Padding policy caps. These are intentionally hardcoded, not configurable:
-// the feature's safety property (never let padding turn "a few glitches"
-// into "unwatchable garbage") depends on a strict, unsurprising ceiling.
-const (
-	// maxPadRunSegments is the longest run of consecutive confirmed-dead
+// Policy holds the padding caps that bound how much damage a file may
+// accumulate before it's failed outright instead of padded. The safety
+// property (never let padding turn "a few glitches" into "unwatchable
+// garbage") depends on these staying strict - see internal/config's
+// RepairConfig.PadMaxRunSegments/PadMaxTotalSegments/PadMaxByteRatio for the
+// configurable, clamped source of these values. The Store holds one Policy,
+// set (and refreshed on config changes) by its owner - see Store.SetPolicy -
+// so Decide, on the reader hot path, never re-derives or re-clamps it itself.
+type Policy struct {
+	// MaxRunSegments is the longest run of consecutive confirmed-dead
 	// segments (by segment index) still eligible for padding. A longer
 	// contiguous run means a large enough hole that zero-filling it would
 	// produce a long freeze/glitch rather than a brief one - fail instead.
-	maxPadRunSegments = 4
+	MaxRunSegments int
 
-	// maxPadTotalSegments is the most dead (non-patched) segments a single
+	// MaxTotalSegments is the most dead (non-patched) segments a single
 	// file may accumulate before it's failed outright, regardless of how
 	// they're distributed.
-	maxPadTotalSegments = 64
+	MaxTotalSegments int
 
-	// maxPadByteRatio is the maximum fraction of a file's total size that may
+	// MaxByteRatio is the maximum fraction of a file's total size that may
 	// be padded (zero-filled) before it's failed outright.
-	maxPadByteRatio = 0.02
+	MaxByteRatio float64
+}
+
+// Built-in padding caps, used whenever a Store has no explicit Policy set
+// (e.g. tests that construct a Store directly) - identical to this
+// feature's original, pre-configurable values.
+const (
+	defaultRunSegments   = 4
+	defaultTotalSegments = 64
+	defaultByteRatio     = 0.02
 )
+
+// DefaultPolicy returns the built-in padding caps.
+func DefaultPolicy() Policy {
+	return Policy{
+		MaxRunSegments:   defaultRunSegments,
+		MaxTotalSegments: defaultTotalSegments,
+		MaxByteRatio:     defaultByteRatio,
+	}
+}
 
 // recomputeVerdictLocked derives fe.Verdict from its current DeadSegments set
 // (excluding patched ones, which no longer count as damage) without
@@ -98,12 +121,18 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	if !IsVideoContainer(file) {
 		fe.Verdict = VerdictFailed
 		_ = s.saveManifestLocked(nzbID, m)
+		s.notifyFailed(nzbID, file)
 		return DecisionFail, VerdictFailed
 	}
 
-	if !withinPadCaps(fe, fileSize) {
+	// Read the caps once - already clamped by whoever set the policy (see
+	// Store.SetPolicy) - and reuse them for every check below rather than
+	// re-deriving or re-clamping anything on this hot path.
+	policy := s.Policy()
+	if !withinPadCaps(fe, fileSize, policy) {
 		fe.Verdict = VerdictFailed
 		_ = s.saveManifestLocked(nzbID, m)
+		s.notifyFailed(nzbID, file)
 		return DecisionFail, VerdictFailed
 	}
 
@@ -122,7 +151,7 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 // segments. Patched segments are excluded throughout: PAR2 repair having
 // already recovered a segment's true bytes means it no longer counts as
 // damage against the file's remaining pad budget.
-func withinPadCaps(fe *FileEntry, fileSize int64) bool {
+func withinPadCaps(fe *FileEntry, fileSize int64, policy Policy) bool {
 	var (
 		total    int
 		padBytes int64
@@ -137,10 +166,10 @@ func withinPadCaps(fe *FileEntry, fileSize int64) bool {
 		indices = append(indices, d.Index)
 	}
 
-	if total > maxPadTotalSegments {
+	if total > policy.MaxTotalSegments {
 		return false
 	}
-	if fileSize > 0 && float64(padBytes) > float64(fileSize)*maxPadByteRatio {
+	if fileSize > 0 && float64(padBytes) > float64(fileSize)*policy.MaxByteRatio {
 		return false
 	}
 
@@ -156,7 +185,7 @@ func withinPadCaps(fe *FileEntry, fileSize int64) bool {
 			best = run
 		}
 	}
-	if len(indices) > 0 && best > maxPadRunSegments {
+	if len(indices) > 0 && best > policy.MaxRunSegments {
 		return false
 	}
 	return true
