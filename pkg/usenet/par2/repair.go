@@ -2,8 +2,19 @@ package par2
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
+
+// ErrChecksumMismatch wraps every error Repair returns because a slice - an
+// intact one that failed its own IFSC check past maxIntactChecksumMismatches,
+// or a reconstructed one that failed IFSC verification before being returned
+// - didn't match its recorded MD5+CRC32. Callers can match it with
+// errors.Is to distinguish this from an ordinary "not enough data" failure:
+// it means the repair pass produced (or trusted) bytes it could prove were
+// wrong, not merely that recovery data was unavailable - the important
+// failure mode to surface distinctly (a "CRC canary").
+var ErrChecksumMismatch = errors.New("par2: checksum verification failed")
 
 // MaxRepairSlices is the exported form of maxRepairSlices, for callers that
 // want to fail before fetching any recovery data when they already know a
@@ -139,7 +150,7 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 		if !ok {
 			mismatches++
 			if mismatches > maxIntactChecksumMismatches {
-				return nil, fmt.Errorf("par2: %d intact slices failed their own IFSC checksum - aborting rather than risk a fabricated repair from a drifted offset mapping", mismatches)
+				return nil, fmt.Errorf("%w: %d intact slices failed their own IFSC checksum - aborting rather than risk a fabricated repair from a drifted offset mapping", ErrChecksumMismatch, mismatches)
 			}
 		}
 
@@ -197,7 +208,7 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 			return nil, fmt.Errorf("par2: verify reconstructed slice %d: %w", out[i].Index, err)
 		}
 		if !ok {
-			return nil, fmt.Errorf("par2: reconstructed slice %d failed IFSC verification", out[i].Index)
+			return nil, fmt.Errorf("%w: reconstructed slice %d failed IFSC verification", ErrChecksumMismatch, out[i].Index)
 		}
 	}
 	return out, nil
