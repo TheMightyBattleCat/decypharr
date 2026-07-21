@@ -196,6 +196,9 @@ func (p *Par2Repair) Enqueue(nzbID string) {
 	if p == nil || nzbID == "" {
 		return
 	}
+	if !p.par2ShouldAutoEnqueue(nzbID) {
+		return
+	}
 	p.mu.Lock()
 	if _, dup := p.queued[nzbID]; dup {
 		p.mu.Unlock()
@@ -493,10 +496,30 @@ func (p *Par2Repair) runJob(nzbID string) {
 	p.active.Store(&id)
 	defer p.active.Store(nil)
 
-	entryName := nzbID
-	if entry, err := p.manager.GetEntry(nzbID); err == nil && entry != nil {
-		entryName = entry.Name
+	entry, entryErr := p.manager.GetEntry(nzbID)
+	if entryErr != nil || entry == nil {
+		// A ghost overlay record - the backing entry is already gone
+		// (deleted, superseded, re-grabbed under a different nzbID). There
+		// is nothing to repair on behalf of and nothing to fall back to
+		// legacy repair for either; mark it terminal so the automatic path
+		// stops re-enqueuing it (Commit A/B's cleanup hooks should reap the
+		// overlay record itself shortly, but a race is not a reason to keep
+		// hammering it in the meantime).
+		terminalErr := fmt.Errorf("entry no longer exists")
+		p.logger.Info().Str("entry", nzbID).Msg("par2 repair: entry no longer exists; marking unrepairable")
+		p.recordAttempt(&storage.Par2RepairAttempt{
+			ID:         uuid.NewString(),
+			EntryName:  nzbID,
+			NzbID:      nzbID,
+			StartedAt:  start,
+			Duration:   time.Since(start),
+			Outcome:    storage.Par2RepairOutcomeUnavailable,
+			FailReason: terminalErr.Error(),
+		})
+		p.recordPar2Outcome(nzbID, terminalErr)
+		return
 	}
+	entryName := entry.Name
 
 	ctx, cancel := context.WithTimeout(p.ctx, par2JobTimeout)
 	defer cancel()
@@ -515,7 +538,8 @@ func (p *Par2Repair) runJob(nzbID string) {
 	var slicesRepaired int
 	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &slicesRepaired); err != nil {
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
-		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Msg("par2 repair unavailable")
+		class := classifyPar2Failure(err)
+		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Bool("terminal", class.terminal).Msg("par2 repair unavailable")
 		p.recordAttempt(&storage.Par2RepairAttempt{
 			ID:         uuid.NewString(),
 			EntryName:  entryName,
@@ -527,8 +551,17 @@ func (p *Par2Repair) runJob(nzbID string) {
 			FailReason: err.Error(),
 			CRCCanary:  canary,
 		})
+		p.recordPar2Outcome(nzbID, err)
 		p.notifyFailed(entryName, err, canary)
-		p.fallbackToLegacy(entryName, pending)
+		// Only a terminal failure - one backoff can never fix - falls
+		// through to the legacy delete+blocklist+re-search path. A
+		// transient failure (a slow provider, a context deadline) instead
+		// waits out its backoff and tries PAR2 again; the file is still
+		// playable (padded) in the meantime, so there is no urgency to
+		// escalate to a full re-grab over what may just be a blip.
+		if class.terminal {
+			p.fallbackToLegacy(entryName, pending)
+		}
 		return
 	}
 
@@ -548,6 +581,7 @@ func (p *Par2Repair) runJob(nzbID string) {
 		SlicesRepaired:  slicesRepaired,
 		SegmentsPatched: deadSegments,
 	})
+	p.recordPar2Outcome(nzbID, nil)
 	p.notifyCompleted(entryName, deadSegments, time.Since(start))
 }
 

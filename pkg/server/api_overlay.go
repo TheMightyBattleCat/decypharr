@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	json "github.com/bytedance/sonic"
 
@@ -43,6 +44,13 @@ const (
 	OverlayRepairCompleted   OverlayRepairStatus = "completed"
 	OverlayRepairFailed      OverlayRepairStatus = "failed"
 	OverlayRepairUnavailable OverlayRepairStatus = "unavailable"
+	// OverlayRepairUnrepairable marks a file the automatic PAR2 path has
+	// stopped retrying after a terminal failure (see classifyPar2Failure) -
+	// distinct from "unavailable" (a preflight Availability() check failed
+	// without ever attempting a repair): this means a repair was actually
+	// attempted and failed for a reason retrying can't fix. Manual "repair
+	// now" still works.
+	OverlayRepairUnrepairable OverlayRepairStatus = "unrepairable"
 )
 
 // OverlayFile summarizes one logical file's overlay damage/repair state for
@@ -66,6 +74,17 @@ type OverlayFile struct {
 
 	Repairable          bool   `json:"repairable"`
 	NotRepairableReason string `json:"not_repairable_reason,omitempty"`
+
+	// Par2Terminal mirrors storage.Par2RepairState.Terminal: true means the
+	// automatic path has given up re-enqueuing this file (see
+	// Par2Repair.par2ShouldAutoEnqueue) after a failure classifyPar2Failure
+	// judged unfixable by retrying. Repairable/manual "repair now" are
+	// UNAFFECTED by this - a manual retry always overrides and re-evaluates
+	// from scratch, per Par2Repair.RunNow bypassing the same gate.
+	Par2Terminal     bool       `json:"par2_terminal,omitempty"`
+	Par2AttemptCount int        `json:"par2_attempt_count,omitempty"`
+	Par2LastError    string     `json:"par2_last_error,omitempty"`
+	Par2NextRetryAt  *time.Time `json:"par2_next_retry_at,omitempty"`
 
 	PatchBytes    int64 `json:"patch_bytes"`
 	Par2MetaBytes int64 `json:"par2_metadata_bytes"`
@@ -194,6 +213,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 		if !running && !queued {
 			lastAttempt, _ = s.manager.Storage().LatestPar2RepairAttemptForNzb(nzbID)
 		}
+		repairState, _ := s.manager.Storage().GetPar2RepairState(nzbID)
 
 		for file, fe := range manifest.Files {
 			if fe == nil {
@@ -242,12 +262,24 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 			if pending && !repairable {
 				of.NotRepairableReason = notRepairableReason
 			}
+			if repairState != nil {
+				of.Par2Terminal = repairState.Terminal
+				of.Par2AttemptCount = repairState.AttemptCount
+				of.Par2LastError = repairState.LastError
+				if !repairState.NextRetryAt.IsZero() {
+					t := repairState.NextRetryAt
+					of.Par2NextRetryAt = &t
+				}
+			}
 
 			switch {
 			case running:
 				of.RepairStatus = OverlayRepairRunning
 			case queued:
 				of.RepairStatus = OverlayRepairQueued
+			case pending && repairState != nil && repairState.Terminal:
+				of.RepairStatus = OverlayRepairUnrepairable
+				of.RepairStatusReason = repairState.TerminalReason
 			case pending && !repairable:
 				of.RepairStatus = OverlayRepairUnavailable
 				of.RepairStatusReason = notRepairableReason

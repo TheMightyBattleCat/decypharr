@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "par2_repair_attempts"}
+var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "par2_repair_attempts", "par2_repair_state"}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -21,14 +21,15 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
-	entries     *hybrid.Store
-	queue       *hybrid.Store
-	entryItems  *hybrid.Store
-	repairState *hybrid.Store
-	repairRuns  *hybrid.Store
-	par2Repairs *hybrid.Store
-	dir         string
-	logger      zerolog.Logger
+	entries         *hybrid.Store
+	queue           *hybrid.Store
+	entryItems      *hybrid.Store
+	repairState     *hybrid.Store
+	repairRuns      *hybrid.Store
+	par2Repairs     *hybrid.Store
+	par2RepairState *hybrid.Store
+	dir             string
+	logger          zerolog.Logger
 
 	healthCountsMu      sync.Mutex
 	healthCounts        map[HealthStatus]int
@@ -88,14 +89,15 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	s := &Storage{
-		entries:     itemStores["entries"],
-		queue:       itemStores["queue"],
-		entryItems:  itemStores["items"],
-		repairState: itemStores["repair_state"],
-		repairRuns:  itemStores["repair_runs"],
-		par2Repairs: itemStores["par2_repair_attempts"],
-		dir:         dbPath,
-		logger:      log,
+		entries:         itemStores["entries"],
+		queue:           itemStores["queue"],
+		entryItems:      itemStores["items"],
+		repairState:     itemStores["repair_state"],
+		repairRuns:      itemStores["repair_runs"],
+		par2Repairs:     itemStores["par2_repair_attempts"],
+		par2RepairState: itemStores["par2_repair_state"],
+		dir:             dbPath,
+		logger:          log,
 	}
 
 	if count, err := s.MigrateMetadata(); err != nil {
@@ -109,7 +111,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs}
+	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState}
 	for _, store := range stores {
 		if store == nil {
 			continue
@@ -127,7 +129,7 @@ func (s *Storage) Close() error {
 // DiskSize returns the total on-disk size of all stores (O(1), no filesystem walk).
 func (s *Storage) DiskSize() int64 {
 	var size int64
-	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs} {
+	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState} {
 		if store != nil {
 			size += store.DiskSize()
 		}
@@ -170,6 +172,7 @@ func (s *Storage) copyFrom(other *Storage) error {
 		{"repair_state", other.repairState, s.repairState},
 		{"repair_runs", other.repairRuns, s.repairRuns},
 		{"par2_repair_attempts", other.par2Repairs, s.par2Repairs},
+		{"par2_repair_state", other.par2RepairState, s.par2RepairState},
 	}
 
 	for _, p := range pairs {
