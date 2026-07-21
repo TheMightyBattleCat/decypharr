@@ -1,11 +1,23 @@
 // The PAR2 repair worker reconstructs confirmed-dead Usenet articles (see
 // pkg/usenet/overlay) using PAR2 recovery data instead of falling straight to
-// a delete + re-search. It is a manager-level background service: one job at
-// a time (the pass reads a meaningful fraction of a release over NNTP, so
-// running several concurrently would just contend with itself), deduped by
-// nzbID, and gated by the repair sweep's Schedule/StopSchedule window (see
-// Repair.repairWindowOpen) - the same bandwidth-heavy-work-hours reasoning
-// StopSchedule already applies to sweeps.
+// a delete + re-search. It is a manager-level background service split into
+// two lanes:
+//
+//   - BATCH: today's original behaviour. One job at a time (the pass reads a
+//     meaningful fraction of a release over NNTP, so running several
+//     concurrently would just contend with itself), deduped by nzbID, and
+//     gated by the repair sweep's Schedule/StopSchedule window (see
+//     Repair.repairWindowOpen) - the same bandwidth-heavy-work-hours
+//     reasoning StopSchedule already applies to sweeps.
+//   - URGENT: fed by playback-proximity-aware callers (see EnqueueUrgent,
+//     wired up from the read-ahead/precache feature) that need a damaged
+//     region fixed before the playhead reaches it. Runs immediately -
+//     ignores the batch lane's off-peak window - at bounded concurrency, may
+//     preempt an in-flight BATCH pass for the same nzbID, and its NNTP
+//     fetches carry nntp.PriorityUrgent so they may draw a capped provider's
+//     reserve band instead of being demoted to fills-only. Both lanes remain
+//     gated by the bandwidth monitor's hard quota (QuotaBlocked) and by
+//     config.Repair.Par2RepairEnabled.
 //
 // Escalation ordering end to end: a padded segment enqueues here; on success
 // the segment is patched and padding for it stops on the next read. On any
@@ -19,6 +31,7 @@
 package manager
 
 import (
+	"container/heap"
 	"context"
 	"crypto/md5"
 	"errors"
@@ -35,6 +48,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
@@ -71,7 +85,27 @@ const (
 	// hit the recovery-coverage ceiling and abort with a clear terminal
 	// reason well before this, not spin.
 	maxIntactRepairRounds = 3
+
+	// par2DefaultUrgentConcurrency is used when
+	// config.Repair.Par2UrgentConcurrency is unset/non-positive.
+	par2DefaultUrgentConcurrency = 2
 )
+
+// repairLane distinguishes the two Par2Repair worker lanes - see the package
+// doc comment above.
+type repairLane int
+
+const (
+	laneBatch repairLane = iota
+	laneUrgent
+)
+
+func (l repairLane) String() string {
+	if l == laneUrgent {
+		return "urgent"
+	}
+	return "batch"
+}
 
 // articleFetchFunc downloads and yEnc-decodes a single NNTP article. Narrowed
 // from *usenet.Usenet to just this one method so the byte-range-fetching
@@ -95,12 +129,64 @@ type articleFetchFunc func(ctx context.Context, messageID string) ([]byte, error
 // anything first; see censusPar2Volumes for the count math per separator.
 var par2VolPattern = regexp.MustCompile(`(?i)\.vol(\d+)([+-])(\d+)\.par2$`)
 
-// Par2Repair is the manager-level PAR2 repair worker.
+// urgentJob is one pending URGENT-lane request: an nzbID and how far
+// playback currently is from the damaged region it's protecting, in
+// wall-clock playback time - smaller proximity outranks larger. index is
+// maintained by container/heap; seq breaks ties in submission order.
+type urgentJob struct {
+	nzbID     string
+	proximity time.Duration
+	seq       int64
+	index     int
+}
+
+// urgentHeap is a min-heap of *urgentJob ordered by proximity (then seq).
+type urgentHeap []*urgentJob
+
+func (h urgentHeap) Len() int { return len(h) }
+func (h urgentHeap) Less(i, j int) bool {
+	if h[i].proximity != h[j].proximity {
+		return h[i].proximity < h[j].proximity
+	}
+	return h[i].seq < h[j].seq
+}
+func (h urgentHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *urgentHeap) Push(x any) {
+	item := x.(*urgentJob)
+	item.index = len(*h)
+	*h = append(*h, item)
+}
+func (h *urgentHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	item.index = -1
+	*h = old[:n-1]
+	return item
+}
+
+// runningJob tracks one nzbID's in-flight repair pass, in whichever lane is
+// running it, so EnqueueUrgent can preempt an in-flight BATCH pass for the
+// same nzbID and so lane state can be surfaced for status/UI purposes.
+type runningJob struct {
+	lane      repairLane
+	cancel    context.CancelFunc
+	preempted atomic.Bool
+}
+
+// Par2Repair is the manager-level PAR2 repair worker. See the package doc
+// comment for the BATCH/URGENT lane split.
 type Par2Repair struct {
 	manager *Manager
 	repair  *Repair
 	logger  zerolog.Logger
 
+	// BATCH lane: unchanged from the original single-lane worker.
 	mu     sync.Mutex
 	queued map[string]struct{}
 	queue  chan string
@@ -118,6 +204,20 @@ type Par2Repair struct {
 	// runJob/runRepair so a stall is visible within seconds via Progress,
 	// not just at completion.
 	progress par2ProgressTracker
+
+	// URGENT lane: a proximity-ordered priority queue served by a bounded
+	// pool of worker goroutines (see Start/urgentWorker).
+	urgentMu   sync.Mutex
+	urgentHeap urgentHeap
+	urgentSet  map[string]*urgentJob
+	urgentSeq  int64
+	urgentWake chan struct{}
+
+	// running tracks every nzbID currently executing in either lane, so
+	// EnqueueUrgent can preempt a BATCH pass and so at most one pass per
+	// nzbID is ever active regardless of lane.
+	runningMu sync.Mutex
+	running   map[string]*runningJob
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -140,24 +240,41 @@ func (p *Par2Repair) Progress(nzbID string) (Par2JobProgress, bool) {
 // NewPar2Repair builds the worker. Call Start to begin processing.
 func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 	return &Par2Repair{
-		manager:  m,
-		repair:   repair,
-		logger:   logger.New("par2-repair"),
-		queued:   make(map[string]struct{}),
-		deferred: make(map[string]struct{}),
-		queue:    make(chan string, par2QueueDepth),
-		progress: newPar2ProgressTracker(),
+		manager:    m,
+		repair:     repair,
+		logger:     logger.New("par2-repair"),
+		queued:     make(map[string]struct{}),
+		deferred:   make(map[string]struct{}),
+		queue:      make(chan string, par2QueueDepth),
+		progress:   newPar2ProgressTracker(),
+		urgentSet:  make(map[string]*urgentJob),
+		urgentWake: make(chan struct{}, 1),
+		running:    make(map[string]*runningJob),
 	}
 }
 
-// Start begins the worker's single processing goroutine.
+// Start begins the worker's BATCH loop plus a bounded pool of URGENT lane
+// workers.
 func (p *Par2Repair) Start(ctx context.Context) {
 	p.ctx, p.cancel = context.WithCancel(ctx)
 	p.wg.Add(1)
 	go p.loop()
+
+	for range p.urgentConcurrency() {
+		p.wg.Add(1)
+		go p.urgentWorker()
+	}
 }
 
-// Stop cancels any in-flight job and waits for the worker goroutine to exit.
+func (p *Par2Repair) urgentConcurrency() int {
+	if n := config.Get().Repair.Par2UrgentConcurrency; n > 0 {
+		return n
+	}
+	return par2DefaultUrgentConcurrency
+}
+
+// Stop cancels any in-flight job and waits for every worker goroutine
+// (BATCH loop and URGENT pool) to exit.
 func (p *Par2Repair) Stop() {
 	if p.cancel != nil {
 		p.cancel()
@@ -217,16 +334,19 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	p.Enqueue(nzbID)
 }
 
-// Enqueue schedules nzbID for a PAR2 repair pass. Deduped: a burst of padded
-// segments across one playback session collapses to a single pass. Safe to
-// call from any goroutine. Unlike AutoEnqueue, this is never gated by
-// Par2RepairMode - it is the explicit-trigger primitive used by both
-// AutoEnqueue and the GUI's manual "repair now" action.
+// Enqueue schedules nzbID for a BATCH-lane PAR2 repair pass. Deduped: a burst
+// of padded segments across one playback session collapses to a single pass.
+// Safe to call from any goroutine (this is exactly what
+// overlay.Handle.EnqueueRepair does, from inside the reader's fetch path).
+// Unlike AutoEnqueue, this is never gated by Par2RepairMode - it is the
+// explicit-trigger primitive used by both AutoEnqueue and the GUI's manual
+// "repair now" action. A no-op when nzbID is already being handled by the
+// URGENT lane, which supersedes it.
 func (p *Par2Repair) Enqueue(nzbID string) {
 	if p == nil || nzbID == "" {
 		return
 	}
-	if !p.par2ShouldAutoEnqueue(nzbID) {
+	if !p.par2ShouldAutoEnqueue(nzbID) || p.handledByUrgent(nzbID) {
 		return
 	}
 	p.mu.Lock()
@@ -285,7 +405,7 @@ func (p *Par2Repair) RunNow(nzbID string) error {
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
 		}()
-		p.runJob(nzbID)
+		p.runJob(nzbID, laneBatch)
 	}()
 	return nil
 }
@@ -464,6 +584,104 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 	return true, "", nil
 }
 
+// EnqueueUrgent schedules nzbID for an immediate URGENT-lane PAR2 repair
+// pass, prioritized ahead of any URGENT job with a larger proximity.
+// proximity is the playback-time gap between the current playhead and the
+// damaged region nzbID protects - callers should re-call as that gap
+// narrows (or a closer-in damaged region is discovered) so priority stays
+// accurate; the smallest proximity ever reported for a still-pending nzbID
+// wins. If a BATCH pass for the same nzbID is currently running, it is
+// preempted (cancelled without falling back to legacy repair) so the URGENT
+// lane can take over immediately. Safe to call from any goroutine; a no-op
+// if p is nil or nzbID is empty.
+func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
+	if p == nil || nzbID == "" {
+		return
+	}
+	if proximity < 0 {
+		proximity = 0
+	}
+
+	p.runningMu.Lock()
+	if job, ok := p.running[nzbID]; ok && job.lane == laneBatch {
+		job.preempted.Store(true)
+		job.cancel()
+	}
+	p.runningMu.Unlock()
+
+	p.urgentMu.Lock()
+	if item, ok := p.urgentSet[nzbID]; ok {
+		if proximity < item.proximity {
+			item.proximity = proximity
+			heap.Fix(&p.urgentHeap, item.index)
+		}
+		p.urgentMu.Unlock()
+		return
+	}
+	p.urgentSeq++
+	item := &urgentJob{nzbID: nzbID, proximity: proximity, seq: p.urgentSeq}
+	p.urgentSet[nzbID] = item
+	heap.Push(&p.urgentHeap, item)
+	p.urgentMu.Unlock()
+
+	select {
+	case p.urgentWake <- struct{}{}:
+	default:
+	}
+}
+
+// handledByUrgent reports whether nzbID is already queued or actively
+// running in the URGENT lane, in which case a BATCH enqueue for it is
+// redundant.
+func (p *Par2Repair) handledByUrgent(nzbID string) bool {
+	p.urgentMu.Lock()
+	_, queued := p.urgentSet[nzbID]
+	p.urgentMu.Unlock()
+	if queued {
+		return true
+	}
+	p.runningMu.Lock()
+	job, running := p.running[nzbID]
+	p.runningMu.Unlock()
+	return running && job.lane == laneUrgent
+}
+
+// popUrgent blocks until an URGENT job is available or ctx is done,
+// returning the highest-priority (smallest-proximity) nzbID.
+func (p *Par2Repair) popUrgent(ctx context.Context) (string, bool) {
+	for {
+		p.urgentMu.Lock()
+		if len(p.urgentHeap) > 0 {
+			item := heap.Pop(&p.urgentHeap).(*urgentJob)
+			delete(p.urgentSet, item.nzbID)
+			p.urgentMu.Unlock()
+			return item.nzbID, true
+		}
+		p.urgentMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return "", false
+		case <-p.urgentWake:
+		}
+	}
+}
+
+// urgentWorker is one member of the bounded URGENT-lane worker pool.
+func (p *Par2Repair) urgentWorker() {
+	defer p.wg.Done()
+	for {
+		nzbID, ok := p.popUrgent(p.ctx)
+		if !ok {
+			return
+		}
+		if !config.Get().Repair.Par2RepairEnabled() {
+			continue
+		}
+		p.runJob(nzbID, laneUrgent)
+	}
+}
+
 func (p *Par2Repair) loop() {
 	defer p.wg.Done()
 
@@ -479,8 +697,11 @@ func (p *Par2Repair) loop() {
 			p.mu.Lock()
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
+			if p.handledByUrgent(nzbID) {
+				continue
+			}
 			if p.readyToRun() {
-				p.runJob(nzbID)
+				p.runJob(nzbID, laneBatch)
 			} else {
 				p.mu.Lock()
 				p.deferred[nzbID] = struct{}{}
@@ -502,21 +723,28 @@ func (p *Par2Repair) loop() {
 				if p.ctx.Err() != nil {
 					return
 				}
-				p.runJob(id)
+				if p.handledByUrgent(id) {
+					continue
+				}
+				p.runJob(id, laneBatch)
 			}
 		}
 	}
 }
 
+// readyToRun gates the BATCH lane only: enabled, and within the repair
+// sweep's off-peak window. The URGENT lane ignores the window entirely (see
+// urgentWorker) - it exists specifically to act immediately.
 func (p *Par2Repair) readyToRun() bool {
 	return config.Get().Repair.Par2RepairEnabled() && p.repair.repairWindowOpen()
 }
 
-// runJob runs one NZB's PAR2 repair pass end to end. Every exit path either
-// leaves the overlay state as-is (nothing to do, or a genuine "can't tell
-// yet" error worth retrying later) or falls through to the legacy repair
-// path - it never partially patches and calls it done.
-func (p *Par2Repair) runJob(nzbID string) {
+// runJob runs one NZB's PAR2 repair pass end to end in the given lane. Every
+// exit path either leaves the overlay state as-is (nothing to do, a genuine
+// "can't tell yet" error worth retrying later, or a BATCH pass preempted by
+// the URGENT lane) or falls through to the legacy repair path - it never
+// partially patches and calls it done.
+func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	start := time.Now()
 	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
 	if p.manager.usenet == nil {
@@ -557,8 +785,25 @@ func (p *Par2Repair) runJob(nzbID string) {
 	entryName := entry.Name
 	progress.SetEntryName(entryName)
 
-	ctx, cancel := context.WithTimeout(p.ctx, par2JobTimeout)
-	defer cancel()
+	jobCtx, jobCancel := context.WithCancel(p.ctx)
+	timeoutCtx, timeoutCancel := context.WithTimeout(jobCtx, par2JobTimeout)
+	defer timeoutCancel()
+	if lane == laneUrgent {
+		timeoutCtx = nntp.WithPriority(timeoutCtx, nntp.PriorityUrgent)
+	}
+
+	job := &runningJob{lane: lane, cancel: jobCancel}
+	p.runningMu.Lock()
+	p.running[nzbID] = job
+	p.runningMu.Unlock()
+	defer func() {
+		p.runningMu.Lock()
+		if p.running[nzbID] == job {
+			delete(p.running, nzbID)
+		}
+		p.runningMu.Unlock()
+		jobCancel()
+	}()
 
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
 	if err != nil || len(pending) == 0 {
@@ -569,15 +814,19 @@ func (p *Par2Repair) runJob(nzbID string) {
 	for _, segs := range pending {
 		deadSegments += len(segs)
 	}
-	p.logger.Info().Str("entry", entryName).Int("dead_segments", deadSegments).Msg("par2 repair queued")
+	p.logger.Info().Str("entry", entryName).Str("lane", lane.String()).Int("dead_segments", deadSegments).Msg("par2 repair queued")
 
 	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
 	var slicesRepaired int
-	if err := p.runRepair(ctx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, progress); err != nil {
+	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, progress); err != nil {
+		if job.preempted.Load() {
+			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
+			return
+		}
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := classifyPar2Failure(err)
-		p.logger.Info().Err(err).Str("entry", entryName).Bool("crc_canary", canary).Bool("terminal", class.terminal).
+		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
 			Msg("par2 repair unavailable")
 		progress.SetPhase(Par2PhaseFailed)
@@ -609,6 +858,7 @@ func (p *Par2Repair) runJob(nzbID string) {
 
 	p.logger.Info().
 		Str("entry", entryName).
+		Str("lane", lane.String()).
 		Int("segments_patched", deadSegments).
 		Dur("duration", time.Since(start)).
 		Int64("cache_bytes", cacheBytes).

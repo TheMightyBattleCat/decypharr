@@ -532,7 +532,7 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	leadExists := false
 	leadUsable := false
 	for _, p := range c.providers {
-		if c.providerTier(p) != tierLead {
+		if c.providerTier(ctx, p) != tierLead {
 			continue
 		}
 		leadExists = true
@@ -554,7 +554,7 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	// within the target tier.
 	eligibleCount := 0
 	for _, provider := range c.providers {
-		if c.providerTier(provider) != target || exclusions.excludes(provider) {
+		if c.providerTier(ctx, provider) != target || exclusions.excludes(provider) {
 			continue
 		}
 		eligibleCount++
@@ -584,7 +584,7 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	// the fill tier remain idle rather than getting roped in.
 	eligible := make([]config.UsenetProvider, 0, eligibleCount)
 	for _, provider := range c.providers {
-		if c.providerTier(provider) == target && !exclusions.excludes(provider) {
+		if c.providerTier(ctx, provider) == target && !exclusions.excludes(provider) {
 			eligible = append(eligible, provider)
 		}
 	}
@@ -995,7 +995,7 @@ func (c *Client) Stats() map[string]any {
 			"ssl":             p.SSL,
 			// Computed live (not cached) so a soft-threshold demotion or a
 			// calendar-aligned quota reset is reflected on the very next poll.
-			"tier": tierLabel(c.providerTier(p)),
+			"tier": tierLabel(c.providerTier(context.Background(), p)),
 		}
 
 		// Add speed test result if available

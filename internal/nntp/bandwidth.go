@@ -1,6 +1,7 @@
 package nntp
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -429,8 +430,9 @@ const (
 )
 
 // providerTier maps a provider to its effective serving tier right now,
-// combining its configured Backup flag with its live quota state.
-func (c *Client) providerTier(p config.UsenetProvider) serveTier {
+// combining its configured Backup flag with its live quota state and the
+// request's context priority (see Priority/WithPriority).
+func (c *Client) providerTier(ctx context.Context, p config.UsenetProvider) serveTier {
 	t := QuotaNormal
 	if c.bw != nil {
 		t = c.bw.Tier(p.Host)
@@ -439,6 +441,13 @@ func (c *Client) providerTier(p config.UsenetProvider) serveTier {
 	case QuotaBlocked:
 		return tierBlocked
 	case QuotaReserve:
+		// A PriorityUrgent caller may draw a capped PRIMARY's held-back
+		// reserve at lead tier instead of being demoted to fills-only - the
+		// hard cap (QuotaBlocked) above is never bypassed. Configured
+		// backups stay fill-only regardless of priority.
+		if !p.Backup && priorityFrom(ctx) == PriorityUrgent {
+			return tierLead
+		}
 		return tierFill // a capped primary is demoted to fills
 	default:
 		if p.Backup {
