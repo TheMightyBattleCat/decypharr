@@ -86,6 +86,11 @@ var par2TerminalSubstrings = []string{
 	"recovery slices fetched/available",
 	"recovery slice",
 	"parse PAR2 index",
+	// An intact slice confirmed missing across every provider (a hard 430,
+	// not a timeout) pushed the damaged set beyond what recovery data can
+	// cover - see runRepair's retry loop. No amount of retrying fixes a
+	// genuinely-gone article; only new PAR2/source data posted later could.
+	"more damage than recorded",
 }
 
 // classifyPar2Failure decides whether err (a runRepair failure) should back

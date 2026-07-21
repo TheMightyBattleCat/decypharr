@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 func TestConcurrentSliceSourceReturnsResultsForCorrectIndex(t *testing.T) {
@@ -111,5 +113,50 @@ func TestConcurrentSliceSourceBoundsConcurrency(t *testing.T) {
 	}
 	if got := peak.Load(); got < 2 {
 		t.Errorf("peak concurrent fetches = %d, want > 1 (fetches should genuinely overlap, not run one at a time)", got)
+	}
+}
+
+func TestConcurrentSliceSourceTracksNotFoundIndices(t *testing.T) {
+	order := []int64{0, 1, 2, 3}
+	notFoundErr := &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
+	fetchOne := func(idx int64) ([]byte, error) {
+		if idx == 1 || idx == 3 {
+			return nil, notFoundErr
+		}
+		return []byte{byte(idx)}, nil
+	}
+	src := newConcurrentSliceSource(context.Background(), order, 4, fetchOne)
+
+	for _, idx := range order {
+		_, _ = src.ReadSlice(idx) // drain everything so all workers have reported in
+	}
+
+	got := src.NotFoundIndices()
+	want := map[int64]bool{1: true, 3: true}
+	if len(got) != len(want) {
+		t.Fatalf("NotFoundIndices() = %v, want exactly %v", got, want)
+	}
+	for _, idx := range got {
+		if !want[idx] {
+			t.Errorf("NotFoundIndices() contains unexpected index %d", idx)
+		}
+	}
+}
+
+func TestConcurrentSliceSourceDoesNotTrackOtherErrorsAsNotFound(t *testing.T) {
+	order := []int64{0, 1}
+	timeoutErr := &nntp.Error{Type: nntp.ErrorTypeTimeout, Code: 0, Message: "deadline exceeded"}
+	fetchOne := func(idx int64) ([]byte, error) {
+		if idx == 1 {
+			return nil, timeoutErr
+		}
+		return []byte{0}, nil
+	}
+	src := newConcurrentSliceSource(context.Background(), order, 2, fetchOne)
+	for _, idx := range order {
+		_, _ = src.ReadSlice(idx)
+	}
+	if got := src.NotFoundIndices(); len(got) != 0 {
+		t.Errorf("NotFoundIndices() = %v, want empty - a timeout is not a confirmed not-found", got)
 	}
 }

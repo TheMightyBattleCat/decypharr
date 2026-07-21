@@ -3,8 +3,11 @@ package manager
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/sourcegraph/conc/pool"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 // sliceFetchResult is one concurrent worker's outcome for one global PAR2
@@ -35,6 +38,12 @@ type sliceFetchResult struct {
 type concurrentSliceSource struct {
 	resultCh chan sliceFetchResult
 	pending  map[int64]sliceFetchResult // out-of-order results not yet consumed - read/written only from ReadSlice's single caller goroutine
+
+	// notFoundMu guards notFound - written concurrently by every worker in
+	// run(), read by NotFoundIndices after the pool has drained (or
+	// mid-flight, best-effort). See NotFoundIndices.
+	notFoundMu sync.Mutex
+	notFound   map[int64]struct{}
 }
 
 // newConcurrentSliceSource launches maxConcurrency worker goroutines that
@@ -51,6 +60,7 @@ func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency
 	s := &concurrentSliceSource{
 		resultCh: make(chan sliceFetchResult, maxConcurrency*2),
 		pending:  make(map[int64]sliceFetchResult),
+		notFound: make(map[int64]struct{}),
 	}
 	go s.run(ctx, order, maxConcurrency, fetchOne)
 	return s
@@ -61,6 +71,19 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 	for _, idx := range order {
 		p.Go(func(ctx context.Context) error {
 			data, err := fetchOne(idx)
+			if err != nil && nntp.IsArticleNotFoundError(err) {
+				// Confirmed missing across every provider (ExecuteWithFailover
+				// already exhausted them all before returning this) - this
+				// slice's data is genuinely gone, not a transient hiccup.
+				// Recorded regardless of whether ReadSlice ever gets asked for
+				// this exact index: par2.Repair aborts on the FIRST error it
+				// sees, so a later index's not-found here would otherwise be
+				// silently lost - see runRepair's retry loop, which reclassifies
+				// every index collected here into the damaged set at once.
+				s.notFoundMu.Lock()
+				s.notFound[idx] = struct{}{}
+				s.notFoundMu.Unlock()
+			}
 			select {
 			case s.resultCh <- sliceFetchResult{idx: idx, data: data, err: err}:
 			case <-ctx.Done():
@@ -70,6 +93,23 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 	}
 	_ = p.Wait()
 	close(s.resultCh)
+}
+
+// NotFoundIndices returns every global slice index whose fetch has failed
+// with a confirmed article-not-found (across every provider) so far. Safe
+// to call at any time, including while workers are still running (the
+// returned set just may not be complete yet) - runRepair's retry loop
+// calls it only after par2.Repair has already returned, by which point
+// every worker that was going to report anything has either finished or
+// been abandoned by the pool's context cancellation.
+func (s *concurrentSliceSource) NotFoundIndices() []int64 {
+	s.notFoundMu.Lock()
+	defer s.notFoundMu.Unlock()
+	out := make([]int64, 0, len(s.notFound))
+	for idx := range s.notFound {
+		out = append(out, idx)
+	}
+	return out
 }
 
 // ReadSlice implements par2.SliceSource, satisfying the "read exactly once

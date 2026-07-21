@@ -61,6 +61,16 @@ const (
 	// md5_16kSize is the PAR2-defined sample size for tie-breaking a
 	// posted-file/FileDesc length match.
 	md5_16kSize = 16384
+
+	// maxIntactRepairRounds bounds how many times runRepair will expand the
+	// damaged set and retry the solve after discovering an intact slice is
+	// actually confirmed-missing (a hard 430 across every provider) rather
+	// than just slow/unlucky. Each round is cheap relative to a fresh job
+	// (no re-fetch of anything already in sources, no re-matching files) but
+	// still bounded: a release with many genuinely-missing articles should
+	// hit the recovery-coverage ceiling and abort with a clear terminal
+	// reason well before this, not spin.
+	maxIntactRepairRounds = 3
 )
 
 // articleFetchFunc downloads and yEnc-decodes a single NNTP article. Narrowed
@@ -718,18 +728,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 
 	needed := estimateNeededSlices(pending)
 	var fetchedSlices uint32
-	for _, v := range vols {
-		if fetchedSlices >= needed {
-			break
-		}
-		data, err := fetchWholePar2File(ctx, fetch, v.ref)
-		if err != nil {
-			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
-			continue
-		}
-		sources = append(sources, par2.Source{Name: v.ref.Name, Data: data})
-		fetchedSlices += v.count
-	}
+	var nextVolIdx int
+	nextVolIdx, fetchedSlices, sources, _ = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, needed, sources, entryName, p.logger)
 	if len(sources) == 0 {
 		return fmt.Errorf("failed to fetch any PAR2 file")
 	}
@@ -808,60 +808,108 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
 
-	k := len(damaged)
-	if k == 0 {
-		return fmt.Errorf("no damaged slices resolved (nothing to repair)")
-	}
-	if k > par2.MaxRepairSlices {
-		return fmt.Errorf("%d damaged slices exceeds the %d repair cap", k, par2.MaxRepairSlices)
-	}
-	if k > len(idx.Recovery) {
-		return fmt.Errorf("%d damaged slices but only %d recovery slices fetched/available", k, len(idx.Recovery))
-	}
-
-	recovery := make([]par2.RecoverySlice, k)
-	for i, ref := range idx.Recovery[:k] {
-		src := sources[ref.Source].Data
-		if ref.Offset+ref.Length > int64(len(src)) {
-			return fmt.Errorf("recovery slice %d out of range in %s", i, sources[ref.Source].Name)
+	// Each round attempts the solve with the current damaged set; a hard,
+	// confirmed-across-every-provider 430 on what was assumed to be an
+	// intact slice means that slice's data is genuinely gone too - not a
+	// reason to keep retrying the SAME attempt (par2.Repair already gives up
+	// on the first ReadSlice error it sees), but a reason to fold it into
+	// the damaged set and retry the solve, if recovery coverage still
+	// allows it. Bounded by maxIntactRepairRounds; a release with damage
+	// beyond what the overlay had recorded aborts with a clear terminal
+	// reason well before that, rather than spinning.
+	var repaired []par2.RepairedSlice
+	var damagedPos map[int64]struct{}
+	for round := 0; ; round++ {
+		k := len(damaged)
+		if k == 0 {
+			return fmt.Errorf("no damaged slices resolved (nothing to repair)")
 		}
-		recovery[i] = par2.RecoverySlice{
-			Exponent: ref.Exponent,
-			Data:     src[ref.Offset : ref.Offset+ref.Length],
+		if k > par2.MaxRepairSlices || uint32(k) > available {
+			return fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", k, par2.MaxRepairSlices, available)
 		}
-	}
 
-	// intactOrder lists every slice par2.Repair's own streaming loop will
-	// call ReadSlice for, in the exact ascending order it calls them
-	// (idx.NumSlices() total, minus damaged) - the concurrent fetch pool
-	// below processes this same set in parallel, so ReadSlice never blocks
-	// on more than its own per-segment timeout once a result is actually
-	// needed.
-	damagedPos := make(map[int64]struct{}, len(damaged))
-	for _, d := range damaged {
-		damagedPos[d] = struct{}{}
-	}
-	intactOrder := make([]int64, 0, idx.NumSlices()-int64(len(damaged)))
-	for s := int64(0); s < idx.NumSlices(); s++ {
-		if _, isDamaged := damagedPos[s]; isDamaged {
-			continue
+		// Top up recovery slice DATA for the current k if needed - discovering
+		// more damage mid-pass can push k past the original name-only
+		// estimate (needed) that sized the first fetch. Picks up exactly
+		// where the last fetch left off; re-parses only when new sources
+		// were actually added.
+		if uint32(k) > fetchedSlices {
+			var added int
+			nextVolIdx, fetchedSlices, sources, added = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, uint32(k), sources, entryName, p.logger)
+			if added > 0 {
+				idx, err = par2.ParseIndex(sources)
+				if err != nil {
+					return fmt.Errorf("parse PAR2 index: %w", err)
+				}
+			}
 		}
-		intactOrder = append(intactOrder, s)
-	}
+		if k > len(idx.Recovery) {
+			return fmt.Errorf("%d damaged slices but only %d recovery slices fetched/available", k, len(idx.Recovery))
+		}
 
-	// Fetch intact slices through the same bounded, concurrent pool model
-	// Download uses (pool.New().WithMaxGoroutines(ProcessingMaxConnections)),
-	// instead of one strictly-sequential fetch at a time: a release with
-	// thousands of segments previously meant thousands of sequential
-	// up-to-60s fetch attempts, whose cumulative worst case could exceed the
-	// whole job's deadline even with no single connection ever "stuck"
-	// forever - concurrency divides that cumulative latency by the
-	// connection limit instead.
-	jobSource := &jobSliceSource{idx: idx, fetchers: fetchers}
-	sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), jobSource.ReadSlice)
-	repaired, err := par2.Repair(idx, damaged, recovery, sliceSource)
-	if err != nil {
-		return fmt.Errorf("repair: %w", err)
+		recovery := make([]par2.RecoverySlice, k)
+		for i, ref := range idx.Recovery[:k] {
+			src := sources[ref.Source].Data
+			if ref.Offset+ref.Length > int64(len(src)) {
+				return fmt.Errorf("recovery slice %d out of range in %s", i, sources[ref.Source].Name)
+			}
+			recovery[i] = par2.RecoverySlice{
+				Exponent: ref.Exponent,
+				Data:     src[ref.Offset : ref.Offset+ref.Length],
+			}
+		}
+
+		// intactOrder lists every slice par2.Repair's own streaming loop will
+		// call ReadSlice for, in the exact ascending order it calls them
+		// (idx.NumSlices() total, minus damaged) - the concurrent fetch pool
+		// below processes this same set in parallel, so ReadSlice never
+		// blocks on more than its own per-segment timeout once a result is
+		// actually needed.
+		damagedPos = make(map[int64]struct{}, len(damaged))
+		for _, d := range damaged {
+			damagedPos[d] = struct{}{}
+		}
+		intactOrder := make([]int64, 0, idx.NumSlices()-int64(len(damaged)))
+		for s := int64(0); s < idx.NumSlices(); s++ {
+			if _, isDamaged := damagedPos[s]; isDamaged {
+				continue
+			}
+			intactOrder = append(intactOrder, s)
+		}
+
+		// Fetch intact slices through the same bounded, concurrent pool model
+		// Download uses (pool.New().WithMaxGoroutines(ProcessingMaxConnections)),
+		// instead of one strictly-sequential fetch at a time: a release with
+		// thousands of segments previously meant thousands of sequential
+		// up-to-60s fetch attempts, whose cumulative worst case could exceed
+		// the whole job's deadline even with no single connection ever
+		// "stuck" forever - concurrency divides that cumulative latency by
+		// the connection limit instead.
+		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers}
+		sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), jobSource.ReadSlice)
+		var repairErr error
+		repaired, repairErr = par2.Repair(idx, damaged, recovery, sliceSource)
+		if repairErr == nil {
+			break
+		}
+
+		notFound := sliceSource.NotFoundIndices()
+		newlyDamaged := make([]int64, 0, len(notFound))
+		for _, ni := range notFound {
+			if _, already := damagedPos[ni]; !already {
+				newlyDamaged = append(newlyDamaged, ni)
+			}
+		}
+		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
+			return fmt.Errorf("repair: %w", repairErr)
+		}
+		p.logger.Info().
+			Str("entry", entryName).
+			Int("newly_damaged", len(newlyDamaged)).
+			Int("round", round+1).
+			Msg("par2 repair: intact slice(s) confirmed missing across every provider; expanding damaged set and retrying")
+		damaged = append(damaged, newlyDamaged...)
+		sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
 	}
 	if slicesRepaired != nil {
 		*slicesRepaired = len(repaired)
@@ -960,6 +1008,30 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].ref.Size < vols[j].ref.Size })
 	return vols, indexFiles
+}
+
+// fetchMoreVolumes fetches additional recovery volumes from vols (already
+// sorted smallest-first), continuing from nextVolIdx, until fetchedSlices
+// covers needed or vols is exhausted. Returns the updated position/count/
+// sources so a later call - after discovering MORE damage than originally
+// estimated (see runRepair's retry loop) - can pick up exactly where an
+// earlier call left off, without re-fetching anything already in sources.
+// The added return is how many new entries were appended to sources this
+// call - callers only need to re-parse the PAR2 index when it's non-zero.
+func fetchMoreVolumes(ctx context.Context, fetch articleFetchFunc, vols []par2Volume, nextVolIdx int, fetchedSlices, needed uint32, sources []par2.Source, entryName string, logger zerolog.Logger) (newNextVolIdx int, newFetchedSlices uint32, newSources []par2.Source, added int) {
+	for nextVolIdx < len(vols) && fetchedSlices < needed {
+		v := vols[nextVolIdx]
+		nextVolIdx++
+		data, err := fetchWholePar2File(ctx, fetch, v.ref)
+		if err != nil {
+			logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
+			continue
+		}
+		sources = append(sources, par2.Source{Name: v.ref.Name, Data: data})
+		fetchedSlices += v.count
+		added++
+	}
+	return nextVolIdx, fetchedSlices, sources, added
 }
 
 // fetchWholePar2File downloads and concatenates every segment of a retained
