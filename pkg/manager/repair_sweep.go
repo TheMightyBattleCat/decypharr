@@ -482,22 +482,26 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 }
 
 // routeAutoRepair applies the coordinated auto-repair policy
-// (decideAutoRepairAction) to a file the sweep just confirmed has a
-// segment-missing failure, claiming the handler registry before acting so a
-// concurrent playback-failure escalation or the PAR2 worker's own queueing
-// can never double-queue or double-re-grab the same entry (nzbID =
+// (decideAutoRepairAction, source=sweep) to a file the sweep just confirmed
+// has a segment-missing failure, claiming the handler registry before acting
+// so a concurrent playback-failure escalation or the PAR2 worker's own
+// queueing can never double-queue or double-re-grab the same entry (nzbID =
 // entry.InfoHash - see repair_handler_registry.go).
 //
-// A VerdictClean result (recordDeadSegments' detail probe itself failed, or
-// found nothing) carries no policy-relevant information - it's treated as a
-// plain segment-missing failure and always routed to the legacy re-grab
-// path, exactly as it was before this policy existed.
+// With source=sweep, decideAutoRepairAction never returns autoActionNone for
+// a real verdict - sweep detection is never pad-and-forget, so a degraded
+// verdict with PAR2 disabled re-grabs instead of the "leave it padded" outcome
+// source=playback would get for the same inputs. A VerdictClean result
+// (recordDeadSegments' detail probe itself failed, or found nothing) carries
+// no policy-relevant information - it's treated as a plain segment-missing
+// failure and always routed to the legacy re-grab path, exactly as it was
+// before this policy existed.
 func (r *Repair) routeAutoRepair(entry *storage.Entry, name string, verdict overlay.Verdict, res fileResult) fileResult {
 	nzbID := entry.InfoHash
 
 	action := autoActionRegrab
 	if verdict != overlay.VerdictClean {
-		action = decideAutoRepairAction(config.Get().Repair.Par2RepairEnabled(), verdict)
+		action = decideAutoRepairAction(RepairSourceSweep, config.Get().Repair.Par2RepairEnabled(), verdict)
 	}
 
 	switch action {
@@ -513,7 +517,7 @@ func (r *Repair) routeAutoRepair(entry *storage.Entry, name string, verdict over
 		r.queuePar2FromSweep(entry, name)
 		res.reason = "usenet_segment_missing_par2_queued"
 		return res
-	case autoActionRegrab:
+	default: // autoActionRegrab - source=sweep never returns autoActionNone.
 		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
 			// Already being handled (PAR2 queued/running, an in-flight
 			// re-grab from another candidate, or a rare race with a manual
@@ -526,9 +530,6 @@ func (r *Repair) routeAutoRepair(entry *storage.Entry, name string, verdict over
 		// broken files - see probeAndHealCandidates.
 		res.broken = true
 		res.reason = "usenet_segment_missing"
-		return res
-	default: // autoActionNone: within caps, PAR2 disabled - pad only.
-		res.reason = "usenet_segment_missing_padded"
 		return res
 	}
 }
@@ -1568,7 +1569,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 	par2Enabled := config.Get().Repair.Par2RepairEnabled()
 	verdict := r.manager.usenet.OverlayVerdict(nzbID, fileName)
 
-	switch decideAutoRepairAction(par2Enabled, verdict) {
+	switch decideAutoRepairAction(RepairSourcePlayback, par2Enabled, verdict) {
 	case autoActionRegrab:
 		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
 			r.logger.Debug().Str("entry", entryName).Str("file", fileName).
