@@ -104,6 +104,11 @@ type Par2Repair struct {
 	mu     sync.Mutex
 	queued map[string]struct{}
 	queue  chan string
+	// urgentQueue is checked with priority over queue in loop() - used for a
+	// PAR2 pass triggered by a LIVE playback failure (see
+	// Repair.HandlePlaybackFailure / EnqueueUrgent), which should not sit
+	// behind whatever the background sweep already queued.
+	urgentQueue chan string
 	// deferred holds nzbIDs dequeued from queue but not yet run because the
 	// repair window was closed (see readyToRun) - loop's local pending slice
 	// mirrors this set so IsQueued can see them too.
@@ -140,13 +145,14 @@ func (p *Par2Repair) Progress(nzbID string) (Par2JobProgress, bool) {
 // NewPar2Repair builds the worker. Call Start to begin processing.
 func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 	return &Par2Repair{
-		manager:  m,
-		repair:   repair,
-		logger:   logger.New("par2-repair"),
-		queued:   make(map[string]struct{}),
-		deferred: make(map[string]struct{}),
-		queue:    make(chan string, par2QueueDepth),
-		progress: newPar2ProgressTracker(),
+		manager:     m,
+		repair:      repair,
+		logger:      logger.New("par2-repair"),
+		queued:      make(map[string]struct{}),
+		deferred:    make(map[string]struct{}),
+		queue:       make(chan string, par2QueueDepth),
+		urgentQueue: make(chan string, par2QueueDepth),
+		progress:    newPar2ProgressTracker(),
 	}
 }
 
@@ -217,18 +223,46 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	p.Enqueue(nzbID)
 }
 
-// Enqueue schedules nzbID for a PAR2 repair pass. Deduped: a burst of padded
-// segments across one playback session collapses to a single pass. Safe to
-// call from any goroutine. Unlike AutoEnqueue, this is never gated by
-// Par2RepairMode - it is the explicit-trigger primitive used by both
-// AutoEnqueue and the GUI's manual "repair now" action.
+// Enqueue schedules nzbID for a PAR2 repair pass on the normal (background)
+// lane. Deduped: a burst of padded segments across one playback session
+// collapses to a single pass. Safe to call from any goroutine. Unlike
+// AutoEnqueue, this is never gated by Par2RepairMode - it is the
+// explicit-trigger primitive AutoEnqueue itself uses once its own mode/
+// threshold gating passes.
 func (p *Par2Repair) Enqueue(nzbID string) {
+	p.enqueue(nzbID, false)
+}
+
+// EnqueueUrgent is Enqueue's priority counterpart: the PAR2 pass jumps ahead
+// of anything already sitting in the normal queue (see loop()'s priority
+// select). Used when a LIVE playback read - not the background sweep - is
+// what discovered the damage (see Repair.HandlePlaybackFailure): the user is
+// watching right now, so this shouldn't wait behind a backlog of
+// sweep-discovered entries nobody is actively viewing. Still subject to the
+// same par2ShouldAutoEnqueue gate (backoff/terminal) and handler-registry
+// dedup as Enqueue - "urgent" only affects queue position, not whether it
+// queues at all.
+func (p *Par2Repair) EnqueueUrgent(nzbID string) {
+	p.enqueue(nzbID, true)
+}
+
+func (p *Par2Repair) enqueue(nzbID string, urgent bool) {
 	if p == nil || nzbID == "" {
 		return
 	}
 	if !p.par2ShouldAutoEnqueue(nzbID) {
 		return
 	}
+	if p.repair != nil && p.repair.handlers != nil {
+		if !p.repair.handlers.TryAcquire(nzbID, handlerPar2Queued) {
+			// Already par2_queued/par2_running (the common case - repeated
+			// calls for the same entry collapse to the first one, same as
+			// the p.queued dedup below) or claimed by an in-flight regrab.
+			// Either way, nothing new to do here.
+			return
+		}
+	}
+
 	p.mu.Lock()
 	if _, dup := p.queued[nzbID]; dup {
 		p.mu.Unlock()
@@ -237,13 +271,20 @@ func (p *Par2Repair) Enqueue(nzbID string) {
 	p.queued[nzbID] = struct{}{}
 	p.mu.Unlock()
 
+	target := p.queue
+	if urgent {
+		target = p.urgentQueue
+	}
 	select {
-	case p.queue <- nzbID:
+	case target <- nzbID:
 	default:
-		p.logger.Warn().Str("entry", nzbID).Msg("par2 repair queue full; dropping request")
+		p.logger.Warn().Str("entry", nzbID).Bool("urgent", urgent).Msg("par2 repair queue full; dropping request")
 		p.mu.Lock()
 		delete(p.queued, nzbID)
 		p.mu.Unlock()
+		if p.repair != nil && p.repair.handlers != nil {
+			p.repair.handlers.Release(nzbID)
+		}
 	}
 }
 
@@ -471,22 +512,43 @@ func (p *Par2Repair) loop() {
 	ticker := time.NewTicker(par2RetryInterval)
 	defer ticker.Stop()
 
+	// dequeue handles one nzbID pulled off either queue: run it now if the
+	// repair window is open, otherwise defer it to the next ticker tick that
+	// finds the window open.
+	dequeue := func(nzbID string) {
+		p.mu.Lock()
+		delete(p.queued, nzbID)
+		p.mu.Unlock()
+		if p.readyToRun() {
+			p.runJob(nzbID)
+		} else {
+			p.mu.Lock()
+			p.deferred[nzbID] = struct{}{}
+			p.mu.Unlock()
+			pending = append(pending, nzbID)
+		}
+	}
+
 	for {
+		// Urgent jobs (triggered by a live playback failure, not the
+		// background sweep) always jump the normal queue: check non-blocking
+		// first so a burst of normal-queue sends ready at the same instant
+		// (select among multiple ready cases is unordered in Go) never wins
+		// the race against a waiting urgent one.
+		select {
+		case nzbID := <-p.urgentQueue:
+			dequeue(nzbID)
+			continue
+		default:
+		}
+
 		select {
 		case <-p.ctx.Done():
 			return
+		case nzbID := <-p.urgentQueue:
+			dequeue(nzbID)
 		case nzbID := <-p.queue:
-			p.mu.Lock()
-			delete(p.queued, nzbID)
-			p.mu.Unlock()
-			if p.readyToRun() {
-				p.runJob(nzbID)
-			} else {
-				p.mu.Lock()
-				p.deferred[nzbID] = struct{}{}
-				p.mu.Unlock()
-				pending = append(pending, nzbID)
-			}
+			dequeue(nzbID)
 		case <-ticker.C:
 			if len(pending) == 0 || !p.readyToRun() {
 				continue
