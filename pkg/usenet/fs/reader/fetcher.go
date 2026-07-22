@@ -307,7 +307,13 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// the fetch path uses, so nothing downstream (reader, downloaders.go
 		// circuit breaker, escalation) needs to know padding/patching ever
 		// happened — the segment is just OnDisk.
-		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) {
+		//
+		// Skipped entirely when ctx is marked no-pad (an internal-token
+		// ffprobe verification read, see ContextWithoutPadding): that read
+		// must observe the real failure so a broken import/sweep candidate
+		// can never look healthy by way of the padding that makes it
+		// playable.
+		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) && !paddingDisabled(ctx) {
 			if sf.handleConfirmedMissing(segIdx, messageID) {
 				sf.stats.Downloads.Add(1)
 				return nil

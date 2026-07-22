@@ -1007,6 +1007,16 @@ func (u *Usenet) FailedFileCause(nzoID, filename string) error {
 	return nil
 }
 
+// ContextForVerificationRead marks ctx so the segment fetcher treats a
+// confirmed-dead segment as a hard failure instead of padding/patching it -
+// see reader.ContextWithoutPadding. Callers pass the returned context into
+// Stream for internal-bearer-token reads (ffprobe import/sweep checks), so a
+// broken grab can never look healthy by way of the very padding that makes
+// it playable during real playback.
+func ContextForVerificationRead(ctx context.Context) context.Context {
+	return reader.ContextWithoutPadding(ctx)
+}
+
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
 	if start < 0 {

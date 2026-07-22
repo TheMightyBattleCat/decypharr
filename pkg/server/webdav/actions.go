@@ -71,6 +71,12 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, r *http.Request) {
+	if h.isInternalBearer(r) {
+		// ffprobe/verification read: never let a confirmed-dead segment be
+		// papered over by padding or a PAR2 patch - the real NNTP failure
+		// must surface so a broken grab can't pass validation.
+		r = r.WithContext(manager.ContextForVerificationRead(r.Context()))
+	}
 	etag := fmt.Sprintf("\"%x-%x\"", info.ModTime().Unix(), info.Size())
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
