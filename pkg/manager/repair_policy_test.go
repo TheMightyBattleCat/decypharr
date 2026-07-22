@@ -99,11 +99,13 @@ func TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback(t *testing.T) {
 // TestDecideAutoRepairActionImportAndSweepNeverPad is the extended
 // truth-table test: source=import and source=sweep must NEVER resolve to
 // autoActionNone for a real (degraded/failed) verdict - detection there is
-// never pad-and-forget. This directly proves the divergence from
-// source=playback for the one cell where they differ: par2 disabled +
-// degraded. Playback pads (a live viewer is watching now); import/sweep
-// re-grab instead (nobody is watching a padded, undetected glitch resolve
-// itself outside a playback session).
+// never pad-and-forget. PAR2 is a playback-only mechanism (see
+// decideAutoRepairAction's doc comment: at import/sweep time the DFS cache
+// is cold, so PAR2 would fetch the entire release from Usenet instead of
+// the cache-warm slices it relies on to be cheap), so import/sweep also
+// never resolve to autoActionQueuePar2 - par2Enabled is ignored entirely for
+// these sources. The assertion holds across the whole (par2Enabled, verdict)
+// space: every combination collapses to the single re-grab action.
 func TestDecideAutoRepairActionImportAndSweepNeverPad(t *testing.T) {
 	sources := []RepairSource{RepairSourceImport, RepairSourceSweep}
 	verdicts := []overlay.Verdict{overlay.VerdictDegraded, overlay.VerdictFailed}
@@ -112,9 +114,9 @@ func TestDecideAutoRepairActionImportAndSweepNeverPad(t *testing.T) {
 		for _, par2Enabled := range []bool{true, false} {
 			for _, verdict := range verdicts {
 				got := decideAutoRepairAction(source, par2Enabled, verdict)
-				if got == autoActionNone {
-					t.Errorf("decideAutoRepairAction(%s, par2Enabled=%v, verdict=%v) = none, want pad/none is never valid for source=%s",
-						source, par2Enabled, verdict, source)
+				if got != autoActionRegrab {
+					t.Errorf("decideAutoRepairAction(%s, par2Enabled=%v, verdict=%v) = %v, want autoActionRegrab - import/sweep never pad and never queue PAR2 (playback-only)",
+						source, par2Enabled, verdict, got)
 				}
 			}
 		}
@@ -123,11 +125,17 @@ func TestDecideAutoRepairActionImportAndSweepNeverPad(t *testing.T) {
 
 // TestDecideAutoRepairActionSourceTruthTable is the full extended truth
 // table: (source, par2Enabled, verdict) -> action, across all three
-// sources. It proves the specific divergence the task requires: import/sweep
-// + degraded + par2-disabled resolves to a re-grab, whereas playback +
-// degraded + par2-disabled pads (autoActionNone - padding is applied by the
-// reader itself, not this function; "none" here means "no automatic repair
-// action", which is exactly what leaves the segment padded).
+// sources. PAR2 is a playback-only mechanism: only source=playback ever
+// resolves to autoActionQueuePar2. This splits what was previously a single
+// "any source | par2 enabled | degraded/failed -> queue PAR2" row: for
+// source=playback that still holds (par2Enabled fully determines the
+// outcome alongside verdict), but for source=import and source=sweep every
+// combination - INCLUDING par2Enabled=true - now resolves to a re-grab,
+// since PAR2 would run against a cold DFS cache at import/sweep time and
+// gets no benefit from it. Proves the three cases the divergence hinges on:
+// import + par2-on + degraded -> regrab, sweep + par2-on + failed -> regrab,
+// and playback + par2-on + degraded -> queuePar2 (the one source that still
+// consults par2Enabled at all).
 func TestDecideAutoRepairActionSourceTruthTable(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -136,24 +144,25 @@ func TestDecideAutoRepairActionSourceTruthTable(t *testing.T) {
 		verdict     overlay.Verdict
 		want        autoRepairAction
 	}{
-		// --- source=playback: unchanged four-quadrant behavior ---
+		// --- source=playback: unchanged four-quadrant behavior; the only
+		// source that ever consults par2Enabled ---
 		{"playback + degraded + par2 enabled -> queue par2", RepairSourcePlayback, true, overlay.VerdictDegraded, autoActionQueuePar2},
 		{"playback + degraded + par2 disabled -> pad (none)", RepairSourcePlayback, false, overlay.VerdictDegraded, autoActionNone},
 		{"playback + failed + par2 enabled -> queue par2", RepairSourcePlayback, true, overlay.VerdictFailed, autoActionQueuePar2},
 		{"playback + failed + par2 disabled -> regrab", RepairSourcePlayback, false, overlay.VerdictFailed, autoActionRegrab},
 		{"playback + clean -> none", RepairSourcePlayback, true, overlay.VerdictClean, autoActionNone},
 
-		// --- source=import: never pad-and-forget ---
-		{"import + degraded + par2 enabled -> queue par2", RepairSourceImport, true, overlay.VerdictDegraded, autoActionQueuePar2},
+		// --- source=import: never pad-and-forget, never PAR2 (par2Enabled ignored) ---
+		{"import + degraded + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceImport, true, overlay.VerdictDegraded, autoActionRegrab},
 		{"import + degraded + par2 disabled -> REGRAB (would be pad for playback)", RepairSourceImport, false, overlay.VerdictDegraded, autoActionRegrab},
-		{"import + failed + par2 enabled -> queue par2", RepairSourceImport, true, overlay.VerdictFailed, autoActionQueuePar2},
+		{"import + failed + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceImport, true, overlay.VerdictFailed, autoActionRegrab},
 		{"import + failed + par2 disabled -> regrab", RepairSourceImport, false, overlay.VerdictFailed, autoActionRegrab},
 		{"import + clean -> none", RepairSourceImport, true, overlay.VerdictClean, autoActionNone},
 
-		// --- source=sweep: never pad-and-forget ---
-		{"sweep + degraded + par2 enabled -> queue par2", RepairSourceSweep, true, overlay.VerdictDegraded, autoActionQueuePar2},
+		// --- source=sweep: never pad-and-forget, never PAR2 (par2Enabled ignored) ---
+		{"sweep + degraded + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceSweep, true, overlay.VerdictDegraded, autoActionRegrab},
 		{"sweep + degraded + par2 disabled -> REGRAB (would be pad for playback)", RepairSourceSweep, false, overlay.VerdictDegraded, autoActionRegrab},
-		{"sweep + failed + par2 enabled -> queue par2", RepairSourceSweep, true, overlay.VerdictFailed, autoActionQueuePar2},
+		{"sweep + failed + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceSweep, true, overlay.VerdictFailed, autoActionRegrab},
 		{"sweep + failed + par2 disabled -> regrab", RepairSourceSweep, false, overlay.VerdictFailed, autoActionRegrab},
 		{"sweep + clean -> none", RepairSourceSweep, true, overlay.VerdictClean, autoActionNone},
 	}

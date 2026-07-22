@@ -18,11 +18,13 @@ const (
 	// source=sweep on a real verdict - see decideAutoRepairAction.
 	autoActionNone autoRepairAction = iota
 	// autoActionQueuePar2 means hand the file to the PAR2 worker instead of
-	// re-grabbing: either the damage is within caps (background repair,
-	// playback stays smooth in the meantime) or beyond them but PAR2 is
-	// enabled and gets first refusal - only a PAR2-classified terminal
-	// failure (see classifyPar2Failure) ever escalates beyond this, and even
-	// then to a manual-only "unrepairable" mark, never an automatic re-grab.
+	// re-grabbing. PAR2 is a playback-only mechanism: it is only ever
+	// returned for source=playback, where a live viewer is watching and PAR2
+	// can repair from the DFS cache the viewer is already warming. Import
+	// and sweep detection happen against a cold cache (nothing has played),
+	// so PAR2 there would fetch the entire release from Usenet - never worth
+	// it - and always resolve to autoActionRegrab instead, regardless of
+	// whether PAR2 repair is enabled.
 	autoActionQueuePar2
 	// autoActionRegrab means delete + blocklist + re-search via the Arr
 	// (the legacy path).
@@ -59,7 +61,8 @@ const (
 // decideAutoRepairAction implements the coordinated auto-repair policy over
 // (source, par2Enabled, verdict).
 //
-// source=playback keeps the original four-quadrant table exactly as before
+// PAR2 is a playback-only mechanism, so only source=playback ever consults
+// par2Enabled. It keeps the original four-quadrant table exactly as before
 // this source distinction existed:
 //
 //	par2 enabled  + degraded (within padding caps): queue PAR2 (background). No re-grab.
@@ -70,16 +73,23 @@ const (
 //	par2 disabled + degraded: nothing automatic (padding alone covers it, a live viewer keeps watching).
 //	par2 disabled + failed:   auto re-grab (today's legacy behavior).
 //
-// source=import and source=sweep collapse that "par2 disabled + degraded ->
-// nothing automatic" cell into a re-grab instead: detection there is never
-// pad-and-forget, so ANY confirmed-dead segment (degraded or failed verdict
-// alike) resolves to PAR2 repair when enabled, otherwise a full re-grab -
-// never a no-op:
+// source=import and source=sweep ignore par2Enabled entirely and always
+// re-grab on any damage (degraded or failed verdict alike) - never a no-op,
+// never PAR2:
 //
-//	par2 enabled  + degraded: queue PAR2. No re-grab.
-//	par2 enabled  + failed:   queue PAR2. No re-grab.
-//	par2 disabled + degraded: auto re-grab (would have been "none" for playback).
-//	par2 disabled + failed:   auto re-grab.
+//	degraded: auto re-grab (would have been "none" for playback).
+//	failed:   auto re-grab (would have been "queue PAR2" for playback when par2 is enabled).
+//
+// This isn't just "detection there is never pad-and-forget" - it's that PAR2
+// only pays off once the DFS cache is warm from playback. At import (and at
+// sweep time, since nothing is playing then either) the cache is cold, so a
+// PAR2 pass would have to fetch the entire release from Usenet: the one case
+// where PAR2's cache-source optimization gives zero benefit and costs the
+// most (import latency). A re-grab is strictly better there, so import and
+// sweep detection route straight to it regardless of the PAR2 toggle. The
+// sweep is also the backstop for anything playback PAR2 left terminal: a
+// file PAR2 couldn't fix during playback is left padded until the next
+// sweep re-grabs it.
 //
 // VerdictClean (or any other value) never triggers automatic action for any
 // source - there is no damage for the policy to act on.
@@ -92,14 +102,17 @@ const (
 func decideAutoRepairAction(source RepairSource, par2Enabled bool, verdict overlay.Verdict) autoRepairAction {
 	switch verdict {
 	case overlay.VerdictDegraded:
+		if source != RepairSourcePlayback {
+			return autoActionRegrab
+		}
 		if par2Enabled {
 			return autoActionQueuePar2
 		}
-		if source == RepairSourcePlayback {
-			return autoActionNone
-		}
-		return autoActionRegrab
+		return autoActionNone
 	case overlay.VerdictFailed:
+		if source != RepairSourcePlayback {
+			return autoActionRegrab
+		}
 		if par2Enabled {
 			return autoActionQueuePar2
 		}
