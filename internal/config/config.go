@@ -296,6 +296,17 @@ type RepairConfig struct {
 	// import; requires the ffprobe binary and WebDAV. Default off.
 	FFProbeOnImport bool `json:"ffprobe_on_import,omitempty"`
 
+	// ImportAvailabilityCheck, when true, samples a newly-downloaded NZB file's segments
+	// (via the same BatchStat primitive the repair sweep uses) BEFORE it is reported
+	// complete to Sonarr/Radarr, and now reads back UNPADDED (see
+	// usenet.ContextForVerificationRead) so a confirmed-dead segment can't be papered
+	// over by the very padding that makes the file playable. Any confirmed-missing
+	// segment queues a PAR2 repair (when enabled) or blocklists + re-searches the grab -
+	// never imports the file broken. Defaults true when unset (same convention as
+	// PlaybackPadding/Par2Repair): a broken import is never desirable, so this check is
+	// on by default rather than opt-in like FFProbeOnImport.
+	ImportAvailabilityCheck *bool `json:"import_availability_check,omitempty"`
+
 	// PlaybackPadding, when enabled, serves zero-filled data for a Usenet segment
 	// confirmed missing (430 across every provider) instead of stalling/killing
 	// playback, bounded by a strict per-file cap - see pkg/usenet/overlay. Also
@@ -345,7 +356,7 @@ func (r RepairConfig) IsZero() bool {
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
 		!r.CleanupSuperseded &&
-		r.PlaybackPadding == nil && r.Par2Repair == nil &&
+		r.PlaybackPadding == nil && r.Par2Repair == nil && r.ImportAvailabilityCheck == nil &&
 		r.PadMaxRunSegments == 0 && r.PadMaxTotalSegments == 0 && r.PadMaxByteRatio == 0 &&
 		r.Par2RepairMode == "" && r.Par2RepairMinSegments == 0
 }
@@ -360,6 +371,13 @@ func (r RepairConfig) PlaybackPaddingEnabled() bool {
 // when unset (see Par2Repair's doc comment).
 func (r RepairConfig) Par2RepairEnabled() bool {
 	return r.Par2Repair == nil || *r.Par2Repair
+}
+
+// ImportAvailabilityCheckEnabled reports whether the import-time segment
+// availability gate is active, defaulting to true when unset (see
+// ImportAvailabilityCheck's doc comment).
+func (r RepairConfig) ImportAvailabilityCheckEnabled() bool {
+	return r.ImportAvailabilityCheck == nil || *r.ImportAvailabilityCheck
 }
 
 type Config struct {

@@ -1729,6 +1729,56 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	return nil
 }
 
+// RegrabImportGrab blocklists a grab that failed the import-time
+// availability gate (see Downloader.importAvailabilityGate) so the Arr's own
+// "redownload failed" handling (on by default) picks a fresh candidate. The
+// entry has deliberately NOT been added to storage yet at this point - the
+// import is being rejected, not repaired - so this can't resolve the grab
+// via manager.GetEntryItem/GetMedia the way RepairPlaybackFileNow and the
+// sweep do for already-imported files. Instead it looks up the Arr's own
+// grab history directly by download ID (entry.InfoHash - the same ID the Arr
+// received back when it originally sent this release to decypharr), which
+// exists from the moment of the grab regardless of import status.
+//
+// Claims the handler registry around the call so a concurrent sweep/PAR2
+// pass discovering the same nzbID (unlikely pre-import, but the registry
+// dedup is cheap insurance) can't double-handle it.
+func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fileName, reason string) error {
+	if entry == nil || entry.InfoHash == "" {
+		return errors.New("entry is required")
+	}
+	nzbID := entry.InfoHash
+	if r.handlers != nil {
+		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
+			r.logger.Debug().Str("entry", entry.Name).Str("file", fileName).
+				Msg("Import: entry already being handled; skipping re-grab")
+			return nil
+		}
+		defer r.handlers.Release(nzbID)
+	}
+
+	a := r.manager.arr.GetOrCreate(entry.Category)
+	if a == nil || a.Host == "" || a.Token == "" {
+		return fmt.Errorf("no arr configured for category %q", entry.Category)
+	}
+
+	history := a.GetHistory(entry.InfoHash, "1") // eventType 1 = grabbed
+	if history == nil || len(history.Records) == 0 {
+		return fmt.Errorf("no grab history found for %q in arr %q", entry.Name, a.Name)
+	}
+	record := history.Records[0]
+	if err := a.MarkHistoryFailed(record.ID); err != nil {
+		return fmt.Errorf("failed to blocklist grab: %w", err)
+	}
+	r.logger.Info().
+		Str("entry", entry.Name).
+		Str("file", fileName).
+		Str("arr", a.Name).
+		Str("reason", reason).
+		Msg("Import: blocklisted broken grab; arr will re-search")
+	return nil
+}
+
 // normalizeCooldownKey reduces an entry/release name to lowercase alphanumerics
 // so the same episode's differently-formatted releases collapse to one key
 // (e.g. "Bosch.S05E07.The.Wisdom...REAL.REPACK...1-NTb" and
