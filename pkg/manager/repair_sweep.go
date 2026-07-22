@@ -1489,6 +1489,65 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 	})
 }
 
+// HandlePlaybackFailure is the coordination entry point for a live playback
+// read that just hit a hard, permanent article-not-found (BODY 430) -
+// definitive proof the segment's body is truly gone, not merely slow. It
+// replaces calling RepairPlaybackFileNow directly: rather than always
+// re-grabbing (this feature's original, pre-coordination behavior), it
+// consults the auto-repair policy (decideAutoRepairAction) over this file's
+// current overlay verdict and whether PAR2 repair is enabled, then the
+// handler registry, so a live playback failure never races a concurrent
+// sweep pass or the PAR2 worker into double-handling the same entry:
+//
+//   - PAR2 disabled AND verdict failed (the only quadrant that re-grabs):
+//     claim the entry's handler slot and call RepairPlaybackFileNow exactly
+//     as before this policy existed. If something else already claimed the
+//     slot, defer to it - do nothing.
+//   - PAR2 enabled (verdict degraded or failed): queue a PAR2 pass on the
+//     urgent lane (EnqueueUrgent) instead of re-grabbing - the user is
+//     watching right now, so this jumps ahead of anything the background
+//     sweep already queued. A PAR2-terminal outcome for this entry marks it
+//     unrepairable for the overlay GUI's manual "Delete & re-search"; it
+//     never falls back to an automatic re-grab (see Par2Repair.runJob).
+//   - Anything else (clean verdict, or the entry/verdict can't be resolved -
+//     e.g. no overlay tracking for this release) falls back to
+//     RepairPlaybackFileNow directly, exactly as before this policy existed.
+//     Padding itself already suppresses within-cap 430s from ever reaching
+//     countErrors/escalatePlaybackFailure in the first place (see
+//     pkg/usenet/fs/reader's handleConfirmedMissing) - this function only
+//     ever sees a failure once padding has already declined to cover it.
+func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName string) error {
+	entry, err := r.manager.GetEntryByName(entryName, fileName)
+	if err != nil || entry == nil || entry.InfoHash == "" || r.manager.usenet == nil {
+		// Can't resolve enough to consult the policy (non-NZB entry, no
+		// overlay/usenet tracking, or the file isn't where we expect it) -
+		// fall back to the pre-coordination default.
+		return r.RepairPlaybackFileNow(ctx, entryName, fileName)
+	}
+	nzbID := entry.InfoHash
+
+	par2Enabled := config.Get().Repair.Par2RepairEnabled()
+	verdict := r.manager.usenet.OverlayVerdict(nzbID, fileName)
+
+	switch decideAutoRepairAction(par2Enabled, verdict) {
+	case autoActionRegrab:
+		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
+			r.logger.Debug().Str("entry", entryName).Str("file", fileName).
+				Msg("playback repair: entry already being handled; skipping re-grab")
+			return nil
+		}
+		defer r.handlers.Release(nzbID)
+		return r.RepairPlaybackFileNow(ctx, entryName, fileName)
+	case autoActionQueuePar2:
+		if r.manager.par2Repair != nil {
+			r.manager.par2Repair.EnqueueUrgent(nzbID)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 // RepairPlaybackFileNow repairs a file that just failed playback WITHOUT
 // re-probing it. The triggering read already hit a hard article-not-found
 // (BODY 430) — that is definitive proof the body is missing, so a confirming

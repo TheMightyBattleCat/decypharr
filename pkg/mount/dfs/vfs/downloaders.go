@@ -801,14 +801,16 @@ func (dls *Downloaders) openCircuitLocked() {
 	dls.item.cache.circuitBreakers.Add(1)
 }
 
-// escalatePlaybackFailure asks the repair system to repair this entry after a
+// escalatePlaybackFailure asks the repair system to handle this entry after a
 // streaming read failed with a permanent NNTP article-not-found. It is the
 // safety net for "head alive, body dead" files that a sampling availability
 // probe can pass. The read that triggered this already hit a hard 430 — that
-// is definitive proof the body is missing — so this repairs the played file
-// immediately without a confirming re-probe (a re-probe sample can miss the
-// exact dead segments and wrongly report the file healthy, suppressing the
-// repair).
+// is definitive proof the body is missing — so this hands the played file to
+// Repair.HandlePlaybackFailure without a confirming re-probe (a re-probe
+// sample can miss the exact dead segments and wrongly report the file
+// healthy, suppressing the repair). HandlePlaybackFailure decides whether
+// that means an immediate re-grab or a PAR2 queue — see its doc comment for
+// the policy — never re-grabbing unconditionally.
 //
 // Fire-and-forget on its own goroutine and context: countErrors runs under
 // dls.mu on the read hot path, and the repair call must not block it.
@@ -864,7 +866,7 @@ func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 		// the tripped breaker) but bounded so a stuck repair can't leak.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		if err := mgr.Repair().RepairPlaybackFileNow(ctx, entryName, filename); err != nil {
+		if err := mgr.Repair().HandlePlaybackFailure(ctx, entryName, filename); err != nil {
 			dls.item.cache.logger.Debug().
 				Err(err).
 				Str("entry", entryName).
