@@ -8,11 +8,13 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -235,7 +237,28 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 }
 
 // notifyReadiness fires the "next play is ready" notification for a
-// completed next-episode pre-cache pass. Wired up to the notifications
-// service separately (see notifications_precache.go); a no-op until then.
+// completed next-episode pre-cache pass: "next episode cached, clean" or
+// "next episode cached, N segments repaired ahead of time" (or, if the
+// URGENT repair didn't land within precacheRepairWaitTimeout, a
+// still-damaged variant so the operator isn't told it's clean when it
+// isn't).
 func (p *Precache) notifyReadiness(entry *storage.Entry, r EpisodeReadiness) {
+	if p.manager.Notifications == nil {
+		return
+	}
+	var msg string
+	switch {
+	case r.Clean:
+		msg = fmt.Sprintf("Next episode cached, clean: %s / %s", entry.Name, r.Filename)
+	case r.SegmentsRepaired > 0:
+		msg = fmt.Sprintf("Next episode cached, %d segment(s) repaired ahead of time: %s / %s", r.SegmentsRepaired, entry.Name, r.Filename)
+	default:
+		msg = fmt.Sprintf("Next episode cached, %d segment(s) still damaged: %s / %s", r.SegmentsPending, entry.Name, r.Filename)
+	}
+	p.manager.Notifications.Notify(notifications.Event{
+		Type:    config.EventPrecacheReady,
+		Status:  "ready",
+		Entry:   entry,
+		Message: msg,
+	})
 }

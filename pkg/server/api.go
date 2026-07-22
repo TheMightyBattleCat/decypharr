@@ -647,6 +647,13 @@ func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, svc.Status(), http.StatusOK)
 }
 
+// handlePrecacheStatus reports the read-ahead / next-episode precache
+// feature's live config and state (see Manager.PrecacheStatus) for the
+// repair/overlay GUI's summary.
+func (s *Server) handlePrecacheStatus(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, s.manager.PrecacheStatus(), http.StatusOK)
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`
