@@ -150,9 +150,18 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // strm, none) and both protocols (torrent, NZB) funnel through once their
 // files are in place and servable via WebDAV, right before the entry is
 // reported complete to the Arr. That makes it the natural home for the
-// optional ffprobe import gate: it runs here, before markAsCompleted /
+// import-time validation gates: they run here, before markAsCompleted /
 // notifyCompleted, so a confirmed-broken file never gets reported done.
+//
+// importAvailabilityGate runs first: it catches genuinely missing segments
+// directly (independent of padding), which is what a front-loaded-damage
+// grab needs, since the ffprobe gate below reads through the same shared
+// padding path real playback uses and can otherwise be fooled by a
+// container whose only damage is a zero-filled hole.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
+	if err := d.importAvailabilityGate(entry); err != nil {
+		return err
+	}
 	if err := d.ffprobeImportGate(entry); err != nil {
 		return err
 	}
