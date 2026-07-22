@@ -668,6 +668,13 @@ func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
+	// Manual override: proceed regardless of whatever the automatic
+	// auto-repair policy currently claims for this entry - including a
+	// terminal mark left by a PAR2 pass that gave up - and clear that claim
+	// once this one-shot action has run its course. See
+	// Repair.HandlePlaybackFailure for the automatic policy this bypasses.
+	svc.ClaimManualAutoRepairOverride(entry.InfoHash)
+	defer svc.ReleaseManualAutoRepairOverride(entry.InfoHash)
 	if err := svc.RepairPlaybackFileNow(s.manager.Context(), entry.Name, req.File); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
