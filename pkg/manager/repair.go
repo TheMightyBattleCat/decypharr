@@ -108,6 +108,13 @@ type Repair struct {
 	// preview or cleanup pass, polled by the modal's progress endpoint. See
 	// stale_nzb_progress.go.
 	staleNZBProgress atomic.Pointer[StaleNZBProgress]
+
+	// handlers coordinates the four auto-repair call sites (playback-failure
+	// escalation, the repair sweep, the PAR2 worker, and manual repair-now)
+	// so an entry already being handled by one is never double-queued or
+	// double-re-grabbed by another. See repair_handler_registry.go and the
+	// policy in repair_policy.go.
+	handlers *repairHandlerRegistry
 }
 
 // NewRepair builds the repair service for the given manager. Call
@@ -118,6 +125,7 @@ func NewRepair(m *Manager) *Repair {
 		scheduler: m.scheduler,
 		logger:    logger.New("repair"),
 		parentCtx: context.Background(),
+		handlers:  newRepairHandlerRegistry(defaultRepairHandlerTTL),
 	}
 }
 
