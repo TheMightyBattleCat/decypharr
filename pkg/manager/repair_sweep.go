@@ -295,6 +295,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			// Arr delete + re-search for just this entry.
 			if autoRepair && h.Status == storage.HealthBroken {
 				r.healBrokenEntry(gctx, run, &runMu, name, h)
+				r.releaseRegrabClaims(h)
 			}
 
 			runMu.Lock()
@@ -474,69 +475,79 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	}
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
 		verdict := r.recordDeadSegments(ctx, entry, name)
-		if r.queueForPar2Repair(entry, name, verdict) {
-			// Damage is within the padding caps and PAR2 data is retained -
-			// hand it to the PAR2 worker instead of the legacy re-grab path.
-			// Deliberately NOT marking res.broken: this file should neither
-			// show up in this run's BrokenFiles (which would re-grab it
-			// immediately) nor count as healthy - "unknown/pending" is the
-			// correct rollup while the PAR2 pass is outstanding. Everything
-			// else (verdict failed, PAR2 disabled/unavailable, or no
-			// verdict at all because the detail probe itself failed) falls
-			// through to exactly today's path below.
-			res.reason = "usenet_segment_missing_par2_queued"
-			return res
-		}
-		res.broken = true
-		res.reason = "usenet_segment_missing"
-	} else {
-		res.reason = "usenet_probe_error"
+		return r.routeAutoRepair(entry, name, verdict, res)
 	}
+	res.reason = "usenet_probe_error"
 	return res
 }
 
-// queueForPar2Repair reports whether name should be handed to the PAR2
-// worker instead of this sweep's legacy re-grab path: the overlay verdict is
-// degraded (damage within the padding caps - a failed verdict means it's
-// beyond them, or not a paddable container, either way not PAR2's call to
-// make), PAR2 repair is enabled, a worker is actually running, and PAR2 data
-// is retained for this NZB. Any one of those being false means "exactly
-// today's path" - the whole point of this gate is that everything else about
-// the sweep is unchanged.
+// routeAutoRepair applies the coordinated auto-repair policy
+// (decideAutoRepairAction) to a file the sweep just confirmed has a
+// segment-missing failure, claiming the handler registry before acting so a
+// concurrent playback-failure escalation or the PAR2 worker's own queueing
+// can never double-queue or double-re-grab the same entry (nzbID =
+// entry.InfoHash - see repair_handler_registry.go).
 //
-// Par2RepairMode further narrows this: "manual" defers to the legacy path
-// exactly as if PAR2 repair were disabled (returns false), while
-// "auto_threshold" claims the file (returns true, so it's neither re-grabbed
-// nor counted broken) but only actually enqueues once the file's dead segment
-// count reaches Par2RepairMinSegments - below that it's left padded.
-func (r *Repair) queueForPar2Repair(entry *storage.Entry, name string, verdict overlay.Verdict) bool {
-	if verdict != overlay.VerdictDegraded {
-		return false
+// A VerdictClean result (recordDeadSegments' detail probe itself failed, or
+// found nothing) carries no policy-relevant information - it's treated as a
+// plain segment-missing failure and always routed to the legacy re-grab
+// path, exactly as it was before this policy existed.
+func (r *Repair) routeAutoRepair(entry *storage.Entry, name string, verdict overlay.Verdict, res fileResult) fileResult {
+	nzbID := entry.InfoHash
+
+	action := autoActionRegrab
+	if verdict != overlay.VerdictClean {
+		action = decideAutoRepairAction(config.Get().Repair.Par2RepairEnabled(), verdict)
 	}
-	cfg := config.Get().Repair
-	if !cfg.Par2RepairEnabled() {
-		return false
+
+	switch action {
+	case autoActionQueuePar2:
+		// Damage is within the padding caps (or beyond them but PAR2 is
+		// enabled and gets first refusal) - hand it to the PAR2 worker
+		// instead of the legacy re-grab path. Deliberately NOT marking
+		// res.broken: this file should neither show up in this run's
+		// BrokenFiles (which would re-grab it immediately) nor count as
+		// healthy - "unknown/pending" is the correct rollup while the PAR2
+		// pass is outstanding (or, if PAR2 already marked this entry
+		// terminal, while it waits for a MANUAL "Delete & re-search").
+		r.queuePar2FromSweep(entry, name)
+		res.reason = "usenet_segment_missing_par2_queued"
+		return res
+	case autoActionRegrab:
+		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
+			// Already being handled (PAR2 queued/running, an in-flight
+			// re-grab from another candidate, or a rare race with a manual
+			// action) - defer to it. Same "unknown/pending" rollup as the
+			// PAR2-queued case above: not broken, not healthy.
+			res.reason = "usenet_segment_missing_deferred"
+			return res
+		}
+		// Released once healBrokenEntry has processed this candidate's
+		// broken files - see probeAndHealCandidates.
+		res.broken = true
+		res.reason = "usenet_segment_missing"
+		return res
+	default: // autoActionNone: within caps, PAR2 disabled - pad only.
+		res.reason = "usenet_segment_missing_padded"
+		return res
 	}
+}
+
+// queuePar2FromSweep hands entry/name to the PAR2 worker via AutoEnqueue,
+// which applies config.Repair.Par2RepairMode's own mode/threshold gating
+// (manual: never auto-queues; auto_threshold: only once this file's dead
+// segment count reaches Par2RepairMinSegments) - the same gate the reader's
+// own padding-triggered EnqueueRepair path uses, so a file left below
+// threshold stays exactly padded rather than being queued regardless.
+func (r *Repair) queuePar2FromSweep(entry *storage.Entry, name string) {
 	if r.manager.par2Repair == nil || r.manager.usenet == nil {
-		return false
+		return
 	}
-	if !r.manager.usenet.HasPar2Data(entry.InfoHash) {
-		return false
+	deadSegments := 0
+	if pending, err := r.manager.usenet.OverlayPendingRepair(entry.InfoHash); err == nil {
+		deadSegments = len(pending[name])
 	}
-	if cfg.Par2RepairMode == config.Par2RepairModeManual {
-		return false
-	}
-	if cfg.Par2RepairMode == config.Par2RepairModeAutoThreshold {
-		deadSegments := 0
-		if pending, err := r.manager.usenet.OverlayPendingRepair(entry.InfoHash); err == nil {
-			deadSegments = len(pending[name])
-		}
-		if deadSegments < cfg.Par2RepairMinSegments {
-			return true
-		}
-	}
-	r.manager.par2Repair.Enqueue(entry.InfoHash)
-	return true
+	r.manager.par2Repair.AutoEnqueue(entry.InfoHash, deadSegments)
 }
 
 // recordDeadSegments re-probes name for the specific segments confirmed
@@ -819,6 +830,34 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	}
 
 	r.finalizeEntryRepair(name, h, succeeded)
+}
+
+// releaseRegrabClaims releases the handler-registry slot routeAutoRepair
+// claimed (autoActionRegrab -> handlers.TryAcquire(nzbID, handlerRegrab))
+// for every distinct nzbID among h's broken files, now that healBrokenEntry
+// has acted on them - so a later decision for the same entry isn't blocked
+// by a stale claim. Only releases entries this sweep's own auto-regrab path
+// actually claimed (kind == handlerRegrab): a broken file whose InfoHash
+// happens to also be mid-PAR2-pass for a DIFFERENT file in the same
+// candidate must keep that claim untouched, and a manual action that raced
+// in and overwrote the claim (Set) always wins over this cleanup.
+func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
+	if h == nil {
+		return
+	}
+	seen := make(map[string]struct{}, len(h.BrokenFiles))
+	for _, bf := range h.BrokenFiles {
+		if bf.InfoHash == "" {
+			continue
+		}
+		if _, ok := seen[bf.InfoHash]; ok {
+			continue
+		}
+		seen[bf.InfoHash] = struct{}{}
+		if kind, terminal, exists := r.handlers.State(bf.InfoHash); exists && !terminal && kind == handlerRegrab {
+			r.handlers.Release(bf.InfoHash)
+		}
+	}
 }
 
 // repairArrFiles deletes the broken files in one Arr, blocklists their grabs,
@@ -1546,6 +1585,31 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 	default:
 		return nil
 	}
+}
+
+// ClaimManualAutoRepairOverride force-claims nzbID's auto-repair
+// handler-registry slot for a manual, user-initiated re-grab, clearing any
+// terminal mark left by an automatic PAR2 failure in the process. Call this
+// before a manual "Delete & re-search" style action (see the overlay GUI's
+// handleOverlayResearch) so it always proceeds and re-evaluates the entry
+// from scratch, exactly like Par2Repair.RunNow's own manual override, rather
+// than being silently blocked by whatever the automatic path last claimed.
+func (r *Repair) ClaimManualAutoRepairOverride(nzbID string) {
+	if r == nil || r.handlers == nil || nzbID == "" {
+		return
+	}
+	r.handlers.Set(nzbID, handlerRegrab)
+}
+
+// ReleaseManualAutoRepairOverride releases the claim
+// ClaimManualAutoRepairOverride took, once the manual action it guarded has
+// finished (success or failure) - so it doesn't sit blocking a later
+// automatic decision for the registry's full stale-claim TTL.
+func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
+	if r == nil || r.handlers == nil || nzbID == "" {
+		return
+	}
+	r.handlers.Release(nzbID)
 }
 
 // RepairPlaybackFileNow repairs a file that just failed playback WITHOUT

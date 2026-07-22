@@ -10,12 +10,18 @@
 // Escalation ordering end to end: a padded segment enqueues here; on success
 // the segment is patched and padding for it stops on the next read. On any
 // failure - no PAR2 data, too much damage, a fetch or verification failure -
-// the job hands the entry to the existing playback-repair path
-// (Repair.RepairPlaybackFileNow), exactly the delete + re-search a live 430
-// would have triggered if padding didn't exist. With config.Repair.Par2Repair
-// disabled this worker never does anything but fall through to that same
-// legacy path; with PlaybackPadding also disabled, EnqueueRepair is never
-// even called (see pkg/usenet/fs/reader), so the whole feature is inert.
+// classifyPar2Failure decides whether it's worth retrying (backed off) or
+// terminal. A terminal outcome marks the entry unrepairable in the handler
+// registry (see repair_handler_registry.go) - surfaced in the overlay GUI
+// for a MANUAL "Delete & re-search" - and never falls back to an automatic
+// re-grab: this worker only ever runs with PAR2 repair enabled (see
+// readyToRun/RunNow), and decideAutoRepairAction (repair_policy.go) never
+// selects an automatic re-grab in that case. With config.Repair.Par2Repair
+// disabled this worker is never queued at all - the caller's own
+// decideAutoRepairAction call routes straight to the legacy re-grab path
+// instead; with PlaybackPadding also disabled, EnqueueRepair is never even
+// called (see pkg/usenet/fs/reader) for the padding-triggered path, though
+// the sweep and playback-failure paths still queue this worker directly.
 package manager
 
 import (
@@ -318,6 +324,15 @@ func (p *Par2Repair) RunNow(nzbID string) error {
 	p.queued[nzbID] = struct{}{}
 	p.mu.Unlock()
 
+	// Manual override: force-claim the handler registry regardless of
+	// whatever it currently holds (including a terminal mark from a prior
+	// automatic PAR2 failure) - a user-initiated "repair now" always
+	// proceeds and always re-evaluates from scratch, same as
+	// par2ShouldAutoEnqueue's terminal gate not applying here either.
+	if p.repair != nil && p.repair.handlers != nil {
+		p.repair.handlers.Set(nzbID, handlerPar2Running)
+	}
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -576,11 +591,39 @@ func (p *Par2Repair) readyToRun() bool {
 
 // runJob runs one NZB's PAR2 repair pass end to end. Every exit path either
 // leaves the overlay state as-is (nothing to do, or a genuine "can't tell
-// yet" error worth retrying later) or falls through to the legacy repair
-// path - it never partially patches and calls it done.
+// yet" error worth retrying later) or marks the entry terminal - it never
+// partially patches and calls it done, and it never falls back to an
+// automatic re-grab: with PAR2 repair enabled (the only way this worker ever
+// runs - see readyToRun/RunNow), decideAutoRepairAction never selects
+// autoActionRegrab, so a terminal PAR2 failure surfaces in the overlay GUI
+// for a MANUAL "Delete & re-search" instead (see handleOverlayResearch).
 func (p *Par2Repair) runJob(nzbID string) {
 	start := time.Now()
 	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
+
+	if p.repair != nil && p.repair.handlers != nil {
+		// Normally already par2_queued (from Enqueue/EnqueueUrgent) or
+		// par2_running (RunNow's manual override already Set it) - Transition
+		// is a no-op if neither claim exists, which should not happen on the
+		// normal queue/urgentQueue path but is harmless if it ever does.
+		p.repair.handlers.Transition(nzbID, handlerPar2Running)
+	}
+	// terminal decides, in the deferred release below, whether this job's
+	// outcome sticks the handler registry's terminal mark (blocking further
+	// automatic claims until a manual action clears it) or simply frees the
+	// slot for whatever runs next.
+	terminal := false
+	defer func() {
+		if p.repair == nil || p.repair.handlers == nil {
+			return
+		}
+		if terminal {
+			p.repair.handlers.MarkTerminal(nzbID)
+		} else {
+			p.repair.handlers.Release(nzbID)
+		}
+	}()
+
 	if p.manager.usenet == nil {
 		progress.SetPhase(Par2PhaseFailed)
 		progress.SetLastError("usenet client not configured")
@@ -595,11 +638,10 @@ func (p *Par2Repair) runJob(nzbID string) {
 	if entryErr != nil || entry == nil {
 		// A ghost overlay record - the backing entry is already gone
 		// (deleted, superseded, re-grabbed under a different nzbID). There
-		// is nothing to repair on behalf of and nothing to fall back to
-		// legacy repair for either; mark it terminal so the automatic path
-		// stops re-enqueuing it (Commit A/B's cleanup hooks should reap the
-		// overlay record itself shortly, but a race is not a reason to keep
-		// hammering it in the meantime).
+		// is nothing to repair on behalf of; mark it terminal so the
+		// automatic path stops re-enqueuing it (Commit A/B's cleanup hooks
+		// should reap the overlay record itself shortly, but a race is not a
+		// reason to keep hammering it in the meantime).
 		terminalErr := fmt.Errorf("entry no longer exists")
 		p.logger.Info().Str("entry", nzbID).Msg("par2 repair: entry no longer exists; marking unrepairable")
 		progress.SetPhase(Par2PhaseFailed)
@@ -614,6 +656,7 @@ func (p *Par2Repair) runJob(nzbID string) {
 			FailReason: terminalErr.Error(),
 		})
 		p.recordPar2Outcome(nzbID, terminalErr)
+		terminal = true
 		return
 	}
 	entryName := entry.Name
@@ -657,14 +700,17 @@ func (p *Par2Repair) runJob(nzbID string) {
 		})
 		p.recordPar2Outcome(nzbID, err)
 		p.notifyFailed(entryName, err, canary)
-		// Only a terminal failure - one backoff can never fix - falls
-		// through to the legacy delete+blocklist+re-search path. A
-		// transient failure (a slow provider, a context deadline) instead
-		// waits out its backoff and tries PAR2 again; the file is still
-		// playable (padded) in the meantime, so there is no urgency to
-		// escalate to a full re-grab over what may just be a blip.
+		// A terminal failure - one backoff can never fix - marks the entry
+		// unrepairable (see the deferred release above) instead of falling
+		// back to a re-grab: PAR2 being enabled is exactly the quadrant
+		// where decideAutoRepairAction never chooses autoActionRegrab, so
+		// the file waits for a manual "Delete & re-search" rather than being
+		// auto-re-grabbed out from under the user. A transient failure (a
+		// slow provider, a context deadline) instead waits out its backoff
+		// and tries PAR2 again; the file is still playable (padded) in the
+		// meantime, so there is no urgency either way.
 		if class.terminal {
-			p.fallbackToLegacy(entryName, pending)
+			terminal = true
 		}
 		return
 	}
@@ -1047,25 +1093,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 	return nil
-}
-
-// fallbackToLegacy hands every file with pending dead segments to the
-// existing playback-repair path (delete + re-search), exactly what a live
-// 430 would have triggered without padding - gated by the same config flags
-// escalatePlaybackFailure checks, since this is standing in for that exact
-// escalation having fired.
-func (p *Par2Repair) fallbackToLegacy(entryName string, pending map[string][]overlay.DeadSegment) {
-	cfg := config.Get().Repair
-	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	for file := range pending {
-		if err := p.repair.RepairPlaybackFileNow(ctx, entryName, file); err != nil {
-			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", file).Msg("par2 repair failed; legacy fallback also failed")
-		}
-	}
 }
 
 // estimateNeededSlices is a cheap upper bound (one slice per dead segment)
