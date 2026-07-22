@@ -15,6 +15,7 @@ package manager
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -49,7 +50,26 @@ type Precache struct {
 	logger  zerolog.Logger
 
 	mu        sync.Mutex
-	triggered map[string]time.Time // "infoHash:filename" -> when read-ahead was kicked off
+	triggered map[string]time.Time // "infoHash:filename" -> when work on it was kicked off (read-ahead or next-episode burst)
+
+	// precachedBytes is a running total of bytes this feature has
+	// deliberately pulled ahead of need (Sonarr next-episode bursts only -
+	// see PrecacheMaxBytes), checked/reserved before starting a new burst so
+	// the total never exceeds config.Precache.MaxBytes. An approximation
+	// (real disk accounting lives in the shared segment cache, which this
+	// feature doesn't own exclusively), but a real, live-adjusted one: never
+	// negative, incremented on reservation, decremented on release/eviction.
+	precachedBytes atomic.Int64
+
+	// precachedMu/precached track which (infoHash,filename) pairs currently
+	// hold a next-episode budget reservation, keyed the same as triggered,
+	// so a later watch of that same file can release it (see
+	// PrecacheEvictAfterWatched / evictIfWatched).
+	precachedMu sync.Mutex
+	precached   map[string]int64
+
+	readinessMu sync.Mutex
+	readiness   map[string]EpisodeReadiness
 }
 
 // NewPrecache builds the precache service.
@@ -58,6 +78,8 @@ func NewPrecache(m *Manager) *Precache {
 		manager:   m,
 		logger:    logger.New("precache"),
 		triggered: make(map[string]time.Time),
+		precached: make(map[string]int64),
+		readiness: make(map[string]EpisodeReadiness),
 	}
 }
 
@@ -74,6 +96,8 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	if p == nil || entry == nil || size <= 0 {
 		return
 	}
+	p.evictIfWatched(entry, filename, start, size)
+
 	if !p.cfg().ReadAheadEnabled() {
 		return
 	}
@@ -131,6 +155,7 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	}
 
 	p.repairAhead(entry, filename, from)
+	p.maybePrecacheNextEpisodes(entry, filename)
 }
 
 // repairAhead checks whether the read-ahead pass left any damage pending for
@@ -186,6 +211,84 @@ func (p *Precache) repairAhead(entry *storage.Entry, filename string, from int64
 		Dur("proximity", proximity).
 		Msg("read-ahead found damage ahead of the playhead; requesting urgent repair")
 	p.manager.par2Repair.EnqueueUrgent(entry.InfoHash, proximity)
+}
+
+// reserveBudget reserves size bytes against config.Precache.MaxBytes,
+// returning false (reserving nothing) if doing so would exceed the cap. This
+// is what makes PrecacheMaxBytes an actual bound rather than a suggestion -
+// a next-episode burst never starts without a successful reservation.
+func (p *Precache) reserveBudget(size int64) bool {
+	if size <= 0 {
+		return true
+	}
+	limit := p.cfg().MaxBytes()
+	for {
+		cur := p.precachedBytes.Load()
+		if cur+size > limit {
+			return false
+		}
+		if p.precachedBytes.CompareAndSwap(cur, cur+size) {
+			return true
+		}
+	}
+}
+
+// releaseBudget returns size bytes to the PrecacheMaxBytes budget. Never
+// drives the total negative (a defensive clamp - reserve/release calls are
+// meant to be paired, but a double-release must not corrupt the budget for
+// every other in-flight reservation).
+func (p *Precache) releaseBudget(size int64) {
+	if size <= 0 {
+		return
+	}
+	for {
+		cur := p.precachedBytes.Load()
+		next := cur - size
+		if next < 0 {
+			next = 0
+		}
+		if p.precachedBytes.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+// markPrecached records that (infoHash,filename) is holding a budget
+// reservation of size bytes because PrecacheEvictAfterWatched is enabled, so
+// evictIfWatched can find and release it once that file is actually watched.
+func (p *Precache) markPrecached(infoHash, filename string, size int64) {
+	key := infoHash + ":" + filename
+	p.precachedMu.Lock()
+	p.precached[key] = size
+	p.precachedMu.Unlock()
+}
+
+// evictIfWatched reclaims a next-episode pre-cache's disk footprint once
+// it's actually been watched (read position at/past 90% of the file),
+// releasing its PrecacheMaxBytes reservation. No-op unless
+// PrecacheEvictAfterWatched is enabled and this exact (entry,filename) was
+// previously pre-cached by this feature (see markPrecached) - organically
+// watched files that were never pre-cached are left entirely alone.
+func (p *Precache) evictIfWatched(entry *storage.Entry, filename string, start, size int64) {
+	if !p.cfg().PrecacheEvictAfterWatched || size <= 0 || start*100 < size*90 {
+		return
+	}
+	key := entry.InfoHash + ":" + filename
+
+	p.precachedMu.Lock()
+	bytes, ok := p.precached[key]
+	if ok {
+		delete(p.precached, key)
+	}
+	p.precachedMu.Unlock()
+	if !ok {
+		return
+	}
+
+	if p.manager.usenet != nil && p.manager.usenet.EvictCache(entry.InfoHash, filename) {
+		p.logger.Info().Str("entry", entry.Name).Str("file", filename).Msg("evicted pre-cached episode after it was watched")
+	}
+	p.releaseBudget(bytes)
 }
 
 // estimatePlaybackGap converts a byte gap into an estimated playback-time

@@ -842,6 +842,13 @@ func (c *Config) applyPrecacheDefaults() {
 	if c.Precache.PrecacheReadAheadConcurrency <= 0 {
 		c.Precache.PrecacheReadAheadConcurrency = 12
 	}
+	if c.Precache.PrecacheNextEpisodes == nil {
+		v := 1
+		c.Precache.PrecacheNextEpisodes = &v
+	}
+	if c.Precache.PrecacheMaxBytes <= 0 {
+		c.Precache.PrecacheMaxBytes = precacheDefaultMaxBytes
+	}
 }
 
 func (c *Config) applyRepairDefaults() {
