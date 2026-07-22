@@ -474,8 +474,8 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		return res
 	}
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
-		verdict := r.recordDeadSegments(ctx, entry, name)
-		return r.routeAutoRepair(entry, name, verdict, res)
+		r.recordDeadSegments(ctx, entry, name)
+		return r.routeAutoRepair(entry, res)
 	}
 	res.reason = "usenet_probe_error"
 	return res
@@ -484,71 +484,31 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 // routeAutoRepair applies the coordinated auto-repair policy
 // (decideAutoRepairAction, source=sweep) to a file the sweep just confirmed
 // has a segment-missing failure, claiming the handler registry before acting
-// so a concurrent playback-failure escalation or the PAR2 worker's own
-// queueing can never double-queue or double-re-grab the same entry (nzbID =
-// entry.InfoHash - see repair_handler_registry.go).
+// so a concurrent playback-failure escalation never double-re-grabs the same
+// entry (nzbID = entry.InfoHash - see repair_handler_registry.go).
 //
-// With source=sweep, decideAutoRepairAction never returns autoActionNone for
-// a real verdict - sweep detection is never pad-and-forget, so a degraded
-// verdict with PAR2 disabled re-grabs instead of the "leave it padded" outcome
-// source=playback would get for the same inputs. A VerdictClean result
-// (recordDeadSegments' detail probe itself failed, or found nothing) carries
-// no policy-relevant information - it's treated as a plain segment-missing
-// failure and always routed to the legacy re-grab path, exactly as it was
-// before this policy existed.
-func (r *Repair) routeAutoRepair(entry *storage.Entry, name string, verdict overlay.Verdict, res fileResult) fileResult {
+// PAR2 is a playback-only mechanism (see decideAutoRepairAction's doc
+// comment): with source=sweep, decideAutoRepairAction always resolves a real
+// verdict to autoActionRegrab, regardless of the PAR2 toggle - the sweep runs
+// with a cold DFS cache (nothing is playing), so PAR2 there would fetch the
+// entire release from Usenet instead of the cache-warm slices it relies on to
+// be cheap. Since the outcome for source=sweep never varies, this routes
+// straight to the re-grab path rather than consulting the policy for an
+// already-known answer.
+func (r *Repair) routeAutoRepair(entry *storage.Entry, res fileResult) fileResult {
 	nzbID := entry.InfoHash
 
-	action := autoActionRegrab
-	if verdict != overlay.VerdictClean {
-		action = decideAutoRepairAction(RepairSourceSweep, config.Get().Repair.Par2RepairEnabled(), verdict)
-	}
-
-	switch action {
-	case autoActionQueuePar2:
-		// Damage is within the padding caps (or beyond them but PAR2 is
-		// enabled and gets first refusal) - hand it to the PAR2 worker
-		// instead of the legacy re-grab path. Deliberately NOT marking
-		// res.broken: this file should neither show up in this run's
-		// BrokenFiles (which would re-grab it immediately) nor count as
-		// healthy - "unknown/pending" is the correct rollup while the PAR2
-		// pass is outstanding (or, if PAR2 already marked this entry
-		// terminal, while it waits for a MANUAL "Delete & re-search").
-		r.queuePar2FromSweep(entry, name)
-		res.reason = "usenet_segment_missing_par2_queued"
-		return res
-	default: // autoActionRegrab - source=sweep never returns autoActionNone.
-		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
-			// Already being handled (PAR2 queued/running, an in-flight
-			// re-grab from another candidate, or a rare race with a manual
-			// action) - defer to it. Same "unknown/pending" rollup as the
-			// PAR2-queued case above: not broken, not healthy.
-			res.reason = "usenet_segment_missing_deferred"
-			return res
-		}
-		// Released once healBrokenEntry has processed this candidate's
-		// broken files - see probeAndHealCandidates.
-		res.broken = true
-		res.reason = "usenet_segment_missing"
+	if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
+		// Already being handled (an in-flight re-grab from another
+		// candidate, or a rare race with a manual action) - defer to it.
+		res.reason = "usenet_segment_missing_deferred"
 		return res
 	}
-}
-
-// queuePar2FromSweep hands entry/name to the PAR2 worker via AutoEnqueue,
-// which applies config.Repair.Par2RepairMode's own mode/threshold gating
-// (manual: never auto-queues; auto_threshold: only once this file's dead
-// segment count reaches Par2RepairMinSegments) - the same gate the reader's
-// own padding-triggered EnqueueRepair path uses, so a file left below
-// threshold stays exactly padded rather than being queued regardless.
-func (r *Repair) queuePar2FromSweep(entry *storage.Entry, name string) {
-	if r.manager.par2Repair == nil || r.manager.usenet == nil {
-		return
-	}
-	deadSegments := 0
-	if pending, err := r.manager.usenet.OverlayPendingRepair(entry.InfoHash); err == nil {
-		deadSegments = len(pending[name])
-	}
-	r.manager.par2Repair.AutoEnqueue(entry.InfoHash, deadSegments)
+	// Released once healBrokenEntry has processed this candidate's broken
+	// files - see probeAndHealCandidates.
+	res.broken = true
+	res.reason = "usenet_segment_missing"
+	return res
 }
 
 // recordDeadSegments re-probes name for the specific segments confirmed
