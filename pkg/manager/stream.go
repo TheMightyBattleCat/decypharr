@@ -15,6 +15,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/retry"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 const (
@@ -129,6 +130,16 @@ func isConnectionError(err error) bool {
 	// Check for net.Error types
 	var netErr net.Error
 	return errors.As(err, &netErr)
+}
+
+// ContextForVerificationRead marks ctx as an internal verification read (see
+// usenet.ContextForVerificationRead): the segment fetcher skips padding and
+// PAR2-patch serving for a confirmed-dead segment on this read, surfacing the
+// real NNTP error instead. Used by the WebDAV handler for internal-token
+// reads (ffprobe import/sweep checks), so a broken grab can't pass validation
+// by way of the padding that makes it playable for real clients.
+func ContextForVerificationRead(ctx context.Context) context.Context {
+	return usenet.ContextForVerificationRead(ctx)
 }
 
 // Stream streams a file from an entry to the provided writer within the specified byte range.

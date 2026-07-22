@@ -292,6 +292,30 @@ func (s *ReaderStats) Snapshot() map[string]int64 {
 	}
 }
 
+// noPadCtxKey marks a context as an internal verification read - ffprobe's
+// import/sweep checks, served through the WebDAV handler's internal bearer
+// token (see webdav.Handler.isInternalBearer) - that must see the real NNTP
+// failure instead of padded/patched bytes when a segment is confirmed
+// missing. Without this, padding a dead segment during ffprobe's own read
+// lets a genuinely broken grab pass validation, since the padded bytes are
+// exactly what ffprobe then reads back as "healthy".
+type noPadCtxKey struct{}
+
+// ContextWithoutPadding marks ctx so SegmentFetcher.doFetch never pads or
+// serves a PAR2 patch for a confirmed-dead segment on this read - the real
+// NNTP article-not-found error propagates instead, so the reader fails
+// honestly. Real client playback (no internal token, ctx not marked) pads
+// exactly as before.
+func ContextWithoutPadding(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noPadCtxKey{}, true)
+}
+
+// paddingDisabled reports whether ctx was marked by ContextWithoutPadding.
+func paddingDisabled(ctx context.Context) bool {
+	v, _ := ctx.Value(noPadCtxKey{}).(bool)
+	return v
+}
+
 // PrefetchableReaderAt extends io.ReaderAt with prefetch capability.
 // This allows callers to trigger segment downloads before starting reads.
 type PrefetchableReaderAt interface {
