@@ -15,7 +15,16 @@ class RepairManager {
         this.overlaySelected = new Set();
         this.overlayDiskUsage = {};
         this.overlayHistory = [];
+        this.overlayHistoryTotalCount = 0;
+        // Server has no pagination on this endpoint yet (see loadOverlayHistory) -
+        // this caps how many rows we ever hold/render client-side.
+        this.overlayHistoryCap = 500;
         this.overlayOrphanCount = 0;
+        this.overlayFilesSearch = '';
+        this.overlayFilesVerdictFilter = 'all';
+        this.overlayFilesRepairFilter = 'all';
+        this.overlayHistorySearch = '';
+        this.overlayHistoryOutcomeFilter = 'all';
         // Per-row live-progress poll timers, keyed by overlayKey() - see
         // pollOverlayProgress. Cleared and rebuilt on every renderOverlayFiles
         // pass so a stale row never keeps polling after the table's rebuilt.
@@ -60,6 +69,26 @@ class RepairManager {
         $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
         $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
         $('overlayGCOrphansBtn')?.addEventListener('click', () => this.handleOverlayGCOrphans());
+        this.bindDebouncedInput($('overlayFilesSearchInput'), (v) => {
+            this.overlayFilesSearch = v.trim().toLowerCase();
+            this.renderOverlayFiles();
+        });
+        $('overlayFilesVerdictFilter')?.addEventListener('change', (e) => {
+            this.overlayFilesVerdictFilter = e.target.value;
+            this.renderOverlayFiles();
+        });
+        $('overlayFilesRepairFilter')?.addEventListener('change', (e) => {
+            this.overlayFilesRepairFilter = e.target.value;
+            this.renderOverlayFiles();
+        });
+        this.bindDebouncedInput($('overlayHistorySearchInput'), (v) => {
+            this.overlayHistorySearch = v.trim().toLowerCase();
+            this.renderOverlayHistory();
+        });
+        $('overlayHistoryOutcomeFilter')?.addEventListener('change', (e) => {
+            this.overlayHistoryOutcomeFilter = e.target.value;
+            this.renderOverlayHistory();
+        });
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
             () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
@@ -756,6 +785,18 @@ class RepairManager {
         return String(s || '').replace(/[^a-zA-Z0-9_-]+/g, '_');
     }
 
+    // bindDebouncedInput wires a live-search box: onChange fires `delay`ms
+    // after the user stops typing, not on every keystroke.
+    bindDebouncedInput(el, onChange, delay = 200) {
+        if (!el) return;
+        let timer = null;
+        el.addEventListener('input', (e) => {
+            clearTimeout(timer);
+            const value = e.target.value;
+            timer = setTimeout(() => onChange(value), delay);
+        });
+    }
+
     escapeAttr(s) {
         return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
@@ -876,12 +917,45 @@ class RepairManager {
 
     async loadOverlayHistory() {
         try {
-            this.overlayHistory = await this.fetchJSON(`${this.api}/overlay/repair-history`) || [];
+            // /overlay/repair-history has no server-side limit or pagination
+            // yet - it returns every persisted attempt, newest first. Cap
+            // what we hold client-side so this can't balloon into thousands
+            // of rendered rows; server-side paginated search is a follow-up.
+            const all = await this.fetchJSON(`${this.api}/overlay/repair-history`) || [];
+            this.overlayHistoryTotalCount = all.length;
+            this.overlayHistory = all.slice(0, this.overlayHistoryCap);
         } catch (e) {
             console.error('Failed to load par2 repair history', e);
             this.overlayHistory = [];
+            this.overlayHistoryTotalCount = 0;
         }
         this.renderOverlayHistory();
+    }
+
+    renderOverlayHistoryCapNote() {
+        const note = document.getElementById('overlayHistoryCapNote');
+        if (!note) return;
+        if (this.overlayHistoryTotalCount > this.overlayHistoryCap) {
+            note.textContent = `Showing most recent ${this.overlayHistoryCap} of ${this.overlayHistoryTotalCount} attempts. Server-side paginated search is a planned follow-up.`;
+            note.classList.remove('hidden');
+        } else {
+            note.classList.add('hidden');
+        }
+    }
+
+    // filteredOverlayHistory applies the search box + outcome dropdown
+    // (AND'd together) to the loaded (already capped) history, client-side.
+    filteredOverlayHistory() {
+        const search = this.overlayHistorySearch;
+        const outcome = this.overlayHistoryOutcomeFilter;
+        return (this.overlayHistory || []).filter((run) => {
+            if (search) {
+                const hay = `${run.entry_name || ''} ${run.nzb_id || ''}`.toLowerCase();
+                if (!hay.includes(search)) return false;
+            }
+            if (outcome !== 'all' && run.outcome !== outcome) return false;
+            return true;
+        });
     }
 
     async loadOverlayOrphanCount() {
@@ -972,6 +1046,35 @@ class RepairManager {
             return `<span class="badge badge-warning badge-sm" title="${this.escapeAttr(reason)}">insufficient recovery</span>`;
         }
         return `<span class="badge badge-ghost badge-sm" title="${this.escapeAttr(reason)}">no par2</span>`;
+    }
+
+    // overlayRepairStatusBucket maps a file's raw repair_status (+ repairable)
+    // onto the coarser buckets the "Repair status" filter offers - repairable
+    // covers both never-attempted (none) and transient-failed-but-still-
+    // retrying (failed), since both are "will be repaired automatically".
+    // Returns null for files that don't fall in any actionable bucket (e.g.
+    // clean, no damage at all) - only matched by the "all" filter.
+    overlayRepairStatusBucket(f) {
+        if (f.repair_status === 'running' || f.repair_status === 'queued') return 'running';
+        if (f.repair_status === 'unrepairable') return 'terminal-unrepairable';
+        if (f.repair_status === 'unavailable') return 'unavailable';
+        if (f.repair_status === 'completed') return 'patched';
+        if (f.repairable) return 'repairable';
+        return null;
+    }
+
+    // filteredOverlayFiles applies the search box + both status dropdowns
+    // (AND'd together) to the loaded overlay files, client-side.
+    filteredOverlayFiles() {
+        const search = this.overlayFilesSearch;
+        const verdict = this.overlayFilesVerdictFilter;
+        const repairFilter = this.overlayFilesRepairFilter;
+        return (this.overlayFiles || []).filter((f) => {
+            if (search && !`${f.file || ''} ${f.entry || ''}`.toLowerCase().includes(search)) return false;
+            if (verdict !== 'all' && f.verdict !== verdict) return false;
+            if (repairFilter !== 'all' && this.overlayRepairStatusBucket(f) !== repairFilter) return false;
+            return true;
+        });
     }
 
     // renderOverlayRepairStatusCell renders the full "Repair status" cell for
@@ -1120,19 +1223,30 @@ class RepairManager {
     renderOverlayFiles() {
         const tbody = document.getElementById('overlayFilesTableBody');
         const empty = document.getElementById('overlayFilesEmpty');
+        const noMatch = document.getElementById('overlayFilesNoMatch');
         if (!tbody) return;
         // Every row is about to be torn down and rebuilt - drop any live
         // progress pollers pointed at the old DOM nodes before they're gone.
         this.stopAllOverlayProgressPolling();
         tbody.innerHTML = '';
 
-        const files = this.overlayFiles || [];
-        if (!files.length) {
+        if (!(this.overlayFiles || []).length) {
             empty?.classList.remove('hidden');
+            noMatch?.classList.add('hidden');
             this.updateOverlayBulkBar();
             return;
         }
         empty?.classList.add('hidden');
+
+        // Search box + verdict/repair-status dropdowns, AND'd together, over
+        // the already-loaded rows - see filteredOverlayFiles.
+        const files = this.filteredOverlayFiles();
+        if (!files.length) {
+            noMatch?.classList.remove('hidden');
+            this.updateOverlayBulkBar();
+            return;
+        }
+        noMatch?.classList.add('hidden');
 
         for (let i = 0; i < files.length; i++) {
             const f = files[i];
@@ -1407,17 +1521,28 @@ class RepairManager {
     }
 
     renderOverlayHistory() {
+        this.renderOverlayHistoryCapNote();
         const tbody = document.getElementById('overlayHistoryTableBody');
         const empty = document.getElementById('overlayHistoryEmpty');
+        const noMatch = document.getElementById('overlayHistoryNoMatch');
         if (!tbody) return;
         tbody.innerHTML = '';
 
-        const runs = this.overlayHistory || [];
-        if (!runs.length) {
+        if (!(this.overlayHistory || []).length) {
             empty?.classList.remove('hidden');
+            noMatch?.classList.add('hidden');
             return;
         }
         empty?.classList.add('hidden');
+
+        // Search box + outcome dropdown, AND'd together, over the loaded
+        // (capped) history - see filteredOverlayHistory.
+        const runs = this.filteredOverlayHistory();
+        if (!runs.length) {
+            noMatch?.classList.remove('hidden');
+            return;
+        }
+        noMatch?.classList.add('hidden');
 
         for (const run of runs) {
             const tr = document.createElement('tr');
