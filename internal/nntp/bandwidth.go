@@ -457,6 +457,25 @@ func (c *Client) providerTier(ctx context.Context, p config.UsenetProvider) serv
 	}
 }
 
+// HasLeadHeadroom reports whether at least one non-backup provider currently
+// has lead-tier capacity available (i.e. is below its reserve/soft
+// threshold). Used by bulk, deferrable background work (e.g. Sonarr
+// next-episode pre-caching) to decide whether now is a good time to start a
+// large burst without eating into any provider's held-back reserve - unlike
+// URGENT-lane PAR2 repair, this kind of work has no playback deadline, so it
+// should simply wait for headroom rather than drawing on a reserve band.
+func (c *Client) HasLeadHeadroom() bool {
+	for _, p := range c.providers {
+		if p.Backup {
+			continue
+		}
+		if c.providerTier(context.Background(), p) == tierLead {
+			return true
+		}
+	}
+	return false
+}
+
 // tierLabel is the stats-API string for a serveTier: "primary" while a
 // provider is leading bulk, "backup" once it's fills-only (reserve band) or
 // blocked (over its hard cap) - from the UI's perspective both mean bulk

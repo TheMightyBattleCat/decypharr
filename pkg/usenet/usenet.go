@@ -425,6 +425,35 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 	}
 }
 
+// HasBandwidthHeadroom reports whether at least one non-backup provider
+// currently has lead-tier capacity available. Used to gate deferrable bulk
+// background work (Sonarr next-episode pre-caching) so it never eats into a
+// provider's held-back reserve - see nntp.Client.HasLeadHeadroom.
+func (u *Usenet) HasBandwidthHeadroom() bool {
+	return u.nntp.HasLeadHeadroom()
+}
+
+// EvictCache immediately tears down the cached reader/disk buffer for one
+// file, if it is currently idle (no active Stream holding a reference).
+// Used by the next-episode precache feature to reclaim a pre-cached
+// episode's disk footprint once it has actually been watched (see
+// config.Precache.PrecacheEvictAfterWatched) instead of waiting for the
+// normal idle-timeout cleanup (cleanupIdleFS). Returns false (no-op) if the
+// entry doesn't exist or is currently in use.
+func (u *Usenet) EvictCache(nzoID, filename string) bool {
+	key := fsKey(nzoID, filename)
+	entry, ok := u.fs.Load(key)
+	if !ok {
+		return false
+	}
+	if !entry.claimForCleanup() {
+		return false
+	}
+	u.fs.Delete(key)
+	entry.cleanup()
+	return true
+}
+
 // releaseFS releases an fs entry using a pre-computed key (avoids redundant allocation).
 func (u *Usenet) releaseFS(key string) {
 	entry, ok := u.fs.Load(key)
