@@ -3,16 +3,12 @@ package config
 // PrecacheConfig configures proactive pre-caching and repair ahead of
 // playback: read-ahead damage detection for the file currently playing
 // (movies and episodes alike, see pkg/manager.Precache), and (for Sonarr
-// episodes) pre-caching the next episode before it's needed.
+// episodes) pre-caching the next episode before it's needed. Whether the
+// read-ahead burst runs at all is gated by RepairConfig.PrecacheReadAhead
+// (see its doc comment) rather than a field here, so it lives in the same
+// settings section as the other repair-adjacent toggles (PlaybackPadding,
+// Par2Repair) and shares their save/load path.
 type PrecacheConfig struct {
-	// PrecacheReadAheadEnabled turns on aggressive read-ahead caching once a
-	// playing file's read position crosses PrecacheThresholdPercent. Off
-	// entirely leaves playback exactly as it behaves without this feature -
-	// normal streaming prefetch (Usenet.ReadAhead) is unaffected either way.
-	// *bool so an existing config.json predating this field defaults to true
-	// on load, same convention as Repair.PlaybackPadding.
-	PrecacheReadAheadEnabled *bool `json:"precache_read_ahead_enabled,omitempty"`
-
 	// PrecacheThresholdPercent is how far (1-100) into a file playback must
 	// reach, by byte position, before read-ahead pre-caching kicks in.
 	// Default 10.
@@ -30,8 +26,8 @@ type PrecacheConfig struct {
 	// of time once the current episode crosses the threshold. *int so 0 can
 	// mean "explicitly disabled" forever, not just before the first
 	// migration - nil defaults to 1. Movies have no "next episode"; this only
-	// applies to Sonarr-tracked episode files (see PrecacheReadAheadEnabled
-	// for movies' equivalent).
+	// applies to Sonarr-tracked episode files (see
+	// RepairConfig.PrecacheReadAhead for the movies' read-ahead equivalent).
 	PrecacheNextEpisodes *int `json:"precache_next_episodes,omitempty"`
 
 	// PrecacheEvictAfterWatched, when true, reclaims a pre-cached next
@@ -48,18 +44,11 @@ type PrecacheConfig struct {
 }
 
 func (p PrecacheConfig) IsZero() bool {
-	return p.PrecacheReadAheadEnabled == nil &&
-		p.PrecacheThresholdPercent == 0 &&
+	return p.PrecacheThresholdPercent == 0 &&
 		p.PrecacheReadAheadConcurrency == 0 &&
 		p.PrecacheNextEpisodes == nil &&
 		!p.PrecacheEvictAfterWatched &&
 		p.PrecacheMaxBytes == 0
-}
-
-// ReadAheadEnabled reports whether read-ahead precache is active, defaulting
-// to true when unset (see PrecacheReadAheadEnabled's doc comment).
-func (p PrecacheConfig) ReadAheadEnabled() bool {
-	return p.PrecacheReadAheadEnabled == nil || *p.PrecacheReadAheadEnabled
 }
 
 // ThresholdPercent returns the configured threshold, clamped to a sane

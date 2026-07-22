@@ -1530,6 +1530,7 @@ class RepairManager {
         const $ = (id) => document.getElementById(id);
         if ($('overlayPlaybackPadding')) $('overlayPlaybackPadding').checked = c.playback_padding !== false;
         if ($('overlayPar2Repair')) $('overlayPar2Repair').checked = c.par2_repair !== false;
+        if ($('overlayPrecacheReadAhead')) $('overlayPrecacheReadAhead').checked = c.precache_read_ahead_enabled === true;
         if ($('overlayPadMaxRun')) $('overlayPadMaxRun').value = c.pad_max_run_segments || 4;
         if ($('overlayPadMaxTotal')) $('overlayPadMaxTotal').value = c.pad_max_total_segments || 64;
         if ($('overlayPadMaxRatio')) $('overlayPadMaxRatio').value = c.pad_max_byte_ratio || 0.02;
@@ -1546,6 +1547,7 @@ class RepairManager {
                 ...this.repairConfig,
                 playback_padding: !!$('overlayPlaybackPadding')?.checked,
                 par2_repair: !!$('overlayPar2Repair')?.checked,
+                precache_read_ahead_enabled: !!$('overlayPrecacheReadAhead')?.checked,
                 pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
                 pad_max_total_segments: parseInt($('overlayPadMaxTotal')?.value, 10) || 0,
                 pad_max_byte_ratio: parseFloat($('overlayPadMaxRatio')?.value) || 0,

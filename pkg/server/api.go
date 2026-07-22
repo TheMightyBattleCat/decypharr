@@ -537,6 +537,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio
 	newConfig.Repair.Par2RepairMode = currentConfig.Repair.Par2RepairMode
 	newConfig.Repair.Par2RepairMinSegments = currentConfig.Repair.Par2RepairMinSegments
+	newConfig.Repair.PrecacheReadAhead = currentConfig.Repair.PrecacheReadAhead
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
