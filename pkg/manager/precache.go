@@ -14,6 +14,7 @@ package manager
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -300,4 +301,55 @@ func estimatePlaybackGap(gapBytes int64) time.Duration {
 		return 0
 	}
 	return time.Duration(gapBytes) * time.Second / time.Duration(precacheDefaultBitrateBytesPerSec)
+}
+
+// PrecacheSummary is the GUI/API snapshot of this feature's live state - see
+// Manager.PrecacheStatus.
+type PrecacheSummary struct {
+	ReadAheadEnabled     bool  `json:"read_ahead_enabled"`
+	ThresholdPercent     int   `json:"threshold_percent"`
+	ReadAheadConcurrency int   `json:"read_ahead_concurrency"`
+	NextEpisodes         int   `json:"next_episodes"`
+	EvictAfterWatched    bool  `json:"evict_after_watched"`
+	PrecachedBytes       int64 `json:"precached_bytes"`
+	MaxBytes             int64 `json:"max_bytes"`
+	// Readiness lists the most recent next-episode pre-cache outcomes
+	// (newest first), capped at precacheReadinessDisplayLimit.
+	Readiness []EpisodeReadiness `json:"readiness"`
+}
+
+// precacheReadinessDisplayLimit bounds how many EpisodeReadiness records
+// Summary returns, so a long-running process with many pre-cached episodes
+// doesn't grow an unbounded response.
+const precacheReadinessDisplayLimit = 25
+
+// Summary returns a snapshot of the precache feature's live config and
+// state, for the overlay/repair GUI and API. Safe to call on a nil Precache.
+func (p *Precache) Summary() PrecacheSummary {
+	if p == nil {
+		return PrecacheSummary{}
+	}
+	cfg := p.cfg()
+
+	p.readinessMu.Lock()
+	readiness := make([]EpisodeReadiness, 0, len(p.readiness))
+	for _, r := range p.readiness {
+		readiness = append(readiness, r)
+	}
+	p.readinessMu.Unlock()
+	sort.Slice(readiness, func(i, j int) bool { return readiness[i].ReadyAt.After(readiness[j].ReadyAt) })
+	if len(readiness) > precacheReadinessDisplayLimit {
+		readiness = readiness[:precacheReadinessDisplayLimit]
+	}
+
+	return PrecacheSummary{
+		ReadAheadEnabled:     cfg.ReadAheadEnabled(),
+		ThresholdPercent:     cfg.ThresholdPercent(),
+		ReadAheadConcurrency: cfg.ReadAheadConcurrency(),
+		NextEpisodes:         cfg.NextEpisodes(),
+		EvictAfterWatched:    cfg.PrecacheEvictAfterWatched,
+		PrecachedBytes:       p.precachedBytes.Load(),
+		MaxBytes:             cfg.MaxBytes(),
+		Readiness:            readiness,
+	}
 }

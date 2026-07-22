@@ -75,7 +75,7 @@ class RepairManager {
     }
 
     async loadAll() {
-        await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll()]);
+        await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
         this.populateOverlayConfigForm();
     }
 
@@ -815,6 +815,75 @@ class RepairManager {
         const m = Math.floor(s / 60);
         const r = s % 60;
         return `${m}m ${r}s`;
+    }
+
+    // === Pre-cache summary (read-ahead + Sonarr next-episode) ===
+
+    async loadPrecacheStatus() {
+        try {
+            const status = await this.fetchJSON(`${this.api}/precache/status`);
+            this.renderPrecache(status || {});
+        } catch (e) {
+            console.error('Failed to load precache status', e);
+        } finally {
+            if (this.precacheTimer) clearTimeout(this.precacheTimer);
+            this.precacheTimer = setTimeout(() => this.loadPrecacheStatus(), 15000);
+        }
+    }
+
+    renderPrecache(status) {
+        const line = document.getElementById('precacheStatusLine');
+        if (line) {
+            if (!status.read_ahead_enabled) {
+                line.textContent = 'Read-ahead pre-caching is disabled. Enable it in Settings → Repair.';
+            } else {
+                line.textContent = `Read-ahead kicks in at ${status.threshold_percent ?? 10}% into playback, `
+                    + `${status.read_ahead_concurrency ?? '-'} segments in parallel.`;
+            }
+        }
+        const footprint = document.getElementById('precacheFootprint');
+        if (footprint) {
+            footprint.textContent = `${this.formatBytes(status.precached_bytes || 0)} / ${this.formatBytes(status.max_bytes || 0)}`;
+        }
+        const nextEpisodes = document.getElementById('precacheNextEpisodes');
+        if (nextEpisodes) {
+            const n = status.next_episodes || 0;
+            nextEpisodes.textContent = n > 0 ? `${n} ahead${status.evict_after_watched ? ' · evict after watched' : ''}` : 'off';
+        }
+        this.renderPrecacheReadiness(status.readiness || []);
+    }
+
+    renderPrecacheReadiness(readiness) {
+        const tbody = document.getElementById('precacheReadinessBody');
+        const empty = document.getElementById('noPrecacheMessage');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        if (!readiness.length) {
+            empty?.classList.remove('hidden');
+            return;
+        }
+        empty?.classList.add('hidden');
+        for (const r of readiness) {
+            const tr = document.createElement('tr');
+            const readyAt = r.ready_at ? new Date(r.ready_at).toLocaleString() : '-';
+            let outcome;
+            if (r.clean) {
+                outcome = '<span class="badge badge-success">clean</span>';
+            } else if (r.segments_repaired > 0) {
+                outcome = `<span class="badge badge-warning">${r.segments_repaired} segment(s) repaired ahead of time</span>`;
+            } else if (r.segments_pending > 0) {
+                outcome = `<span class="badge badge-error">${r.segments_pending} segment(s) still damaged</span>`;
+            } else {
+                outcome = '<span class="badge badge-ghost">unknown</span>';
+            }
+            tr.innerHTML = `
+                <td class="font-mono text-sm">${readyAt}</td>
+                <td>${r.entry_name || '-'}</td>
+                <td class="text-xs opacity-70">${r.filename || '-'}</td>
+                <td>${outcome}</td>
+            `;
+            tbody.appendChild(tr);
+        }
     }
 
     async fetchJSON(url) {
