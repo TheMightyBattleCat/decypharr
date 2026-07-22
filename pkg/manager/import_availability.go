@@ -19,11 +19,16 @@ import (
 // find that damage directly, independent of padding.
 //
 // Any confirmed-missing segment is recorded to the overlay store (exactly
-// like the repair sweep's recordDeadSegments). PAR2 repair, when enabled,
-// gets first refusal - the entry still completes import degraded-but-
-// self-healing, since playback padding covers any interim access until the
-// PAR2 pass lands. Otherwise the grab is blocklisted and re-searched via the
-// Arr and the file is NOT imported.
+// like the repair sweep's recordDeadSegments) and routed through the
+// coordinated auto-repair policy (decideAutoRepairAction, source=import) -
+// the same decision function the repair sweep and playback-failure
+// escalation use, so import-time detection is never pad-and-forget: PAR2
+// repair when enabled (the entry still completes import degraded-but-
+// self-healing - playback padding covers any interim access until the PAR2
+// pass lands), otherwise the grab is blocklisted and re-searched via the Arr
+// and the file is NOT imported. Claims the handler registry before acting
+// (via queueImportPar2/RegrabImportGrab), so a concurrent sweep/PAR2 pass
+// for the same nzbID is never double-queued or double-re-grabbed.
 func (d *Downloader) importAvailabilityGate(entry *storage.Entry) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -72,48 +77,44 @@ func (d *Downloader) importAvailabilityGate(entry *storage.Entry) (err error) {
 					Msg("Import: failed to record dead segment in overlay")
 			}
 		}
+		verdict := d.manager.usenet.OverlayVerdict(entry.InfoHash, file.Name)
+		par2Enabled := config.Get().Repair.Par2RepairEnabled()
 
-		if d.tryQueueImportPar2(entry, file.Name, len(missing)) {
-			continue
+		switch decideAutoRepairAction(RepairSourceImport, par2Enabled, verdict) {
+		case autoActionQueuePar2:
+			d.logger.Warn().
+				Str("entry", entry.Name).
+				Str("file", file.Name).
+				Int("missing_segments", len(missing)).
+				Msg("Import: confirmed-missing segment(s); queuing PAR2 repair, import proceeds")
+			d.queueImportPar2(entry, file.Name, len(missing))
+		default: // autoActionRegrab - source=import never returns autoActionNone.
+			d.logger.Warn().
+				Str("entry", entry.Name).
+				Str("file", file.Name).
+				Int("missing_segments", len(missing)).
+				Msg("Import: confirmed-missing segment(s), not PAR2-repairable; blocklisting and rejecting import")
+			if rerr := d.manager.Repair().RegrabImportGrab(ctx, entry, file.Name, "usenet_segment_missing"); rerr != nil {
+				d.logger.Warn().Err(rerr).Str("entry", entry.Name).Str("file", file.Name).
+					Msg("Import: failed to blocklist + re-search via Arr")
+			}
+			return fmt.Errorf("import availability check: file %q has confirmed-missing segments", file.Name)
 		}
-
-		d.logger.Warn().
-			Str("entry", entry.Name).
-			Str("file", file.Name).
-			Int("missing_segments", len(missing)).
-			Msg("Import: confirmed-missing segment(s), not PAR2-repairable; blocklisting and rejecting import")
-		if rerr := d.manager.Repair().RegrabImportGrab(ctx, entry, file.Name, "usenet_segment_missing"); rerr != nil {
-			d.logger.Warn().Err(rerr).Str("entry", entry.Name).Str("file", file.Name).
-				Msg("Import: failed to blocklist + re-search via Arr")
-		}
-		return fmt.Errorf("import availability check: file %q has confirmed-missing segments", file.Name)
 	}
 	return nil
 }
 
-// tryQueueImportPar2 hands entry/name to the PAR2 worker when repair is
-// enabled, via the same AutoEnqueue mode/threshold gating (and handler-
-// registry claim) the repair sweep's own queuePar2FromSweep uses. Returns
-// false (nothing queued) when PAR2 repair is disabled outright - the caller
-// falls back to re-grabbing via the Arr in that case.
-func (d *Downloader) tryQueueImportPar2(entry *storage.Entry, name string, missingSegments int) bool {
-	if !config.Get().Repair.Par2RepairEnabled() {
-		return false
+// queueImportPar2 hands entry/name to the PAR2 worker via AutoEnqueue, which
+// claims the handler registry itself and applies Par2RepairMode's own
+// mode/threshold gating (manual: never auto-queues; auto_threshold: only
+// once this file's dead segment count reaches Par2RepairMinSegments) - the
+// same gate the repair sweep's queuePar2FromSweep and the reader's own
+// padding-triggered EnqueueRepair path use, so a file left below threshold
+// stays exactly as padding-during-playback would leave it rather than being
+// queued regardless.
+func (d *Downloader) queueImportPar2(entry *storage.Entry, name string, missingSegments int) {
+	if d.manager.par2Repair == nil {
+		return
 	}
-	if d.manager.par2Repair == nil || d.manager.usenet == nil {
-		return false
-	}
-	d.logger.Warn().
-		Str("entry", entry.Name).
-		Str("file", name).
-		Int("missing_segments", missingSegments).
-		Msg("Import: confirmed-missing segment(s); queuing PAR2 repair, import proceeds")
-	// AutoEnqueue claims the handler registry itself (see Par2Repair.enqueue)
-	// and applies Par2RepairMode's own mode/threshold gating - a no-op call
-	// here (mode=manual, or below auto_threshold's minimum) is not a
-	// rejection: the entry still isn't handed to the caller's regrab path,
-	// since a below-threshold amount of damage is exactly what padding
-	// during playback is meant to absorb.
 	d.manager.par2Repair.AutoEnqueue(entry.InfoHash, missingSegments)
-	return true
 }
