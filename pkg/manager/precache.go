@@ -99,7 +99,7 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	}
 	p.evictIfWatched(entry, filename, start, size)
 
-	if !p.cfg().ReadAheadEnabled() {
+	if !config.Get().Repair.PrecacheReadAheadEnabled() {
 		return
 	}
 	threshold := int64(p.cfg().ThresholdPercent())
@@ -343,7 +343,7 @@ func (p *Precache) Summary() PrecacheSummary {
 	}
 
 	return PrecacheSummary{
-		ReadAheadEnabled:     cfg.ReadAheadEnabled(),
+		ReadAheadEnabled:     config.Get().Repair.PrecacheReadAheadEnabled(),
 		ThresholdPercent:     cfg.ThresholdPercent(),
 		ReadAheadConcurrency: cfg.ReadAheadConcurrency(),
 		NextEpisodes:         cfg.NextEpisodes(),

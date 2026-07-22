@@ -832,10 +832,6 @@ func (c *Config) setDefaults() {
 }
 
 func (c *Config) applyPrecacheDefaults() {
-	if c.Precache.PrecacheReadAheadEnabled == nil {
-		v := true
-		c.Precache.PrecacheReadAheadEnabled = &v
-	}
 	if c.Precache.PrecacheThresholdPercent <= 0 {
 		c.Precache.PrecacheThresholdPercent = 10
 	}

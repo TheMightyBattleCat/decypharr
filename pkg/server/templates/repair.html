@@ -279,7 +279,7 @@
             </p>
 
             <form id="overlayConfigForm" class="mt-4 space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
                         <span>
                             <span class="block font-medium">Playback padding</span>
@@ -293,6 +293,13 @@
                             <span class="block text-xs opacity-70">Reconstruct dead segments' true bytes from PAR2 recovery data.</span>
                         </span>
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
+                    </label>
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                        <span>
+                            <span class="block font-medium">Fast read-ahead</span>
+                            <span class="block text-xs opacity-70">Aggressively pre-fetch the rest of a file once playback passes the threshold so damage can be repaired before you reach it — uses extra bandwidth and cache.</span>
+                        </span>
+                        <input type="checkbox" class="toggle toggle-primary" id="overlayPrecacheReadAhead">
                     </label>
                 </div>
 
