@@ -324,6 +324,24 @@
                     </button>
                 </div>
             </div>
+            <div class="flex flex-wrap items-center gap-2 px-6 py-3 border-b border-base-200 bg-base-200/20">
+                <input type="text" class="input input-sm flex-1 min-w-48" id="overlayFilesSearchInput"
+                       placeholder="Filter by filename or entry...">
+                <select class="select select-sm" id="overlayFilesVerdictFilter" title="Filter by verdict">
+                    <option value="all">All verdicts</option>
+                    <option value="clean">Clean</option>
+                    <option value="degraded">Degraded</option>
+                    <option value="failed">Failed</option>
+                </select>
+                <select class="select select-sm" id="overlayFilesRepairFilter" title="Filter by repair status">
+                    <option value="all">All repair statuses</option>
+                    <option value="repairable">Repairable</option>
+                    <option value="running">Running</option>
+                    <option value="patched">Patched</option>
+                    <option value="unavailable">Unavailable</option>
+                    <option value="terminal-unrepairable">Terminal (unrepairable)</option>
+                </select>
+            </div>
         </div>
         <div class="card-body p-0">
             <div id="overlayBulkBar" class="px-6 py-3 border-b border-base-200 bg-base-200/40 hidden">
@@ -344,9 +362,9 @@
                     </div>
                 </div>
             </div>
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="table table-hover">
-                    <thead class="bg-base-200">
+                    <thead class="bg-base-200 sticky top-0 z-10">
                     <tr>
                         <th class="w-8">
                             <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" id="overlaySelectAllCheckbox">
@@ -366,6 +384,10 @@
                 <div id="overlayFilesEmpty" class="text-center py-12 hidden text-base-content/70">
                     <i class="bi bi-check2-circle text-3xl block mb-2 text-success"></i>
                     No overlay damage recorded.
+                </div>
+                <div id="overlayFilesNoMatch" class="text-center py-12 hidden text-base-content/70">
+                    <i class="bi bi-search text-3xl block mb-2"></i>
+                    No files match the current search/filter.
                 </div>
             </div>
         </div>
@@ -387,11 +409,22 @@
                     </button>
                 </div>
             </div>
+            <div class="flex flex-wrap items-center gap-2 px-6 py-3 border-b border-base-200 bg-base-200/20">
+                <input type="text" class="input input-sm flex-1 min-w-48" id="overlayHistorySearchInput"
+                       placeholder="Filter by entry name...">
+                <select class="select select-sm" id="overlayHistoryOutcomeFilter" title="Filter by outcome">
+                    <option value="all">All outcomes</option>
+                    <option value="completed">Completed</option>
+                    <option value="failed">Failed</option>
+                    <option value="unavailable">Unavailable</option>
+                </select>
+            </div>
+            <div id="overlayHistoryCapNote" class="px-6 py-2 text-xs opacity-60 hidden border-b border-base-200"></div>
         </div>
         <div class="card-body p-0">
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="table table-hover">
-                    <thead class="bg-base-200">
+                    <thead class="bg-base-200 sticky top-0 z-10">
                     <tr>
                         <th>Started</th>
                         <th>Entry</th>
@@ -408,6 +441,10 @@
                 <div id="overlayHistoryEmpty" class="text-center py-12 hidden text-base-content/70">
                     <i class="bi bi-clipboard-x text-3xl block mb-2"></i>
                     No PAR2 repair attempts yet.
+                </div>
+                <div id="overlayHistoryNoMatch" class="text-center py-12 hidden text-base-content/70">
+                    <i class="bi bi-search text-3xl block mb-2"></i>
+                    No attempts match the current search/filter.
                 </div>
             </div>
         </div>
