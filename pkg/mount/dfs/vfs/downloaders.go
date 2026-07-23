@@ -866,15 +866,29 @@ func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 		// the tripped breaker) but bounded so a stuck repair can't leak.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		if err := mgr.Repair().HandlePlaybackFailure(ctx, entryName, filename); err != nil {
+		// acted distinguishes "a repair/re-grab actually ran" from every
+		// no-op nil-error return (cooldown active, entry already claimed by
+		// another repair mechanism, regrab guard tripped, or padding
+		// already covers the damage so there's nothing to do) - logging
+		// "done" for all of those regardless produced a debug line for
+		// nearly every escalation with no corresponding action, drowning
+		// out the rare escalations that actually did something.
+		acted, reason, err := mgr.Repair().HandlePlaybackFailure(ctx, entryName, filename)
+		switch {
+		case err != nil:
 			dls.item.cache.logger.Debug().
 				Err(err).
 				Str("entry", entryName).
 				Msg("Playback-failure immediate repair failed")
-		} else {
+		case acted:
 			dls.item.cache.logger.Debug().
 				Str("entry", entryName).
 				Msg("Playback-failure immediate repair done")
+		default:
+			dls.item.cache.logger.Debug().
+				Str("entry", entryName).
+				Str("reason", reason).
+				Msg("Playback-failure immediate repair suppressed, no action taken")
 		}
 	}()
 }

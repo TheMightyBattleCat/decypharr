@@ -1516,7 +1516,15 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 //     countErrors/escalatePlaybackFailure in the first place (see
 //     pkg/usenet/fs/reader's handleConfirmedMissing) - this function only
 //     ever sees a failure once padding has already declined to cover it.
-func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName string) error {
+//
+// Returns acted=true only when this call actually did something (a
+// delete+blocklist+re-search ran, or a PAR2 pass was queued) - false for
+// every no-op branch (registry busy, cooldown active, regrab guard tripped,
+// or nothing to do because padding already covers the damage), with reason
+// explaining which. The caller (escalatePlaybackFailure) uses this to log
+// "done" only when real work happened, instead of on every nil-error return
+// regardless of whether anything ran.
+func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName string) (acted bool, reason string, err error) {
 	entry, err := r.manager.GetEntryByName(entryName, fileName)
 	if err != nil || entry == nil || entry.InfoHash == "" || r.manager.usenet == nil {
 		// Can't resolve enough to consult the policy (non-NZB entry, no
@@ -1536,7 +1544,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
 			r.logger.Debug().Str("entry", entryName).Str("file", fileName).
 				Msg("playback repair: entry already being handled; skipping re-grab")
-			return nil
+			return false, "entry already being handled by another repair mechanism", nil
 		}
 		defer r.handlers.Release(nzbID)
 		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
@@ -1544,9 +1552,9 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 		if r.manager.par2Repair != nil {
 			r.manager.par2Repair.EnqueueUrgent(nzbID)
 		}
-		return nil
+		return true, "", nil
 	default:
-		return nil
+		return false, fmt.Sprintf("no action needed (verdict=%s)", verdict), nil
 	}
 }
 
@@ -1584,7 +1592,8 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 // go through HandlePlaybackFailure, which calls the gated, auto=true form
 // of repairPlaybackFileNow instead.
 func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName string) error {
-	return r.repairPlaybackFileNow(ctx, entryName, fileName, false)
+	_, _, err := r.repairPlaybackFileNow(ctx, entryName, fileName, false)
+	return err
 }
 
 // repairPlaybackFileNow repairs a file that just failed playback WITHOUT
@@ -1602,9 +1611,12 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 // candidate release tried so far shares the same missing articles (see
 // regrab_guard.go) - a manual retry always overrides and resets the guard's
 // count for this file instead of being blocked by it.
-func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName string, auto bool) error {
+//
+// acted/reason mirror HandlePlaybackFailure's return values - see its doc
+// comment.
+func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName string, auto bool) (acted bool, reason string, err error) {
 	if entryName == "" {
-		return errors.New("entry name is empty")
+		return false, "", errors.New("entry name is empty")
 	}
 
 	// Manager-level per-entry cooldown. This must be checked here (not only in
@@ -1626,18 +1638,19 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	}
 	if last, ok := r.lastPlaybackRepair[cooldownKey]; ok && time.Since(last) < playbackRepairCooldown {
 		r.playbackRepairMu.Unlock()
+		remaining := (playbackRepairCooldown - time.Since(last)).Round(time.Second)
 		r.logger.Debug().
 			Str("entry", entryName).
 			Dur("since_last", time.Since(last)).
 			Msg("playback repair: skipped, entry within cooldown")
-		return nil
+		return false, fmt.Sprintf("within cooldown, %s remaining", remaining), nil
 	}
 	r.lastPlaybackRepair[cooldownKey] = time.Now()
 	r.playbackRepairMu.Unlock()
 
 	item, err := r.manager.GetEntryItem(entryName)
 	if err != nil || item == nil {
-		return fmt.Errorf("entry %q not found", entryName)
+		return false, "", fmt.Errorf("entry %q not found", entryName)
 	}
 
 	// Detach from the caller's (short-lived) context: the escalation cancels
@@ -1654,7 +1667,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	c := &candidate{name: entryName, item: item}
 	r.attachArrContext(runCtx, c)
 	if len(c.contentMap) == 0 || c.arrName == "" {
-		return fmt.Errorf("no Arr owns entry %q; cannot re-acquire", entryName)
+		return false, "", fmt.Errorf("no Arr owns entry %q; cannot re-acquire", entryName)
 	}
 
 	// Build the broken-file set. Scope to the single file that failed when we
@@ -1688,7 +1701,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 		h.BrokenFiles = append(h.BrokenFiles, bf)
 	}
 	if !matched {
-		return fmt.Errorf("file %q not found among Arr-known files for entry %q", fileName, entryName)
+		return false, "", fmt.Errorf("file %q not found among Arr-known files for entry %q", fileName, entryName)
 	}
 	h.BrokenCount = len(h.BrokenFiles)
 
@@ -1700,17 +1713,17 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 		// Manual override: always proceed, and reset the guard so a fresh
 		// automatic streak starts counting from zero after this.
 		r.regrabGuard.clear(identity)
-	} else if allowed, reason, firstTrip := r.regrabGuard.checkAndRecord(identity); !allowed {
+	} else if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity); !allowed {
 		logEvt := r.logger.Debug()
 		if firstTrip {
 			logEvt = r.logger.Warn()
 		}
-		logEvt.Str("entry", entryName).Str("file", fileName).Str("reason", reason).
+		logEvt.Str("entry", entryName).Str("file", fileName).Str("reason", guardReason).
 			Msg("playback repair: stopping automatic re-grab, every candidate so far shares the same missing articles")
 		if firstTrip {
-			r.markRegrabGuardTripped(entryName, fileName, h, reason)
+			r.markRegrabGuardTripped(entryName, fileName, h, guardReason)
 		}
-		return nil
+		return false, guardReason, nil
 	}
 	// FileCount is the entry's total tracked file count (matching probeEntry's
 	// h.FileCount = len(names)) - finalizeEntryRepair's shouldDelete check
@@ -1733,7 +1746,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	pseudo := &storage.RepairRun{ID: "playback-" + entryName, Stats: storage.RepairRunStats{}}
 	var statsMu sync.Mutex
 	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h)
-	return nil
+	return true, "", nil
 }
 
 // markRegrabGuardTripped surfaces a regrab-guard trip for manual action,
