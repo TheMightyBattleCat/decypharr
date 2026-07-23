@@ -451,6 +451,40 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 	return errors.New("all providers failed")
 }
 
+// ExecuteOnce runs fn on a single connection from any available provider,
+// with no retry and no cross-provider failover - unlike ExecuteWithFailover,
+// one failure is the final answer. For latency-sensitive, best-effort
+// operations (e.g. the parser's PAR2 source-size probe) where eating a
+// multi-provider retry ladder on a dead article costs far more than the
+// operation is worth, and a documented fallback estimate covers the loss.
+// Callers should wrap ctx with a short deadline; this only bounds connection
+// acquisition, not the operation itself.
+func (c *Client) ExecuteOnce(ctx context.Context, fn func(conn *Connection) error) error {
+	conn, provider, err := c.getAnyAvailableConnection(ctx, providerExclusions{})
+	if err != nil {
+		return err
+	}
+	execErr := c.safeExecute(conn, fn)
+	if execErr == nil {
+		c.returnOrReleaseConn(conn, provider)
+		return nil
+	}
+
+	var nntpErr *Error
+	if errors.As(execErr, &nntpErr) {
+		switch nntpErr.Type {
+		case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
+			// Potentially dead connection - don't return it to the pool.
+			c.release(conn)
+		default:
+			c.returnOrReleaseConn(conn, provider)
+		}
+	} else {
+		c.returnOrReleaseConn(conn, provider)
+	}
+	return execErr
+}
+
 // returnOrReleaseConn returns a connection to the pool or releases it if closed
 func (c *Client) returnOrReleaseConn(conn *Connection, provider config.UsenetProvider) {
 	if conn == nil {

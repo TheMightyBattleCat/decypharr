@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/Tensai75/nzbparser"
 	"github.com/google/uuid"
@@ -28,6 +30,34 @@ var (
 	// metadataOnly requests the yEnc header (name/size/offsets) without any
 	// decoded payload — the connection is drained and returned to the pool.
 	metadataOnly = 0
+)
+
+const (
+	// yencOverheadEstimate approximates a segment's real decoded byte length
+	// from its NZB XML-declared (yEnc-ENCODED, wire) byte count, when no real
+	// header fetch is available or trustworthy - see realPar2SegmentRefs's
+	// doc comment.
+	yencOverheadEstimate = 0.97
+	// par2ProbeTimeout bounds a single PAR2 source-size probe. Short and
+	// non-negotiable: this is an optimization with a documented XML-bytes
+	// fallback, not a correctness requirement, so a slow/dead article should
+	// fail fast into that fallback rather than eating the connection's full
+	// StreamBodyTimeout.
+	par2ProbeTimeout = 5 * time.Second
+	// par2ProbeMaxFailedFetches is how many failed real yEnc fetches
+	// buildPar2RefsWithFetch tolerates before giving up on PAR2 probing for
+	// the rest of the release. Past this many dead articles in one release,
+	// the post-parse availability check is going to reject it anyway, so
+	// further probing only spends more round trips confirming what's already
+	// known; the release is marked aborted and every remaining file falls
+	// back to the XML-bytes estimate with no further fetches.
+	par2ProbeMaxFailedFetches = 3
+	// postingSizeToleranceFrac bounds how far a file's own non-final segment
+	// byte count (as declared in the NZB XML) may deviate, as a fraction of
+	// the expected value, from the release's shared posting article size
+	// before that file is deemed inconsistent and gets its own real probe
+	// instead of reusing the shared size.
+	postingSizeToleranceFrac = 0.10
 )
 
 // NZBParser provides a simplified, robust NZB parser
@@ -154,7 +184,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	// so there is no reason to spend a yEnc body-probe per posted file only to
 	// discard the result. Checked first, not just cheaper first: a dead
 	// posting fails in one round trip instead of after N probe round trips.
-	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeader)
+	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeaderFast)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -217,7 +247,11 @@ func availabilityThenPar2Refs(
 	// RAR/7z/zip grouping and extraction decides to do with these files
 	// afterwards. Only reached once the release has passed the availability
 	// check above.
-	par2Files, source = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
+	var aborted bool
+	par2Files, source, aborted = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
+	if aborted {
+		return nil, nil, fmt.Errorf("PAR2 source-file probing aborted after %d failed article fetches; release likely damaged", par2ProbeMaxFailedFetches)
+	}
 	return par2Files, source, nil
 }
 
@@ -276,8 +310,38 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 	return nzb, nil
 }
 
+// par2ProbeCandidate pairs a raw NZB file with its presorted segments and
+// its original index in the eligible-files list, so buildPar2RefsWithFetch
+// can dispatch every non-seed file through a concurrent iter.Mapper while
+// still reassembling results in original order.
+type par2ProbeCandidate struct {
+	idx  int
+	file nzbparser.NzbFile
+	segs nzbparser.NzbSegments
+}
+
+type builtPar2File struct {
+	name     string
+	size     int64
+	segments []storage.Par2SegmentRef
+	isPar2   bool
+}
+
 // buildPar2RefsWithFetch is buildPar2Refs with its yEnc header fetch and file
 // type classification injected, so it can be exercised with fakes in tests.
+//
+// A real header fetch (see realPar2SegmentRefs) is only ever attempted for
+// one file per release: upload tooling always encodes same-posting volumes
+// to a uniform segment byte budget, so once that shared article size is
+// known from a single probe, every other file's geometry is checked against
+// it (segmentsConsistentWithPostingSize) and, if consistent, its refs are
+// built for free (par2SegmentRefsFromPostingSize) - no network round trip.
+// Only a file whose geometry doesn't match gets its own real probe. Past
+// par2ProbeMaxFailedFetches failed fetches in one release, probing stops
+// entirely (aborted=true) and every remaining file falls back to the plain
+// XML-bytes estimate: this many dead articles means the release is going to
+// be rejected by the availability check regardless, so further probing only
+// spends more round trips confirming what's already known.
 func buildPar2RefsWithFetch(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -285,38 +349,93 @@ func buildPar2RefsWithFetch(
 	files nzbparser.NzbFiles,
 	detectFileType func(string) storage.NZBFileType,
 	fetch yencHeaderFetchFunc,
-) ([]storage.Par2FileRef, []storage.PostedFileRef) {
-	type built struct {
-		name     string
-		size     int64
-		segments []storage.Par2SegmentRef
-		isPar2   bool
-	}
-
+) (par2Files []storage.Par2FileRef, source []storage.PostedFileRef, aborted bool) {
 	var eligible []nzbparser.NzbFile
 	for _, file := range files {
 		if len(file.Segments) > 0 {
 			eligible = append(eligible, file)
 		}
 	}
+	if len(eligible) == 0 {
+		return nil, nil, false
+	}
 
-	mapper := iter.Mapper[nzbparser.NzbFile, *built]{MaxGoroutines: maxConcurrent}
-	results := mapper.Map(eligible, func(file *nzbparser.NzbFile) *built {
+	sortedSegs := make([]nzbparser.NzbSegments, len(eligible))
+	for i, file := range eligible {
 		segs := make(nzbparser.NzbSegments, len(file.Segments))
 		copy(segs, file.Segments)
 		sort.Sort(segs)
+		sortedSegs[i] = segs
+	}
 
-		refs, size := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
-		return &built{
-			name:     file.Filename,
-			size:     size,
-			segments: refs,
-			isPar2:   detectFileType(file.Filename) == storage.NZBFileTypePar2,
+	// Prefer a seed file with more than one segment, so its non-final
+	// segment length is a meaningful sample of the posting's shared article
+	// size. If every eligible file has only one segment, there's no shared
+	// size to derive and seedIdx stays -1 - every file then falls through to
+	// its own probe below, same as before this optimization.
+	seedIdx := -1
+	for i, segs := range sortedSegs {
+		if len(segs) >= 2 {
+			seedIdx = i
+			break
 		}
-	})
+	}
 
-	var par2Files []storage.Par2FileRef
-	var source []storage.PostedFileRef
+	results := make([]*builtPar2File, len(eligible))
+	var failedProbes int32
+	var abortedFlag int32
+	var postingSegmentSize int64
+
+	if seedIdx >= 0 {
+		file, segs := eligible[seedIdx], sortedSegs[seedIdx]
+		refs, total, fetchFailed, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
+		if fetchFailed && atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
+			atomic.StoreInt32(&abortedFlag, 1)
+		}
+		if real {
+			// refs[i] for i < len(refs)-1 is the real derived per-article
+			// size (see realPar2SegmentRefs) - a meaningful sample only when
+			// there's more than one segment, guaranteed by seedIdx's choice.
+			postingSegmentSize = refs[0].Bytes
+		}
+		results[seedIdx] = &builtPar2File{
+			name: file.Filename, size: total, segments: refs,
+			isPar2: detectFileType(file.Filename) == storage.NZBFileTypePar2,
+		}
+	}
+
+	candidates := make([]par2ProbeCandidate, 0, len(eligible)-1)
+	for i, file := range eligible {
+		if i == seedIdx {
+			continue
+		}
+		candidates = append(candidates, par2ProbeCandidate{idx: i, file: file, segs: sortedSegs[i]})
+	}
+
+	mapper := iter.Mapper[par2ProbeCandidate, *builtPar2File]{MaxGoroutines: maxConcurrent}
+	mapped := mapper.Map(candidates, func(c *par2ProbeCandidate) *builtPar2File {
+		isPar2 := detectFileType(c.file.Filename) == storage.NZBFileTypePar2
+
+		if segmentsConsistentWithPostingSize(c.segs, postingSegmentSize) {
+			refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize)
+			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+		}
+
+		if atomic.LoadInt32(&abortedFlag) != 0 {
+			refs, total := par2SegmentRefsFallback(c.segs)
+			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+		}
+
+		refs, total, fetchFailed, _ := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
+		if fetchFailed && atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
+			atomic.StoreInt32(&abortedFlag, 1)
+		}
+		return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+	})
+	for i, c := range candidates {
+		results[c.idx] = mapped[i]
+	}
+
 	for _, b := range results {
 		if b.isPar2 {
 			par2Files = append(par2Files, storage.Par2FileRef{Name: b.name, Size: b.size, Segments: b.segments})
@@ -324,7 +443,68 @@ func buildPar2RefsWithFetch(
 		}
 		source = append(source, storage.PostedFileRef{Name: b.name, Size: b.size, Segments: b.segments})
 	}
-	return par2Files, source
+	return par2Files, source, atomic.LoadInt32(&abortedFlag) != 0
+}
+
+// segmentsConsistentWithPostingSize reports whether segs' own non-final
+// segment byte sizes (as declared in the NZB XML) look consistent with a
+// shared posting article size, within postingSizeToleranceFrac. A
+// single-segment file has no non-final segment to compare and is always
+// probed directly instead; likewise when postingSegmentSize is unknown (0).
+func segmentsConsistentWithPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64) bool {
+	if postingSegmentSize <= 0 || len(segs) < 2 {
+		return false
+	}
+	expectedXMLBytes := float64(postingSegmentSize) / yencOverheadEstimate
+	tolerance := expectedXMLBytes * postingSizeToleranceFrac
+	for _, seg := range segs[:len(segs)-1] {
+		if seg.Bytes <= 0 {
+			return false
+		}
+		diff := float64(seg.Bytes) - expectedXMLBytes
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > tolerance {
+			return false
+		}
+	}
+	return true
+}
+
+// par2SegmentRefsFromPostingSize builds a file's per-segment refs from a
+// known-good, already-probed posting article size, with no network round
+// trip: every non-final segment gets the shared real decoded size, and the
+// final (possibly partial) segment uses the same XML-bytes estimate
+// par2SegmentRefsFallback does, since a real per-file fetch is the only way
+// to learn that exactly.
+func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64) ([]storage.Par2SegmentRef, int64) {
+	n := len(segs)
+	refs := make([]storage.Par2SegmentRef, n)
+	var total int64
+	for i, seg := range segs {
+		b := postingSegmentSize
+		if i == n-1 {
+			b = int64(float64(seg.Bytes) * yencOverheadEstimate)
+		}
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
+		total += b
+	}
+	return refs, total
+}
+
+// par2SegmentRefsFallback estimates every segment's decoded size from its
+// XML-declared (yEnc-ENCODED, wire) byte count, for when no real per-file or
+// per-posting size is available or trustworthy.
+func par2SegmentRefsFallback(segs nzbparser.NzbSegments) ([]storage.Par2SegmentRef, int64) {
+	refs := make([]storage.Par2SegmentRef, len(segs))
+	var total int64
+	for i, seg := range segs {
+		b := int64(float64(seg.Bytes) * yencOverheadEstimate)
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
+		total += b
+	}
+	return refs, total
 }
 
 // yencHeaderFetchFunc fetches yEnc header metadata for one article. Narrowed
@@ -332,10 +512,18 @@ func buildPar2RefsWithFetch(
 // exercised with a fake in tests, without a real, provider-backed client.
 type yencHeaderFetchFunc func(ctx context.Context, messageID string) (*nntp.YencMetadata, error)
 
-func (p *NZBParser) fetchYencHeader(ctx context.Context, messageID string) (*nntp.YencMetadata, error) {
+// fetchYencHeaderFast probes one article's yEnc header with a single
+// connection attempt and a short, non-negotiable timeout - no cross-provider
+// failover and no retry ladder (see nntp.Client.ExecuteOnce). This is the
+// PAR2 source-size probe's own fetch: an optimization with a documented
+// XML-bytes fallback, so a dead or slow article should fail fast into that
+// fallback rather than eating a multi-provider retry sequence.
+func (p *NZBParser) fetchYencHeaderFast(ctx context.Context, messageID string) (*nntp.YencMetadata, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, par2ProbeTimeout)
+	defer cancel()
 	var data *nntp.YencMetadata
-	err := p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-		d, e := conn.GetHeaderPrefix(messageID, metadataOnly)
+	err := p.manager.ExecuteOnce(probeCtx, func(conn *nntp.Connection) error {
+		d, e := conn.GetHeaderPrefixWithTimeout(messageID, metadataOnly, par2ProbeTimeout)
 		data = d
 		return e
 	})
@@ -358,31 +546,28 @@ func (p *NZBParser) fetchYencHeader(ctx context.Context, messageID string) (*nnt
 // upload tooling always encodes same-file segments to a uniform byte budget.
 // On fetch failure (or any inconsistency the same threshold check
 // processFileGroup's last-segment fallback uses), falls back to the
-// XML-declared bytes scaled by the same ~3% yEnc-overhead estimate used
-// there - approximate, but PAR2 support for this one file is best-effort
+// XML-declared bytes scaled by the same yEnc-overhead estimate used there -
+// approximate, but PAR2 support for this one file is best-effort
 // bookkeeping, not something worth failing the whole NZB parse over.
-func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) ([]storage.Par2SegmentRef, int64) {
-	fallback := func() ([]storage.Par2SegmentRef, int64) {
-		refs := make([]storage.Par2SegmentRef, len(segs))
-		var total int64
-		for i, seg := range segs {
-			b := int64(float64(seg.Bytes) * 0.97)
-			refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
-			total += b
-		}
-		return refs, total
-	}
-
+//
+// Returns fetchFailed=true only when the fetch itself errored (a genuine
+// network/article-not-found failure - the signal buildPar2RefsWithFetch
+// counts toward its early-abort threshold), and real=true only when refs
+// came from actual per-segment yEnc data rather than any fallback estimate -
+// the signal buildPar2RefsWithFetch uses to seed the shared posting size.
+func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) (refs []storage.Par2SegmentRef, total int64, fetchFailed, real bool) {
 	yencData, err := fetch(ctx, segs[0].Id)
 	if err != nil || yencData == nil || yencData.Size <= 0 {
-		logger.Warn().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
-		return fallback()
+		logger.Debug().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
+		refs, total = par2SegmentRefsFallback(segs)
+		return refs, total, true, false
 	}
 
 	fileSize := yencData.Size
 	segmentSize := yencData.End - yencData.Begin + 1
 	if segmentSize <= 0 {
-		return fallback()
+		refs, total = par2SegmentRefsFallback(segs)
+		return refs, total, false, false
 	}
 
 	n := len(segs)
@@ -396,11 +581,12 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 		// The header's declared total is inconsistent with this segment
 		// count/size (e.g. a mixed-subject group false match) - don't trust
 		// derived per-segment math against it.
-		return fallback()
+		refs, total = par2SegmentRefsFallback(segs)
+		return refs, total, false, false
 	}
 
-	refs := make([]storage.Par2SegmentRef, n)
-	var total int64
+	refs = make([]storage.Par2SegmentRef, n)
+	total = 0
 	for i, seg := range segs {
 		b := segmentSize
 		if i == n-1 {
@@ -409,7 +595,7 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
 		total += b
 	}
-	return refs, total
+	return refs, total, false, true
 }
 
 func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) map[string]*FileGroup {
