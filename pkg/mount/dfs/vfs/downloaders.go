@@ -15,7 +15,19 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	fuseconfig "github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs/ranges"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
+
+// ErrStaleHandle indicates this Downloaders' backing entry (captured once,
+// at CacheItem creation - see cache.go's newItem) has been confirmed gone,
+// almost always because playback repair deleted+re-grabbed it while this
+// handle stayed open (see usenet.ErrEntryGone). Reads fail with this
+// immediately instead of retrying/circuit-cooling on a grab that can never
+// come back, so the player's own error handling (close + fresh open, which
+// resolves against any replacement at the same path) kicks in fast instead
+// of hammering a dead nzbID in a slow, permanent loop for the life of the
+// handle.
+var ErrStaleHandle = errors.New("vfs: stale file handle, backing entry no longer exists")
 
 const (
 	// maxDownloaderIdleTime is how long a downloader waits before stopping
@@ -112,6 +124,16 @@ type Downloaders struct {
 	// escalates again — so detection is reliable per playback attempt, not
 	// once per session.
 	lastPlaybackEscalateAt atomic.Int64
+
+	// staleEntry is set once countErrors sees ErrEntryGone: this session's
+	// backing entry has been confirmed deleted/superseded, and CacheItem.
+	// entry is never refreshed for the life of this Downloaders (see
+	// cache.go's newItem). Every subsequent read fails immediately with
+	// ErrStaleHandle instead of retrying/circuit-cooling on a grab that can
+	// never come back. Sticky for the session - a fresh Open() creates a
+	// fresh CacheItem/Downloaders (see vfs.Manager.GetFile), so this
+	// naturally clears for the replacement.
+	staleEntry atomic.Bool
 }
 
 // ensureStreamTracked makes sure the active stream is registered when reads begin.
@@ -278,6 +300,13 @@ func (dls *Downloaders) Download(ctx context.Context, r ranges.Range) error {
 // downloader with no read-ahead extension so they are not starved behind bulk
 // sequential prefetch under high connection load.
 func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range, priority bool) error {
+	// Stale handle: the backing entry is confirmed gone (see
+	// ErrStaleHandle's doc comment) - fail every read on this session
+	// immediately rather than retrying or waiting out the circuit
+	// breaker's cooldown on a grab that will never come back.
+	if dls.staleEntry.Load() {
+		return ErrStaleHandle
+	}
 	// Circuit breaker: reject immediately if circuit is open
 	if dls.isCircuitOpen() {
 		lastErr := dls.getLastErr()
@@ -599,6 +628,13 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 		dls.lastErr = err
 		if !customerror.IsSilentError(err) {
 			dls.item.logger.Debug().Err(err).Int("count", dls.errorCount).Msg("download error")
+		}
+		// The backing entry is confirmed gone (deleted/superseded since this
+		// CacheItem was created - see ErrStaleHandle's doc comment). Mark
+		// the session stale so every subsequent read fails fast instead of
+		// retrying/circuit-cooling on a grab that can never come back.
+		if errors.Is(err, usenet.ErrEntryGone) {
+			dls.staleEntry.Store(true)
 		}
 		// Only a genuinely permanent provider failure (article missing, auth,
 		// payment/permission) fast-trips the breaker — retrying those 10× is

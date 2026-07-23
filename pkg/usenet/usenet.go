@@ -3,6 +3,7 @@ package usenet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -226,6 +227,19 @@ func (r *contextSectionReader) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+// ErrEntryGone indicates the backing NZB record for a stream request no
+// longer exists - nzoID was deleted or superseded by a re-grab (see Delete)
+// after a caller resolved a reference to it and before this read ran. The
+// canonical case is a FUSE handle opened against an entry that playback
+// repair then deleted+re-grabbed while the handle stayed open (see
+// pkg/mount/dfs/vfs's Downloaders.staleEntry): the handle's *storage.Entry
+// is captured once at open time and never refreshed, so every subsequent
+// read resolves the same, now-gone nzoID forever. Distinct from a live NNTP
+// article-not-found (which padding/PAR2 repair can address) - there is
+// nothing to retry or repair here, only a fresh Open() against whatever
+// entry (if any) now exists at the same path can recover.
+var ErrEntryGone = errors.New("usenet: entry no longer exists")
 
 type Usenet struct {
 	nntp                     *nntp.Client
@@ -974,7 +988,13 @@ func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
 func (u *Usenet) getFiles(nzoID string, filenames []string) (map[string]*storage.NZBFile, error) {
 	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
-		return nil, fmt.Errorf("metadata load failed: %w", err)
+		// The NZB record itself is gone - nzoID was deleted or superseded
+		// by a re-grab since this call was made to resolve it (e.g. a FUSE
+		// handle opened before the entry was replaced). Distinct from a
+		// live NNTP article-not-found: retrying/padding/repairing can never
+		// fix this, only re-resolving against whatever entry (if any) now
+		// exists at the same path can - see ErrEntryGone's doc comment.
+		return nil, fmt.Errorf("%w: metadata load failed: %w", ErrEntryGone, err)
 	}
 
 	requested := make(map[string]struct{}, len(filenames))

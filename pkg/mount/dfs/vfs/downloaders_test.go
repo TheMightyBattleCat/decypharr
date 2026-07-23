@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs/ranges"
 )
 
@@ -183,6 +184,32 @@ func TestStopAllClearsWaiters(t *testing.T) {
 
 	if got := dls.waiterCount.Load(); got != 0 {
 		t.Fatalf("unexpected waiter count after StopAll: got %d, want 0", got)
+	}
+}
+
+// TestDownloadWithPriorityFailsFastOnStaleEntry proves commit F's central
+// property: once a session is marked stale (its backing entry confirmed
+// gone - see countErrors' ErrEntryGone handling), every subsequent read
+// fails immediately with ErrStaleHandle instead of going through the
+// circuit breaker / retry machinery that would otherwise loop on a grab
+// that can never come back.
+func TestDownloadWithPriorityFailsFastOnStaleEntry(t *testing.T) {
+	dls := &Downloaders{}
+	dls.staleEntry.Store(true)
+
+	err := dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1}, false)
+	if err != ErrStaleHandle {
+		t.Fatalf("DownloadWithPriority() = %v, want ErrStaleHandle", err)
+	}
+}
+
+// TestErrStaleHandleIsNotRetriable proves ErrStaleHandle is classified
+// non-retriable, so DownloadWithRetry's retry loop (which retries only
+// customerror.IsRetriableError errors) surfaces it to the caller on the
+// first attempt instead of retrying a handle that can never recover.
+func TestErrStaleHandleIsNotRetriable(t *testing.T) {
+	if customerror.IsRetriableError(ErrStaleHandle) {
+		t.Fatalf("IsRetriableError(ErrStaleHandle) = true, want false")
 	}
 }
 
