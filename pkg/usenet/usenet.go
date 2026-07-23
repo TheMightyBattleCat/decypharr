@@ -1088,12 +1088,31 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		u.failedFiles.Store(key, err) // Reuse pre-computed key
+		if u.shouldPoisonFailedFile(ctx, nzoID, filename) {
+			u.failedFiles.Store(key, err) // Reuse pre-computed key
+		}
 		// Wrap error to mark as permanent
 		return customerror.NewArticleNotFoundError(err)
 	}
 
 	return err
+}
+
+// shouldPoisonFailedFile decides whether an article-not-found from this read
+// should permanently poison (nzoID, filename) for every future Stream call
+// (see preStreamChecks).
+//
+// A verification read (ContextForVerificationRead - ffprobe import/sweep
+// checks) deliberately disables padding to observe the raw failure. That
+// tells the import gate the grab is broken; it says nothing about whether
+// normal playback - which pads within the overlay's caps - could have
+// survived the same dead segment. Never let it poison the cache real
+// playback consults.
+func (u *Usenet) shouldPoisonFailedFile(ctx context.Context, nzoID, filename string) bool {
+	if reader.PaddingDisabled(ctx) {
+		return false
+	}
+	return true
 }
 
 // safeCopyBuffer copies from src to dst using buf, with context checking and

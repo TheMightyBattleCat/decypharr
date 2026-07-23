@@ -316,6 +316,14 @@ func paddingDisabled(ctx context.Context) bool {
 	return v
 }
 
+// PaddingDisabled is the exported form of paddingDisabled, for callers
+// outside this package (pkg/usenet.Stream) that need to know a read was
+// marked as verification-only before deciding whether a resulting failure
+// says anything about real playback - see ContextWithoutPadding.
+func PaddingDisabled(ctx context.Context) bool {
+	return paddingDisabled(ctx)
+}
+
 // PrefetchableReaderAt extends io.ReaderAt with prefetch capability.
 // This allows callers to trigger segment downloads before starting reads.
 type PrefetchableReaderAt interface {
