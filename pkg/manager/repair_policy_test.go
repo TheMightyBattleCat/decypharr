@@ -15,55 +15,66 @@ import (
 // of (see TestDecideAutoRepairActionImportAndSweepNeverPad below).
 func TestDecideAutoRepairActionFourQuadrantTruthTable(t *testing.T) {
 	cases := []struct {
-		name        string
-		par2Enabled bool
-		verdict     overlay.Verdict
-		want        autoRepairAction
+		name       string
+		par2Usable bool
+		verdict    overlay.Verdict
+		want       autoRepairAction
 	}{
 		{
-			name:        "par2 enabled + within caps (degraded): pad + queue par2 background, no re-grab",
-			par2Enabled: true,
-			verdict:     overlay.VerdictDegraded,
-			want:        autoActionQueuePar2,
+			name:       "par2 enabled + within caps (degraded): pad + queue par2 background, no re-grab",
+			par2Usable: true,
+			verdict:    overlay.VerdictDegraded,
+			want:       autoActionQueuePar2,
 		},
 		{
-			name:        "par2 enabled + failed: queue par2 (urgent if playing), never an automatic re-grab",
-			par2Enabled: true,
-			verdict:     overlay.VerdictFailed,
-			want:        autoActionQueuePar2,
+			name:       "par2 enabled + failed: queue par2 (urgent if playing), never an automatic re-grab",
+			par2Usable: true,
+			verdict:    overlay.VerdictFailed,
+			want:       autoActionQueuePar2,
 		},
 		{
-			name:        "par2 disabled + within caps (degraded): pad only, no re-grab",
-			par2Enabled: false,
-			verdict:     overlay.VerdictDegraded,
-			want:        autoActionNone,
+			name:       "par2 disabled + within caps (degraded): pad only, no re-grab",
+			par2Usable: false,
+			verdict:    overlay.VerdictDegraded,
+			want:       autoActionNone,
 		},
 		{
-			name:        "par2 disabled + failed: auto re-grab (legacy behavior)",
-			par2Enabled: false,
-			verdict:     overlay.VerdictFailed,
-			want:        autoActionRegrab,
+			name:       "par2 disabled + failed: auto re-grab (legacy behavior)",
+			par2Usable: false,
+			verdict:    overlay.VerdictFailed,
+			want:       autoActionRegrab,
 		},
 		{
-			name:        "clean verdict never triggers action, par2 enabled",
-			par2Enabled: true,
-			verdict:     overlay.VerdictClean,
-			want:        autoActionNone,
+			// par2Usable=false covers both "toggle off" and "toggle on but
+			// not usable for this file" (e.g. a FAILED file whose record
+			// predates PAR2 retention, with no backfillable source NZB left
+			// on disk - see Par2Repair.par2Usable). Either way this row
+			// fires: no new truth-table row, same regrab outcome.
+			name:       "par2 usable=false (toggle on, but no par2 data for this file) + failed: auto re-grab, not left terminal",
+			par2Usable: false,
+			verdict:    overlay.VerdictFailed,
+			want:       autoActionRegrab,
 		},
 		{
-			name:        "clean verdict never triggers action, par2 disabled",
-			par2Enabled: false,
-			verdict:     overlay.VerdictClean,
-			want:        autoActionNone,
+			name:       "clean verdict never triggers action, par2 enabled",
+			par2Usable: true,
+			verdict:    overlay.VerdictClean,
+			want:       autoActionNone,
+		},
+		{
+			name:       "clean verdict never triggers action, par2 disabled",
+			par2Usable: false,
+			verdict:    overlay.VerdictClean,
+			want:       autoActionNone,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := decideAutoRepairAction(RepairSourcePlayback, c.par2Enabled, c.verdict)
+			got := decideAutoRepairAction(RepairSourcePlayback, c.par2Usable, c.verdict)
 			if got != c.want {
-				t.Errorf("decideAutoRepairAction(playback, par2Enabled=%v, verdict=%v) = %v, want %v",
-					c.par2Enabled, c.verdict, got, c.want)
+				t.Errorf("decideAutoRepairAction(playback, par2Usable=%v, verdict=%v) = %v, want %v",
+					c.par2Usable, c.verdict, got, c.want)
 			}
 		})
 	}
@@ -71,19 +82,19 @@ func TestDecideAutoRepairActionFourQuadrantTruthTable(t *testing.T) {
 
 // TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback is a direct
 // assertion of source=playback's single most important safety property:
-// across the entire (par2Enabled, verdict) space this test enumerates,
+// across the entire (par2Usable, verdict) space this test enumerates,
 // auto-re-grab is chosen in exactly one combination - padding is always
 // given the chance to cover tolerable, within-caps damage while a live
 // viewer is watching.
 func TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback(t *testing.T) {
 	verdicts := []overlay.Verdict{overlay.VerdictClean, overlay.VerdictDegraded, overlay.VerdictFailed}
 	regrabCount := 0
-	for _, par2Enabled := range []bool{true, false} {
+	for _, par2Usable := range []bool{true, false} {
 		for _, v := range verdicts {
-			if decideAutoRepairAction(RepairSourcePlayback, par2Enabled, v) == autoActionRegrab {
+			if decideAutoRepairAction(RepairSourcePlayback, par2Usable, v) == autoActionRegrab {
 				regrabCount++
-				if par2Enabled {
-					t.Errorf("autoActionRegrab chosen with par2Enabled=true, verdict=%v - re-grab must never fire while PAR2 repair is enabled", v)
+				if par2Usable {
+					t.Errorf("autoActionRegrab chosen with par2Usable=true, verdict=%v - re-grab must never fire while PAR2 repair is enabled", v)
 				}
 				if v != overlay.VerdictFailed {
 					t.Errorf("autoActionRegrab chosen for verdict=%v - re-grab must only fire for a failed verdict", v)
@@ -92,7 +103,7 @@ func TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback(t *testing.T) {
 		}
 	}
 	if regrabCount != 1 {
-		t.Errorf("autoActionRegrab chosen %d times across the (par2Enabled, verdict) space, want exactly 1 (disabled + failed)", regrabCount)
+		t.Errorf("autoActionRegrab chosen %d times across the (par2Usable, verdict) space, want exactly 1 (disabled + failed)", regrabCount)
 	}
 }
 
@@ -103,20 +114,20 @@ func TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback(t *testing.T) {
 // decideAutoRepairAction's doc comment: at import/sweep time the DFS cache
 // is cold, so PAR2 would fetch the entire release from Usenet instead of
 // the cache-warm slices it relies on to be cheap), so import/sweep also
-// never resolve to autoActionQueuePar2 - par2Enabled is ignored entirely for
-// these sources. The assertion holds across the whole (par2Enabled, verdict)
+// never resolve to autoActionQueuePar2 - par2Usable is ignored entirely for
+// these sources. The assertion holds across the whole (par2Usable, verdict)
 // space: every combination collapses to the single re-grab action.
 func TestDecideAutoRepairActionImportAndSweepNeverPad(t *testing.T) {
 	sources := []RepairSource{RepairSourceImport, RepairSourceSweep}
 	verdicts := []overlay.Verdict{overlay.VerdictDegraded, overlay.VerdictFailed}
 
 	for _, source := range sources {
-		for _, par2Enabled := range []bool{true, false} {
+		for _, par2Usable := range []bool{true, false} {
 			for _, verdict := range verdicts {
-				got := decideAutoRepairAction(source, par2Enabled, verdict)
+				got := decideAutoRepairAction(source, par2Usable, verdict)
 				if got != autoActionRegrab {
-					t.Errorf("decideAutoRepairAction(%s, par2Enabled=%v, verdict=%v) = %v, want autoActionRegrab - import/sweep never pad and never queue PAR2 (playback-only)",
-						source, par2Enabled, verdict, got)
+					t.Errorf("decideAutoRepairAction(%s, par2Usable=%v, verdict=%v) = %v, want autoActionRegrab - import/sweep never pad and never queue PAR2 (playback-only)",
+						source, par2Usable, verdict, got)
 				}
 			}
 		}
@@ -124,42 +135,42 @@ func TestDecideAutoRepairActionImportAndSweepNeverPad(t *testing.T) {
 }
 
 // TestDecideAutoRepairActionSourceTruthTable is the full extended truth
-// table: (source, par2Enabled, verdict) -> action, across all three
+// table: (source, par2Usable, verdict) -> action, across all three
 // sources. PAR2 is a playback-only mechanism: only source=playback ever
 // resolves to autoActionQueuePar2. This splits what was previously a single
 // "any source | par2 enabled | degraded/failed -> queue PAR2" row: for
-// source=playback that still holds (par2Enabled fully determines the
+// source=playback that still holds (par2Usable fully determines the
 // outcome alongside verdict), but for source=import and source=sweep every
-// combination - INCLUDING par2Enabled=true - now resolves to a re-grab,
+// combination - INCLUDING par2Usable=true - now resolves to a re-grab,
 // since PAR2 would run against a cold DFS cache at import/sweep time and
 // gets no benefit from it. Proves the three cases the divergence hinges on:
 // import + par2-on + degraded -> regrab, sweep + par2-on + failed -> regrab,
 // and playback + par2-on + degraded -> queuePar2 (the one source that still
-// consults par2Enabled at all).
+// consults par2Usable at all).
 func TestDecideAutoRepairActionSourceTruthTable(t *testing.T) {
 	cases := []struct {
-		name        string
-		source      RepairSource
-		par2Enabled bool
-		verdict     overlay.Verdict
-		want        autoRepairAction
+		name       string
+		source     RepairSource
+		par2Usable bool
+		verdict    overlay.Verdict
+		want       autoRepairAction
 	}{
 		// --- source=playback: unchanged four-quadrant behavior; the only
-		// source that ever consults par2Enabled ---
+		// source that ever consults par2Usable ---
 		{"playback + degraded + par2 enabled -> queue par2", RepairSourcePlayback, true, overlay.VerdictDegraded, autoActionQueuePar2},
 		{"playback + degraded + par2 disabled -> pad (none)", RepairSourcePlayback, false, overlay.VerdictDegraded, autoActionNone},
 		{"playback + failed + par2 enabled -> queue par2", RepairSourcePlayback, true, overlay.VerdictFailed, autoActionQueuePar2},
 		{"playback + failed + par2 disabled -> regrab", RepairSourcePlayback, false, overlay.VerdictFailed, autoActionRegrab},
 		{"playback + clean -> none", RepairSourcePlayback, true, overlay.VerdictClean, autoActionNone},
 
-		// --- source=import: never pad-and-forget, never PAR2 (par2Enabled ignored) ---
+		// --- source=import: never pad-and-forget, never PAR2 (par2Usable ignored) ---
 		{"import + degraded + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceImport, true, overlay.VerdictDegraded, autoActionRegrab},
 		{"import + degraded + par2 disabled -> REGRAB (would be pad for playback)", RepairSourceImport, false, overlay.VerdictDegraded, autoActionRegrab},
 		{"import + failed + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceImport, true, overlay.VerdictFailed, autoActionRegrab},
 		{"import + failed + par2 disabled -> regrab", RepairSourceImport, false, overlay.VerdictFailed, autoActionRegrab},
 		{"import + clean -> none", RepairSourceImport, true, overlay.VerdictClean, autoActionNone},
 
-		// --- source=sweep: never pad-and-forget, never PAR2 (par2Enabled ignored) ---
+		// --- source=sweep: never pad-and-forget, never PAR2 (par2Usable ignored) ---
 		{"sweep + degraded + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceSweep, true, overlay.VerdictDegraded, autoActionRegrab},
 		{"sweep + degraded + par2 disabled -> REGRAB (would be pad for playback)", RepairSourceSweep, false, overlay.VerdictDegraded, autoActionRegrab},
 		{"sweep + failed + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceSweep, true, overlay.VerdictFailed, autoActionRegrab},
@@ -169,10 +180,10 @@ func TestDecideAutoRepairActionSourceTruthTable(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := decideAutoRepairAction(c.source, c.par2Enabled, c.verdict)
+			got := decideAutoRepairAction(c.source, c.par2Usable, c.verdict)
 			if got != c.want {
-				t.Errorf("decideAutoRepairAction(%s, par2Enabled=%v, verdict=%v) = %v, want %v",
-					c.source, c.par2Enabled, c.verdict, got, c.want)
+				t.Errorf("decideAutoRepairAction(%s, par2Usable=%v, verdict=%v) = %v, want %v",
+					c.source, c.par2Usable, c.verdict, got, c.want)
 			}
 		})
 	}

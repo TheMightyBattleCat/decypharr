@@ -1536,10 +1536,13 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 	}
 	nzbID := entry.InfoHash
 
-	par2Enabled := config.Get().Repair.Par2RepairEnabled()
+	var par2Usable bool
+	if r.manager.par2Repair != nil {
+		par2Usable, _ = r.manager.par2Repair.par2Usable(nzbID)
+	}
 	verdict := r.manager.usenet.OverlayVerdict(nzbID, fileName)
 
-	switch decideAutoRepairAction(RepairSourcePlayback, par2Enabled, verdict) {
+	switch decideAutoRepairAction(RepairSourcePlayback, par2Usable, verdict) {
 	case autoActionRegrab:
 		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
 			r.logger.Debug().Str("entry", entryName).Str("file", fileName).

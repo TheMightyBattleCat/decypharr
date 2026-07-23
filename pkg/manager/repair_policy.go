@@ -11,11 +11,12 @@ type autoRepairAction int
 const (
 	// autoActionNone means nothing automatic to do: the file isn't damaged
 	// (VerdictClean/unknown), or - source=playback only - the damage is
-	// within the padding caps and PAR2 is disabled, so padding alone already
-	// covers it and an automatic re-grab would be premature (the whole point
-	// of padding is to keep playing a file with tolerable damage without
-	// treating it as broken). Never returned for source=import or
-	// source=sweep on a real verdict - see decideAutoRepairAction.
+	// within the padding caps and PAR2 isn't usable for this file, so padding
+	// alone already covers it and an automatic re-grab would be premature
+	// (the whole point of padding is to keep playing a file with tolerable
+	// damage without treating it as broken). Never returned for
+	// source=import or source=sweep on a real verdict - see
+	// decideAutoRepairAction.
 	autoActionNone autoRepairAction = iota
 	// autoActionQueuePar2 means hand the file to the PAR2 worker instead of
 	// re-grabbing. PAR2 is a playback-only mechanism: it is only ever
@@ -24,7 +25,7 @@ const (
 	// and sweep detection happen against a cold cache (nothing has played),
 	// so PAR2 there would fetch the entire release from Usenet - never worth
 	// it - and always resolve to autoActionRegrab instead, regardless of
-	// whether PAR2 repair is enabled.
+	// whether PAR2 is usable for the file.
 	autoActionQueuePar2
 	// autoActionRegrab means delete + blocklist + re-search via the Arr
 	// (the legacy path).
@@ -59,26 +60,37 @@ const (
 )
 
 // decideAutoRepairAction implements the coordinated auto-repair policy over
-// (source, par2Enabled, verdict).
+// (source, par2Usable, verdict).
+//
+// par2Usable is NOT just the Par2Repair config toggle - it is that toggle
+// AND PAR2 actually being usable for THIS file: Par2Files/Par2Source on
+// record (or backfillable from the still-on-disk source NZB) with recovery
+// coverage sufficient for the pending damage (see Par2Repair.par2Usable,
+// which reuses the same check that drives the overlay GUI's "repairable"
+// badge). A file whose record predates PAR2 retention, or whose damage
+// exceeds what the retained recovery volumes can fix, is par2Usable=false
+// even with the toggle on - there is no truth-table row for "PAR2 enabled
+// but not usable"; it takes the disabled path below.
 //
 // PAR2 is a playback-only mechanism, so only source=playback ever consults
-// par2Enabled. It keeps the original four-quadrant table exactly as before
+// par2Usable. It keeps the original four-quadrant table exactly as before
 // this source distinction existed:
 //
-//	par2 enabled  + degraded (within padding caps): queue PAR2 (background). No re-grab.
-//	par2 enabled  + failed   (beyond caps):          queue PAR2 (urgent if actively playing).
-//	                                                  A PAR2-terminal outcome marks the file
-//	                                                  unrepairable for MANUAL "Delete & re-search" -
-//	                                                  it never falls back to an automatic re-grab.
-//	par2 disabled + degraded: nothing automatic (padding alone covers it, a live viewer keeps watching).
-//	par2 disabled + failed:   auto re-grab (today's legacy behavior).
+//	par2 usable    + degraded (within padding caps): queue PAR2 (background). No re-grab.
+//	par2 usable    + failed   (beyond caps):          queue PAR2 (urgent if actively playing).
+//	                                                   A PAR2-terminal outcome marks the file
+//	                                                   unrepairable for MANUAL "Delete & re-search" -
+//	                                                   it never falls back to an automatic re-grab.
+//	par2 not usable + degraded: nothing automatic (padding alone covers it, a live viewer keeps watching).
+//	par2 not usable + failed:   auto re-grab (today's legacy behavior; also what a FAILED file with no
+//	                            retained/backfillable PAR2 data now gets, instead of sitting terminal).
 //
-// source=import and source=sweep ignore par2Enabled entirely and always
+// source=import and source=sweep ignore par2Usable entirely and always
 // re-grab on any damage (degraded or failed verdict alike) - never a no-op,
 // never PAR2:
 //
 //	degraded: auto re-grab (would have been "none" for playback).
-//	failed:   auto re-grab (would have been "queue PAR2" for playback when par2 is enabled).
+//	failed:   auto re-grab (would have been "queue PAR2" for playback when par2 is usable).
 //
 // This isn't just "detection there is never pad-and-forget" - it's that PAR2
 // only pays off once the DFS cache is warm from playback. At import (and at
@@ -99,13 +111,13 @@ const (
 // responsible for consulting repairHandlerRegistry around the action this
 // returns, so an entry already being handled is never double-queued or
 // double-re-grabbed.
-func decideAutoRepairAction(source RepairSource, par2Enabled bool, verdict overlay.Verdict) autoRepairAction {
+func decideAutoRepairAction(source RepairSource, par2Usable bool, verdict overlay.Verdict) autoRepairAction {
 	switch verdict {
 	case overlay.VerdictDegraded:
 		if source != RepairSourcePlayback {
 			return autoActionRegrab
 		}
-		if par2Enabled {
+		if par2Usable {
 			return autoActionQueuePar2
 		}
 		return autoActionNone
@@ -113,7 +125,7 @@ func decideAutoRepairAction(source RepairSource, par2Enabled bool, verdict overl
 		if source != RepairSourcePlayback {
 			return autoActionRegrab
 		}
-		if par2Enabled {
+		if par2Usable {
 			return autoActionQueuePar2
 		}
 		return autoActionRegrab
