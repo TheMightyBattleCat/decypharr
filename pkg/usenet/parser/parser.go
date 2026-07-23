@@ -148,27 +148,60 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		return nil, nil, fmt.Errorf("no valid file groups found in NZB")
 	}
 
-	// Retain PAR2 files (parsed but otherwise discarded above) and the exact
-	// as-posted segment layout of every other posted file, purely for PAR2
-	// repair - see storage.NZB.Par2Files/Par2Source. Computed directly from
-	// the flat, pre-grouping raw.Files list so it's independent of whatever
-	// RAR/7z/zip grouping and extraction decides to do with these files
-	// afterwards.
-	nzb.Par2Files, nzb.Par2Source = p.buildPar2Refs(ctx, raw.Files)
+	// Confirm availability BEFORE any PAR2 metadata work: a release with
+	// missing segments gets rejected (and, per our re-grab-on-any-import-damage
+	// policy, re-searched) regardless of what buildPar2Refs would have found,
+	// so there is no reason to spend a yEnc body-probe per posted file only to
+	// discard the result. Checked first, not just cheaper first: a dead
+	// posting fails in one round trip instead of after N probe round trips.
+	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeader)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	// Stat the first segment to confirm connectivity
+	nzb.ID = uuid.New().String()
+	return nzb, fileGroups, nil
+}
+
+// segmentStatFunc confirms a single segment exists on the server. Narrowed
+// from *nntp.Client to just this one operation so availabilityThenPar2Refs
+// can be exercised with a fake in tests, without a real, provider-backed
+// client.
+type segmentStatFunc func(ctx context.Context, messageID string) error
+
+func (p *NZBParser) statSegment(ctx context.Context, messageID string) error {
+	return p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		_, _, statErr := conn.Stat(messageID)
+		return statErr
+	})
+}
+
+// availabilityThenPar2Refs is Parse's availability-check-then-PAR2-probe
+// core, with the STAT and yEnc-fetch operations injected so the ordering
+// (and buildPar2RefsWithFetch's per-posting reuse / early-abort behavior)
+// can be exercised with fakes in tests, without a real, provider-backed NNTP
+// client. Only the first segment of the first non-empty group is stat'd -
+// this is a connectivity check, not a full availability scan (that's
+// Usenet.checkNZBAvailability, later in the pipeline); its only job here is
+// to catch a wholesale-dead posting before any PAR2 probing runs.
+func availabilityThenPar2Refs(
+	ctx context.Context,
+	logger zerolog.Logger,
+	maxConcurrent int,
+	fileGroups map[string]*FileGroup,
+	rawFiles nzbparser.NzbFiles,
+	detectFileType func(string) storage.NZBFileType,
+	statSegment segmentStatFunc,
+	fetch yencHeaderFetchFunc,
+) (par2Files []storage.Par2FileRef, source []storage.PostedFileRef, err error) {
 	checked := false
 	for _, group := range fileGroups {
 		if len(group.Files) == 0 || len(group.Files[0].Segments) == 0 {
 			continue
 		}
 		segment := group.Files[0].Segments[0]
-		err = p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-			_, _, statErr := conn.Stat(segment.Id)
-			return statErr
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w", group.ActualFilename, segment.Id, err)
+		if statErr := statSegment(ctx, segment.Id); statErr != nil {
+			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w", group.ActualFilename, segment.Id, statErr)
 		}
 		checked = true
 		break
@@ -177,8 +210,15 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		return nil, nil, fmt.Errorf("no segments available to stat in NZB")
 	}
 
-	nzb.ID = uuid.New().String()
-	return nzb, fileGroups, nil
+	// Retain PAR2 files (parsed but otherwise discarded above) and the exact
+	// as-posted segment layout of every other posted file, purely for PAR2
+	// repair - see storage.NZB.Par2Files/Par2Source. Computed directly from
+	// the flat, pre-grouping raw.Files list so it's independent of whatever
+	// RAR/7z/zip grouping and extraction decides to do with these files
+	// afterwards. Only reached once the release has passed the availability
+	// check above.
+	par2Files, source = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
+	return par2Files, source, nil
 }
 
 func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[string]*FileGroup) (result *storage.NZB, err error) {
@@ -234,17 +274,6 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 		return nil, fmt.Errorf("no valid files found in NZB after processing")
 	}
 	return nzb, nil
-}
-
-// buildPar2Refs derives storage.NZB's Par2Files and Par2Source from the raw,
-// pre-grouping/pre-extraction NZB file list: every PAR2 file becomes a
-// Par2FileRef, and every other (non-empty-segment) posted file becomes a
-// PostedFileRef in its exact as-posted segment order. Segments are sorted by
-// their NZB part Number defensively, since Par2Source's whole purpose -
-// mapping a dead article to a byte range via cumulative segment bytes -
-// depends on that order being correct.
-func (p *NZBParser) buildPar2Refs(ctx context.Context, files nzbparser.NzbFiles) ([]storage.Par2FileRef, []storage.PostedFileRef) {
-	return buildPar2RefsWithFetch(ctx, p.logger, p.maxConcurrent, files, p.detectFileType, p.fetchYencHeader)
 }
 
 // buildPar2RefsWithFetch is buildPar2Refs with its yEnc header fetch and file
