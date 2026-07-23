@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -32,6 +33,18 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 
 	meta, groups, err := m.usenet.ParseWithID(ctx, req.Id, req.Name, req.NZBContent, req.Arr.Name)
 	if err != nil {
+		if errors.Is(err, parser.ErrReleaseUnavailable) {
+			// A confirmed-damaged release (missing segments, or the
+			// negative cache already knows this exact content is dead)
+			// still needs an Arr-visible outcome, or Sonarr just retries the
+			// identical grab forever (observed: FLUX/ETHEL/Kitsune/RAWR
+			// cycling every ~60s with no blocklist, since a bare error here
+			// never gave the Arr anything to poll). Queue it pre-failed
+			// instead of erroring the add outright, so it flows through the
+			// same queue-status propagation an availability-check failure
+			// during Process already relies on to get blocklisted.
+			return m.rejectDamagedNZB(req, err)
+		}
 		return "", fmt.Errorf("usenet parse failed: %w", err)
 	}
 
@@ -77,6 +90,46 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		return "", fmt.Errorf("failed to queue NZB: %w", err)
 	}
 	return meta.ID, nil
+}
+
+// rejectDamagedNZB records a confirmed-damaged NZB (see AddNewNZB) as an
+// already-errored queue entry, rather than failing the add outright. Both
+// outcomes end with the Arr informed, but only this one gets there: SABnzbd
+// download clients only surface failures the Arr can see via a tracked
+// queue/history item, and a bare error from the add call itself creates no
+// such item, so the Arr has nothing to blocklist and just retries the
+// identical grab on its next cycle. No job is submitted - there's nothing to
+// process for a release that never actually parsed - so this is a
+// synchronous terminal record, not an active download.
+func (m *Manager) rejectDamagedNZB(req *ImportRequest, cause error) (string, error) {
+	id := req.Id
+	if id == "" {
+		id = uuid.New().String()
+	}
+	entry := &storage.Entry{
+		InfoHash:         id,
+		Name:             req.Name,
+		OriginalFilename: req.Name,
+		Protocol:         config.ProtocolNZB,
+		Category:         req.Arr.Name,
+		SavePath:         filepath.Join(req.DownloadFolder, req.Arr.Name),
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+		AddedOn:          time.Now(),
+		Providers:        make(map[string]*storage.ProviderEntry),
+		Files:            make(map[string]*storage.File),
+		Tags:             []string{},
+	}
+	entry.MarkAsError(cause)
+	if err := m.queue.Add(entry); err != nil {
+		return "", fmt.Errorf("usenet parse failed (%v) and failed to record the rejection: %w", cause, err)
+	}
+	m.logger.Warn().
+		Str("name", req.Name).
+		Str("category", req.Arr.Name).
+		Err(cause).
+		Msg("NZB rejected: release confirmed unavailable; queued as failed so the Arr blocklists and re-searches")
+	return id, nil
 }
 
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
