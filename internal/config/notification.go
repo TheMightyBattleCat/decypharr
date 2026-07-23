@@ -25,6 +25,11 @@ const (
 	// damage exceeded the padding caps, or it isn't a paddable container,
 	// and it now needs a re-grab.
 	EventOverlayFileFailed NotificationEvent = "overlay_file_failed"
+
+	// EventPrecacheReady fires once a Sonarr next-episode pre-cache pass
+	// finishes (see pkg/manager.Precache) - "next episode cached, clean" or
+	// "next episode cached, N segments repaired ahead of time".
+	EventPrecacheReady NotificationEvent = "precache_ready"
 )
 
 // Notifications holds all notification configuration

@@ -28,8 +28,13 @@ type ContentFile struct {
 	IsSymlink    bool   `json:"isSymlink"`
 	IsBroken     bool   `json:"isBroken"`
 	SeasonNumber int    `json:"seasonNumber"`
-	Processed    bool   `json:"processed"`
-	Size         int64  `json:"size"`
+	// EpisodeNumber is the Sonarr episode number within SeasonNumber (0 for
+	// movies, or when Sonarr has no episode mapped to this file at all - see
+	// EpisodeCountConfirmed). For a multi-episode file this is the FIRST
+	// episode's number.
+	EpisodeNumber int   `json:"episodeNumber,omitempty"`
+	Processed     bool  `json:"processed"`
+	Size          int64 `json:"size"`
 
 	// RuntimeSec is this file's expected playback duration in seconds, sourced
 	// from the Arr (movie runtime, or the summed/derived runtime of the
@@ -55,6 +60,18 @@ type Content struct {
 	Title string        `json:"title"`
 	Id    int           `json:"id"`
 	Files []ContentFile `json:"files"`
+}
+
+// NextEpisodeInfo describes the episode immediately after a given
+// (season, episode) in a series - see Arr.NextEpisode.
+type NextEpisodeInfo struct {
+	EpisodeId     int // Sonarr's episode row id, for Arr.SearchEpisode
+	SeasonNumber  int
+	EpisodeNumber int
+	HasFile       bool
+	FileId        int
+	Path          string
+	Size          int64
 }
 
 type seriesFile struct {

@@ -37,14 +37,16 @@ func newTestPar2Repair(t *testing.T) (*Par2Repair, *Repair) {
 	m.repair = repair
 
 	p := &Par2Repair{
-		manager:     m,
-		repair:      repair,
-		logger:      logger.New("test-par2-repair"),
-		queued:      make(map[string]struct{}),
-		deferred:    make(map[string]struct{}),
-		queue:       make(chan string, par2QueueDepth),
-		urgentQueue: make(chan string, par2QueueDepth),
-		progress:    newPar2ProgressTracker(),
+		manager:    m,
+		repair:     repair,
+		logger:     logger.New("test-par2-repair"),
+		queued:     make(map[string]struct{}),
+		deferred:   make(map[string]struct{}),
+		queue:      make(chan string, par2QueueDepth),
+		progress:   newPar2ProgressTracker(),
+		urgentSet:  make(map[string]*urgentJob),
+		urgentWake: make(chan struct{}, 1),
+		running:    make(map[string]*runningJob),
 	}
 	m.par2Repair = p
 	return p, repair
@@ -73,20 +75,18 @@ func TestPar2RepairEnqueueClaimsRegistryAndDedupsQueue(t *testing.T) {
 }
 
 // TestPar2RepairEnqueueUrgentUsesThePriorityLane proves EnqueueUrgent lands
-// its job on urgentQueue, not the normal queue, and still claims the
-// registry the same way Enqueue does.
+// its job on the URGENT lane's priority heap, not the normal queue, and that
+// a subsequent normal Enqueue for the same entry is suppressed by
+// handledByUrgent rather than double-queueing across lanes.
 func TestPar2RepairEnqueueUrgentUsesThePriorityLane(t *testing.T) {
-	p, repair := newTestPar2Repair(t)
+	p, _ := newTestPar2Repair(t)
 
-	p.EnqueueUrgent("nzb1")
-	if len(p.urgentQueue) != 1 {
-		t.Fatalf("urgentQueue has %d items, want 1", len(p.urgentQueue))
+	p.EnqueueUrgent("nzb1", 0)
+	if !p.handledByUrgent("nzb1") {
+		t.Fatalf("EnqueueUrgent must land nzb1 on the URGENT lane (handledByUrgent should report true)")
 	}
 	if len(p.queue) != 0 {
 		t.Fatalf("queue has %d items, want 0 - EnqueueUrgent must use the urgent lane", len(p.queue))
-	}
-	if kind, _, exists := repair.handlers.State("nzb1"); !exists || kind != handlerPar2Queued {
-		t.Fatalf("EnqueueUrgent must claim the registry just like Enqueue: kind=%v exists=%v", kind, exists)
 	}
 
 	// A normal Enqueue for the same entry, while the urgent claim is still

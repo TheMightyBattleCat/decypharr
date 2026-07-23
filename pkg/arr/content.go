@@ -16,6 +16,8 @@ type episode struct {
 	Id            int `json:"id"`
 	EpisodeFileID int `json:"episodeFileId"`
 	Runtime       int `json:"runtime"` // minutes; per-episode override of the series runtime
+	SeasonNumber  int `json:"seasonNumber"`
+	EpisodeNumber int `json:"episodeNumber"`
 }
 
 type sonarrSearch struct {
@@ -87,8 +89,10 @@ func (a *Arr) GetMedia(ctx context.Context, mediaId string) ([]Content, error) {
 		for _, file := range seriesFiles {
 			matched := episodesByFile[file.Id]
 			eId := 0
+			episodeNumber := 0
 			if len(matched) > 0 {
 				eId = matched[0].Id
+				episodeNumber = matched[0].EpisodeNumber
 			}
 			if file.Id == 0 || file.Path == "" {
 				// Skip files without path
@@ -101,6 +105,7 @@ func (a *Arr) GetMedia(ctx context.Context, mediaId string) ([]Content, error) {
 				Id:                    d.Id,
 				EpisodeId:             eId,
 				SeasonNumber:          file.SeasonNumber,
+				EpisodeNumber:         episodeNumber,
 				Size:                  file.Size,
 				RuntimeSec:            runtimeSec,
 				EpisodeCount:          episodeCount,
@@ -291,6 +296,71 @@ func (a *Arr) searchRadarr(ctx context.Context, files []ContentFile) error {
 	}
 	if statusOk := strconv.Itoa(resp.StatusCode)[0] == '2'; !statusOk {
 		return fmt.Errorf("failed to automatic search. Status Code: %s", resp.Status)
+	}
+	return nil
+}
+
+// NextEpisode reports the episode immediately following (seasonNumber,
+// episodeNumber) in seriesId - same season only; a season boundary (e.g.
+// asking for the episode after a season finale) reports found=false rather
+// than rolling over into the next season. When the episode already has a
+// file, HasFile/FileId/Path/Size are populated so the caller can pre-cache
+// it immediately; otherwise the caller should fall back to SearchEpisode to
+// have Sonarr grab it.
+func (a *Arr) NextEpisode(ctx context.Context, seriesId, seasonNumber, episodeNumber int) (NextEpisodeInfo, bool, error) {
+	if a.Type != Sonarr {
+		return NextEpisodeInfo{}, false, fmt.Errorf("NextEpisode is only supported for Sonarr")
+	}
+	var episodes []episode
+	if _, err := a.RequestCtx(ctx, http.MethodGet, fmt.Sprintf("api/v3/episode?seriesId=%d", seriesId), nil, &episodes); err != nil {
+		return NextEpisodeInfo{}, false, err
+	}
+	for _, e := range episodes {
+		if e.SeasonNumber != seasonNumber || e.EpisodeNumber != episodeNumber+1 {
+			continue
+		}
+		info := NextEpisodeInfo{
+			EpisodeId:     e.Id,
+			SeasonNumber:  e.SeasonNumber,
+			EpisodeNumber: e.EpisodeNumber,
+			HasFile:       e.EpisodeFileID != 0,
+		}
+		if info.HasFile {
+			var files []seriesFile
+			if _, err := a.RequestCtx(ctx, http.MethodGet, fmt.Sprintf("api/v3/episodefile?seriesId=%d", seriesId), nil, &files); err == nil {
+				for _, f := range files {
+					if f.Id == e.EpisodeFileID {
+						info.FileId = f.Id
+						info.Path = f.Path
+						info.Size = f.Size
+						break
+					}
+				}
+			}
+		}
+		return info, true, nil
+	}
+	return NextEpisodeInfo{}, false, nil
+}
+
+// SearchEpisode triggers a targeted Sonarr search for one specific episode
+// (the EpisodeSearch command), unlike SearchMissing's season-wide
+// SeasonSearch. Used to proactively grab a not-yet-downloaded next episode
+// ahead of playback reaching it (see pkg/manager.Precache).
+func (a *Arr) SearchEpisode(ctx context.Context, episodeId int) error {
+	if a.Type != Sonarr {
+		return fmt.Errorf("SearchEpisode is only supported for Sonarr")
+	}
+	payload := struct {
+		Name       string `json:"name"`
+		EpisodeIds []int  `json:"episodeIds"`
+	}{Name: "EpisodeSearch", EpisodeIds: []int{episodeId}}
+	resp, err := a.RequestCtx(ctx, http.MethodPost, "api/v3/command", payload, nil)
+	if err != nil {
+		return fmt.Errorf("failed to search episode: %w", err)
+	}
+	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+		return fmt.Errorf("failed to search episode. Status Code: %s", resp.Status)
 	}
 	return nil
 }
