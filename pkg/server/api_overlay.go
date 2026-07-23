@@ -636,6 +636,11 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The overlay record is gone, but the file could still be sitting in
+	// the permanent-failure cache from before it was reclaimed - un-poison
+	// it so the next read re-verifies from scratch instead of
+	// short-circuiting on a stale cause.
+	u.ClearFailedFile(entry.InfoHash, req.File)
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
 }
 
@@ -661,6 +666,11 @@ func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
 		if err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
 			s.logger.Warn().Err(err).Str("entry", req.Entry).Str("file", req.File).Msg("overlay research: failed to clear overlay state")
 		}
+		// Manual research always overrides: the re-grab this triggers must
+		// not have its own eventual playback short-circuited by a stale
+		// permanent-failure record left over from the release being
+		// replaced.
+		u.ClearFailedFile(entry.InfoHash, req.File)
 	}
 
 	svc := s.manager.Repair()
