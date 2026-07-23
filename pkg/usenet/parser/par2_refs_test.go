@@ -140,6 +140,89 @@ func TestBuildPar2RefsNoPar2Files(t *testing.T) {
 	}
 }
 
+// TestAvailabilityThenPar2RefsShortCircuitsOnStatFailure proves the
+// reordering: when the connectivity STAT check fails, availabilityThenPar2Refs
+// must return immediately and never invoke the (expensive) yEnc fetch for
+// PAR2 source-size resolution - a release with missing segments gets
+// rejected regardless of what PAR2 probing would have found, so there's no
+// reason to pay for it.
+func TestAvailabilityThenPar2RefsShortCircuitsOnStatFailure(t *testing.T) {
+	fileGroups := map[string]*FileGroup{
+		"release": {
+			BaseName:       "release",
+			ActualFilename: "release.rar",
+			Files: []nzbparser.NzbFile{
+				{Filename: "release.rar", Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: "<seg1>"}}},
+			},
+		},
+	}
+	rawFiles := nzbparser.NzbFiles{
+		{Filename: "release.rar", Bytes: 1000, Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: "<seg1>"}}},
+	}
+
+	fetchCalled := false
+	fetch := func(_ context.Context, _ string) (*nntp.YencMetadata, error) {
+		fetchCalled = true
+		return &nntp.YencMetadata{Size: 970, Begin: 0, End: 969}, nil
+	}
+	statErr := errors.New("article not found")
+	stat := func(_ context.Context, _ string) error { return statErr }
+
+	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 4}
+	par2Files, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+	if err == nil {
+		t.Fatal("expected an error when the availability stat fails")
+	}
+	if !errors.Is(err, statErr) {
+		t.Errorf("error = %v, want it to wrap the stat failure %v", err, statErr)
+	}
+	if fetchCalled {
+		t.Error("yEnc fetch was called despite the availability check failing; PAR2 probing should short-circuit")
+	}
+	if par2Files != nil || source != nil {
+		t.Errorf("par2Files/source = %+v/%+v, want nil on availability failure", par2Files, source)
+	}
+}
+
+// TestAvailabilityThenPar2RefsRunsProbeAfterSuccessfulStat proves PAR2
+// probing still runs, and produces its normal result, once the availability
+// check passes.
+func TestAvailabilityThenPar2RefsRunsProbeAfterSuccessfulStat(t *testing.T) {
+	fileGroups := map[string]*FileGroup{
+		"release": {
+			BaseName:       "release",
+			ActualFilename: "release.rar",
+			Files: []nzbparser.NzbFile{
+				{Filename: "release.rar", Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: "<seg1>"}}},
+			},
+		},
+	}
+	rawFiles := nzbparser.NzbFiles{
+		{Filename: "release.rar", Bytes: 1000, Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: "<seg1>"}}},
+	}
+
+	statCalled := false
+	stat := func(_ context.Context, _ string) error {
+		statCalled = true
+		return nil
+	}
+	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{
+		"<seg1>": {Size: 970, Begin: 0, End: 969},
+	})
+
+	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 4}
+	_, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !statCalled {
+		t.Error("availability stat was never called")
+	}
+	if len(source) != 1 || source[0].Size != 970 {
+		t.Errorf("source = %+v, want one entry sized 970 (real decoded)", source)
+	}
+}
+
 // TestRealPar2SegmentRefsFallsBackOnSizeMismatch covers the case where the
 // fetched header's declared total is wildly inconsistent with this segment
 // count/size (e.g. a mixed-subject false match) - must not trust the derived
