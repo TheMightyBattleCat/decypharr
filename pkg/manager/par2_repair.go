@@ -29,6 +29,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -372,7 +373,15 @@ func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string)
 	if len(nzb.Par2Files) == 0 {
 		return false, "no par2 metadata retained for this release"
 	}
+	return p.coverageSufficient(nzbID, nzb)
+}
 
+// coverageSufficient is Availability's damage-vs-recovery-coverage check,
+// factored out so par2Usable can share it once it has separately confirmed
+// nzb.Par2Source/Par2Files are present (or established they're
+// backfillable, which this function does not attempt itself - see
+// par2Usable). WITHOUT fetching any article data, same as Availability.
+func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (sufficient bool, reason string) {
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
 	if err != nil {
 		return false, "failed to read overlay state"
@@ -394,6 +403,48 @@ func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string)
 		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
 	}
 	return true, ""
+}
+
+// par2Usable reports whether PAR2 is genuinely usable for nzbID right now -
+// the input decideAutoRepairAction's policy consults for source=playback
+// (see repair_policy.go). Unlike the config toggle alone, this also accounts
+// for whether PAR2 metadata actually exists (or can be cheaply expected to
+// exist) for THIS release: a FAILED file whose record predates PAR2
+// retention (see commit 31b3594) has no Par2Files/Par2Source and, if its
+// source .nzb is also gone from disk, can never be repaired via PAR2 no
+// matter how long it waits - decideAutoRepairAction should route it to an
+// immediate re-grab instead of leaving it terminal pending the sweep or
+// manual action.
+//
+// "Backfillable" is checked as a cheap, network-free stat of the source .nzb
+// file (BackfillPar2Refs, which this function never calls itself, does the
+// actual - expensive, network-fetching - re-parse, lazily, only when a real
+// PAR2 pass runs - see Par2Repair.runRepair). A backfillable release is
+// optimistically usable=true here: if the backfill then fails when the PAR2
+// worker actually runs, that pass fails and falls back to
+// classifyPar2Failure exactly as it would for any other PAR2 failure - never
+// a silent re-grab bypass.
+func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
+	if p == nil || p.manager.usenet == nil {
+		return false, "usenet client not configured"
+	}
+	if !config.Get().Repair.Par2RepairEnabled() {
+		return false, "par2 repair disabled"
+	}
+	nzb, err := p.manager.usenet.GetNZB(nzbID)
+	if err != nil {
+		return false, "nzb record not found"
+	}
+	if len(nzb.Par2Source) == 0 || len(nzb.Par2Files) == 0 {
+		if nzb.Path == "" {
+			return false, "no par2 metadata retained and source nzb no longer on disk"
+		}
+		if _, statErr := os.Stat(nzb.Path); statErr != nil {
+			return false, "no par2 metadata retained and source nzb no longer on disk"
+		}
+		return true, ""
+	}
+	return p.coverageSufficient(nzbID, nzb)
 }
 
 // postedLayoutMatches reports whether posted and nzbFile are the same
