@@ -395,18 +395,33 @@ func buildPar2RefsWithFetch(
 	var failedProbes int32
 	var abortedFlag int32
 	var postingSegmentSize int64
+	// Per-release counters for the single summary log below, replacing what
+	// used to be one WARN per probed file (observed: 4297 in one live
+	// import window). filesProbed/filesFailed count real fetch attempts
+	// only - the posting-size reuse path is deliberately excluded, since it
+	// costs no network round trip and isn't a fallback. fellBack counts
+	// every file whose final result came from the plain XML-bytes estimate,
+	// whichever path reached it (a failed/inconsistent probe, or a
+	// post-abort skip).
+	var filesProbed, filesFailed, fellBack int32
 
 	if seedIdx >= 0 {
 		file, segs := eligible[seedIdx], sortedSegs[seedIdx]
 		refs, total, fetchFailed, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
-		if fetchFailed && atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
-			atomic.StoreInt32(&abortedFlag, 1)
+		atomic.AddInt32(&filesProbed, 1)
+		if fetchFailed {
+			atomic.AddInt32(&filesFailed, 1)
+			if atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
+				atomic.StoreInt32(&abortedFlag, 1)
+			}
 		}
 		if real {
 			// refs[i] for i < len(refs)-1 is the real derived per-article
 			// size (see realPar2SegmentRefs) - a meaningful sample only when
 			// there's more than one segment, guaranteed by seedIdx's choice.
 			postingSegmentSize = refs[0].Bytes
+		} else {
+			atomic.AddInt32(&fellBack, 1)
 		}
 		results[seedIdx] = &builtPar2File{
 			name: file.Filename, size: total, segments: refs,
@@ -432,13 +447,21 @@ func buildPar2RefsWithFetch(
 		}
 
 		if atomic.LoadInt32(&abortedFlag) != 0 {
+			atomic.AddInt32(&fellBack, 1)
 			refs, total := par2SegmentRefsFallback(c.segs)
 			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 		}
 
-		refs, total, fetchFailed, _ := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
-		if fetchFailed && atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
-			atomic.StoreInt32(&abortedFlag, 1)
+		refs, total, fetchFailed, real := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
+		atomic.AddInt32(&filesProbed, 1)
+		if fetchFailed {
+			atomic.AddInt32(&filesFailed, 1)
+			if atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
+				atomic.StoreInt32(&abortedFlag, 1)
+			}
+		}
+		if !real {
+			atomic.AddInt32(&fellBack, 1)
 		}
 		return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 	})
@@ -453,7 +476,21 @@ func buildPar2RefsWithFetch(
 		}
 		source = append(source, storage.PostedFileRef{Name: b.name, Size: b.size, Segments: b.segments})
 	}
-	return par2Files, source, atomic.LoadInt32(&abortedFlag) != 0
+
+	aborted = atomic.LoadInt32(&abortedFlag) != 0
+	logEvt := logger.Debug()
+	if fellBack > 0 {
+		logEvt = logger.Warn()
+	}
+	logEvt.
+		Int("files_total", len(eligible)).
+		Int32("files_probed", filesProbed).
+		Int32("files_failed", filesFailed).
+		Int32("fell_back_to_estimate", fellBack).
+		Bool("aborted", aborted).
+		Msg("PAR2 source-size probing complete")
+
+	return par2Files, source, aborted
 }
 
 // segmentsConsistentWithPostingSize reports whether segs' own non-final
