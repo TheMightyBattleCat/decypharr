@@ -115,17 +115,23 @@ type Repair struct {
 	// double-re-grabbed by another. See repair_handler_registry.go and the
 	// policy in repair_policy.go.
 	handlers *repairHandlerRegistry
+
+	// regrabGuard stops the automatic re-grab path from looping forever
+	// across nzbIDs when every candidate release shares the same missing
+	// articles (a posting dead at the source). See regrab_guard.go.
+	regrabGuard *regrabGuard
 }
 
 // NewRepair builds the repair service for the given manager. Call
 // Repair.Start to register the recurring sweep with the scheduler.
 func NewRepair(m *Manager) *Repair {
 	return &Repair{
-		manager:   m,
-		scheduler: m.scheduler,
-		logger:    logger.New("repair"),
-		parentCtx: context.Background(),
-		handlers:  newRepairHandlerRegistry(defaultRepairHandlerTTL),
+		manager:     m,
+		scheduler:   m.scheduler,
+		logger:      logger.New("repair"),
+		parentCtx:   context.Background(),
+		handlers:    newRepairHandlerRegistry(defaultRepairHandlerTTL),
+		regrabGuard: newRegrabGuard(),
 	}
 }
 

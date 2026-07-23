@@ -1521,8 +1521,10 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 	if err != nil || entry == nil || entry.InfoHash == "" || r.manager.usenet == nil {
 		// Can't resolve enough to consult the policy (non-NZB entry, no
 		// overlay/usenet tracking, or the file isn't where we expect it) -
-		// fall back to the pre-coordination default.
-		return r.RepairPlaybackFileNow(ctx, entryName, fileName)
+		// fall back to the pre-coordination default. Still the automatic
+		// path (see repairPlaybackFileNow's auto flag) - the regrab guard
+		// still applies if Arr context can be resolved further in.
+		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
 	}
 	nzbID := entry.InfoHash
 
@@ -1537,7 +1539,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 			return nil
 		}
 		defer r.handlers.Release(nzbID)
-		return r.RepairPlaybackFileNow(ctx, entryName, fileName)
+		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
 	case autoActionQueuePar2:
 		if r.manager.par2Repair != nil {
 			r.manager.par2Repair.EnqueueUrgent(nzbID)
@@ -1574,6 +1576,18 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 }
 
 // RepairPlaybackFileNow repairs a file that just failed playback WITHOUT
+// re-probing it, as a manual, user-initiated action (the overlay GUI's
+// "Delete & re-search" - see handleOverlayResearch) - always proceeds and
+// clears any regrab-guard terminal mark for this file, exactly like
+// ClaimManualAutoRepairOverride bypasses the handler registry for the same
+// kind of manual override. Automatic callers (playback-failure escalation)
+// go through HandlePlaybackFailure, which calls the gated, auto=true form
+// of repairPlaybackFileNow instead.
+func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName string) error {
+	return r.repairPlaybackFileNow(ctx, entryName, fileName, false)
+}
+
+// repairPlaybackFileNow repairs a file that just failed playback WITHOUT
 // re-probing it. The triggering read already hit a hard article-not-found
 // (BODY 430) — that is definitive proof the body is missing, so a confirming
 // BODY re-probe is redundant and, worse, unreliable: a re-probe sample may not
@@ -1581,7 +1595,14 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 // "healthy" and suppressing the repair. We trust the read: this resolves the
 // file's Arr mapping (no probe) and goes straight to delete + blocklist +
 // re-search for the single played entry.
-func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName string) error {
+//
+// auto distinguishes an automatic caller (HandlePlaybackFailure) from a
+// manual one (RepairPlaybackFileNow): only an automatic caller is subject to
+// r.regrabGuard, which stops the delete+blocklist+re-search loop once every
+// candidate release tried so far shares the same missing articles (see
+// regrab_guard.go) - a manual retry always overrides and resets the guard's
+// count for this file instead of being blocked by it.
+func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName string, auto bool) error {
 	if entryName == "" {
 		return errors.New("entry name is empty")
 	}
@@ -1641,9 +1662,13 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	// (a single-file movie entry, or a filename we couldn't line up).
 	h := &storage.EntryHealth{EntryName: entryName, Status: storage.HealthBroken}
 	matched := false
+	var firstMediaID, firstEpisodeID int
 	for name, cf := range c.contentMap {
 		if fileName != "" && name != fileName && filepath.Base(name) != filepath.Base(fileName) {
 			continue
+		}
+		if !matched {
+			firstMediaID, firstEpisodeID = cf.Id, cf.EpisodeId
 		}
 		matched = true
 		bf := storage.BrokenFile{
@@ -1666,6 +1691,27 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 		return fmt.Errorf("file %q not found among Arr-known files for entry %q", fileName, entryName)
 	}
 	h.BrokenCount = len(h.BrokenFiles)
+
+	// Stable identity (independent of nzbID, which changes every re-grab
+	// cycle - see regrab_guard.go) for a broken file's underlying Arr media
+	// record.
+	identity := regrabIdentityKey(c.arrName, firstMediaID, firstEpisodeID, entryName)
+	if !auto {
+		// Manual override: always proceed, and reset the guard so a fresh
+		// automatic streak starts counting from zero after this.
+		r.regrabGuard.clear(identity)
+	} else if allowed, reason, firstTrip := r.regrabGuard.checkAndRecord(identity); !allowed {
+		logEvt := r.logger.Debug()
+		if firstTrip {
+			logEvt = r.logger.Warn()
+		}
+		logEvt.Str("entry", entryName).Str("file", fileName).Str("reason", reason).
+			Msg("playback repair: stopping automatic re-grab, every candidate so far shares the same missing articles")
+		if firstTrip {
+			r.markRegrabGuardTripped(entryName, fileName, h, reason)
+		}
+		return nil
+	}
 	// FileCount is the entry's total tracked file count (matching probeEntry's
 	// h.FileCount = len(names)) - finalizeEntryRepair's shouldDelete check
 	// (BrokenCount == FileCount) is how it tells "this repair covered the
@@ -1688,6 +1734,26 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	var statsMu sync.Mutex
 	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h)
 	return nil
+}
+
+// markRegrabGuardTripped surfaces a regrab-guard trip for manual action,
+// reusing the existing broken-file health surface (EntryHealth.
+// FailureReason, already rendered by the repair health list GUI) rather
+// than the delete+blocklist+re-search action the guard just refused to
+// take. h is the EntryHealth repairPlaybackFileNow already built for this
+// failure (broken-file set intact) - only its status/reason are repointed
+// at the guard's terminal verdict before persisting.
+func (r *Repair) markRegrabGuardTripped(entryName, fileName string, h *storage.EntryHealth, reason string) {
+	h.Status = storage.HealthBroken
+	h.FailureReason = reason
+	h.LastFailedAt = time.Now()
+	h.LastCheckedAt = time.Now()
+	r.saveHealth(h)
+	r.logger.Warn().
+		Str("entry", entryName).
+		Str("file", fileName).
+		Str("reason", reason).
+		Msg("playback repair: marked terminal-unrepairable, manual action required")
 }
 
 // RegrabImportGrab blocklists a grab that failed the import-time
