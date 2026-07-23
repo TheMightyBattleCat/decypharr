@@ -1100,19 +1100,33 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 // shouldPoisonFailedFile decides whether an article-not-found from this read
 // should permanently poison (nzoID, filename) for every future Stream call
-// (see preStreamChecks).
+// (see preStreamChecks). Two safety gates, in order:
 //
-// A verification read (ContextForVerificationRead - ffprobe import/sweep
-// checks) deliberately disables padding to observe the raw failure. That
-// tells the import gate the grab is broken; it says nothing about whether
-// normal playback - which pads within the overlay's caps - could have
-// survived the same dead segment. Never let it poison the cache real
-// playback consults.
+//   - A verification read (ContextForVerificationRead - ffprobe import/sweep
+//     checks) deliberately disables padding to observe the raw failure. That
+//     tells the import gate the grab is broken; it says nothing about
+//     whether normal playback - which pads within the overlay's caps -
+//     could have survived the same dead segment. Never let it poison the
+//     cache real playback consults.
+//   - When padding is active for this file, the reader already pads
+//     anything within the overlay's caps (see reader.SegmentFetcher.
+//     handleConfirmedMissing) - an article-not-found only reaches here
+//     after the overlay itself gave up, which means Decide already set the
+//     file's verdict to Failed before returning. Poisoning on anything
+//     less than Failed (Clean because padding never got a chance to run
+//     yet, or Degraded because the damage is within caps) would
+//     permanently block the padding path above from ever running again via
+//     preStreamChecks - exactly the bug that let Bad Sisters S02E01 fail
+//     for 69 minutes without a single padded segment: two verification
+//     reads poisoned the file before real playback ever built a reader, so
+//     the overlay verdict stayed Clean the whole time. If the overlay has
+//     no record yet (Clean), the safe default is to NOT poison - the next
+//     read builds the reader and records real damage instead.
 func (u *Usenet) shouldPoisonFailedFile(ctx context.Context, nzoID, filename string) bool {
 	if reader.PaddingDisabled(ctx) {
 		return false
 	}
-	return true
+	return u.OverlayVerdict(nzoID, filename) == overlay.VerdictFailed
 }
 
 // safeCopyBuffer copies from src to dst using buf, with context checking and
