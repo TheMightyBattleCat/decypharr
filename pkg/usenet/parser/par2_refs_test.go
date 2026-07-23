@@ -3,12 +3,14 @@ package parser
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Tensai75/nzbparser"
 	"github.com/rs/zerolog"
 
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // fakeYencFetch returns canned yEnc metadata per message ID, so tests never
@@ -72,7 +74,10 @@ func TestBuildPar2Refs(t *testing.T) {
 		// forcing a fetch error -> the ~3% XML-bytes fallback estimate.
 	})
 
-	par2Files, source := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	if aborted {
+		t.Fatal("aborted = true, want false (only one probe failure, well under the abort threshold)")
+	}
 
 	if len(par2Files) != 2 {
 		t.Fatalf("par2Files len = %d, want 2 (release.par2, release.vol000+01.par2); got %+v", len(par2Files), par2Files)
@@ -131,7 +136,10 @@ func TestBuildPar2RefsNoPar2Files(t *testing.T) {
 	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{
 		"<mkv-seg1>": {Size: 1940, Begin: 0, End: 1939},
 	})
-	par2Files, source := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	if aborted {
+		t.Fatal("aborted = true, want false")
+	}
 	if len(par2Files) != 0 {
 		t.Fatalf("par2Files = %+v, want empty", par2Files)
 	}
@@ -237,13 +245,164 @@ func TestRealPar2SegmentRefsFallsBackOnSizeMismatch(t *testing.T) {
 	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{
 		"<s1>": {Size: 50, Begin: 0, End: 999},
 	})
-	refs, total := realPar2SegmentRefs(context.Background(), zerolog.Nop(), "mismatched.dat", segs, fetch)
-	wantS1 := int64(float64(1000) * 0.97)
-	wantS2 := int64(float64(1000) * 0.97)
+	refs, total, fetchFailed, real := realPar2SegmentRefs(context.Background(), zerolog.Nop(), "mismatched.dat", segs, fetch)
+	if fetchFailed {
+		t.Error("fetchFailed = true, want false (the fetch itself succeeded; only the sanity check rejected it)")
+	}
+	if real {
+		t.Error("real = true, want false (result came from the fallback estimate, not real per-segment data)")
+	}
+	wantS1 := int64(float64(1000) * yencOverheadEstimate)
+	wantS2 := int64(float64(1000) * yencOverheadEstimate)
 	if len(refs) != 2 || refs[0].Bytes != wantS1 || refs[1].Bytes != wantS2 {
 		t.Fatalf("refs = %+v, want fallback estimate [%d %d]", refs, wantS1, wantS2)
 	}
 	if total != wantS1+wantS2 {
 		t.Errorf("total = %d, want %d", total, wantS1+wantS2)
 	}
+}
+
+// TestBuildPar2RefsReusesPostingSizeAcrossFiles proves the per-posting-size
+// optimization: only the seed file (the first eligible file with more than
+// one segment) gets a real yEnc fetch. Every other file whose own segment
+// geometry is consistent with the seed's derived article size reuses it
+// with zero network round trips.
+func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
+	files := nzbparser.NzbFiles{
+		{
+			// Seed: 3 full segments, real per-segment size (from the fetch
+			// below) = 970, matching its own XML-declared Bytes of 1000
+			// scaled by yencOverheadEstimate exactly - a clean baseline.
+			Filename: "a.rar",
+			Segments: nzbparser.NzbSegments{
+				{Number: 1, Bytes: 1000, Id: "<a-seg1>"},
+				{Number: 2, Bytes: 1000, Id: "<a-seg2>"},
+				{Number: 3, Bytes: 1000, Id: "<a-seg3>"},
+			},
+		},
+		{
+			// Consistent geometry (non-final segment Bytes == seed's) - must
+			// reuse the seed's derived size with no fetch.
+			Filename: "b.rar",
+			Segments: nzbparser.NzbSegments{
+				{Number: 1, Bytes: 1000, Id: "<b-seg1>"},
+				{Number: 2, Bytes: 1000, Id: "<b-seg2>"},
+			},
+		},
+		{
+			// Still within postingSizeToleranceFrac (8% high on the
+			// non-final segment) - must also reuse, not probe.
+			Filename: "c.rar",
+			Segments: nzbparser.NzbSegments{
+				{Number: 1, Bytes: 1080, Id: "<c-seg1>"},
+				{Number: 2, Bytes: 900, Id: "<c-seg2>"},
+			},
+		},
+	}
+
+	var calls int32
+	fetch := func(_ context.Context, messageID string) (*nntp.YencMetadata, error) {
+		atomic.AddInt32(&calls, 1)
+		if messageID == "<a-seg1>" {
+			return &nntp.YencMetadata{Size: 2910, Begin: 0, End: 969}, nil // segmentSize=970
+		}
+		return nil, errors.New("unexpected fetch for " + messageID)
+	}
+
+	p := &NZBParser{logger: zerolog.Nop()}
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	if aborted {
+		t.Fatal("aborted = true, want false")
+	}
+	if len(par2Files) != 0 {
+		t.Fatalf("par2Files = %+v, want empty (all files are .rar)", par2Files)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("fetch called %d times, want exactly 1 (only the seed file)", got)
+	}
+
+	byName := make(map[string]storage.PostedFileRef)
+	for _, f := range source {
+		byName[f.Name] = f
+	}
+
+	segBytesOf := func(f storage.PostedFileRef) []int64 {
+		out := make([]int64, len(f.Segments))
+		for i, s := range f.Segments {
+			out[i] = s.Bytes
+		}
+		return out
+	}
+
+	a := byName["a.rar"]
+	if a.Size != 2910 || !equalInt64(segBytesOf(a), []int64{970, 970, 970}) {
+		t.Errorf("a.rar = %+v, want size=2910 segBytes=[970 970 970]", a)
+	}
+	b := byName["b.rar"]
+	wantBLast := int64(float64(1000) * yencOverheadEstimate)
+	if b.Size != 970+wantBLast || !equalInt64(segBytesOf(b), []int64{970, wantBLast}) {
+		t.Errorf("b.rar = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", b, wantBLast)
+	}
+	c := byName["c.rar"]
+	wantCLast := int64(float64(900) * yencOverheadEstimate)
+	if c.Size != 970+wantCLast || !equalInt64(segBytesOf(c), []int64{970, wantCLast}) {
+		t.Errorf("c.rar = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", c, wantCLast)
+	}
+}
+
+// TestBuildPar2RefsEarlyAbortAfterKFailures proves the early-abort behavior:
+// once par2ProbeMaxFailedFetches real fetches have failed, probing stops for
+// every remaining file in the release - no further fetch calls - and the
+// release is reported aborted. maxConcurrent=1 makes candidate processing
+// deterministic (strictly in input order) so the exact fetch count is
+// assertable.
+func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
+	// All single-segment files, so none qualifies as a multi-segment seed -
+	// every file goes through the same per-candidate probe path in order.
+	files := make(nzbparser.NzbFiles, 0, 6)
+	for i := 0; i < 6; i++ {
+		id := "<seg" + string(rune('0'+i)) + ">"
+		files = append(files, nzbparser.NzbFile{
+			Filename: "file" + string(rune('0'+i)) + ".rar",
+			Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: id}},
+		})
+	}
+
+	var calls int32
+	fetch := func(_ context.Context, _ string) (*nntp.YencMetadata, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, errors.New("simulated dead article")
+	}
+
+	p := &NZBParser{logger: zerolog.Nop()}
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	if aborted != true {
+		t.Fatal("aborted = false, want true after par2ProbeMaxFailedFetches failures")
+	}
+	if len(par2Files) != 0 || len(source) != 6 {
+		t.Fatalf("par2Files/source = %d/%d, want 0/6", len(par2Files), len(source))
+	}
+	if got := atomic.LoadInt32(&calls); got != par2ProbeMaxFailedFetches {
+		t.Fatalf("fetch called %d times, want exactly %d (probing stops once the threshold trips)", got, par2ProbeMaxFailedFetches)
+	}
+	// Every file - probed-and-failed or skipped post-abort - falls back to
+	// the same XML-bytes estimate, so all 6 results are consistent.
+	want := int64(float64(1000) * yencOverheadEstimate)
+	for _, f := range source {
+		if len(f.Segments) != 1 || f.Segments[0].Bytes != want {
+			t.Errorf("%s Segments = %+v, want one segment of %d bytes", f.Name, f.Segments, want)
+		}
+	}
+}
+
+func equalInt64(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

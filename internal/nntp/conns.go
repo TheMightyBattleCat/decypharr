@@ -494,12 +494,21 @@ func metadataFromDecoder(dec *nntpyenc.Decoder, snippet []byte) *YencMetadata {
 // GetHeaderPrefix retrieves exact yEnc metadata plus a small decoded prefix
 // while keeping the NNTP connection reusable by draining the decoder to EOF.
 func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMetadata, error) {
+	return c.GetHeaderPrefixWithTimeout(messageID, maxSnippet, timeouts.StreamBodyTimeout)
+}
+
+// GetHeaderPrefixWithTimeout is GetHeaderPrefix with the read/idle deadline
+// overridden - for latency-sensitive, best-effort callers (e.g. the parser's
+// PAR2 source-size probe, see nntp.Client.ExecuteOnce) that want a fast
+// failure rather than waiting out the full StreamBodyTimeout on a dead
+// article.
+func (c *Connection) GetHeaderPrefixWithTimeout(messageID string, maxSnippet int, timeout time.Duration) (*YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
 		return nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
 	}
 
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
+	code, message, err := c.readResponseCodeWithDeadline(timeout)
 	if err != nil {
 		return nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
 	}
@@ -508,7 +517,7 @@ func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMet
 		return nil, classifyNNTPError(code, string(message))
 	}
 
-	_ = c.conn.SetReadDeadline(utils.Now().Add(timeouts.StreamBodyTimeout))
+	_ = c.conn.SetReadDeadline(utils.Now().Add(timeout))
 	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 
 	dec := nntpyenc.AcquireDecoder(c.reader)
@@ -525,7 +534,7 @@ func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMet
 		snippet = snippet[:n]
 	}
 
-	if _, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeouts.StreamBodyTimeout); err != nil {
+	if _, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeout); err != nil {
 		_ = c.conn.Close()
 		return nil, classifyTransferError("failed to drain article body", err)
 	}
