@@ -1091,6 +1091,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
 			return fmt.Errorf("write patch for %s segment %d: %w", dr.file, dr.seg.Index, err)
 		}
+		// A prior playback read may have permanently cached this file as
+		// failed (see Usenet.shouldPoisonFailedFile) before this repair
+		// patched its damage. Un-poison it now so the next read builds a
+		// fresh reader against the now-repaired file instead of
+		// short-circuiting on a stale cause. Covers both automatic repair
+		// and a manual "repair now" (RunNow runs this exact same path).
+		u.ClearFailedFile(nzbID, dr.file)
 	}
 	return nil
 }

@@ -30,6 +30,15 @@ import (
 
 const (
 	bufferSize = 256 * 1024 // 256KB buffer for streaming
+
+	// failedFileTTL bounds how long a permanent-failure record in
+	// failedFiles survives before preStreamChecks/FailedFileCause treat it
+	// as expired and let the next read re-verify from scratch. Without
+	// this, a transient provider-side 430 storm (an indexer/provider
+	// briefly missing articles it actually has) could poison a file for
+	// the entire process lifetime with no way back short of a restart or
+	// an explicit Clear call.
+	failedFileTTL = 15 * time.Minute
 )
 
 var streamBufferPool = sync.Pool{
@@ -226,7 +235,7 @@ type Usenet struct {
 	maxConnections           int         // Connections allocated per streaming file
 	processingMaxConnections int         // Connections allocated per file for parsing and NZB downloads
 	prefetchSize             int64       // Streaming prefetch size in bytes
-	failedFiles              *xsync.Map[string, error]
+	failedFiles              *xsync.Map[string, failedFileRecord]
 
 	// overlay is the playback-padding/PAR2-patch store. Nil only if it failed
 	// to initialize (e.g. an unwritable data dir) - streaming then behaves
@@ -319,7 +328,7 @@ func New() (*Usenet, error) {
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
-		failedFiles:              xsync.NewMap[string, error](),
+		failedFiles:              xsync.NewMap[string, failedFileRecord](),
 		overlay:                  overlayStore,
 	}
 
@@ -767,11 +776,20 @@ func overlayPolicyFromConfig(repair config.RepairConfig) overlay.Policy {
 // installs them on the overlay store. Called after the repair config is
 // updated live (see Repair.ApplyConfig) so a saved change applies without a
 // restart.
+//
+// Also clears every cached permanent failure: raising the caps can turn a
+// file the OLD, stricter policy condemned (verdict Failed, poisoning
+// failedFiles per shouldPoisonFailedFile) into one the new policy would
+// have padded instead. There's no cheap way to know which specific files
+// the change affects, so this un-poisons everything and lets the next read
+// of each re-verify against the new policy - the overlay's own persisted
+// verdicts are untouched, only the in-memory short-circuit cache is reset.
 func (u *Usenet) ApplyOverlayPolicy() {
 	if u.overlay == nil {
 		return
 	}
 	u.overlay.SetPolicy(overlayPolicyFromConfig(config.Get().Repair))
+	u.failedFiles.Clear()
 }
 
 // FetchArticle downloads and yEnc-decodes a single NNTP article, returning
@@ -989,8 +1007,13 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 	}
 
 	// Check if file was marked as failed previously
-	if cause, ok := u.failedFiles.Load(fsKey(file.NzbID, file.Name)); ok {
-		return customerror.NewSilentError(cause).Permanent()
+	if rec, ok := u.loadFailedFile(file.NzbID, file.Name); ok {
+		u.logger.Debug().
+			Str("nzb_id", file.NzbID).
+			Str("file", file.Name).
+			Err(rec.err).
+			Msg("preStreamChecks: short-circuiting on cached permanent failure")
+		return customerror.NewSilentError(rec.err).Permanent()
 	}
 
 	return nil
@@ -1001,10 +1024,57 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 // Lets higher layers surface the real cause instead of a generic "no data"
 // error when a stream produces nothing because every segment is missing.
 func (u *Usenet) FailedFileCause(nzoID, filename string) error {
-	if cause, ok := u.failedFiles.Load(fsKey(nzoID, filename)); ok {
-		return cause
+	if rec, ok := u.loadFailedFile(nzoID, filename); ok {
+		return rec.err
 	}
 	return nil
+}
+
+// failedFileRecord is one permanently-failed (nzbID, filename)'s cached
+// cause plus when it was recorded, so loadFailedFile can expire it after
+// failedFileTTL instead of poisoning a file for the process lifetime.
+type failedFileRecord struct {
+	err        error
+	recordedAt time.Time
+}
+
+// loadFailedFile returns (nzoID, filename)'s cached permanent-failure
+// record, self-healing an expired one by deleting it on read so a stale
+// entry never needs an explicit Clear call to eventually recover.
+func (u *Usenet) loadFailedFile(nzoID, filename string) (failedFileRecord, bool) {
+	key := fsKey(nzoID, filename)
+	rec, ok := u.failedFiles.Load(key)
+	if !ok {
+		return failedFileRecord{}, false
+	}
+	if time.Since(rec.recordedAt) > failedFileTTL {
+		u.failedFiles.Delete(key)
+		return failedFileRecord{}, false
+	}
+	return rec, true
+}
+
+// ClearFailedFile un-poisons (nzoID, filename), letting the next read build
+// a fresh reader and re-verify the file from scratch instead of
+// short-circuiting on a stale cause. Called wherever the file's underlying
+// damage may have changed since the record was written: a successful PAR2
+// repair/patch, a manual "repair now", the overlay GUI's reclaim/research
+// actions, and a raised padding-cap policy change (see ApplyOverlayPolicy).
+func (u *Usenet) ClearFailedFile(nzoID, filename string) {
+	u.failedFiles.Delete(fsKey(nzoID, filename))
+}
+
+// ClearFailedEntry un-poisons every file cached under nzoID. Called wherever
+// an entry is deleted or superseded (see Delete) so a re-grab's fresh nzbID
+// never inherits a stale cache key pointing at the old, now-gone grab.
+func (u *Usenet) ClearFailedEntry(nzoID string) {
+	prefix := nzoID + "::"
+	u.failedFiles.Range(func(key string, _ failedFileRecord) bool {
+		if strings.HasPrefix(key, prefix) {
+			u.failedFiles.Delete(key)
+		}
+		return true
+	})
 }
 
 // ContextForVerificationRead marks ctx so the segment fetcher treats a
@@ -1089,7 +1159,12 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
 		if u.shouldPoisonFailedFile(ctx, nzoID, filename) {
-			u.failedFiles.Store(key, err) // Reuse pre-computed key
+			u.logger.Warn().
+				Str("nzb_id", nzoID).
+				Str("file", filename).
+				Err(err).
+				Msg("Stream: caching permanent failure, future reads will short-circuit")
+			u.failedFiles.Store(key, failedFileRecord{err: err, recordedAt: time.Now()}) // Reuse pre-computed key
 		}
 		// Wrap error to mark as permanent
 		return customerror.NewArticleNotFoundError(err)
@@ -1523,6 +1598,12 @@ func (u *Usenet) Delete(nzoID string) error {
 			u.logger.Warn().Err(err).Str("nzb_id", nzoID).Msg("Failed to delete overlay entry")
 		}
 	}
+
+	// Also drop any cached permanent failure under this nzbID. A re-grab
+	// always mints a fresh nzbID, so this is mostly cheap insurance - but a
+	// caller superseding-in-place (rare) must not have a fresh entry
+	// inherit a stale short-circuit from the grab it's replacing.
+	u.ClearFailedEntry(nzoID)
 	return nil
 }
 
