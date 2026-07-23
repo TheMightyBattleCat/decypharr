@@ -23,6 +23,16 @@ import (
 
 var ErrMoreRarDataNeeded = fmt.Errorf("rar: need more data")
 
+// ErrReleaseUnavailable marks a Parse failure as a confirmed-damaged release
+// - missing segments (the connectivity STAT check) or too many failed PAR2
+// source-size probes (buildPar2RefsWithFetch's early abort) - rather than a
+// malformed-input error (bad XML, empty content). Callers use errors.Is
+// against this to distinguish "this release is genuinely dead, blocklist +
+// re-search it" from an ordinary parse error, and to key a short-lived
+// negative cache so an identical re-grab of the same dead posting doesn't
+// pay for the same STAT/probe round trips again.
+var ErrReleaseUnavailable = fmt.Errorf("release unavailable")
+
 var (
 	// defaultMaxSnippetSize is used for content-type detection via magic bytes.
 	// TS sync-byte check at offset 188 is the deepest we go, so 512 bytes is ample.
@@ -231,7 +241,7 @@ func availabilityThenPar2Refs(
 		}
 		segment := group.Files[0].Segments[0]
 		if statErr := statSegment(ctx, segment.Id); statErr != nil {
-			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w", group.ActualFilename, segment.Id, statErr)
+			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w: %w", group.ActualFilename, segment.Id, statErr, ErrReleaseUnavailable)
 		}
 		checked = true
 		break
@@ -250,7 +260,7 @@ func availabilityThenPar2Refs(
 	var aborted bool
 	par2Files, source, aborted = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
 	if aborted {
-		return nil, nil, fmt.Errorf("PAR2 source-file probing aborted after %d failed article fetches; release likely damaged", par2ProbeMaxFailedFetches)
+		return nil, nil, fmt.Errorf("PAR2 source-file probing aborted after %d failed article fetches; release likely damaged: %w", par2ProbeMaxFailedFetches, ErrReleaseUnavailable)
 	}
 	return par2Files, source, nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 func newTestUsenetWithOverlay(t *testing.T) *Usenet {
@@ -159,4 +160,47 @@ func TestClearFailedFileRestoresReadability(t *testing.T) {
 			t.Fatalf("ClearFailedEntry(%s) incorrectly cleared a record under a different nzbID", nzbID)
 		}
 	})
+}
+
+// TestParseWithIDRejectsKnownDeadPosting proves the negative cache actually
+// short-circuits ParseWithID: a re-grab of content already marked dead
+// within deadPostingTTL is rejected immediately, with no parser or NNTP
+// client ever touched (u.nntp is nil here - a real parse attempt would
+// nil-pointer panic, which this test would catch).
+func TestParseWithIDRejectsKnownDeadPosting(t *testing.T) {
+	u := &Usenet{
+		logger:       zerolog.Nop(),
+		deadPostings: newDeadPostingCache(),
+	}
+	content := []byte("<nzb><file>dead release</file></nzb>")
+	u.deadPostings.Mark(hashNZBContent(content))
+
+	_, _, err := u.ParseWithID(context.Background(), "", "release.nzb", content, "tv")
+	if err == nil {
+		t.Fatal("ParseWithID() = nil error, want a rejection for a known-dead posting")
+	}
+	if !errors.Is(err, parser.ErrReleaseUnavailable) {
+		t.Errorf("error = %v, want it to wrap parser.ErrReleaseUnavailable", err)
+	}
+}
+
+// TestParseWithIDAllowsUnmarkedContent proves the negative cache doesn't
+// over-reject: content that was never marked dead reaches the real parser
+// (which then fails for an unrelated reason - no NNTP client configured in
+// this fixture - proving the cache check itself let it through rather than
+// rejecting it).
+func TestParseWithIDAllowsUnmarkedContent(t *testing.T) {
+	u := &Usenet{
+		logger:       zerolog.Nop(),
+		deadPostings: newDeadPostingCache(),
+	}
+	content := []byte("<nzb><file>never seen before</file></nzb>")
+
+	_, _, err := u.ParseWithID(context.Background(), "", "release.nzb", content, "tv")
+	if err == nil {
+		t.Fatal("expected an error (no NNTP client configured), but ParseWithID succeeded")
+	}
+	if errors.Is(err, parser.ErrReleaseUnavailable) {
+		t.Errorf("error = %v, want a plain parse failure, not ErrReleaseUnavailable (content was never marked dead)", err)
+	}
 }

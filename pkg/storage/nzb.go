@@ -43,6 +43,14 @@ type NZB struct {
 	FailMessage    string    `json:"fail_message,omitempty" msgpack:"fail_message,omitempty"`
 	Password       string    `json:"password,omitempty" msgpack:"password,omitempty"`
 
+	// ContentHash is a hash of the raw NZB content this record was parsed
+	// from - the release's identity independent of ID (a fresh UUID every
+	// grab) or Name/Category. Used to key a short-lived negative cache of
+	// confirmed-unavailable postings, so an Arr re-grabbing the identical
+	// dead release doesn't pay for re-parsing/re-probing it again within the
+	// cache's TTL - see pkg/usenet's deadPostingCache.
+	ContentHash string `json:"content_hash,omitempty" msgpack:"content_hash,omitempty"`
+
 	// Par2Files retains the release's PAR2 index/recovery-volume files
 	// (parsed but otherwise discarded before this field existed) purely for
 	// PAR2 repair - see pkg/usenet/par2. Never exposed as mount entries.

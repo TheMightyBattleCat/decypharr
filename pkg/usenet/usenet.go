@@ -256,6 +256,11 @@ type Usenet struct {
 	// exactly as it did before the overlay feature existed.
 	overlay *overlay.Store
 
+	// deadPostings suppresses re-parsing/re-probing a re-grab of an NZB
+	// whose content was already confirmed unavailable within the last
+	// deadPostingTTL - see ParseWithID and checkNZBAvailability.
+	deadPostings *deadPostingCache
+
 	fs *xsync.Map[string, *fsEntry]
 }
 
@@ -344,6 +349,7 @@ func New() (*Usenet, error) {
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, failedFileRecord](),
 		overlay:                  overlayStore,
+		deadPostings:             newDeadPostingCache(),
 	}
 
 	// clean streams dir
@@ -503,18 +509,32 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 		return nil, nil, fmt.Errorf("invalid NZB content: %w", err)
 	}
 
+	// Reject a re-grab of a posting already confirmed unavailable within
+	// deadPostingTTL without spending a single round trip on it - keyed on
+	// content, not nzbID, so it catches the identical release coming back
+	// under a fresh grab ID (the FLUX/ETHEL/Kitsune/RAWR cycling this cache
+	// exists to stop).
+	contentHash := hashNZBContent(content)
+	if u.deadPostings.Check(contentHash) {
+		return nil, nil, fmt.Errorf("%q: %w (confirmed unavailable within the last %s)", name, parser.ErrReleaseUnavailable, deadPostingTTL)
+	}
+
 	// Create parser with the manager
 	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "parser").Logger())
 
 	// Quick parse: defer archive extraction for async processing
 	nzb, groups, err := prs.Parse(ctx, name, content)
 	if err != nil {
+		if errors.Is(err, parser.ErrReleaseUnavailable) {
+			u.deadPostings.Mark(contentHash)
+		}
 		return nil, nil, err
 	}
 	if id != "" {
 		nzb.ID = id
 	}
 
+	nzb.ContentHash = contentHash
 	nzb.Category = category
 	nzb.Status = NZBStatusParsing
 	// Save NZB file to disk
@@ -572,7 +592,11 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 	// missing segment (gone on every provider) fails the NZB.
 	if err := u.checkNZBAvailability(ctx, updatedNZB); err != nil {
 		_ = u.markAsFailed(updatedNZB, err)
-		return updatedNZB, fmt.Errorf("availability check failed: %w", err)
+		// Same negative cache ParseWithID checks/marks for a STAT/PAR2-probe
+		// abort - a re-grab of this exact content within deadPostingTTL is
+		// rejected before it re-parses or re-probes the same dead articles.
+		u.deadPostings.Mark(updatedNZB.ContentHash)
+		return updatedNZB, fmt.Errorf("availability check failed: %w: %w", err, parser.ErrReleaseUnavailable)
 	}
 
 	// Mark as completed
