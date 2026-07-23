@@ -537,6 +537,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio
 	newConfig.Repair.Par2RepairMode = currentConfig.Repair.Par2RepairMode
 	newConfig.Repair.Par2RepairMinSegments = currentConfig.Repair.Par2RepairMinSegments
+	newConfig.Repair.PrecacheReadAhead = currentConfig.Repair.PrecacheReadAhead
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
@@ -645,6 +646,13 @@ func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.JSONResponse(w, svc.Status(), http.StatusOK)
+}
+
+// handlePrecacheStatus reports the read-ahead / next-episode precache
+// feature's live config and state (see Manager.PrecacheStatus) for the
+// repair/overlay GUI's summary.
+func (s *Server) handlePrecacheStatus(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, s.manager.PrecacheStatus(), http.StatusOK)
 }
 
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {

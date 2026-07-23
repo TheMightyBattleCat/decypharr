@@ -1,6 +1,7 @@
 package nntp
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -429,8 +430,9 @@ const (
 )
 
 // providerTier maps a provider to its effective serving tier right now,
-// combining its configured Backup flag with its live quota state.
-func (c *Client) providerTier(p config.UsenetProvider) serveTier {
+// combining its configured Backup flag with its live quota state and the
+// request's context priority (see Priority/WithPriority).
+func (c *Client) providerTier(ctx context.Context, p config.UsenetProvider) serveTier {
 	t := QuotaNormal
 	if c.bw != nil {
 		t = c.bw.Tier(p.Host)
@@ -439,6 +441,13 @@ func (c *Client) providerTier(p config.UsenetProvider) serveTier {
 	case QuotaBlocked:
 		return tierBlocked
 	case QuotaReserve:
+		// A PriorityUrgent caller may draw a capped PRIMARY's held-back
+		// reserve at lead tier instead of being demoted to fills-only - the
+		// hard cap (QuotaBlocked) above is never bypassed. Configured
+		// backups stay fill-only regardless of priority.
+		if !p.Backup && priorityFrom(ctx) == PriorityUrgent {
+			return tierLead
+		}
 		return tierFill // a capped primary is demoted to fills
 	default:
 		if p.Backup {
@@ -446,6 +455,25 @@ func (c *Client) providerTier(p config.UsenetProvider) serveTier {
 		}
 		return tierLead
 	}
+}
+
+// HasLeadHeadroom reports whether at least one non-backup provider currently
+// has lead-tier capacity available (i.e. is below its reserve/soft
+// threshold). Used by bulk, deferrable background work (e.g. Sonarr
+// next-episode pre-caching) to decide whether now is a good time to start a
+// large burst without eating into any provider's held-back reserve - unlike
+// URGENT-lane PAR2 repair, this kind of work has no playback deadline, so it
+// should simply wait for headroom rather than drawing on a reserve band.
+func (c *Client) HasLeadHeadroom() bool {
+	for _, p := range c.providers {
+		if p.Backup {
+			continue
+		}
+		if c.providerTier(context.Background(), p) == tierLead {
+			return true
+		}
+	}
+	return false
 }
 
 // tierLabel is the stats-API string for a serveTier: "primary" while a

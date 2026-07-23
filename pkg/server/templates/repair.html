@@ -80,6 +80,52 @@
         </div>
     </div>
 
+    <!-- Pre-cache summary -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <div class="flex flex-col lg:flex-row gap-4 lg:items-center lg:justify-between">
+                <div>
+                    <h3 class="card-title text-xl">
+                        <i class="bi bi-cloud-arrow-down-fill mr-2 text-primary"></i>Pre-cache
+                    </h3>
+                    <p class="text-sm opacity-70 mt-1" id="precacheStatusLine">Loading…</p>
+                    <p class="text-xs opacity-60 mt-1">
+                        Configure pre-caching in
+                        <a href="{{.URLBase}}settings#repair" class="link link-hover font-medium">Settings → Repair</a>.
+                    </p>
+                </div>
+                <div class="stats stats-vertical sm:stats-horizontal shadow bg-base-200/60">
+                    <div class="stat py-2 px-4">
+                        <div class="stat-title text-xs">Footprint</div>
+                        <div class="stat-value text-base" id="precacheFootprint">-</div>
+                    </div>
+                    <div class="stat py-2 px-4">
+                        <div class="stat-title text-xs">Next episodes</div>
+                        <div class="stat-value text-base" id="precacheNextEpisodes">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="overflow-x-auto mt-4">
+                <table class="table table-sm table-hover">
+                    <thead class="bg-base-200">
+                    <tr>
+                        <th>Ready at</th>
+                        <th>Entry</th>
+                        <th>File</th>
+                        <th>Outcome</th>
+                    </tr>
+                    </thead>
+                    <tbody id="precacheReadinessBody"></tbody>
+                </table>
+                <div id="noPrecacheMessage" class="text-center py-8 hidden text-base-content/70">
+                    <i class="bi bi-hourglass-split text-2xl block mb-2"></i>
+                    Nothing pre-cached yet.
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Targeted recheck (by Arr media id) -->
     <div class="card bg-base-100 shadow-xl">
         <div class="card-body">
@@ -233,7 +279,7 @@
             </p>
 
             <form id="overlayConfigForm" class="mt-4 space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
                         <span>
                             <span class="block font-medium">Playback padding</span>
@@ -247,6 +293,13 @@
                             <span class="block text-xs opacity-70">Reconstruct dead segments' true bytes from PAR2 recovery data.</span>
                         </span>
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
+                    </label>
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                        <span>
+                            <span class="block font-medium">Fast read-ahead</span>
+                            <span class="block text-xs opacity-70">Aggressively pre-fetch the rest of a file once playback passes the threshold so damage can be repaired before you reach it — uses extra bandwidth and cache.</span>
+                        </span>
+                        <input type="checkbox" class="toggle toggle-primary" id="overlayPrecacheReadAhead">
                     </label>
                 </div>
 

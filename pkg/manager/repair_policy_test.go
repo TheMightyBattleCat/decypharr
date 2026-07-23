@@ -80,6 +80,37 @@ func TestDecideAutoRepairActionFourQuadrantTruthTable(t *testing.T) {
 	}
 }
 
+// TestDecideAutoRepairActionPrecacheTriggeredUrgentJob proves the precache
+// read-ahead and next-episode features' urgent-repair trigger
+// (Precache.repairAhead / Precache.recordReadiness) reuses source=playback's
+// par2Usable gate exactly like HandlePlaybackFailure does: par2Usable=true
+// queues PAR2, par2Usable=false takes no PAR2 path at all - precache never
+// acts on autoActionRegrab itself (nothing has actually failed yet), so
+// "not queuePar2" is the only outcome that matters for these callers.
+func TestDecideAutoRepairActionPrecacheTriggeredUrgentJob(t *testing.T) {
+	cases := []struct {
+		name       string
+		par2Usable bool
+		verdict    overlay.Verdict
+		wantQueue  bool
+	}{
+		{"usable + degraded: queues PAR2", true, overlay.VerdictDegraded, true},
+		{"usable + failed: queues PAR2", true, overlay.VerdictFailed, true},
+		{"not usable + degraded: no PAR2 path", false, overlay.VerdictDegraded, false},
+		{"not usable + failed: no PAR2 path (precache never regrabs)", false, overlay.VerdictFailed, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			action := decideAutoRepairAction(RepairSourcePlayback, c.par2Usable, c.verdict)
+			gotQueue := action == autoActionQueuePar2
+			if gotQueue != c.wantQueue {
+				t.Errorf("decideAutoRepairAction(playback, par2Usable=%v, verdict=%v) = %v; queuePar2=%v, want %v",
+					c.par2Usable, c.verdict, action, gotQueue, c.wantQueue)
+			}
+		})
+	}
+}
+
 // TestDecideAutoRepairActionOnlyOneQuadrantRegrabsForPlayback is a direct
 // assertion of source=playback's single most important safety property:
 // across the entire (par2Usable, verdict) space this test enumerates,

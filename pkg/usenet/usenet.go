@@ -186,6 +186,11 @@ func (n *noPrefetchReader) Prefetch(ctx context.Context, off, length int64) {
 	// No-op for multi-volume readers
 }
 
+func (n *noPrefetchReader) FetchRange(ctx context.Context, off, length int64, concurrency int) error {
+	// No-op for multi-volume readers - no dedicated fetcher/cache to drive.
+	return nil
+}
+
 type contextSectionReader struct {
 	ctx   context.Context
 	r     fs.PrefetchableReaderAt
@@ -447,6 +452,35 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 		}
 		runtime.Gosched()
 	}
+}
+
+// HasBandwidthHeadroom reports whether at least one non-backup provider
+// currently has lead-tier capacity available. Used to gate deferrable bulk
+// background work (Sonarr next-episode pre-caching) so it never eats into a
+// provider's held-back reserve - see nntp.Client.HasLeadHeadroom.
+func (u *Usenet) HasBandwidthHeadroom() bool {
+	return u.nntp.HasLeadHeadroom()
+}
+
+// EvictCache immediately tears down the cached reader/disk buffer for one
+// file, if it is currently idle (no active Stream holding a reference).
+// Used by the next-episode precache feature to reclaim a pre-cached
+// episode's disk footprint once it has actually been watched (see
+// config.Precache.PrecacheEvictAfterWatched) instead of waiting for the
+// normal idle-timeout cleanup (cleanupIdleFS). Returns false (no-op) if the
+// entry doesn't exist or is currently in use.
+func (u *Usenet) EvictCache(nzoID, filename string) bool {
+	key := fsKey(nzoID, filename)
+	entry, ok := u.fs.Load(key)
+	if !ok {
+		return false
+	}
+	if !entry.claimForCleanup() {
+		return false
+	}
+	u.fs.Delete(key)
+	entry.cleanup()
+	return true
 }
 
 // releaseFS releases an fs entry using a pre-computed key (avoids redundant allocation).
@@ -1376,6 +1410,46 @@ func (u *Usenet) PreCache(ctx context.Context, nzoID, filename string) error {
 	}
 
 	return nil
+}
+
+// ReadAhead aggressively fetches the remainder of a file - [from, EOF) -
+// into the cache at up to concurrency parallel segment fetches, distinct
+// from (and typically much higher than) the reader's normal steady-state
+// prefetch window used during ordinary streaming. Intended to be triggered
+// once a playing file's read position has crossed a configured threshold
+// (see config.Precache), not on every read.
+//
+// Uses the same shared entry/reader as Stream/PreCache, so anything already
+// cached is skipped and anything fetched here is immediately available to
+// concurrent/subsequent Stream calls. As a side effect of going through the
+// normal per-segment fetch path, any segment confirmed missing across every
+// provider is recorded in the overlay (and padded, if playback padding is
+// enabled) exactly as it would be for a live read - see
+// pkg/usenet/fs/reader.SegmentFetcher.handleConfirmedMissing.
+func (u *Usenet) ReadAhead(ctx context.Context, nzoID, filename string, from int64, concurrency int) error {
+	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	if err != nil {
+		return fmt.Errorf("failed to get or create entry: %w", err)
+	}
+	defer u.releaseFS(key)
+
+	if len(entry.volumes) == 0 {
+		return fmt.Errorf("no volumes available for file %s", filename)
+	}
+	fileSize := entry.volumes[0].Size
+	if from < 0 {
+		from = 0
+	}
+	if from >= fileSize {
+		return nil
+	}
+
+	readerAt, _, err := entry.getOrCreateReader()
+	if err != nil {
+		return fmt.Errorf("failed to get reader: %w", err)
+	}
+
+	return readerAt.FetchRange(ctx, from, fileSize-from, concurrency)
 }
 
 // Stats returns nntp statistics

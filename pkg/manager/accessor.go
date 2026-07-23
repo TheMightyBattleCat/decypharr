@@ -22,6 +22,12 @@ func (m *Manager) Repair() *Repair {
 	return m.repair
 }
 
+// PrecacheStatus returns a snapshot of the read-ahead/next-episode precache
+// feature's live config and state, for the repair/overlay GUI and API.
+func (m *Manager) PrecacheStatus() PrecacheSummary {
+	return m.precache.Summary()
+}
+
 func (m *Manager) Scheduler() gocron.Scheduler {
 	return m.scheduler
 }

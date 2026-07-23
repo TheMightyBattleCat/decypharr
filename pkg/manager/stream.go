@@ -338,6 +338,12 @@ func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filena
 		}
 	}
 
+	// Read-ahead precache: track this file's read position and, once it
+	// crosses the configured threshold, kick off a background aggressive
+	// cache-ahead pass (see precache.go). No-op if disabled/already
+	// triggered for this file.
+	m.precache.Observe(entry, filename, start, file.Size)
+
 	// Stream NZB content directly into writer
 	return m.usenet.Stream(ctx, entry.InfoHash, filename, start, end, writer)
 }

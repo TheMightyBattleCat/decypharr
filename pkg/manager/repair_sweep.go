@@ -1553,7 +1553,11 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
 	case autoActionQueuePar2:
 		if r.manager.par2Repair != nil {
-			r.manager.par2Repair.EnqueueUrgent(nzbID)
+			// proximity=0: a live playback read just hit this damage right
+			// now, the same "playhead is already here" urgency as a
+			// precache-triggered job's closest possible proximity (see
+			// Precache.recordReadiness).
+			r.manager.par2Repair.EnqueueUrgent(nzbID, 0)
 		}
 		return true, "", nil
 	default:

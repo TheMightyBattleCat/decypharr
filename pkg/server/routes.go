@@ -80,6 +80,9 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/overlay/gc-orphans/count", s.handleOverlayOrphanCount)
 			r.Post("/overlay/gc-orphans", s.handleOverlayGCOrphans)
 
+			// Proactive pre-caching / read-ahead repair status
+			r.Get("/precache/status", s.handlePrecacheStatus)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

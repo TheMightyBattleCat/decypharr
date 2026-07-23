@@ -347,6 +347,26 @@ type RepairConfig struct {
 	// PAR2 pass for it; ignored in every other mode. Zero means unset and
 	// falls back to 1.
 	Par2RepairMinSegments int `json:"par2_repair_min_segments,omitempty"`
+
+	// Par2UrgentConcurrency bounds how many URGENT-lane PAR2 repair jobs
+	// (playback-proximity-driven, see pkg/manager.Par2Repair.EnqueueUrgent)
+	// may run at once. Unlike the BATCH lane - serialized by design, since a
+	// pass reads a meaningful fraction of a release and several running
+	// concurrently would just contend with itself off-peak - the urgent lane
+	// exists specifically to race a specific damaged region against an
+	// approaching playhead, so a small amount of real concurrency is the
+	// point. Default 2 when unset/non-positive.
+	Par2UrgentConcurrency int `json:"par2_urgent_concurrency,omitempty"`
+
+	// PrecacheReadAhead, when true, aggressively pre-fetches the rest of a
+	// file once playback passes the read-ahead threshold (see pkg/manager's
+	// read-ahead burst), so PAR2/padding repair has a chance to fix damage
+	// before the playhead reaches it. Covers both movies and episodes. Off
+	// by default - unlike PlaybackPadding/Par2Repair, this trades extra
+	// bandwidth and cache pressure for a head start, so it is opt-in rather
+	// than defaulting on. *bool so unset is distinguishable from an explicit
+	// false, same convention as PlaybackPadding.
+	PrecacheReadAhead *bool `json:"precache_read_ahead_enabled,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
@@ -358,7 +378,8 @@ func (r RepairConfig) IsZero() bool {
 		!r.CleanupSuperseded &&
 		r.PlaybackPadding == nil && r.Par2Repair == nil && r.ImportAvailabilityCheck == nil &&
 		r.PadMaxRunSegments == 0 && r.PadMaxTotalSegments == 0 && r.PadMaxByteRatio == 0 &&
-		r.Par2RepairMode == "" && r.Par2RepairMinSegments == 0
+		r.Par2RepairMode == "" && r.Par2RepairMinSegments == 0 &&
+		r.Par2UrgentConcurrency == 0 && r.PrecacheReadAhead == nil
 }
 
 // PlaybackPaddingEnabled reports whether playback padding is active,
@@ -378,6 +399,13 @@ func (r RepairConfig) Par2RepairEnabled() bool {
 // ImportAvailabilityCheck's doc comment).
 func (r RepairConfig) ImportAvailabilityCheckEnabled() bool {
 	return r.ImportAvailabilityCheck == nil || *r.ImportAvailabilityCheck
+}
+
+// PrecacheReadAheadEnabled reports whether the read-ahead pre-cache burst is
+// active, defaulting to false when unset (see PrecacheReadAhead's doc
+// comment) - the opposite default from PlaybackPaddingEnabled/Par2RepairEnabled.
+func (r RepairConfig) PrecacheReadAheadEnabled() bool {
+	return r.PrecacheReadAhead != nil && *r.PrecacheReadAhead
 }
 
 type Config struct {
@@ -433,6 +461,10 @@ type Config struct {
 	SkipAutoMove bool   `json:"skip_auto_move,omitempty"`
 
 	Repair RepairConfig `json:"repair,omitzero"`
+
+	// Precache is proactive pre-caching/repair ahead of playback - see
+	// PrecacheConfig.
+	Precache PrecacheConfig `json:"precache,omitzero"`
 
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
@@ -814,6 +846,23 @@ func (c *Config) setDefaults() {
 	}
 
 	c.applyRepairDefaults()
+	c.applyPrecacheDefaults()
+}
+
+func (c *Config) applyPrecacheDefaults() {
+	if c.Precache.PrecacheThresholdPercent <= 0 {
+		c.Precache.PrecacheThresholdPercent = 10
+	}
+	if c.Precache.PrecacheReadAheadConcurrency <= 0 {
+		c.Precache.PrecacheReadAheadConcurrency = 12
+	}
+	if c.Precache.PrecacheNextEpisodes == nil {
+		v := 1
+		c.Precache.PrecacheNextEpisodes = &v
+	}
+	if c.Precache.PrecacheMaxBytes <= 0 {
+		c.Precache.PrecacheMaxBytes = precacheDefaultMaxBytes
+	}
 }
 
 func (c *Config) applyRepairDefaults() {
@@ -845,6 +894,10 @@ func (c *Config) applyRepairDefaults() {
 		v := true
 		c.Repair.Par2Repair = &v
 	}
+	// PrecacheReadAhead defaults OFF (nil left as nil), unlike
+	// PlaybackPadding/Par2Repair above - read-ahead is bandwidth- and
+	// cache-aggressive, so it must be explicitly opted into rather than
+	// materialized to true on first save.
 
 	if c.Repair.PadMaxRunSegments == 0 {
 		c.Repair.PadMaxRunSegments = defaultPadMaxRunSegments
@@ -870,6 +923,10 @@ func (c *Config) applyRepairDefaults() {
 
 	if c.Repair.Par2RepairMinSegments <= 0 {
 		c.Repair.Par2RepairMinSegments = defaultPar2RepairMinSegs
+	}
+
+	if c.Repair.Par2UrgentConcurrency <= 0 {
+		c.Repair.Par2UrgentConcurrency = 2
 	}
 }
 
@@ -937,6 +994,7 @@ func clearHotFields(c *Config) {
 	c.Retries = 0
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
+	c.Precache = PrecacheConfig{}
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.
