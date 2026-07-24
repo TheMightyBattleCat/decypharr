@@ -97,6 +97,55 @@ func TestPar2RepairEnqueueUrgentUsesThePriorityLane(t *testing.T) {
 	}
 }
 
+// TestPar2RepairAutoEnqueueNoOpsWhenPar2RepairDisabled proves AutoEnqueue
+// never claims the handler registry while config.Repair.Par2Repair is
+// disabled, regardless of Par2RepairMode. Claiming a par2_queued slot the
+// worker's readyToRun() will then always refuse to run leaves a stale claim
+// sitting forever, which permanently blocks HandlePlaybackFailure's
+// TryAcquire(handlerRegrab) for that file - confirmed live: a padded
+// segment claimed the slot, the worker correctly never ran it, and every
+// later playback failure on that file silently no-opped with "entry
+// already being handled by another repair mechanism" instead of ever
+// re-grabbing it.
+func TestPar2RepairAutoEnqueueNoOpsWhenPar2RepairDisabled(t *testing.T) {
+	p, repair := newTestPar2Repair(t)
+
+	cfg := config.Get()
+	disabled := false
+	cfg.Repair.Par2Repair = &disabled
+	cfg.Repair.Par2RepairMode = config.Par2RepairModeAutoAll
+
+	p.AutoEnqueue("nzb1", 5)
+
+	if len(p.queue) != 0 {
+		t.Fatalf("AutoEnqueue queued %d items while Par2Repair is disabled, want 0", len(p.queue))
+	}
+	if _, _, exists := repair.handlers.State("nzb1"); exists {
+		t.Fatalf("AutoEnqueue claimed the handler registry while Par2Repair is disabled - this permanently blocks HandlePlaybackFailure's regrab path")
+	}
+}
+
+// TestPar2RepairAutoEnqueueQueuesWhenPar2RepairEnabled is the control case
+// for the fix above: proves AutoEnqueue still queues normally once
+// Par2Repair is enabled.
+func TestPar2RepairAutoEnqueueQueuesWhenPar2RepairEnabled(t *testing.T) {
+	p, repair := newTestPar2Repair(t)
+
+	cfg := config.Get()
+	enabled := true
+	cfg.Repair.Par2Repair = &enabled
+	cfg.Repair.Par2RepairMode = config.Par2RepairModeAutoAll
+
+	p.AutoEnqueue("nzb1", 5)
+
+	if len(p.queue) != 1 {
+		t.Fatalf("AutoEnqueue queued %d items while Par2Repair is enabled, want 1", len(p.queue))
+	}
+	if kind, _, exists := repair.handlers.State("nzb1"); !exists || kind != handlerPar2Queued {
+		t.Fatalf("AutoEnqueue must claim the registry when Par2Repair is enabled: kind=%v exists=%v", kind, exists)
+	}
+}
+
 // TestPar2RepairEnqueueSkippedWhenPersistedTerminal proves Enqueue never
 // queues (and never claims the registry) for an entry storage already
 // records as terminal - par2ShouldAutoEnqueue's existing durable gate, which
