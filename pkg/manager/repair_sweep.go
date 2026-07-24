@@ -1705,6 +1705,18 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 			SourcePath: cf.Path,
 			Size:       cf.Size,
 		}
+		// InfoHash pins this BrokenFile to the entry that was actually
+		// broken - without it, fileSuperseded (supersession.go) can
+		// never tell a healthy replacement apart from the same
+		// still-dead entry (an empty InfoHash only ever proves
+		// "unreferenced", never "referenced but different"), so an
+		// entry superseded via this path sits in the broken list
+		// forever even after a working re-grab replaced it. Same field,
+		// same source (item.Files[name].InfoHash), as the sweep-probe
+		// path's brokenFiles().
+		if file, ok := item.Files[name]; ok && file != nil {
+			bf.InfoHash = file.InfoHash
+		}
 		h.BrokenFiles = append(h.BrokenFiles, bf)
 	}
 	if !matched {
