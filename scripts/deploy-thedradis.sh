@@ -96,6 +96,21 @@ preflight() {
     svc_state="$($SSH "systemctl is-active $SERVICE" || true)"
     [ "$svc_state" = "active" ] || fail "$SERVICE is not active on $REMOTE_HOST (state: $svc_state) - refusing to deploy on top of an already-broken service"
 
+    # swap_and_restart (step 5) runs `sudo systemctl stop/start $SERVICE` over
+    # a non-interactive SSH heredoc (no pty allocated), so it can never answer
+    # a password prompt - if the sudoers NOPASSWD rule is missing or wrong,
+    # that stop just hangs/fails with the service already down and nothing
+    # left to start it back up. Prove passwordless sudo actually works for
+    # this service BEFORE the service is touched, not after: `-n` makes sudo
+    # fail immediately instead of prompting, so this is safe to run without
+    # side effects (is-active needs the same NOPASSWD grant stop/start does,
+    # but never changes service state itself).
+    local sudo_check_output
+    if ! sudo_check_output="$($SSH "sudo -n systemctl is-active $SERVICE" 2>&1)"; then
+        fail "passwordless sudo is not working for systemctl on $REMOTE_HOST ('sudo -n systemctl is-active $SERVICE' failed: $sudo_check_output) - fix the sudoers NOPASSWD rule for $SERVICE before deploying; a missing rule takes the service down mid-deploy when step 5's non-interactive stop/start can't answer a password prompt"
+    fi
+    log "Passwordless sudo for $SERVICE confirmed working"
+
     OLD_BINARY_HASH="$($SSH "sha256sum $REMOTE_BIN" | cut -d' ' -f1)"
     log "Current running binary hash: $OLD_BINARY_HASH"
 
