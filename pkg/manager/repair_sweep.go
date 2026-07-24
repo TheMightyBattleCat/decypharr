@@ -292,10 +292,10 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			}
 
 			// Still broken after the inline debrid re-insert: escalate to the
-			// Arr delete + re-search for just this entry.
-			if autoRepair && h.Status == storage.HealthBroken {
-				r.healBrokenEntry(gctx, run, &runMu, name, h)
-				r.releaseRegrabClaims(h)
+			// Arr delete + re-search for just this entry, and release any
+			// regrab claim routeAutoRepair took while probing.
+			if h.Status == storage.HealthBroken {
+				r.finalizeBrokenEntry(gctx, run, &runMu, name, h, autoRepair)
 			}
 
 			runMu.Lock()
@@ -791,6 +791,29 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	}
 
 	r.finalizeEntryRepair(name, h, succeeded)
+}
+
+// finalizeBrokenEntry is probeAndHealCandidates' per-entry tail for a still-
+// broken result: heal it (only when autoRepair is on - a pure health-check
+// sweep records broken state without acting on it), then always release any
+// regrab claim routeAutoRepair took while probing.
+//
+// The release must NOT be gated on autoRepair: routeAutoRepair claims the
+// handlerRegrab slot the moment it confirms a segment-missing failure,
+// regardless of autoRepair. Gating the release on autoRepair too (as this
+// function replaces) left a health-check-only sweep (autoRepair=false)
+// stranding that claim for the registry's full TTL, silently blocking
+// HandlePlaybackFailure's re-grab and PAR2's enqueue for the same file - the
+// same stranded-claim shape AutoEnqueue's Par2Repair-toggle fix addressed,
+// just reached via the sweep instead of the padding path.
+// releaseRegrabClaims itself only releases handlerRegrab claims, so this is
+// always a safe no-op for torrent-protocol brokens that never went through
+// routeAutoRepair.
+func (r *Repair) finalizeBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, autoRepair bool) {
+	if autoRepair {
+		r.healBrokenEntry(ctx, run, statsMu, name, h)
+	}
+	r.releaseRegrabClaims(h)
 }
 
 // releaseRegrabClaims releases the handler-registry slot routeAutoRepair
