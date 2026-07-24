@@ -315,8 +315,20 @@ func (p *Par2Repair) IsRunning(nzbID string) bool {
 
 // AutoEnqueue is the automatic-trigger entry point - called from the reader's
 // padding path (via overlay.Store's repair-enqueue callback) and the repair
-// sweep, never from an explicit GUI action (see Enqueue for that). Gated by
-// config.Repair.Par2RepairMode:
+// sweep, never from an explicit GUI action (see Enqueue for that). A no-op
+// entirely when config.Repair.Par2Repair is disabled, regardless of
+// Par2RepairMode: claiming the handler registry (via Enqueue) for a pass
+// that readyToRun/RunNow will then never actually execute leaves a stale
+// par2_queued claim sitting forever - which permanently blocks
+// HandlePlaybackFailure's TryAcquire(handlerRegrab) for that file, even
+// though decideAutoRepairAction correctly wants to re-grab it once PAR2 is
+// off (see par2Usable). Confirmed live: a padded segment claims the slot,
+// the worker's readyToRun() correctly refuses to run it, and every later
+// playback failure on that same file silently no-ops forever with "entry
+// already being handled by another repair mechanism" instead of ever
+// re-grabbing - the regrab path is unreachable until the stale claim is
+// manually cleared (GUI "Delete & re-search") or the process restarts.
+// Otherwise gated by config.Repair.Par2RepairMode:
 //   - Par2RepairModeManual: never queues, so the caller's damage stays
 //     exactly as PAR2-repair-disabled behavior left it (padded, or handed to
 //     the legacy re-grab path by the caller itself).
@@ -330,6 +342,9 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 		return
 	}
 	cfg := config.Get().Repair
+	if !cfg.Par2RepairEnabled() {
+		return
+	}
 	switch cfg.Par2RepairMode {
 	case config.Par2RepairModeManual:
 		return
