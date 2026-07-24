@@ -3,6 +3,8 @@
 // Settings live in the global Settings page; this controller only handles
 // status, run/stop, and history. Polls /api/repair/status while a run is
 // active so the UI reflects live progress.
+const PRECACHE_GIB = 1024 * 1024 * 1024;
+
 class RepairManager {
     constructor() {
         this.api = (window.API || '/api').replace(/\/$/, '');
@@ -10,6 +12,7 @@ class RepairManager {
         this.activeRunId = null;
         this.brokenState = {items: [], page: 1, pageSize: 25};
         this.repairConfig = {};
+        this.precacheConfig = {};
         this.latestStatus = {};
         this.overlayFiles = [];
         this.overlaySelected = new Set();
@@ -108,7 +111,7 @@ class RepairManager {
     }
 
     async loadAll() {
-        await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
+        await Promise.all([this.loadRepairConfig(), this.loadPrecacheConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
         this.populateOverlayConfigForm();
         this.populatePrecacheConfigForm();
     }
@@ -119,6 +122,15 @@ class RepairManager {
         } catch (e) {
             console.error('Failed to load repair config', e);
             this.repairConfig = {};
+        }
+    }
+
+    async loadPrecacheConfig() {
+        try {
+            this.precacheConfig = await this.fetchJSON(`${this.api}/precache/config`) || {};
+        } catch (e) {
+            console.error('Failed to load precache config', e);
+            this.precacheConfig = {};
         }
     }
 
@@ -1720,9 +1732,15 @@ class RepairManager {
     }
 
     populatePrecacheConfigForm() {
-        const c = this.repairConfig || {};
+        const r = this.repairConfig || {};
+        const p = this.precacheConfig || {};
         const $ = (id) => document.getElementById(id);
-        if ($('precacheReadAhead')) $('precacheReadAhead').checked = c.precache_read_ahead_enabled === true;
+        if ($('precacheReadAhead')) $('precacheReadAhead').checked = r.precache_read_ahead_enabled === true;
+        if ($('precacheMaxBytesGiB')) {
+            const bytes = p.precache_max_bytes ?? (10 * PRECACHE_GIB);
+            $('precacheMaxBytesGiB').value = Math.round((bytes / PRECACHE_GIB) * 100) / 100;
+        }
+        if ($('precacheThresholdPercent')) $('precacheThresholdPercent').value = p.precache_threshold_percent || 10;
     }
 
     async savePrecacheConfig() {
@@ -1730,23 +1748,53 @@ class RepairManager {
         const btn = $('precacheConfigSaveBtn');
         if (btn) btn.disabled = true;
         try {
-            const payload = {
+            const giB = parseFloat($('precacheMaxBytesGiB')?.value);
+            // 0/blank/negative -> 0 bytes, which the backend treats as an
+            // explicit disable (see PrecacheMaxBytes's doc comment), not
+            // "unset" - matches the min="0" on the input.
+            const maxBytes = Number.isFinite(giB) && giB > 0 ? Math.round(giB * PRECACHE_GIB) : 0;
+
+            const repairPayload = {
                 ...this.repairConfig,
                 precache_read_ahead_enabled: !!$('precacheReadAhead')?.checked,
             };
-            const res = await fetch(`${this.api}/repair/config`, {
-                method: 'PUT',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload),
-            });
-            const text = await res.text();
-            let data = null;
-            try {
-                data = text ? JSON.parse(text) : null;
-            } catch { /* leave null */
+            const precachePayload = {
+                ...this.precacheConfig,
+                precache_threshold_percent: parseInt($('precacheThresholdPercent')?.value, 10) || 0,
+                precache_max_bytes: maxBytes,
+            };
+
+            const parseResponse = async (res) => {
+                const text = await res.text();
+                let data = null;
+                try {
+                    data = text ? JSON.parse(text) : null;
+                } catch { /* leave null */
+                }
+                return {res, data, text};
+            };
+
+            const [repairRes, precacheRes] = await Promise.all([
+                fetch(`${this.api}/repair/config`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(repairPayload),
+                }).then(parseResponse),
+                fetch(`${this.api}/precache/config`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(precachePayload),
+                }).then(parseResponse),
+            ]);
+            if (!repairRes.res.ok) {
+                throw new Error((repairRes.data && (repairRes.data.error || repairRes.data.message)) || repairRes.text || `HTTP ${repairRes.res.status}`);
             }
-            if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
-            this.repairConfig = data || payload;
+            if (!precacheRes.res.ok) {
+                throw new Error((precacheRes.data && (precacheRes.data.error || precacheRes.data.message)) || precacheRes.text || `HTTP ${precacheRes.res.status}`);
+            }
+
+            this.repairConfig = repairRes.data || repairPayload;
+            this.precacheConfig = precacheRes.data || precachePayload;
             this.populatePrecacheConfigForm();
             window.createToast('Pre-cache config saved', 'success');
         } catch (e) {

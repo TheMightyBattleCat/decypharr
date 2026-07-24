@@ -38,9 +38,17 @@ type PrecacheConfig struct {
 	// PrecacheMaxBytes caps the total on-disk footprint this feature will
 	// proactively hold at once (read-ahead bursts plus next-episode
 	// pre-caches) - this directly fights the project's minimal-storage goal,
-	// so it MUST stay bounded: 0/unset falls back to a conservative default
-	// (10 GiB) rather than meaning unlimited.
-	PrecacheMaxBytes int64 `json:"precache_max_bytes,omitempty"`
+	// so it MUST stay bounded. *int64, same convention as PrecacheNextEpisodes,
+	// so an explicit 0 is distinguishable from unset: nil falls back to a
+	// conservative default (precacheDefaultMaxBytes), an explicit 0 disables
+	// pre-caching's footprint entirely (equivalent to turning
+	// RepairConfig.PrecacheReadAhead off - see Precache.Observe), and any
+	// other value is clamped to [0, precacheMaxBytesCeiling] on every save
+	// (see Config.applyPrecacheDefaults). The ceiling is a fat-finger
+	// backstop, not the real guard - reserveBudget/HasBandwidthHeadroom
+	// accounting in pkg/manager.Precache is what actually enforces the cap
+	// live.
+	PrecacheMaxBytes *int64 `json:"precache_max_bytes,omitempty"`
 }
 
 func (p PrecacheConfig) IsZero() bool {
@@ -48,7 +56,7 @@ func (p PrecacheConfig) IsZero() bool {
 		p.PrecacheReadAheadConcurrency == 0 &&
 		p.PrecacheNextEpisodes == nil &&
 		!p.PrecacheEvictAfterWatched &&
-		p.PrecacheMaxBytes == 0
+		p.PrecacheMaxBytes == nil
 }
 
 // ThresholdPercent returns the configured threshold, clamped to a sane
@@ -81,15 +89,29 @@ func (p PrecacheConfig) NextEpisodes() int {
 	return *p.PrecacheNextEpisodes
 }
 
-// precacheDefaultMaxBytes is used when PrecacheMaxBytes is unset/non-positive
-// - conservative on purpose (see PrecacheMaxBytes's doc comment).
+// precacheDefaultMaxBytes is used when PrecacheMaxBytes is unset - conservative
+// on purpose (see PrecacheMaxBytes's doc comment).
 const precacheDefaultMaxBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
 
-// MaxBytes returns the configured cap, defaulting to precacheDefaultMaxBytes
-// when unset/non-positive.
+// precacheMaxBytesCeiling is the hard upper bound PrecacheMaxBytes is clamped
+// to on every save - see PrecacheMaxBytes's doc comment.
+const precacheMaxBytesCeiling = 256 * 1024 * 1024 * 1024 // 256 GiB
+
+// MaxBytes returns the configured cap in bytes: nil (unset) defaults to
+// precacheDefaultMaxBytes, an explicit 0 (or negative) disables pre-caching's
+// footprint, and anything else is clamped to precacheMaxBytesCeiling. Values
+// are already clamped at save time (Config.applyPrecacheDefaults); this
+// clamp is defensive for configs constructed directly (e.g. in tests).
 func (p PrecacheConfig) MaxBytes() int64 {
-	if p.PrecacheMaxBytes > 0 {
-		return p.PrecacheMaxBytes
+	if p.PrecacheMaxBytes == nil {
+		return precacheDefaultMaxBytes
 	}
-	return precacheDefaultMaxBytes
+	v := *p.PrecacheMaxBytes
+	if v <= 0 {
+		return 0
+	}
+	if v > precacheMaxBytesCeiling {
+		return precacheMaxBytesCeiling
+	}
+	return v
 }

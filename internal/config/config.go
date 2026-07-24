@@ -860,8 +860,16 @@ func (c *Config) applyPrecacheDefaults() {
 		v := 1
 		c.Precache.PrecacheNextEpisodes = &v
 	}
-	if c.Precache.PrecacheMaxBytes <= 0 {
-		c.Precache.PrecacheMaxBytes = precacheDefaultMaxBytes
+	switch {
+	case c.Precache.PrecacheMaxBytes == nil:
+		v := int64(precacheDefaultMaxBytes)
+		c.Precache.PrecacheMaxBytes = &v
+	case *c.Precache.PrecacheMaxBytes < 0:
+		v := int64(0)
+		c.Precache.PrecacheMaxBytes = &v
+	case *c.Precache.PrecacheMaxBytes > precacheMaxBytesCeiling:
+		v := int64(precacheMaxBytesCeiling)
+		c.Precache.PrecacheMaxBytes = &v
 	}
 }
 

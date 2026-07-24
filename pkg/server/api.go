@@ -538,6 +538,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	newConfig.Repair.Par2RepairMode = currentConfig.Repair.Par2RepairMode
 	newConfig.Repair.Par2RepairMinSegments = currentConfig.Repair.Par2RepairMinSegments
 	newConfig.Repair.PrecacheReadAhead = currentConfig.Repair.PrecacheReadAhead
+	// Precache config (threshold/concurrency/next-episodes/max-bytes) has its
+	// own dedicated save path (handleUpdatePrecacheConfig) - the general
+	// settings form has no fields for it either, so without this it would
+	// silently reset to defaults on every unrelated settings save, same bug
+	// class as the Repair fields preserved above.
+	newConfig.Precache = currentConfig.Precache
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
@@ -637,6 +643,38 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	utils.JSONResponse(w, cfg.Repair, http.StatusOK)
+}
+
+func (s *Server) handleGetPrecacheConfig(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, config.Get().Precache, http.StatusOK)
+}
+
+// handleUpdatePrecacheConfig saves config.Precache (threshold/concurrency/
+// next-episodes/max-bytes) - separate from handleUpdateRepairConfig because
+// it's a sibling Config field, not part of RepairConfig (see PrecacheConfig's
+// doc comment). Bounds-checking here rejects clearly-invalid input;
+// Config.applyPrecacheDefaults (run by cfg.Save()) is what actually clamps
+// PrecacheMaxBytes to its [0, 256GiB] range.
+func (s *Server) handleUpdatePrecacheConfig(w http.ResponseWriter, r *http.Request) {
+	var req config.PrecacheConfig
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PrecacheThresholdPercent < 0 || req.PrecacheThresholdPercent > 100 {
+		http.Error(w, "Invalid precache_threshold_percent (must be between 1 and 100, or 0 for default)", http.StatusBadRequest)
+		return
+	}
+
+	cfg := config.Get()
+	cfg.Precache = req
+	if err := cfg.Save(); err != nil {
+		s.logger.Error().Err(err).Msg("Failed to save precache config")
+		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	utils.JSONResponse(w, cfg.Precache, http.StatusOK)
 }
 
 func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {

@@ -84,6 +84,8 @@ func (s *Server) WebRoutes() http.Handler {
 
 			// Proactive pre-caching / read-ahead repair status
 			r.Get("/precache/status", s.handlePrecacheStatus)
+			r.Get("/precache/config", s.handleGetPrecacheConfig)
+			r.Put("/precache/config", s.handleUpdatePrecacheConfig)
 
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)

@@ -102,7 +102,16 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	if !config.Get().Repair.PrecacheReadAheadEnabled() {
 		return
 	}
-	threshold := int64(p.cfg().ThresholdPercent())
+	cfg := p.cfg()
+	if cfg.MaxBytes() <= 0 {
+		// An explicit PrecacheMaxBytes of 0 disables pre-caching's footprint
+		// entirely (see PrecacheMaxBytes's doc comment) - equivalent to the
+		// master toggle being off, so no read-ahead burst starts either, not
+		// just next-episode bursts (which reserveBudget already gates on its
+		// own).
+		return
+	}
+	threshold := int64(cfg.ThresholdPercent())
 	if start*100 < size*threshold {
 		return
 	}
