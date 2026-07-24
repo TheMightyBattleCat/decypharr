@@ -66,6 +66,10 @@ class RepairManager {
             e.preventDefault();
             this.saveOverlayConfig();
         });
+        $('precacheConfigForm')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.savePrecacheConfig();
+        });
         $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
         $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
         $('overlayGCOrphansBtn')?.addEventListener('click', () => this.handleOverlayGCOrphans());
@@ -106,6 +110,7 @@ class RepairManager {
     async loadAll() {
         await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
         this.populateOverlayConfigForm();
+        this.populatePrecacheConfigForm();
     }
 
     async loadRepairConfig() {
@@ -876,7 +881,7 @@ class RepairManager {
         const line = document.getElementById('precacheStatusLine');
         if (line) {
             if (!status.read_ahead_enabled) {
-                line.textContent = 'Read-ahead pre-caching is disabled. Enable it in Settings → Repair.';
+                line.textContent = 'Read-ahead pre-caching is disabled.';
             } else {
                 line.textContent = `Read-ahead kicks in at ${status.threshold_percent ?? 10}% into playback, `
                     + `${status.read_ahead_concurrency ?? '-'} segments in parallel.`;
@@ -1670,7 +1675,6 @@ class RepairManager {
         const $ = (id) => document.getElementById(id);
         if ($('overlayPlaybackPadding')) $('overlayPlaybackPadding').checked = c.playback_padding !== false;
         if ($('overlayPar2Repair')) $('overlayPar2Repair').checked = c.par2_repair !== false;
-        if ($('overlayPrecacheReadAhead')) $('overlayPrecacheReadAhead').checked = c.precache_read_ahead_enabled === true;
         if ($('overlayPadMaxRun')) $('overlayPadMaxRun').value = c.pad_max_run_segments || 4;
         if ($('overlayPadMaxTotal')) $('overlayPadMaxTotal').value = c.pad_max_total_segments || 64;
         if ($('overlayPadMaxRatio')) $('overlayPadMaxRatio').value = c.pad_max_byte_ratio || 0.02;
@@ -1687,7 +1691,6 @@ class RepairManager {
                 ...this.repairConfig,
                 playback_padding: !!$('overlayPlaybackPadding')?.checked,
                 par2_repair: !!$('overlayPar2Repair')?.checked,
-                precache_read_ahead_enabled: !!$('overlayPrecacheReadAhead')?.checked,
                 pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
                 pad_max_total_segments: parseInt($('overlayPadMaxTotal')?.value, 10) || 0,
                 pad_max_byte_ratio: parseFloat($('overlayPadMaxRatio')?.value) || 0,
@@ -1709,6 +1712,43 @@ class RepairManager {
             this.repairConfig = data || payload;
             this.populateOverlayConfigForm();
             window.createToast('Overlay/PAR2 config saved', 'success');
+        } catch (e) {
+            window.createToast(`Save failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    populatePrecacheConfigForm() {
+        const c = this.repairConfig || {};
+        const $ = (id) => document.getElementById(id);
+        if ($('precacheReadAhead')) $('precacheReadAhead').checked = c.precache_read_ahead_enabled === true;
+    }
+
+    async savePrecacheConfig() {
+        const $ = (id) => document.getElementById(id);
+        const btn = $('precacheConfigSaveBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const payload = {
+                ...this.repairConfig,
+                precache_read_ahead_enabled: !!$('precacheReadAhead')?.checked,
+            };
+            const res = await fetch(`${this.api}/repair/config`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const text = await res.text();
+            let data = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch { /* leave null */
+            }
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+            this.repairConfig = data || payload;
+            this.populatePrecacheConfigForm();
+            window.createToast('Pre-cache config saved', 'success');
         } catch (e) {
             window.createToast(`Save failed: ${e.message}`, 'error');
         } finally {
