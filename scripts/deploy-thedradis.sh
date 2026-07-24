@@ -70,13 +70,19 @@ preflight() {
 
     current_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
     if [ -n "$EXPECTED_COMMIT" ]; then
-        case "$current_commit" in
-            "$EXPECTED_COMMIT"*) ;;
-            *) fail "main checkout is at $current_commit, expected $EXPECTED_COMMIT" ;;
-        esac
+        # Deploy exactly the pinned commit's tree, not necessarily whatever
+        # HEAD has moved on to since (e.g. this very script's own commit) -
+        # but refuse to ship a hash that isn't actually part of this branch's
+        # history.
+        git -C "$REPO_DIR" rev-parse --verify "${EXPECTED_COMMIT}^{commit}" >/dev/null 2>&1 \
+            || fail "expected commit $EXPECTED_COMMIT does not exist in the main checkout"
+        git -C "$REPO_DIR" merge-base --is-ancestor "$EXPECTED_COMMIT" HEAD \
+            || fail "expected commit $EXPECTED_COMMIT is not an ancestor of $BRANCH's current tip ($current_commit)"
+        TARGET_COMMIT="$(git -C "$REPO_DIR" rev-parse "$EXPECTED_COMMIT")"
+    else
+        TARGET_COMMIT="$current_commit"
     fi
-    TARGET_COMMIT="$current_commit"
-    log "Deploying $BRANCH @ ${TARGET_COMMIT:0:12}"
+    log "Deploying $BRANCH @ ${TARGET_COMMIT:0:12} (checkout HEAD is ${current_commit:0:12})"
 
     [ -z "$(git -C "$REPO_DIR" status --porcelain)" ] || fail "main checkout has uncommitted changes"
 
