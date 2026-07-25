@@ -42,12 +42,17 @@ type PrecacheConfig struct {
 	// so an explicit 0 is distinguishable from unset: nil falls back to a
 	// conservative default (precacheDefaultMaxBytes), an explicit 0 disables
 	// pre-caching's footprint entirely (equivalent to turning
-	// RepairConfig.PrecacheReadAhead off - see Precache.Observe), and any
+	// RepairConfig.PrecacheReadAhead off - see Precache.Observe, which
+	// short-circuits before any durable write when MaxBytes()<=0), and any
 	// other value is clamped to [0, precacheMaxBytesCeiling] on every save
 	// (see Config.applyPrecacheDefaults). The ceiling is a fat-finger
 	// backstop, not the real guard - reserveBudget/HasBandwidthHeadroom
 	// accounting in pkg/manager.Precache is what actually enforces the cap
-	// live.
+	// live, checked before a next-episode burst starts and therefore before
+	// any bytes it fetches can be durably written into the DFS cache (see
+	// Precache.persistCleanRanges) - a released reservation does not mean
+	// those durable bytes were deleted, though; the DFS cache's own
+	// eviction (unrelated to this cap) is what eventually reclaims them.
 	PrecacheMaxBytes *int64 `json:"precache_max_bytes,omitempty"`
 }
 
