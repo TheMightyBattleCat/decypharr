@@ -151,6 +151,17 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return m.vfs.PeekCachedRange(entryName, filename, p, off)
 }
 
+// WriteCachedRange durably writes p at [off, off+len(p)) into filename's
+// cache item under entryName, creating it (sized by fileSize) if needed -
+// see vfs.Manager.WriteCachedRange. The write-side mirror of
+// PeekCachedRange.
+func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p []byte, off int64) error {
+	if m.vfs == nil {
+		return fmt.Errorf("VFS manager is not initialized")
+	}
+	return m.vfs.WriteCachedRange(entryName, filename, fileSize, p, off)
+}
+
 func (m *Manager) Type() string {
 	return "dfs"
 }

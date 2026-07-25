@@ -232,6 +232,26 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return item.ReadCachedRange(p, off)
 }
 
+// WriteCachedRange durably writes p at [off, off+len(p)) into filename's
+// cache item under entryName - the write-side mirror of PeekCachedRange.
+// Creates the cache item (data file + .json metadata sidecar), sized by
+// fileSize, if it doesn't already exist. Bytes already present at that
+// range are left untouched - see CacheItem.WriteAtNoOverwrite. This is a
+// pure disk write: no NNTP fetch, no padding, no Stream, no Downloaders -
+// the caller is responsible for only ever handing it bytes it already
+// knows are correct.
+func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p []byte, off int64) error {
+	if m.cache == nil {
+		return fmt.Errorf("cache not initialized")
+	}
+	item, err := m.cache.GetItem(entryName, filename, fileSize)
+	if err != nil {
+		return fmt.Errorf("get cache item: %w", err)
+	}
+	_, _, err = item.WriteAtNoOverwrite(p, off)
+	return err
+}
+
 func buildFileKey(parent, name string) string {
 	if parent == "" {
 		return name
