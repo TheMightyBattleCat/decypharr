@@ -180,7 +180,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// deliberately excluded rather than persisted as padding.
 	p.persistCleanRanges(ctx, nextEntry, filename, next.Size)
 
-	p.recordReadiness(ctx, nextEntry, filename)
+	p.recordReadiness(ctx, nextEntry, filename, next.Size)
 
 	if p.cfg().PrecacheEvictAfterWatched {
 		p.markPrecached(nextEntry.InfoHash, filename, next.Size)
@@ -189,10 +189,10 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	}
 }
 
-// recordReadiness checks for damage the burst-download surfaced, requests an
-// URGENT repair if needed, waits (bounded) for it to land, and stores the
-// outcome for Commit D.
-func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, filename string) {
+// recordReadiness checks for damage the burst-download surfaced, routes it
+// through the live playback-failure policy if so, waits (bounded) for a
+// PAR2 repair to land, and stores the outcome for Commit D.
+func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, filename string, fileSize int64) {
 	readiness := EpisodeReadiness{EntryName: entry.Name, Filename: filename, ReadyAt: time.Now()}
 	defer func() {
 		p.readinessMu.Lock()
@@ -216,17 +216,23 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 		return
 	}
 
-	// Gated by the same decideAutoRepairAction(RepairSourcePlayback, ...)
-	// policy HandlePlaybackFailure consults - par2Usable, not the raw
-	// Par2Repair toggle - so a release with no usable PAR2 data never gets a
-	// doomed urgent pass queued for it. This pre-cache pass never re-grabs
-	// on autoActionRegrab itself; it just takes no PAR2 path and the episode
-	// is recorded still-damaged below.
-	if p.manager.par2Repair != nil && p.manager.usenet != nil {
-		par2Usable, _ := p.manager.par2Repair.par2Usable(entry.InfoHash)
-		verdict := p.manager.usenet.OverlayVerdict(entry.InfoHash, filename)
-		if decideAutoRepairAction(RepairSourcePlayback, par2Usable, verdict) == autoActionQueuePar2 {
-			p.manager.par2Repair.EnqueueUrgent(entry.InfoHash, 0)
+	// Route damage through the SAME decideAutoRepairAction(RepairSourcePlayback,
+	// ...) policy (and regrab guard) the live playback-failure path uses -
+	// HandlePlaybackFailure IS that path (see
+	// pkg/mount/dfs/vfs/downloaders.go's call for a live read), called here
+	// verbatim rather than re-implementing any part of its policy. Unlike
+	// the currently-playing read-ahead path (precache.go's repairAhead),
+	// this DOES re-grab on autoActionRegrab: nothing is playing yet, so
+	// there's no live stream to disrupt, and re-grabbing now gives the
+	// replacement time to land before playback actually reaches this
+	// episode. Given this library is mostly pre-PAR2-retention records, the
+	// common outcome here is re-grab, not PAR2 - expected and correct.
+	// regrabGuard applies exactly as it does to a playback-triggered
+	// re-grab, so a next episode that can't be fixed trips the guard and
+	// goes terminal with its reason surfaced, instead of looping.
+	if r := p.manager.Repair(); r != nil {
+		if _, _, err := r.HandlePlaybackFailure(ctx, entry.Name, filename); err != nil {
+			p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("next-episode pre-cache: damage handling failed")
 		}
 	}
 
@@ -242,6 +248,10 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 		if remaining == 0 {
 			readiness.SegmentsRepaired = n
 			readiness.ReadyAt = time.Now()
+			// PENDING-REPAIR -> REPAIRED: persist the now-clean segments
+			// durably (a no-op for anything a re-grab replaced under a
+			// different InfoHash - there's nothing left here to persist).
+			p.persistCleanRanges(ctx, entry, filename, fileSize)
 			return
 		}
 		if remaining > 0 {
