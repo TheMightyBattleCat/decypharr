@@ -1626,6 +1626,31 @@ func (u *Usenet) PreCache(ctx context.Context, nzoID, filename string) error {
 	return nil
 }
 
+// ReadCachedAt reads [off, off+len(p)) via nzoID/filename's shared
+// entry/reader - the same one Stream/ReadAhead use - serving from whatever
+// is already fetched without any of Stream's side effects (no failedFiles
+// poisoning, no Observe re-entry, no Downloaders). Used by the next-episode
+// precache pass to read back bytes a prior ReadAhead call already fetched,
+// for a durable copy into the DFS cache (see
+// pkg/manager.Precache.persistCleanRanges). Like ReadAtContext, this can
+// still trigger a fetch (and padding/overlay recording) for a segment that
+// isn't actually cached yet - callers that only want segments confirmed
+// clean should check OverlayPendingRepair first (as persistCleanRanges
+// does) rather than relying on this to skip damaged ranges itself.
+func (u *Usenet) ReadCachedAt(ctx context.Context, nzoID, filename string, p []byte, off int64) (int, error) {
+	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get or create entry: %w", err)
+	}
+	defer u.releaseFS(key)
+
+	readerAt, _, err := entry.getOrCreateReader()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get reader: %w", err)
+	}
+	return readerAt.ReadAtContext(ctx, p, off)
+}
+
 // ReadAhead aggressively fetches the remainder of a file - [from, EOF) -
 // into the cache at up to concurrency parallel segment fetches, distinct
 // from (and typically much higher than) the reader's normal steady-state

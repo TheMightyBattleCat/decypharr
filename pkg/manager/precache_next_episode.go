@@ -175,6 +175,11 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 		p.logger.Debug().Err(err).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
 	}
 
+	// Durably persist whatever came back CLEAN into the DFS cache now, before
+	// waiting on repair - see persistCleanRanges for why damaged segments are
+	// deliberately excluded rather than persisted as padding.
+	p.persistCleanRanges(ctx, nextEntry, filename, next.Size)
+
 	p.recordReadiness(ctx, nextEntry, filename)
 
 	if p.cfg().PrecacheEvictAfterWatched {
