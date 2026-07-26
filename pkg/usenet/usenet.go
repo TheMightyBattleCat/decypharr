@@ -915,6 +915,9 @@ func (u *Usenet) RunDamageSample(ctx context.Context, nzoID, filename string, op
 	}
 
 	result := SampleFileDamage(ctx, segments, recordedDead, fetchBody, opts)
+	if u.overlay != nil && result.CoverageFraction > 0 {
+		_ = u.overlay.SetCoverageFraction(nzoID, filename, result.CoverageFraction)
+	}
 	return result, nil
 }
 
