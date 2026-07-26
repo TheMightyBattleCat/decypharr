@@ -109,12 +109,16 @@ func (r *Repair) reconcileStickyFailed(ctx context.Context, c *candidate, entry 
 	if r.manager.par2Repair != nil {
 		par2Usable, _ = r.manager.par2Repair.par2Usable(nzbID)
 	}
-	if par2Usable {
+
+	// When PAR2 is usable and no sampler data is available, leave to the
+	// existing playback-triggered PAR2 path. But we still run the sampler
+	// below so that if extrapolated damage exceeds PAR2 recovery capacity,
+	// we can skip straight to regrab instead of queueing a doomed repair.
+	budget := sampleBudgetFromContext(ctx)
+	if par2Usable && (budget == nil || budget.isExhausted()) {
 		return res, false
 	}
-
-	budget := sampleBudgetFromContext(ctx)
-	if budget != nil && budget.isExhausted() {
+	if !par2Usable && budget != nil && budget.isExhausted() {
 		r.logger.Info().Str("entry", entry.Name).Str("file", name).
 			Msg("Repair: sticky-failed file skipped, per-sweep sample budget exhausted")
 		return res, true
@@ -123,9 +127,27 @@ func (r *Repair) reconcileStickyFailed(ctx context.Context, c *candidate, entry 
 	sampleCtx := usenet.ContextForVerificationRead(ctx)
 	sampleResult, err := r.manager.usenet.RunDamageSample(sampleCtx, nzbID, name, usenet.SampleOpts{})
 	if err != nil {
+		if par2Usable {
+			return res, false
+		}
 		r.logger.Info().Err(err).Str("entry", entry.Name).Str("file", name).
 			Msg("Repair: sticky-failed damage sample failed, inconclusive")
 		return res, true
+	}
+
+	// When PAR2 is usable, check whether extrapolated damage exceeds the
+	// available recovery capacity. If so, queueing a PAR2 job is pointless
+	// — skip straight to regrab.
+	if par2Usable {
+		capacity := r.manager.par2Repair.par2RecoveryCapacity(nzbID)
+		if capacity >= 0 && sampleResult.ExtrapolatedDeadCount > capacity {
+			r.logger.Info().Str("entry", entry.Name).Str("file", name).
+				Int("extrapolated_dead", sampleResult.ExtrapolatedDeadCount).
+				Int("recovery_capacity", capacity).
+				Msg("Repair: extrapolated damage exceeds PAR2 recovery capacity, skipping to regrab")
+			return r.regrabStickyFailed(ctx, c, entry, name, res), true
+		}
+		return res, false
 	}
 
 	switch decideStickyFailedAction(false, sampleResult.Verdict) {

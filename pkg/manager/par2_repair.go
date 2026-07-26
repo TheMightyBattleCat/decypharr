@@ -558,6 +558,26 @@ func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
 	return p.coverageSufficient(nzbID, nzb)
 }
 
+// par2RecoveryCapacity returns the total number of recovery slices available
+// for nzbID from the retained Par2Files metadata, or -1 if recovery capacity
+// cannot be determined (no Par2Files, no par2 repair, etc.). Does NOT check
+// whether PAR2 repair is enabled — callers already know par2Usable.
+func (p *Par2Repair) par2RecoveryCapacity(nzbID string) int {
+	if p == nil || p.manager.usenet == nil {
+		return -1
+	}
+	nzb, err := p.manager.usenet.GetNZB(nzbID)
+	if err != nil || len(nzb.Par2Files) == 0 {
+		return -1
+	}
+	vols, _ := censusPar2Volumes(nzb.Par2Files)
+	var available int
+	for _, v := range vols {
+		available += int(v.count)
+	}
+	return available
+}
+
 // postedLayoutMatches reports whether posted and nzbFile are the same
 // physical posting: identical segment count, in order, with identical
 // message IDs. True only for a file posted directly (not extracted from an
