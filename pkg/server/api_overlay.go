@@ -67,7 +67,8 @@ type OverlayFile struct {
 	PatchedSegments int `json:"patched_segments"`
 	TotalSegments   int `json:"total_segments,omitempty"`
 
-	DamageByteRatio float64 `json:"damage_byte_ratio"`
+	DamageByteRatio  float64 `json:"damage_byte_ratio"`
+	CoverageFraction float64 `json:"coverage_fraction,omitempty"`
 
 	RepairStatus       OverlayRepairStatus `json:"repair_status"`
 	RepairStatusReason string              `json:"repair_status_reason,omitempty"`
@@ -290,6 +291,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 			if fileSize > 0 {
 				of.DamageByteRatio = float64(damageBytes) / float64(fileSize)
 			}
+			of.CoverageFraction = fe.CoverageFraction
 			of.SegmentRuns = segmentRuns(fe.DeadSegments)
 			of.PatchBytes = u.OverlayFilePatchBytes(nzbID, file, fe)
 			of.Par2RetainedMetaBytes = retainedMetaBytes

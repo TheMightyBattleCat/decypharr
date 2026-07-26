@@ -1342,7 +1342,7 @@ class RepairManager {
                 </td>
                 <td>
                     ${this.renderOverlaySparkline(f.segment_runs, f.total_segments)}
-                    <div class="text-[10px] opacity-60 mt-1">${((f.damage_byte_ratio || 0) * 100).toFixed(2)}%</div>
+                    <div class="text-[10px] opacity-60 mt-1">${((f.damage_byte_ratio || 0) * 100).toFixed(2)}%${f.coverage_fraction ? ' (' + (f.coverage_fraction * 100).toFixed(0) + '% verified)' : ''}</div>
                 </td>
                 <td>${this.overlayRepairableBadge(f)}</td>
                 <td>${this.renderOverlayRepairStatusCell(f, progressDomId)}</td>

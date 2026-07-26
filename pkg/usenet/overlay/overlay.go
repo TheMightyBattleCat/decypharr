@@ -69,8 +69,9 @@ type DeadSegment struct {
 
 // FileEntry is the per-logical-filename record inside an NZB's manifest.
 type FileEntry struct {
-	DeadSegments []DeadSegment `json:"dead_segments"`
-	Verdict      Verdict       `json:"verdict"`
+	DeadSegments     []DeadSegment `json:"dead_segments"`
+	Verdict          Verdict       `json:"verdict"`
+	CoverageFraction float64       `json:"coverage_fraction,omitempty"`
 }
 
 // Manifest is the whole-NZB record persisted as overlay/<nzbID>/manifest.json.
@@ -515,6 +516,26 @@ func (s *Store) Verdict(nzbID, file string) Verdict {
 	return fe.Verdict
 }
 
+// SetCoverageFraction records the fraction of the file's segments that the
+// damage sampler verified. Persisted so the API/GUI can show the coverage
+// context alongside the damage ratio.
+func (s *Store) SetCoverageFraction(nzbID, file string, frac float64) error {
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return err
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return nil
+	}
+	fe.CoverageFraction = frac
+	return s.saveManifestLocked(nzbID, m)
+}
+
 // PendingRepair returns, for every file in nzbID's manifest with at least
 // one non-patched (dead or padded) segment, that file's dead segments -
 // patched ones are excluded, since they're already fixed. Returns an empty
@@ -697,6 +718,7 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 
 	fe.DeadSegments = patched
 	fe.Verdict = VerdictClean
+	fe.CoverageFraction = 0
 	return true, s.saveManifestLocked(nzbID, m)
 }
 
