@@ -655,6 +655,51 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	return nil
 }
 
+// ClearFileDamage removes dead and padded segment records from file's
+// FileEntry and resets its verdict to clean, while preserving any patched
+// segments (PAR2-recovered real bytes). If no patched segments remain the
+// FileEntry is removed entirely (same as DeleteFile for the no-patch case).
+// Returns patchesPreserved=true when at least one patched segment was kept.
+func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err error) {
+	if s == nil {
+		return false, nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return false, err
+	}
+	fe, ok := m.Files[file]
+	if !ok {
+		return false, nil
+	}
+
+	var patched []DeadSegment
+	for _, d := range fe.DeadSegments {
+		if d.Status == StatusPatched {
+			patched = append(patched, d)
+		}
+	}
+
+	if len(patched) == 0 {
+		delete(m.Files, file)
+		if len(m.Files) == 0 {
+			if rmErr := os.RemoveAll(s.entryDir(nzbID)); rmErr != nil && !os.IsNotExist(rmErr) {
+				return false, fmt.Errorf("overlay: clear file damage (last in entry): %w", rmErr)
+			}
+			return false, nil
+		}
+		return false, s.saveManifestLocked(nzbID, m)
+	}
+
+	fe.DeadSegments = patched
+	fe.Verdict = VerdictClean
+	return true, s.saveManifestLocked(nzbID, m)
+}
+
 // DeleteFile removes file's overlay record (dead segments + verdict) from
 // nzbID's manifest and every patch blob written for it, without touching any
 // other file recorded against the same nzbID. If file was the manifest's

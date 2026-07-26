@@ -789,6 +789,17 @@ func (u *Usenet) OverlayPatchBytes(nzoID, filename string, segIndex int) ([]byte
 	return u.overlay.PatchBytes(nzoID, filename, segIndex)
 }
 
+// OverlayClearFileDamage removes dead/padded segment records and resets the
+// verdict to clean while preserving any patched segments (PAR2-recovered
+// bytes). Returns patchesPreserved=true when at least one patched segment
+// was kept. No-op (nil error) if the overlay store is unavailable.
+func (u *Usenet) OverlayClearFileDamage(nzoID, filename string) (patchesPreserved bool, err error) {
+	if u.overlay == nil {
+		return false, nil
+	}
+	return u.overlay.ClearFileDamage(nzoID, filename)
+}
+
 // OverlayDeleteFile removes filename's overlay record and patch blobs from
 // nzoID's manifest, without touching any other file - see
 // overlay.Store.DeleteFile. No-op (nil error) if the overlay store is
@@ -862,6 +873,49 @@ func (u *Usenet) ApplyOverlayPolicy() {
 	}
 	u.overlay.SetPolicy(overlayPolicyFromConfig(config.Get().Repair))
 	u.failedFiles.Clear()
+}
+
+// RunDamageSample probes nzoID/filename's segment health using the stratified
+// damage sampler. It loads the file's full segment list, collects the overlay's
+// recorded-dead indices, and wires a fetchBody callback through the NNTP
+// client (real BODY fetch with failover and bandwidth accounting). The caller
+// passes a verification-style context (ContextForVerificationRead) so padding
+// never masks a dead article.
+func (u *Usenet) RunDamageSample(ctx context.Context, nzoID, filename string, opts SampleOpts) (SampleResult, error) {
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return SampleResult{Verdict: VerdictInconclusive}, fmt.Errorf("load NZB: %w", err)
+	}
+	file := nzb.GetFileByName(filename)
+	if file == nil || len(file.Segments) == 0 {
+		return SampleResult{Verdict: VerdictInconclusive}, fmt.Errorf("file %s has no segments", filename)
+	}
+
+	segments := make([]SegmentRef, len(file.Segments))
+	for i, seg := range file.Segments {
+		segments[i] = SegmentRef{Index: i, MessageID: seg.MessageID}
+	}
+
+	var recordedDead []int
+	if u.overlay != nil {
+		if m, merr := u.overlay.GetManifest(nzoID); merr == nil {
+			if fe := m.Files[filename]; fe != nil {
+				for _, d := range fe.DeadSegments {
+					if d.Status != overlay.StatusPatched {
+						recordedDead = append(recordedDead, d.Index)
+					}
+				}
+			}
+		}
+	}
+
+	fetchBody := func(ctx context.Context, seg SegmentRef) error {
+		_, err := u.FetchArticle(ctx, seg.MessageID)
+		return err
+	}
+
+	result := SampleFileDamage(ctx, segments, recordedDead, fetchBody, opts)
+	return result, nil
 }
 
 // FetchArticle downloads and yEnc-decodes a single NNTP article, returning
