@@ -88,6 +88,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 	ctx = r.attachFFProbeChecker(ctx, log)
+	ctx = contextWithSampleBudget(ctx, newSweepSampleBudget(stickyFailedSampleBudget))
 
 	// Resolve auto-repair once: when off, the repair sweep is a pure health check —
 	// it probes and records broken state but attempts no debrid re-insert and
@@ -424,6 +425,15 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 // it back over WebDAV - this is the only check that can catch a STAT-alive,
 // BODY-dead file or a mis-assembled container, since NNTP/provider CheckFile
 // never look past the article/link's existence.
+//
+// For an NZB file CheckFile reports healthy on, reconcileStickyFailed gets a
+// chance to override that: CheckFile tolerates ANY configured provider
+// (including backups) serving the article, which can paper over a sticky
+// VerdictFailed overlay record forever with no automatic remediation (see
+// reconcileStickyFailed's doc comment for the full deadlock). When it
+// reports handled=true it has already fully decided this file's outcome
+// (regrabbed it, or cleared the verdict on strict evidence) - the generic
+// ffprobe re-check below is skipped for it, not run a second time.
 func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts RepairRunOptions) fileResult {
 	file := c.item.Files[name]
 	res := fileResult{name: name}
@@ -447,6 +457,9 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 
 	if entry.IsNZB() {
 		res = r.probeNZBFile(ctx, entry, name, res)
+		if reconciled, handled := r.reconcileStickyFailed(ctx, c, entry, name, res); handled {
+			return reconciled
+		}
 	} else {
 		res = r.probeTorrentFile(ctx, entry, file, name, res, opts)
 	}
