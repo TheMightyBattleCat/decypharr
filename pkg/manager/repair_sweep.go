@@ -2083,6 +2083,17 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		}
 		heal := newHealCache()
 		final := r.probeEntry(runCtx, runID, c, heal, RepairRunOptions{}, fix, sc)
+		// probeEntry's routeAutoRepair may have claimed the handler-registry
+		// regrab slot for a segment-missing file regardless of fix - release
+		// it on every exit from here on (including the !fix early return just
+		// below) so a read-only recheck doesn't strand the claim for the rest
+		// of the registry's TTL, blocking a later re-grab or PAR2 enqueue for
+		// the same file. releaseRegrabClaims is a no-op when nothing was
+		// claimed. Mirrors probeAndHealCandidates/executeRecheckMedia's use of
+		// finalizeBrokenEntry, but calls the release primitive directly since
+		// finalizeBrokenEntry's heal branch (healBrokenEntryGuarded) is not
+		// what RecheckEntry's fix=true path uses.
+		defer r.releaseRegrabClaims(final)
 		if !fix || final.Status != storage.HealthBroken {
 			return
 		}
