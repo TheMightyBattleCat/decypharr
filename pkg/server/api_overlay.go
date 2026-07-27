@@ -606,6 +606,37 @@ func (s *Server) handleOverlayVerify(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, map[string]any{"pass": pass, "reason": reason}, http.StatusOK)
 }
 
+// handleOverlayScreen full-STATs every segment of a degraded file - not just
+// the nightly sweep's fixed ~10% sample - and reports whether its TRUE
+// damage extent would still fit the padding caps. Read-only: see
+// usenet.Usenet.OverlayScreenFile - no verdict is written, nothing is
+// recorded as dead, and no repair or re-grab is triggered by this call.
+func (s *Server) handleOverlayScreen(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeOverlayFileRequest(r)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := s.resolveOverlayEntry(req)
+	if err != nil || entry == nil {
+		http.Error(w, "Entry not found", http.StatusNotFound)
+		return
+	}
+
+	u := s.manager.Usenet()
+	if u == nil {
+		http.Error(w, "Usenet client not available", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := u.OverlayScreenFile(r.Context(), entry.InfoHash, req.File)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	result.Entry = entry.Name
+	utils.JSONResponse(w, result, http.StatusOK)
+}
+
 // handleOverlayReclaim deletes a file's overlay patches + manifest record
 // (see overlay.Store.DeleteFile) WITHOUT re-searching - for reclaiming disk
 // on files that are fine now. Refuses while a PAR2 repair is in-flight for

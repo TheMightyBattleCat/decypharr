@@ -1000,6 +1000,162 @@ func (u *Usenet) CheckFileDetailed(ctx context.Context, nzoID, filename string) 
 	return missing, nil
 }
 
+// OverlayScreenResult is the read-only outcome of screening a file's TRUE
+// damage extent - a full STAT over every segment, not just the nightly
+// sweep's fixed ~10% sample - against the padding caps. Nothing about this
+// screen is persisted: it doesn't call Decide, doesn't write StatusDead or
+// StatusPadded, and doesn't touch the manifest. It only reports what Decide
+// WOULD return if the newly-found missing segments were added to the ones
+// already recorded.
+//
+// Like the live accept-path, this has no notion of WHERE in the file the
+// damage sits relative to what's already played (CreatedAt/ImportedAt aren't
+// surfaced here) - it judges purely by total segment extent, the same blind
+// spot Decide already has.
+type OverlayScreenResult struct {
+	Entry string `json:"entry"`
+	File  string `json:"file"`
+
+	CurrentVerdict string `json:"current_verdict"` // the file's persisted verdict, unchanged by this screen
+
+	TotalSegments  int   `json:"total_segments"`
+	FileSize       int64 `json:"file_size"`
+	AlreadyDead    int   `json:"already_dead"`    // recorded dead, not yet padded or patched
+	AlreadyPadded  int   `json:"already_padded"`  // recorded dead and already padded
+	AlreadyPatched int   `json:"already_patched"` // recorded dead, PAR2-recovered - excluded from the cap math
+	NewlyMissing   int   `json:"newly_missing"`   // confirmed missing by this screen's full STAT, not yet recorded at all
+
+	ProjectedTotalDead int     `json:"projected_total_dead"` // AlreadyDead + AlreadyPadded + NewlyMissing
+	ProjectedRun       int     `json:"projected_run"`        // longest run of consecutive dead indices, projected
+	ProjectedByteRatio float64 `json:"projected_byte_ratio"`
+
+	WouldStayWithinCaps bool   `json:"would_stay_within_caps"`
+	ProjectedVerdict    string `json:"projected_verdict"` // "degraded" (would stay padded) or "failed" (would exceed caps)
+}
+
+// screenHypothesis is the deduplicated union OverlayScreenFile projects
+// against the padding caps, plus the already-known/newly-discovered counts
+// its report surfaces. Building this is pure (no I/O), separated out from
+// OverlayScreenFile so the one thing Phase 2's auto-regrab decision will
+// depend on - that an already-recorded dead/padded segment showing up
+// missing again in the full STAT is never counted as NEW damage - can be
+// unit-tested directly against fabricated inputs, without a network or NZB
+// storage double.
+type screenHypothesis struct {
+	deadSegments                               []overlay.DeadSegment
+	newlyMissing                               int
+	alreadyDead, alreadyPadded, alreadyPatched int
+}
+
+// buildScreenHypothesis merges recorded (already-persisted) dead segments
+// with a full-STAT result into a deduplicated hypothetical dead-set: every
+// recorded segment is kept exactly once, by index, however many times the
+// STAT re-confirms it's still missing - it's already-known damage, not new
+// decay. Only a segment whose index was NOT already recorded, and whose STAT
+// result is a genuine article-not-found (not a connection/protocol error),
+// counts as newly missing and gets added.
+func buildScreenHypothesis(recorded []overlay.DeadSegment, segments []storage.NZBSegment, stat *nntp.BatchStatResult) screenHypothesis {
+	h := screenHypothesis{deadSegments: append([]overlay.DeadSegment{}, recorded...)}
+
+	knownIndex := make(map[int]bool, len(recorded))
+	for _, d := range recorded {
+		knownIndex[d.Index] = true
+		switch d.Status {
+		case overlay.StatusDead:
+			h.alreadyDead++
+		case overlay.StatusPadded:
+			h.alreadyPadded++
+		case overlay.StatusPatched:
+			h.alreadyPatched++
+		}
+	}
+
+	for i, r := range stat.Results {
+		if r.Available || knownIndex[i] {
+			continue
+		}
+		// Only a genuine article-not-found counts as confirmed-missing;
+		// connection/protocol errors mean we couldn't check, not that the
+		// article is gone.
+		if r.Error != nil && !nntp.IsArticleNotFoundError(r.Error) {
+			continue
+		}
+		h.newlyMissing++
+		seg := segments[i]
+		h.deadSegments = append(h.deadSegments, overlay.DeadSegment{
+			Index: i, MessageID: seg.MessageID, Bytes: seg.Bytes, Status: overlay.StatusDead,
+		})
+	}
+	return h
+}
+
+// OverlayScreenFile full-STATs every segment of nzoID/filename - not the
+// fixed sample the nightly sweep is limited to - and reports whether the
+// file's TRUE damage extent would still fit the padding caps. It is entirely
+// read-only: no verdict is written, no segment is recorded as dead, and no
+// repair or re-grab is triggered. Callers act on the report; this only
+// produces it.
+func (u *Usenet) OverlayScreenFile(ctx context.Context, nzoID, filename string) (OverlayScreenResult, error) {
+	result := OverlayScreenResult{File: filename}
+
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return result, fmt.Errorf("failed to load NZB: %w", err)
+	}
+	file := nzb.GetFileByName(filename)
+	if file == nil || len(file.Segments) == 0 {
+		return result, fmt.Errorf("file has no Segments: %s", filename)
+	}
+	result.TotalSegments = len(file.Segments)
+	result.FileSize = file.Size
+
+	// This screen never mutates the real manifest - recorded is read once,
+	// up front, and everything below works against a local hypothetical set.
+	var recorded []overlay.DeadSegment
+	if u.overlay != nil {
+		if m, merr := u.overlay.GetManifest(nzoID); merr == nil {
+			if fe := m.Files[filename]; fe != nil {
+				result.CurrentVerdict = string(fe.Verdict)
+				recorded = fe.DeadSegments
+			}
+		}
+	}
+	if result.CurrentVerdict == "" {
+		result.CurrentVerdict = string(overlay.VerdictClean)
+	}
+
+	messageIDs := make([]string, len(file.Segments))
+	for i, seg := range file.Segments {
+		messageIDs[i] = seg.MessageID
+	}
+	stat, err := u.nntp.BatchStatComplete(ctx, messageIDs)
+	if err != nil {
+		return result, fmt.Errorf("full availability screen failed: %w", err)
+	}
+
+	h := buildScreenHypothesis(recorded, file.Segments, stat)
+	result.AlreadyDead = h.alreadyDead
+	result.AlreadyPadded = h.alreadyPadded
+	result.AlreadyPatched = h.alreadyPatched
+	result.NewlyMissing = h.newlyMissing
+
+	policy := overlay.DefaultPolicy()
+	if u.overlay != nil {
+		policy = u.overlay.Policy()
+	}
+	eval, ok := overlay.WithinPadCaps(&overlay.FileEntry{DeadSegments: h.deadSegments}, file.Size, policy)
+	result.ProjectedTotalDead = eval.TotalDead
+	result.ProjectedRun = eval.LongestRun
+	result.ProjectedByteRatio = eval.ByteRatio
+	result.WouldStayWithinCaps = ok
+	if ok {
+		result.ProjectedVerdict = string(overlay.VerdictDegraded)
+	} else {
+		result.ProjectedVerdict = string(overlay.VerdictFailed)
+	}
+	return result, nil
+}
+
 // checkAvailability batch-STATs the given sampled message ids. The NNTP client
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.

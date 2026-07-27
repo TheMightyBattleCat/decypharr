@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -244,5 +245,75 @@ func TestShouldLogPadOncePerProcess(t *testing.T) {
 	}
 	if !s.ShouldLogPad("nzb-1", "movie.mkv", 1) {
 		t.Fatalf("ShouldLogPad for a different segment should be true")
+	}
+}
+
+// TestScreenProjectionMatchesRealDecide is the anti-drift guard for the
+// read-only damage screen (usenet.OverlayScreenFile): it must project the
+// exact same verdict WithinPadCaps would produce if Decide actually processed
+// the same segments for real. Both call WithinPadCaps directly, so this
+// mainly guards against a future edit to Decide (or the screen) that stops
+// routing through it - if that ever happens, this test starts failing.
+func TestScreenProjectionMatchesRealDecide(t *testing.T) {
+	const file = "movie.mkv"
+	policy := DefaultPolicy()
+
+	cases := []struct {
+		name string
+		// already holds the segments already recorded (as Decide would leave
+		// them); newlyMissing holds the screen's full-STAT discoveries not
+		// yet recorded anywhere.
+		already      []DeadSegment
+		newlyMissing []DeadSegment
+		fileSize     int64
+		wantVerdict  Verdict
+	}{
+		{
+			name:         "stays within caps",
+			already:      []DeadSegment{{Index: 0, Bytes: 100, Status: StatusDead}, {Index: 1, Bytes: 100, Status: StatusDead}},
+			newlyMissing: []DeadSegment{{Index: 5, Bytes: 100, Status: StatusDead}, {Index: 6, Bytes: 100, Status: StatusDead}},
+			fileSize:     10_000_000,
+			wantVerdict:  VerdictDegraded,
+		},
+		{
+			name:         "run cap exceeded by newly-discovered segments",
+			already:      []DeadSegment{{Index: 10, Bytes: 100, Status: StatusDead}},
+			newlyMissing: []DeadSegment{{Index: 11, Bytes: 100, Status: StatusDead}, {Index: 12, Bytes: 100, Status: StatusDead}, {Index: 13, Bytes: 100, Status: StatusDead}, {Index: 14, Bytes: 100, Status: StatusDead}},
+			fileSize:     10_000_000,
+			wantVerdict:  VerdictFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The screen's projection: a hypothetical FileEntry combining
+			// already-recorded segments with the newly-discovered ones,
+			// evaluated WITHOUT persisting anything.
+			hypothetical := &FileEntry{DeadSegments: append(append([]DeadSegment{}, tc.already...), tc.newlyMissing...)}
+			_, projectedOK := WithinPadCaps(hypothetical, tc.fileSize, policy)
+			projectedVerdict := VerdictFailed
+			if projectedOK {
+				projectedVerdict = VerdictDegraded
+			}
+			if projectedVerdict != tc.wantVerdict {
+				t.Fatalf("projected verdict = %v, want %v", projectedVerdict, tc.wantVerdict)
+			}
+
+			// The real path: feed the exact same final segment set through
+			// an actual Store.Decide sequence, in index order, exactly as
+			// live playback failures would arrive - one Decide call per
+			// segment, already-recorded ones first.
+			s := newTestStore(t)
+			s.SetPolicy(policy)
+			all := append(append([]DeadSegment{}, tc.already...), tc.newlyMissing...)
+			sort.Slice(all, func(i, j int) bool { return all[i].Index < all[j].Index })
+			var gotVerdict Verdict
+			for _, seg := range all {
+				_, gotVerdict = s.Decide("nzb-1", file, seg.Index, "<msg>", seg.Bytes, tc.fileSize)
+			}
+			if gotVerdict != tc.wantVerdict {
+				t.Fatalf("real Decide sequence verdict = %v, want %v", gotVerdict, tc.wantVerdict)
+			}
+		})
 	}
 }
