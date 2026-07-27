@@ -25,9 +25,10 @@ func newTestRepairForClaims(t *testing.T) *Repair {
 
 	m := &Manager{storage: strg}
 	repair := &Repair{
-		manager:  m,
-		logger:   logger.New("test-repair"),
-		handlers: newRepairHandlerRegistry(defaultRepairHandlerTTL),
+		manager:     m,
+		logger:      logger.New("test-repair"),
+		handlers:    newRepairHandlerRegistry(defaultRepairHandlerTTL),
+		regrabGuard: newRegrabGuard(),
 	}
 	m.repair = repair
 	return repair

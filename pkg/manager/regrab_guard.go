@@ -32,6 +32,16 @@ const (
 	// FailureReason, the existing broken-file GUI surface) when the guard
 	// trips - see (*regrabGuard).checkAndRecord.
 	regrabGuardTerminalReason = "replacement grabs also missing articles — posting appears dead at source"
+
+	// regrabDedupeWindow bounds how long the guard remembers "this exact
+	// release was already struck" before a re-offer of the same release
+	// counts as a fresh strike again. Deliberately short and independent of
+	// regrabGuardWindow (matches playbackRepairCooldown's scale) - it exists
+	// only so an Arr re-offering the identical, already-blocklisted release
+	// doesn't burn through the 2-strike budget on duplicate evidence. A
+	// genuinely different dead candidate always strikes, no matter how soon
+	// after the last one it arrives.
+	regrabDedupeWindow = playbackRepairCooldown
 )
 
 // regrabAttemptRecord is one logical file's automatic re-grab history.
@@ -44,6 +54,13 @@ type regrabAttemptRecord struct {
 	// DEBUG, not a repeat of the same warning on every subsequent playback
 	// failure (the exact log-storm shape this whole fix is about).
 	loggedTerminal bool
+	// recentReleases remembers, per distinct release identity (the release
+	// name the caller passes to checkAndRecord), the last time that exact
+	// release was struck - see regrabDedupeWindow. A release seen again
+	// inside the window is still refused/blocklisted by the caller as
+	// normal; it just doesn't consume a fresh strike, since it's the same
+	// evidence already counted rather than a new distinct dead candidate.
+	recentReleases map[string]time.Time
 }
 
 // regrabGuard tracks automatic re-grab attempts per stable logical-file
@@ -84,14 +101,18 @@ func regrabIdentityKey(arrName string, mediaID, episodeID int, fallbackEntryName
 }
 
 // checkAndRecord reports whether an automatic re-grab for identity may
-// proceed. If identity is already marked terminal, or if recording this
-// attempt would exceed regrabGuardMaxAttempts within regrabGuardWindow, it
-// refuses (marking identity terminal in the latter case) instead of
-// recording another attempt. Otherwise it records the attempt and allows it
-// to proceed. firstTrip is true only on the call that flips a record from
-// non-terminal to terminal, so the caller logs the transition once instead
-// of on every subsequent suppressed call.
-func (g *regrabGuard) checkAndRecord(identity string) (allowed bool, reason string, firstTrip bool) {
+// proceed. releaseName identifies the specific candidate release being
+// struck (e.g. the entry/release name) - if the SAME release was already
+// struck for this identity inside regrabDedupeWindow, this call is allowed
+// without consuming a strike (duplicate evidence, not a new candidate); pass
+// "" to skip deduping. Otherwise: if identity is already marked terminal, or
+// if recording this attempt would exceed regrabGuardMaxAttempts within
+// regrabGuardWindow, it refuses (marking identity terminal in the latter
+// case) instead of recording another attempt. Otherwise it records the
+// attempt and allows it to proceed. firstTrip is true only on the call that
+// flips a record from non-terminal to terminal, so the caller logs the
+// transition once instead of on every subsequent suppressed call.
+func (g *regrabGuard) checkAndRecord(identity, releaseName string) (allowed bool, reason string, firstTrip bool) {
 	if identity == "" {
 		return true, "", false
 	}
@@ -108,6 +129,13 @@ func (g *regrabGuard) checkAndRecord(identity string) (allowed bool, reason stri
 	}
 
 	now := g.nowFn()
+
+	if releaseName != "" {
+		if last, seen := rec.recentReleases[releaseName]; seen && now.Sub(last) < regrabDedupeWindow {
+			return true, "", false
+		}
+	}
+
 	cutoff := now.Add(-regrabGuardWindow)
 	live := rec.attempts[:0]
 	for _, t := range rec.attempts {
@@ -125,6 +153,20 @@ func (g *regrabGuard) checkAndRecord(identity string) (allowed bool, reason stri
 	}
 
 	rec.attempts = append(rec.attempts, now)
+	if releaseName != "" {
+		if rec.recentReleases == nil {
+			rec.recentReleases = make(map[string]time.Time)
+		}
+		// Prune stale entries opportunistically so this map doesn't grow
+		// unbounded across every distinct release name seen over the
+		// identity's lifetime.
+		for name, t := range rec.recentReleases {
+			if now.Sub(t) >= regrabDedupeWindow {
+				delete(rec.recentReleases, name)
+			}
+		}
+		rec.recentReleases[releaseName] = now
+	}
 	return true, "", false
 }
 

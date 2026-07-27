@@ -228,7 +228,7 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 		if healths.Size() > 0 {
 			run.Stage = storage.RepairStageRepairing
 			r.saveRun(run)
-			r.repairBroken(repairCtx, run, healths)
+			r.repairBroken(repairCtx, run, healths, true)
 		}
 	}
 
@@ -732,18 +732,63 @@ func firstProtocol(results []fileResult) config.Protocol {
 }
 
 // repairBroken runs the Arr delete + re-search heal over a set of already-known
-// broken entries without reprobing. Used by the batch entry-points (FixBroken,
-// media/entry rechecks). The sweep itself heals inline per entry via
-// healBrokenEntry and does not call this.
-func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth]) {
+// broken entries without reprobing. Two callers: FixBroken (manual, a batch
+// entry-point) and finishCancelledRepairSweep's stop-schedule final pass
+// (automatic, part of the sweep itself). automatic distinguishes the two -
+// only the automatic caller is subject to r.regrabGuard, via
+// healBrokenEntryGuarded, matching repairPlaybackFileNow's own auto/manual
+// split. A manual Fix always proceeds and is never blocked by a guard trip.
+func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth], automatic bool) {
 	var statsMu sync.Mutex
 	healths.Range(func(name string, h *storage.EntryHealth) bool {
 		if ctx != nil && ctx.Err() != nil {
 			return false
 		}
-		r.healBrokenEntry(ctx, run, &statsMu, name, h)
+		if automatic {
+			r.healBrokenEntryGuarded(ctx, run, &statsMu, name, h)
+		} else {
+			r.healBrokenEntry(ctx, run, &statsMu, name, h)
+		}
 		return true
 	})
+}
+
+// healBrokenEntryGuarded runs healBrokenEntry for one entry the SCHEDULED
+// sweep found broken and decided to heal automatically - unlike
+// finalizeBrokenEntry's other automatic route (repairPlaybackFileNow, for
+// playback failures and the sticky-failed sampler), this path went straight
+// to healBrokenEntry with no r.regrabGuard consultation at all, so a
+// genuinely dead release blocklisted-and-re-searched by the sweep, then
+// re-blocklisted again on the next sweep once the Arr's replacement also
+// turns out dead, could repeat indefinitely. Consults the guard once per
+// distinct Arr media identity among h's broken files, mirroring
+// repairPlaybackFileNow's check-before-act shape: if ANY identity is
+// currently terminal or trips on this call, the whole entry is left
+// unhealed this pass (matching markRegrabGuardTripped's own entry-level
+// granularity - EntryHealth has no finer-grained per-file terminal surface)
+// rather than issuing a blocklist the guard has already decided against.
+// Manual callers (FixBroken, RecheckEntry fix=true) must keep calling
+// healBrokenEntry directly - never this.
+func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) {
+	if h == nil {
+		return
+	}
+	for _, bf := range h.BrokenFiles {
+		identity := regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name)
+		if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity, name); !allowed {
+			logEvt := r.logger.Debug()
+			if firstTrip {
+				logEvt = r.logger.Warn()
+			}
+			logEvt.Str("entry", name).Str("file", bf.FileName).Str("reason", guardReason).
+				Msg("Repair: stopping automatic re-grab, every candidate so far shares the same missing articles")
+			if firstTrip {
+				r.markRegrabGuardTripped(name, bf.FileName, h, guardReason)
+			}
+			return
+		}
+	}
+	r.healBrokenEntry(ctx, run, statsMu, name, h)
 }
 
 // healBrokenEntry runs the Arr delete + blocklist + re-search for one broken
@@ -824,7 +869,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 // routeAutoRepair.
 func (r *Repair) finalizeBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, autoRepair bool) {
 	if autoRepair {
-		r.healBrokenEntry(ctx, run, statsMu, name, h)
+		r.healBrokenEntryGuarded(ctx, run, statsMu, name, h)
 	}
 	r.releaseRegrabClaims(h)
 }
@@ -1391,7 +1436,7 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		// acting on it - "Fix" must never blocklist or re-search on behalf
 		// of a file the Arr already replaced with a working copy.
 		r.filterSupersededHealths(runCtx, healths)
-		r.repairBroken(runCtx, run, healths)
+		r.repairBroken(runCtx, run, healths, false)
 		if runCtx.Err() != nil {
 			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
 			return
@@ -1768,7 +1813,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 		// Manual override: always proceed, and reset the guard so a fresh
 		// automatic streak starts counting from zero after this.
 		r.regrabGuard.clear(identity)
-	} else if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity); !allowed {
+	} else if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity, entryName); !allowed {
 		logEvt := r.logger.Debug()
 		if firstTrip {
 			logEvt = r.logger.Warn()
@@ -1838,6 +1883,16 @@ func (r *Repair) markRegrabGuardTripped(entryName, fileName string, h *storage.E
 // Claims the handler registry around the call so a concurrent sweep/PAR2
 // pass discovering the same nzbID (unlikely pre-import, but the registry
 // dedup is cheap insurance) can't double-handle it.
+//
+// Subject to r.regrabGuard, same as repairPlaybackFileNow's automatic path:
+// this is the loop an Arr can drive entirely on its own (grab a replacement,
+// have it rejected here, auto-re-search, repeat), so it needs the same
+// two-strikes-and-stop protection or a genuinely dead release just cycles
+// forever, one blocklisted candidate at a time. entry.Category is set to the
+// owning Arr's own Name at grab time (see manager/usenet.go), so a.Name here
+// resolves to the identical string repairPlaybackFileNow's content-matched
+// arrName does for the same entry - strikes from both paths land on the same
+// identity.
 func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fileName, reason string) error {
 	if entry == nil || entry.InfoHash == "" {
 		return errors.New("entry is required")
@@ -1862,6 +1917,49 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 		return fmt.Errorf("no grab history found for %q in arr %q", entry.Name, a.Name)
 	}
 	record := history.Records[0]
+
+	var mediaID, episodeID int
+	switch a.Type {
+	case arr.Sonarr:
+		mediaID, episodeID = record.SeriesID, record.EpisodeID
+	case arr.Radarr:
+		mediaID = record.MovieID
+	}
+	identity := regrabIdentityKey(a.Name, mediaID, episodeID, entry.Name)
+	if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity, entry.Name); !allowed {
+		logEvt := r.logger.Debug()
+		if firstTrip {
+			logEvt = r.logger.Warn()
+		}
+		logEvt.Str("entry", entry.Name).Str("file", fileName).Str("reason", guardReason).
+			Msg("Import: stopping automatic re-grab, every candidate so far shares the same missing articles")
+		if firstTrip {
+			h := &storage.EntryHealth{
+				EntryName: entry.Name,
+				Status:    storage.HealthBroken,
+				BrokenFiles: []storage.BrokenFile{{
+					EntryName: entry.Name,
+					FileName:  fileName,
+					Protocol:  config.ProtocolNZB,
+					Reason:    reason,
+					ArrName:   a.Name,
+					ArrKind:   arrKindFromType(a.Type),
+					MediaID:   mediaID,
+					EpisodeID: episodeID,
+					InfoHash:  entry.InfoHash,
+				}},
+			}
+			r.markRegrabGuardTripped(entry.Name, fileName, h, guardReason)
+		}
+		// Not an error: the import-availability gate rejects a
+		// confirmed-dead file unconditionally regardless of this return
+		// value (see importAvailabilityGate) - refusing to blocklist here
+		// just stops decypharr from actively feeding the Arr another hunt
+		// for this identity, it doesn't change whether this import is
+		// accepted.
+		return nil
+	}
+
 	if err := a.MarkHistoryFailed(record.ID); err != nil {
 		return fmt.Errorf("failed to blocklist grab: %w", err)
 	}
