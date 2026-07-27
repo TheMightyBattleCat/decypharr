@@ -129,7 +129,7 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	// Store.SetPolicy) - and reuse them for every check below rather than
 	// re-deriving or re-clamping anything on this hot path.
 	policy := s.Policy()
-	if !withinPadCaps(fe, fileSize, policy) {
+	if _, ok := WithinPadCaps(fe, fileSize, policy); !ok {
 		fe.Verdict = VerdictFailed
 		_ = s.saveManifestLocked(nzbID, m)
 		s.notifyFailed(nzbID, file)
@@ -147,11 +147,29 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	return DecisionPad, VerdictDegraded
 }
 
-// withinPadCaps evaluates every cap against fe's current (non-patched) dead
-// segments. Patched segments are excluded throughout: PAR2 repair having
-// already recovered a segment's true bytes means it no longer counts as
-// damage against the file's remaining pad budget.
-func withinPadCaps(fe *FileEntry, fileSize int64, policy Policy) bool {
+// CapEvaluation carries the raw damage figures WithinPadCaps derived while
+// checking fe against a Policy, so a caller that needs to explain WHY a
+// verdict landed where it did (e.g. the read-only damage screen) doesn't
+// have to re-derive them itself.
+type CapEvaluation struct {
+	TotalDead  int     // non-patched dead+padded segment count
+	PadBytes   int64   // total bytes of those segments
+	LongestRun int     // longest run of consecutive dead segment indices
+	ByteRatio  float64 // PadBytes / fileSize (0 if fileSize <= 0)
+}
+
+// WithinPadCaps evaluates every cap against fe's current (non-patched) dead
+// segments and returns both the evaluation and whether every cap passed.
+// Patched segments are excluded throughout: PAR2 repair having already
+// recovered a segment's true bytes means it no longer counts as damage
+// against the file's remaining pad budget.
+//
+// This is the one place the padding caps are checked - Decide calls it for
+// the real, persisting decision; the read-only damage screen (see
+// usenet.OverlayScreenFile) calls it against a hypothetical, not-yet-recorded
+// dead-set to project what Decide would return, without persisting anything.
+// Keeping both behind this single function means the two can never drift.
+func WithinPadCaps(fe *FileEntry, fileSize int64, policy Policy) (CapEvaluation, bool) {
 	var (
 		total    int
 		padBytes int64
@@ -166,13 +184,6 @@ func withinPadCaps(fe *FileEntry, fileSize int64, policy Policy) bool {
 		indices = append(indices, d.Index)
 	}
 
-	if total > policy.MaxTotalSegments {
-		return false
-	}
-	if fileSize > 0 && float64(padBytes) > float64(fileSize)*policy.MaxByteRatio {
-		return false
-	}
-
 	sort.Ints(indices)
 	run, best := 1, 1
 	for i := 1; i < len(indices); i++ {
@@ -185,8 +196,26 @@ func withinPadCaps(fe *FileEntry, fileSize int64, policy Policy) bool {
 			best = run
 		}
 	}
-	if len(indices) > 0 && best > policy.MaxRunSegments {
-		return false
+	longestRun := best
+	if len(indices) == 0 {
+		longestRun = 0
 	}
-	return true
+
+	var byteRatio float64
+	if fileSize > 0 {
+		byteRatio = float64(padBytes) / float64(fileSize)
+	}
+	eval := CapEvaluation{TotalDead: total, PadBytes: padBytes, LongestRun: longestRun, ByteRatio: byteRatio}
+
+	ok := true
+	if total > policy.MaxTotalSegments {
+		ok = false
+	}
+	if fileSize > 0 && float64(padBytes) > float64(fileSize)*policy.MaxByteRatio {
+		ok = false
+	}
+	if len(indices) > 0 && best > policy.MaxRunSegments {
+		ok = false
+	}
+	return eval, ok
 }

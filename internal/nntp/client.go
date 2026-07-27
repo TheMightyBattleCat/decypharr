@@ -1166,9 +1166,29 @@ func excludeForArticleNotFound(exclusions *providerExclusions, provider config.U
 // worker holds one repair-bank token for its lifetime, so the total number of
 // concurrent NNTP connections used by all in-flight BatchStat calls never
 // exceeds the bank's capacity. When the client has no bank configured, a small
-// default worker count is used. Does NOT fail-fast: every chunk is processed so
-// the caller sees complete per-segment visibility.
+// default worker count is used. Early-bailout: stops sampling the rest of
+// messageIDs as soon as one segment is confirmed missing - callers here only
+// ever need a pass/fail availability read, not a complete accounting, so
+// there's no reason to keep STAT-ing once the file is already known damaged.
+// Use BatchStatComplete instead when the caller needs every miss counted.
 func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStatResult, error) {
+	return c.batchStat(ctx, messageIDs, false)
+}
+
+// BatchStatComplete is BatchStat without the early-bailout: every message ID
+// is STAT-ed regardless of earlier misses, so the caller sees a complete,
+// exhaustive accounting of what's missing rather than just a pass/fail
+// signal. Used by the read-only damage screen (see
+// usenet.OverlayScreenFile), which needs the full missing-segment count to
+// project a verdict - the nightly sweep's fixed sample intentionally never
+// sees this, so this is the only way to get it.
+func (c *Client) BatchStatComplete(ctx context.Context, messageIDs []string) (*BatchStatResult, error) {
+	return c.batchStat(ctx, messageIDs, true)
+}
+
+// batchStat is the shared implementation behind BatchStat and
+// BatchStatComplete - see those for what exhaustive changes.
+func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive bool) (*BatchStatResult, error) {
 	if c.closed.Load() {
 		return nil, errors.New("nntp client is closed")
 	}
@@ -1176,10 +1196,11 @@ func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStat
 		return &BatchStatResult{}, nil
 	}
 
-	// Early-bailout: cancelled the moment a segment is found definitively
-	// missing (not-found across all providers), so the remaining sample's
-	// workers stop at their per-chunk ctx.Err() checks instead of completing
-	// the full STAT sweep. defer cancel() also covers the normal return path.
+	// Early-bailout (skipped when exhaustive): cancelled the moment a segment
+	// is found definitively missing (not-found across all providers), so the
+	// remaining sample's workers stop at their per-chunk ctx.Err() checks
+	// instead of completing the full STAT sweep. defer cancel() also covers
+	// the normal return path.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1246,11 +1267,14 @@ func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStat
 			// terminal classification carries an ArticleNotFound error.
 			// Per-segment provider failover has already completed inside
 			// this chunk before we get here, so this never short-circuits
-			// failover.
-			for _, r := range results {
-				if !r.Available && IsArticleNotFoundError(r.Error) {
-					bailOnce.Do(cancel)
-					break
+			// failover. Skipped entirely in exhaustive mode - the caller
+			// wants every miss, not just the first.
+			if !exhaustive {
+				for _, r := range results {
+					if !r.Available && IsArticleNotFoundError(r.Error) {
+						bailOnce.Do(cancel)
+						break
+					}
 				}
 			}
 		})

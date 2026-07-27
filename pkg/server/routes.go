@@ -75,6 +75,7 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/overlay/repair-now", s.handleOverlayRepairNow)
 			r.Get("/overlay/repair-progress", s.handleOverlayRepairProgress)
 			r.Post("/overlay/verify", s.handleOverlayVerify)
+			r.Post("/overlay/screen", s.handleOverlayScreen)
 			r.Post("/overlay/reclaim", s.handleOverlayReclaim)
 			r.Post("/overlay/research", s.handleOverlayResearch)
 			r.Get("/overlay/gc-orphans/count", s.handleOverlayOrphanCount)
