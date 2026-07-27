@@ -89,15 +89,12 @@ type OverlayFile struct {
 
 	// PatchBytes and Par2RetainedMetaBytes are real on-disk sizes; their sum,
 	// OverlayDiskBytes, is what this file's overlay state actually costs
-	// locally. Par2MetaBytes (deprecated alias of Par2ProtectedReleaseBytes,
-	// kept only so an already-built frontend bundle doesn't silently show
-	// zeros - prefer ProtectedReleaseBytes) is NOT a disk figure at all: it's
+	// locally. Par2ProtectedReleaseBytes is NOT a disk figure at all: it's
 	// the declared size of the release PAR2 protects on the remote Usenet
 	// server, purely informational.
 	PatchBytes                int64 `json:"patch_bytes"`
 	Par2RetainedMetaBytes     int64 `json:"par2_retained_meta_bytes"`
 	OverlayDiskBytes          int64 `json:"overlay_disk_bytes"`
-	Par2MetaBytes             int64 `json:"par2_metadata_bytes"`
 	Par2ProtectedReleaseBytes int64 `json:"protected_release_bytes"`
 
 	// SegmentRuns covers every recorded segment (dead, padded, AND patched -
@@ -297,7 +294,6 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 			of.Par2RetainedMetaBytes = retainedMetaBytes
 			of.OverlayDiskBytes = of.PatchBytes + retainedMetaBytes
 			of.Par2ProtectedReleaseBytes = protectedBytes
-			of.Par2MetaBytes = protectedBytes // deprecated alias, see field doc
 
 			pending := of.DeadSegments+of.PaddedSegments > 0
 			of.Repairable = pending && repairable
@@ -352,9 +348,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 // sizes; OverlayDiskBytes (their sum) is what this entry's overlay state
 // actually costs locally. ProtectedReleaseBytes is informational only - the
 // declared size of the release PAR2 protects on the remote Usenet server,
-// NOT a local disk figure. Par2MetaBytes is a deprecated alias of
-// ProtectedReleaseBytes, kept only so an already-built frontend bundle
-// doesn't silently show zeros.
+// NOT a local disk figure.
 type OverlayEntryDiskUsage struct {
 	Entry                 string `json:"entry"`
 	NzbID                 string `json:"nzb_id"`
@@ -364,7 +358,6 @@ type OverlayEntryDiskUsage struct {
 	Par2RetainedMetaBytes int64  `json:"par2_retained_meta_bytes"`
 	OverlayDiskBytes      int64  `json:"overlay_disk_bytes"`
 	ProtectedReleaseBytes int64  `json:"protected_release_bytes"`
-	Par2MetaBytes         int64  `json:"par2_metadata_bytes"`
 }
 
 // OverlayDiskUsageResponse is the aggregate overlay disk-usage report. See
@@ -376,7 +369,6 @@ type OverlayDiskUsageResponse struct {
 	TotalPar2RetainedMetaBytes int64                   `json:"total_par2_retained_meta_bytes"`
 	TotalOverlayDiskBytes      int64                   `json:"total_overlay_disk_bytes"`
 	TotalProtectedReleaseBytes int64                   `json:"total_protected_release_bytes"`
-	TotalPar2MetaBytes         int64                   `json:"total_par2_metadata_bytes"`
 	FileCountsByVerdict        map[string]int          `json:"file_counts_by_verdict"`
 	Entries                    []OverlayEntryDiskUsage `json:"entries"`
 }
@@ -434,14 +426,12 @@ func (s *Server) handleOverlayDiskUsage(w http.ResponseWriter, r *http.Request) 
 			Par2RetainedMetaBytes: retainedMetaBytes,
 			OverlayDiskBytes:      diskBytes,
 			ProtectedReleaseBytes: protectedBytes,
-			Par2MetaBytes:         protectedBytes, // deprecated alias, see type doc
 		})
 		resp.TotalPatchBytes += patchBytes
 		resp.TotalManifestBytes += manifestBytes
 		resp.TotalPar2RetainedMetaBytes += retainedMetaBytes
 		resp.TotalOverlayDiskBytes += diskBytes
 		resp.TotalProtectedReleaseBytes += protectedBytes
-		resp.TotalPar2MetaBytes += protectedBytes
 	}
 
 	sort.Slice(resp.Entries, func(i, j int) bool { return resp.Entries[i].Entry < resp.Entries[j].Entry })
