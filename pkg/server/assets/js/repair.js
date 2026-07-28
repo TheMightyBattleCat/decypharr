@@ -1114,6 +1114,9 @@ class RepairManager {
         if (/recovery slice/i.test(reason)) {
             return `<span class="badge badge-warning badge-sm" title="${this.escapeAttr(reason)}">insufficient recovery</span>`;
         }
+        if (f.backfill_eligible) {
+            return `<span class="badge badge-warning badge-sm" title="PAR2 references not retained - will be rebuilt from source on repair">via backfill</span>`;
+        }
         return `<span class="badge badge-ghost badge-sm" title="${this.escapeAttr(reason)}">no par2</span>`;
     }
 
@@ -1351,8 +1354,8 @@ class RepairManager {
                     <div class="opacity-50" title="Informational only - declared size PAR2 protects on Usenet, not a disk cost">protects ${this.formatBytes(f.protected_release_bytes || 0)}</div>
                 </td>
                 <td class="text-right whitespace-nowrap">
-                    <button class="btn btn-xs btn-outline" data-action="repair-now" ${!f.repairable ? 'disabled' : ''}
-                            title="${this.escapeAttr(f.repairable ? 'Run a PAR2 repair pass now' : (f.not_repairable_reason || 'Not repairable'))}"
+                    <button class="btn btn-xs btn-outline" data-action="repair-now" ${!(f.repairable || f.backfill_eligible) ? 'disabled' : ''}
+                            title="${this.escapeAttr(f.repairable ? 'Run a PAR2 repair pass now' : (f.backfill_eligible ? 'Rebuild PAR2 references from source, then repair' : (f.not_repairable_reason || 'Not repairable')))}"
                             aria-label="Repair now">
                         <i class="bi bi-tools"></i>
                     </button>

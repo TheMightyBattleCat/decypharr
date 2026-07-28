@@ -78,6 +78,14 @@ type OverlayFile struct {
 	Repairable          bool   `json:"repairable"`
 	NotRepairableReason string `json:"not_repairable_reason,omitempty"`
 
+	// BackfillEligible is true when this file isn't currently Repairable
+	// because its PAR2 references were never retained, but the source .nzb
+	// they'd be rebuilt from is still present on disk - see
+	// par2RefsBackfillEligible. A manual repair can still succeed for these
+	// by rebuilding the references first, so the UI enables "repair now" for
+	// them too even though Repairable itself is false.
+	BackfillEligible bool `json:"backfill_eligible"`
+
 	// Par2Terminal mirrors storage.Par2RepairState.Terminal: true means the
 	// automatic path has given up re-enqueuing this file (see
 	// Par2Repair.par2ShouldAutoEnqueue) after a failure classifyPar2Failure
@@ -301,6 +309,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 			of.Repairable = pending && repairable
 			if pending && !repairable {
 				of.NotRepairableReason = notRepairableReason
+				of.BackfillEligible = s.par2RefsBackfillEligible(nzbID)
 			}
 			if repairState != nil {
 				of.Par2Terminal = repairState.Terminal
