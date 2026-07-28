@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	json "github.com/bytedance/sonic"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -526,14 +528,52 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if repairable, reason := par2Repair.Availability(entry.InfoHash); !repairable {
-		utils.JSONResponse(w, map[string]any{"status": "unavailable", "reason": reason}, http.StatusOK)
-		return
+		// Availability rejects outright when PAR2 refs were never retained,
+		// but the source .nzb backing them may still be on disk - dispatch
+		// anyway in that case and let runRepair's own backfill
+		// (par2_repair.go's runRepair, via usenet.BackfillPar2Refs) rebuild
+		// them before giving up, instead of rejecting an entry that's
+		// actually recoverable.
+		if !s.par2RefsBackfillEligible(entry.InfoHash) {
+			utils.JSONResponse(w, map[string]any{"status": "unavailable", "reason": reason}, http.StatusOK)
+			return
+		}
 	}
 	if err := par2Repair.RunNow(entry.InfoHash); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	utils.JSONResponse(w, map[string]string{"status": "queued"}, http.StatusOK)
+}
+
+// par2RefsBackfillEligible reports whether nzbID was rejected by
+// Availability specifically because its PAR2 references (Par2Source/
+// Par2Files) were never retained, AND the source .nzb they'd be rebuilt from
+// is still present on disk - the same cheap, network-free precondition
+// runRepair's own backfill (usenet.BackfillPar2Refs) needs to succeed. Rechecks
+// the refs directly rather than parsing Availability's reason string, and
+// mirrors Availability's other reject conditions (usenet client configured,
+// PAR2 repair enabled, nzb record exists) so it never overrides one of those
+// unrelated, non-backfillable rejections.
+func (s *Server) par2RefsBackfillEligible(nzbID string) bool {
+	u := s.manager.Usenet()
+	if u == nil || !config.Get().Repair.Par2RepairEnabled() {
+		return false
+	}
+	nzb, err := u.GetNZB(nzbID)
+	if err != nil {
+		return false
+	}
+	if len(nzb.Par2Source) > 0 && len(nzb.Par2Files) > 0 {
+		return false
+	}
+	if nzb.Path == "" {
+		return false
+	}
+	if _, err := os.Stat(nzb.Path); err != nil {
+		return false
+	}
+	return true
 }
 
 // handleOverlayRepairProgress returns live, in-memory progress for the most
