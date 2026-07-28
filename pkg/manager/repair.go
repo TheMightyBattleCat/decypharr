@@ -120,6 +120,11 @@ type Repair struct {
 	// across nzbIDs when every candidate release shares the same missing
 	// articles (a posting dead at the source). See regrab_guard.go.
 	regrabGuard *regrabGuard
+
+	// arrRefs caches the overlay orphan filter's Arr lookup
+	// (BuildArrReferencedSet). Read only by the overlay path; see
+	// arr_refs_cache.go.
+	arrRefs *arrRefsCache
 }
 
 // NewRepair builds the repair service for the given manager. Call
@@ -132,6 +137,7 @@ func NewRepair(m *Manager) *Repair {
 		parentCtx:   context.Background(),
 		handlers:    newRepairHandlerRegistry(defaultRepairHandlerTTL),
 		regrabGuard: newRegrabGuard(),
+		arrRefs:     newArrRefsCache(),
 	}
 }
 
