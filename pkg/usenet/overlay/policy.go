@@ -36,6 +36,13 @@ const (
 	defaultByteRatio     = 0.02
 )
 
+// headerRegionDivisor defines a file's leading "header region" as the first
+// 1/headerRegionDivisor (1%) of its segments. A confirmed-dead segment
+// landing in that region fails the file outright, regardless of the other
+// caps, since the container's leading metadata/seek data lives there -
+// matching the availability sampler's own header-region notion.
+const headerRegionDivisor = 100
+
 // DefaultPolicy returns the built-in padding caps.
 func DefaultPolicy() Policy {
 	return Policy{
@@ -80,7 +87,7 @@ func recomputeVerdictLocked(fe *FileEntry) {
 // it should be padded under the current policy, plus file's resulting
 // verdict. Only ever called after a segment's article fetch has permanently
 // failed across every provider.
-func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64) (Decision, Verdict) {
+func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -111,11 +118,6 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 			Index: segIndex, MessageID: msgID, Bytes: segBytes, Status: StatusDead,
 		})
 		sortDeadSegments(fe)
-	} else if fe.DeadSegments[existing].Status == StatusPadded {
-		// Already decided (and padded) in an earlier session that hit this
-		// same dead article again - honor that decision rather than
-		// re-running the caps math against an unchanged set.
-		return DecisionPad, fe.Verdict
 	}
 
 	if !IsVideoContainer(file) {
@@ -129,7 +131,7 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	// Store.SetPolicy) - and reuse them for every check below rather than
 	// re-deriving or re-clamping anything on this hot path.
 	policy := s.Policy()
-	if _, ok := WithinPadCaps(fe, fileSize, policy); !ok {
+	if _, ok := WithinPadCaps(fe, fileSize, policy, totalSegments); !ok {
 		fe.Verdict = VerdictFailed
 		_ = s.saveManifestLocked(nzbID, m)
 		s.notifyFailed(nzbID, file)
@@ -152,10 +154,11 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 // verdict landed where it did (e.g. the read-only damage screen) doesn't
 // have to re-derive them itself.
 type CapEvaluation struct {
-	TotalDead  int     // non-patched dead+padded segment count
-	PadBytes   int64   // total bytes of those segments
-	LongestRun int     // longest run of consecutive dead segment indices
-	ByteRatio  float64 // PadBytes / fileSize (0 if fileSize <= 0)
+	TotalDead    int     // non-patched dead+padded segment count
+	PadBytes     int64   // total bytes of those segments
+	LongestRun   int     // longest run of consecutive dead segment indices
+	ByteRatio    float64 // PadBytes / fileSize (0 if fileSize <= 0)
+	HeaderDamage bool    // a non-patched dead segment sits in the header region
 }
 
 // WithinPadCaps evaluates every cap against fe's current (non-patched) dead
@@ -169,7 +172,7 @@ type CapEvaluation struct {
 // usenet.OverlayScreenFile) calls it against a hypothetical, not-yet-recorded
 // dead-set to project what Decide would return, without persisting anything.
 // Keeping both behind this single function means the two can never drift.
-func WithinPadCaps(fe *FileEntry, fileSize int64, policy Policy) (CapEvaluation, bool) {
+func WithinPadCaps(fe *FileEntry, fileSize int64, policy Policy, totalSegments int) (CapEvaluation, bool) {
 	var (
 		total    int
 		padBytes int64
@@ -205,7 +208,10 @@ func WithinPadCaps(fe *FileEntry, fileSize int64, policy Policy) (CapEvaluation,
 	if fileSize > 0 {
 		byteRatio = float64(padBytes) / float64(fileSize)
 	}
-	eval := CapEvaluation{TotalDead: total, PadBytes: padBytes, LongestRun: longestRun, ByteRatio: byteRatio}
+
+	headerDamage := totalSegments > 0 && len(indices) > 0 && indices[0] < max(1, totalSegments/headerRegionDivisor)
+
+	eval := CapEvaluation{TotalDead: total, PadBytes: padBytes, LongestRun: longestRun, ByteRatio: byteRatio, HeaderDamage: headerDamage}
 
 	ok := true
 	if total > policy.MaxTotalSegments {
@@ -215,6 +221,9 @@ func WithinPadCaps(fe *FileEntry, fileSize int64, policy Policy) (CapEvaluation,
 		ok = false
 	}
 	if len(indices) > 0 && best > policy.MaxRunSegments {
+		ok = false
+	}
+	if headerDamage {
 		ok = false
 	}
 	return eval, ok

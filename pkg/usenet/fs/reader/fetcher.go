@@ -352,7 +352,7 @@ func (sf *SegmentFetcher) handleConfirmedMissing(segIdx int, messageID string) b
 		return false
 	}
 
-	decision, _ := overlayHandle.Decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize())
+	decision, _ := overlayHandle.Decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize(), sf.cache.SegmentCount())
 	if decision != overlay.DecisionPad {
 		return false
 	}

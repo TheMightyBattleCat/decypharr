@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -32,10 +33,16 @@ func TestDoFetchPaddingIsSuppressedForVerificationReads(t *testing.T) {
 	// missing must be set before the first Fetch call in the package.
 	t.Setenv("DECYPHARR_FORCE_MISSING_SEGMENTS", msgIDNormal+","+msgIDNoPad)
 
-	segments := []SegmentMeta{
-		{MessageID: msgIDNormal, Number: 1, Bytes: 1024},
-		{MessageID: msgIDNoPad, Number: 2, Bytes: 1024},
+	// 200 segments so the header region ([0, max(1, 200/100)) = [0,2))
+	// stays clear of the two forced-missing segments below - this test is
+	// about the no-pad context bypassing the overlay, not the positional
+	// header-region rule (see policy_test.go for that).
+	segments := make([]SegmentMeta, 200)
+	for i := range segments {
+		segments[i] = SegmentMeta{MessageID: fmt.Sprintf("<filler-%d@test>", i), Number: i + 1, Bytes: 1024}
 	}
+	segments[100].MessageID = msgIDNormal
+	segments[101].MessageID = msgIDNoPad
 
 	store, err := overlay.NewStore(t.TempDir(), zerolog.Nop())
 	if err != nil {
@@ -70,34 +77,34 @@ func TestDoFetchPaddingIsSuppressedForVerificationReads(t *testing.T) {
 	defer sf.Close()
 
 	t.Run("normal read pads the dead segment", func(t *testing.T) {
-		if err := sf.Fetch(context.Background(), 0); err != nil {
+		if err := sf.Fetch(context.Background(), 100); err != nil {
 			t.Fatalf("Fetch(normal) = %v, want nil (padded)", err)
 		}
-		if got := cache.GetState(0); got != StateOnDisk {
-			t.Fatalf("segment 0 state = %v, want StateOnDisk (padded)", got)
+		if got := cache.GetState(100); got != StateOnDisk {
+			t.Fatalf("segment 100 state = %v, want StateOnDisk (padded)", got)
 		}
-		data, ok := cache.Get(0)
+		data, ok := cache.Get(100)
 		if !ok {
-			t.Fatalf("segment 0: expected padded bytes on disk")
+			t.Fatalf("segment 100: expected padded bytes on disk")
 		}
 		for i, b := range data {
 			if b != 0 {
-				t.Fatalf("segment 0 byte %d = %#x, want zero-fill (padding)", i, b)
+				t.Fatalf("segment 100 byte %d = %#x, want zero-fill (padding)", i, b)
 			}
 		}
 	})
 
 	t.Run("verification read (no-pad context) hard-errors on the same dead-segment pattern", func(t *testing.T) {
 		noPadCtx := ContextWithoutPadding(context.Background())
-		err := sf.Fetch(noPadCtx, 1)
+		err := sf.Fetch(noPadCtx, 101)
 		if err == nil {
 			t.Fatalf("Fetch(verification) = nil, want the real article-not-found error")
 		}
 		if !nntp.IsArticleNotFoundError(err) {
 			t.Fatalf("Fetch(verification) error = %v, want article-not-found", err)
 		}
-		if got := cache.GetState(1); got != StateFailed {
-			t.Fatalf("segment 1 state = %v, want StateFailed (no padding/patch applied)", got)
+		if got := cache.GetState(101); got != StateFailed {
+			t.Fatalf("segment 101 state = %v, want StateFailed (no padding/patch applied)", got)
 		}
 	})
 }

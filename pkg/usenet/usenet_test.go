@@ -48,7 +48,7 @@ func TestShouldPoisonFailedFile(t *testing.T) {
 	t.Run("degraded (padded, within caps) does not poison", func(t *testing.T) {
 		u := newTestUsenetWithOverlay(t)
 		u.overlay.SetPolicy(overlay.Policy{MaxRunSegments: 10, MaxTotalSegments: 10, MaxByteRatio: 1.0})
-		if _, verdict := u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20); verdict != overlay.VerdictDegraded {
+		if _, verdict := u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20, 0); verdict != overlay.VerdictDegraded {
 			t.Fatalf("setup: Decide verdict = %v, want degraded", verdict)
 		}
 		if got := u.shouldPoisonFailedFile(context.Background(), nzbID, file); got {
@@ -60,8 +60,8 @@ func TestShouldPoisonFailedFile(t *testing.T) {
 		u := newTestUsenetWithOverlay(t)
 		u.overlay.SetPolicy(overlay.Policy{MaxRunSegments: 1, MaxTotalSegments: 1, MaxByteRatio: 1.0})
 		// First segment exhausts the (tiny) caps; second is beyond them.
-		_, _ = u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20)
-		if _, verdict := u.overlay.Decide(nzbID, file, 2, "<msg2@test>", 1024, 1<<20); verdict != overlay.VerdictFailed {
+		_, _ = u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20, 0)
+		if _, verdict := u.overlay.Decide(nzbID, file, 2, "<msg2@test>", 1024, 1<<20, 0); verdict != overlay.VerdictFailed {
 			t.Fatalf("setup: Decide verdict = %v, want failed", verdict)
 		}
 		if got := u.shouldPoisonFailedFile(context.Background(), nzbID, file); !got {
@@ -72,8 +72,8 @@ func TestShouldPoisonFailedFile(t *testing.T) {
 	t.Run("verification read never poisons, even when verdict is failed", func(t *testing.T) {
 		u := newTestUsenetWithOverlay(t)
 		u.overlay.SetPolicy(overlay.Policy{MaxRunSegments: 1, MaxTotalSegments: 1, MaxByteRatio: 1.0})
-		_, _ = u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20)
-		_, _ = u.overlay.Decide(nzbID, file, 2, "<msg2@test>", 1024, 1<<20)
+		_, _ = u.overlay.Decide(nzbID, file, 0, "<msg1@test>", 1024, 1<<20, 0)
+		_, _ = u.overlay.Decide(nzbID, file, 2, "<msg2@test>", 1024, 1<<20, 0)
 
 		verificationCtx := reader.ContextWithoutPadding(context.Background())
 		if got := u.shouldPoisonFailedFile(verificationCtx, nzbID, file); got {

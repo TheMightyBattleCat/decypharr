@@ -41,7 +41,7 @@ func TestDecidePadsWithinCapsAndPersists(t *testing.T) {
 	const nzbID, file = "nzb-1", "movie.mkv"
 	const fileSize = int64(1_000_000_000) // 1GB, so byte-ratio cap is not the limiter here
 
-	decision, verdict := s.Decide(nzbID, file, 10, "<msg10>", 700_000, fileSize)
+	decision, verdict := s.Decide(nzbID, file, 10, "<msg10>", 700_000, fileSize, 0)
 	if decision != DecisionPad {
 		t.Fatalf("Decide = %v, want DecisionPad", decision)
 	}
@@ -51,7 +51,7 @@ func TestDecidePadsWithinCapsAndPersists(t *testing.T) {
 
 	// Re-deciding the same already-padded segment should return the same
 	// decision without erroring, and without needing to re-run the caps math.
-	decision2, verdict2 := s.Decide(nzbID, file, 10, "<msg10>", 700_000, fileSize)
+	decision2, verdict2 := s.Decide(nzbID, file, 10, "<msg10>", 700_000, fileSize, 0)
 	if decision2 != DecisionPad || verdict2 != VerdictDegraded {
 		t.Fatalf("re-decide = (%v, %v), want (DecisionPad, VerdictDegraded)", decision2, verdict2)
 	}
@@ -63,7 +63,7 @@ func TestDecidePadsWithinCapsAndPersists(t *testing.T) {
 
 func TestDecideFailsNonVideoContainer(t *testing.T) {
 	s := newTestStore(t)
-	decision, verdict := s.Decide("nzb-1", "release.nfo", 0, "<msg0>", 1000, 1_000_000)
+	decision, verdict := s.Decide("nzb-1", "release.nfo", 0, "<msg0>", 1000, 1_000_000, 0)
 	if decision != DecisionFail {
 		t.Fatalf("Decide = %v, want DecisionFail for non-video-container file", decision)
 	}
@@ -80,14 +80,14 @@ func TestDecideFailsBeyondRunCap(t *testing.T) {
 	// DefaultPolicy().MaxRunSegments consecutive dead segments should still pad...
 	maxRun := DefaultPolicy().MaxRunSegments
 	for i := 0; i < maxRun; i++ {
-		decision, _ := s.Decide(nzbID, file, i, "<msg>", 1000, fileSize)
+		decision, _ := s.Decide(nzbID, file, i, "<msg>", 1000, fileSize, 0)
 		if decision != DecisionPad {
 			t.Fatalf("segment %d: Decide = %v, want DecisionPad", i, decision)
 		}
 	}
 
 	// ...but one more, extending the same contiguous run, should fail.
-	decision, verdict := s.Decide(nzbID, file, maxRun, "<msg>", 1000, fileSize)
+	decision, verdict := s.Decide(nzbID, file, maxRun, "<msg>", 1000, fileSize, 0)
 	if decision != DecisionFail {
 		t.Fatalf("Decide = %v, want DecisionFail once the run exceeds the cap", decision)
 	}
@@ -97,7 +97,7 @@ func TestDecideFailsBeyondRunCap(t *testing.T) {
 
 	// The verdict is sticky: even a fresh, non-contiguous segment on this
 	// file must fail now.
-	decision, verdict = s.Decide(nzbID, file, 1000, "<msg>", 1000, fileSize)
+	decision, verdict = s.Decide(nzbID, file, 1000, "<msg>", 1000, fileSize, 0)
 	if decision != DecisionFail || verdict != VerdictFailed {
 		t.Fatalf("Decide after failed verdict = (%v, %v), want (DecisionFail, VerdictFailed)", decision, verdict)
 	}
@@ -110,7 +110,7 @@ func TestDecideFailsBeyondByteRatioCap(t *testing.T) {
 
 	// 2% of 1000 bytes is 20 bytes; a single 21-byte dead segment already
 	// exceeds the ratio cap.
-	decision, verdict := s.Decide(nzbID, file, 0, "<msg>", 21, fileSize)
+	decision, verdict := s.Decide(nzbID, file, 0, "<msg>", 21, fileSize, 0)
 	if decision != DecisionFail {
 		t.Fatalf("Decide = %v, want DecisionFail once pad bytes exceed the ratio cap", decision)
 	}
@@ -149,7 +149,7 @@ func TestWritePatchClearsDegradedVerdictButNotFailed(t *testing.T) {
 	s := newTestStore(t)
 	const nzbID, file = "nzb-1", "movie.mkv"
 
-	if _, verdict := s.Decide(nzbID, file, 0, "<msg>", 1000, 1_000_000_000); verdict != VerdictDegraded {
+	if _, verdict := s.Decide(nzbID, file, 0, "<msg>", 1000, 1_000_000_000, 0); verdict != VerdictDegraded {
 		t.Fatalf("setup: verdict = %v, want VerdictDegraded", verdict)
 	}
 	if err := s.WritePatch(nzbID, file, 0, []byte("fixed")); err != nil {
@@ -162,7 +162,7 @@ func TestWritePatchClearsDegradedVerdictButNotFailed(t *testing.T) {
 	// Once a file has failed, patching a segment must not resurrect it back
 	// to degraded/clean - the legacy repair path may already be in flight.
 	s2 := newTestStore(t)
-	s2.Decide(nzbID, "release.nfo", 0, "<msg>", 1000, 1_000_000) // non-video -> immediate fail
+	s2.Decide(nzbID, "release.nfo", 0, "<msg>", 1000, 1_000_000, 0) // non-video -> immediate fail
 	if err := s2.WritePatch(nzbID, "release.nfo", 0, []byte("fixed")); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestHandleNilSafety(t *testing.T) {
 	if _, ok := h.PatchBytes("f", 0); ok {
 		t.Fatalf("nil Handle.PatchBytes should report no patch")
 	}
-	if decision, verdict := h.Decide("f", 0, "<m>", 10, 100); decision != DecisionFail || verdict != VerdictFailed {
+	if decision, verdict := h.Decide("f", 0, "<m>", 10, 100, 0); decision != DecisionFail || verdict != VerdictFailed {
 		t.Fatalf("nil Handle.Decide = (%v, %v), want (DecisionFail, VerdictFailed)", decision, verdict)
 	}
 	if h.ShouldLogPad("f", 0) {
@@ -290,7 +290,7 @@ func TestScreenProjectionMatchesRealDecide(t *testing.T) {
 			// already-recorded segments with the newly-discovered ones,
 			// evaluated WITHOUT persisting anything.
 			hypothetical := &FileEntry{DeadSegments: append(append([]DeadSegment{}, tc.already...), tc.newlyMissing...)}
-			_, projectedOK := WithinPadCaps(hypothetical, tc.fileSize, policy)
+			_, projectedOK := WithinPadCaps(hypothetical, tc.fileSize, policy, 0)
 			projectedVerdict := VerdictFailed
 			if projectedOK {
 				projectedVerdict = VerdictDegraded
@@ -309,11 +309,80 @@ func TestScreenProjectionMatchesRealDecide(t *testing.T) {
 			sort.Slice(all, func(i, j int) bool { return all[i].Index < all[j].Index })
 			var gotVerdict Verdict
 			for _, seg := range all {
-				_, gotVerdict = s.Decide("nzb-1", file, seg.Index, "<msg>", seg.Bytes, tc.fileSize)
+				_, gotVerdict = s.Decide("nzb-1", file, seg.Index, "<msg>", seg.Bytes, tc.fileSize, 0)
 			}
 			if gotVerdict != tc.wantVerdict {
 				t.Fatalf("real Decide sequence verdict = %v, want %v", gotVerdict, tc.wantVerdict)
 			}
 		})
+	}
+}
+
+func TestDecideFailsHeaderRegionDamage(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	// Segment 10 sits inside the first 1% of a 5000-segment file (indices
+	// 0-49), so it must fail outright even though every other cap is
+	// nowhere close to being hit.
+	decision, verdict := s.Decide(nzbID, file, 10, "<m>", 1000, 1_000_000_000, 5000)
+	if decision != DecisionFail {
+		t.Fatalf("Decide = %v, want DecisionFail for a dead segment in the header region", decision)
+	}
+	if verdict != VerdictFailed {
+		t.Fatalf("verdict = %v, want VerdictFailed", verdict)
+	}
+}
+
+func TestDecidePadsJustPastHeaderRegion(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	// Segment 50 is the first index outside the header region (0-49) of a
+	// 5000-segment file, so it pads normally.
+	decision, verdict := s.Decide(nzbID, file, 50, "<m>", 1000, 1_000_000_000, 5000)
+	if decision != DecisionPad {
+		t.Fatalf("Decide = %v, want DecisionPad just past the header region", decision)
+	}
+	if verdict != VerdictDegraded {
+		t.Fatalf("verdict = %v, want VerdictDegraded", verdict)
+	}
+}
+
+func TestDecideUnknownTotalSegmentsSkipsHeaderCheck(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	// totalSegments = 0 means "unknown" - the header-region check must be
+	// disabled rather than treating index 0 as always in-region.
+	decision, verdict := s.Decide(nzbID, file, 3, "<m>", 1000, 1_000_000_000, 0)
+	if decision != DecisionPad {
+		t.Fatalf("Decide = %v, want DecisionPad when totalSegments is unknown", decision)
+	}
+	if verdict != VerdictDegraded {
+		t.Fatalf("verdict = %v, want VerdictDegraded", verdict)
+	}
+}
+
+func TestDecideHeaderDamageSelfHealsPreviouslyPadded(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	// First decided without knowing totalSegments - pads.
+	decision, verdict := s.Decide(nzbID, file, 3, "<m>", 1000, 1_000_000_000, 0)
+	if decision != DecisionPad || verdict != VerdictDegraded {
+		t.Fatalf("setup Decide = (%v, %v), want (DecisionPad, VerdictDegraded)", decision, verdict)
+	}
+
+	// Replayed later with totalSegments known: the same segment now falls
+	// in the header region, so it must fail instead of honoring the earlier
+	// pad decision - proving a previously-padded segment re-evaluates
+	// through the caps/positional check rather than short-circuiting.
+	decision, verdict = s.Decide(nzbID, file, 3, "<m>", 1000, 1_000_000_000, 5000)
+	if decision != DecisionFail {
+		t.Fatalf("Decide = %v, want DecisionFail once header damage is detected on replay", decision)
+	}
+	if verdict != VerdictFailed {
+		t.Fatalf("verdict = %v, want VerdictFailed", verdict)
 	}
 }

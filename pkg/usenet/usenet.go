@@ -1143,7 +1143,7 @@ func (u *Usenet) OverlayScreenFile(ctx context.Context, nzoID, filename string) 
 	if u.overlay != nil {
 		policy = u.overlay.Policy()
 	}
-	eval, ok := overlay.WithinPadCaps(&overlay.FileEntry{DeadSegments: h.deadSegments}, file.Size, policy)
+	eval, ok := overlay.WithinPadCaps(&overlay.FileEntry{DeadSegments: h.deadSegments}, file.Size, policy, len(file.Segments))
 	result.ProjectedTotalDead = eval.TotalDead
 	result.ProjectedRun = eval.LongestRun
 	result.ProjectedByteRatio = eval.ByteRatio
