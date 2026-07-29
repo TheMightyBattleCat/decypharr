@@ -95,8 +95,8 @@ func TestOverlayClearFileDamagePreservesPatches(t *testing.T) {
 	file := "movie.mkv"
 
 	// Record a dead segment and get it padded/decided.
-	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000)
-	s.Decide(nzbID, file, 1, "<msg-1>", 1000, 1_000_000)
+	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
+	s.Decide(nzbID, file, 1, "<msg-1>", 1000, 1_000_000, 0)
 
 	// Write a patch for segment 0 (simulating PAR2 repair).
 	if err := s.WritePatch(nzbID, file, 0, []byte("recovered-data")); err != nil {
@@ -157,7 +157,7 @@ func TestOverlayClearFileDamageNoPatches(t *testing.T) {
 	nzbID := "test-nzb"
 	file := "movie.mkv"
 
-	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000)
+	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
 
 	patchesPreserved, err := s.ClearFileDamage(nzbID, file)
 	if err != nil {
@@ -185,8 +185,8 @@ func TestOverlayClearFileDamagePreservesSibling(t *testing.T) {
 	file := "movie.mkv"
 	sibling := "extras.mkv"
 
-	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000)
-	s.Decide(nzbID, sibling, 0, "<msg-sibling>", 1000, 1_000_000)
+	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
+	s.Decide(nzbID, sibling, 0, "<msg-sibling>", 1000, 1_000_000, 0)
 
 	if _, err := s.ClearFileDamage(nzbID, file); err != nil {
 		t.Fatalf("ClearFileDamage: %v", err)
@@ -264,7 +264,7 @@ func TestOverlayDeleteFileRemovesPatches(t *testing.T) {
 	nzbID := "test-nzb"
 	file := "movie.mkv"
 
-	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000)
+	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
 	if err := s.WritePatch(nzbID, file, 0, []byte("recovered")); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestOverlayClearFileDamageDeletesEntryDirWhenEmpty(t *testing.T) {
 	nzbID := "solo-nzb"
 	file := "only-file.mkv"
 
-	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000)
+	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
 
 	if _, err := s.ClearFileDamage(nzbID, file); err != nil {
 		t.Fatalf("ClearFileDamage: %v", err)
@@ -331,10 +331,10 @@ func TestOverlayClearFileDamageDeletesEntryDirWhenEmpty(t *testing.T) {
 // correctly parses both par2cmdline (+count) and MultiPar (-end) naming.
 func TestCensusPar2VolumesCountsRecoveryBlocks(t *testing.T) {
 	files := []storage.Par2FileRef{
-		{Name: "release.par2", Size: 1000},                     // index, not a volume
-		{Name: "release.vol00+04.par2", Size: 5000},             // 4 blocks
-		{Name: "release.vol04+08.par2", Size: 10000},            // 8 blocks
-		{Name: "release.vol12+16.par2", Size: 20000},            // 16 blocks
+		{Name: "release.par2", Size: 1000},           // index, not a volume
+		{Name: "release.vol00+04.par2", Size: 5000},  // 4 blocks
+		{Name: "release.vol04+08.par2", Size: 10000}, // 8 blocks
+		{Name: "release.vol12+16.par2", Size: 20000}, // 16 blocks
 	}
 	vols, indexFiles := censusPar2Volumes(files)
 	if len(indexFiles) != 1 || indexFiles[0].Name != "release.par2" {

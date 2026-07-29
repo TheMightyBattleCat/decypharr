@@ -56,7 +56,7 @@ func TestBuildScreenHypothesisNoFurtherDecay(t *testing.T) {
 
 	policy := overlay.DefaultPolicy()
 	fe := &overlay.FileEntry{DeadSegments: h.deadSegments}
-	if _, ok := overlay.WithinPadCaps(fe, 10_000_000, policy); !ok {
+	if _, ok := overlay.WithinPadCaps(fe, 10_000_000, policy, 0); !ok {
 		t.Fatalf("WithinPadCaps on the projected set = false, want true (a file already degraded within caps, with no further decay, must stay degraded)")
 	}
 }

@@ -250,11 +250,11 @@ func (h *Handle) RecordDead(file string, segIndex int, msgID string, bytes int64
 	return h.store.RecordDead(h.nzbID, file, segIndex, msgID, bytes)
 }
 
-func (h *Handle) Decide(file string, segIndex int, msgID string, segBytes, fileSize int64) (Decision, Verdict) {
+func (h *Handle) Decide(file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
 	if h == nil {
 		return DecisionFail, VerdictFailed
 	}
-	return h.store.Decide(h.nzbID, file, segIndex, msgID, segBytes, fileSize)
+	return h.store.Decide(h.nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments)
 }
 
 func (h *Handle) Verdict(file string) Verdict {
