@@ -195,6 +195,46 @@ func TestRecordDeadIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRecordDeadUpdatesVerdictImmediately(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	// Before any damage is recorded, the file reads as clean.
+	if got := s.Verdict(nzbID, file); got != VerdictClean {
+		t.Fatalf("Verdict before any RecordDead = %v, want VerdictClean", got)
+	}
+
+	// RecordDead is used by the background sweep and the import-availability
+	// gate, neither of which goes through Decide - so it must recompute the
+	// verdict itself instead of leaving a stale VerdictClean sitting next to
+	// a non-empty DeadSegments list.
+	if err := s.RecordDead(nzbID, file, 3, "<msg3>", 500); err != nil {
+		t.Fatalf("RecordDead: %v", err)
+	}
+	if got := s.Verdict(nzbID, file); got == VerdictClean {
+		t.Fatalf("Verdict after RecordDead = %v, want non-clean (verdict must reflect the recorded dead segment)", got)
+	}
+	if got := s.Verdict(nzbID, file); got != VerdictDegraded {
+		t.Fatalf("Verdict after a single RecordDead = %v, want VerdictDegraded", got)
+	}
+}
+
+func TestRecordDeadDoesNotUnfailAStickyFailedVerdict(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "release.nfo" // non-video container -> Decide fails it immediately
+
+	if _, verdict := s.Decide(nzbID, file, 0, "<msg0>", 1000, 1_000_000, 0); verdict != VerdictFailed {
+		t.Fatalf("setup: verdict = %v, want VerdictFailed", verdict)
+	}
+
+	if err := s.RecordDead(nzbID, file, 1, "<msg1>", 500); err != nil {
+		t.Fatalf("RecordDead: %v", err)
+	}
+	if got := s.Verdict(nzbID, file); got != VerdictFailed {
+		t.Fatalf("Verdict after RecordDead on an already-failed file = %v, want VerdictFailed (sticky)", got)
+	}
+}
+
 func TestDeleteEntryRemovesManifestAndPatches(t *testing.T) {
 	s := newTestStore(t)
 	const nzbID, file = "nzb-1", "movie.mkv"
