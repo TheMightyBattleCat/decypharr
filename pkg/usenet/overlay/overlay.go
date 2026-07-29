@@ -426,6 +426,7 @@ func (s *Store) RecordDead(nzbID, file string, segIndex int, msgID string, bytes
 		Index: segIndex, MessageID: msgID, Bytes: bytes, Status: StatusDead,
 	})
 	sortDeadSegments(fe)
+	recomputeVerdictLocked(fe)
 	return s.saveManifestLocked(nzbID, m)
 }
 
