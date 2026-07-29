@@ -642,7 +642,17 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 		// produced no data", "exhausted retries") only increment, so the
 		// breaker requires SUSTAINED failure. This is what stops one bad
 		// moment under load from locking a file out of every ffprobe.
-		if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
+		//
+		// ErrEntryGone is excluded here even though its message ("entry no
+		// longer exists ... not found") satisfies IsPermanentError's substring
+		// match: it means this handle's own backing grab was replaced, not
+		// that an article is missing. staleEntry (just above) already gives it
+		// the correct, passive handling for this handle. Escalating from it too
+		// would resolve by entry name - not by this handle's original nzbID -
+		// and could delete+re-search whatever CURRENT, unrelated grab now
+		// happens to sit at that name, on the strength of a read that never
+		// touched it.
+		if !errors.Is(err, usenet.ErrEntryGone) && (nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err)) {
 			dls.errorCount = maxErrorCount
 			// A permanent article-not-found during a live read is the signal a
 			// repair sweep's sampler can miss: the file's header segments are present
