@@ -730,9 +730,15 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 // Used by the overlay management API's "reclaim disk" action, which must not
 // discard a sibling file's still-live damage record just because one file in
 // the release is fine now.
-func (s *Store) DeleteFile(nzbID, file string) error {
+//
+// removed reports whether there was actually anything to delete: false with
+// a nil error means the call ran cleanly but found no matching record (a
+// no-op, not a failure) - callers must not treat that as success. A non-nil
+// err means the delete itself failed (e.g. I/O error), independent of
+// whether a record existed.
+func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	if s == nil {
-		return nil
+		return false, nil
 	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
@@ -740,11 +746,11 @@ func (s *Store) DeleteFile(nzbID, file string) error {
 
 	m, err := s.loadManifestLocked(nzbID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fe, ok := m.Files[file]
 	if !ok {
-		return nil
+		return false, nil
 	}
 	for _, d := range fe.DeadSegments {
 		if d.Status == StatusPatched {
@@ -755,11 +761,14 @@ func (s *Store) DeleteFile(nzbID, file string) error {
 
 	if len(m.Files) == 0 {
 		if err := os.RemoveAll(s.entryDir(nzbID)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("overlay: delete file (last in entry): %w", err)
+			return false, fmt.Errorf("overlay: delete file (last in entry): %w", err)
 		}
-		return nil
+		return true, nil
 	}
-	return s.saveManifestLocked(nzbID, m)
+	if err := s.saveManifestLocked(nzbID, m); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ShouldLogPad reports whether this is the first time (this process) that

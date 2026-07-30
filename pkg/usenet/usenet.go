@@ -802,11 +802,12 @@ func (u *Usenet) OverlayClearFileDamage(nzoID, filename string) (patchesPreserve
 
 // OverlayDeleteFile removes filename's overlay record and patch blobs from
 // nzoID's manifest, without touching any other file - see
-// overlay.Store.DeleteFile. No-op (nil error) if the overlay store is
-// unavailable.
-func (u *Usenet) OverlayDeleteFile(nzoID, filename string) error {
+// overlay.Store.DeleteFile. removed=false (nil error) if the overlay store
+// is unavailable or held no matching record - callers must not treat that as
+// success.
+func (u *Usenet) OverlayDeleteFile(nzoID, filename string) (removed bool, err error) {
 	if u.overlay == nil {
-		return nil
+		return false, nil
 	}
 	return u.overlay.DeleteFile(nzoID, filename)
 }

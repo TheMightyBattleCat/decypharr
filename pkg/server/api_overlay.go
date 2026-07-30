@@ -704,8 +704,16 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Usenet client not available", http.StatusServiceUnavailable)
 		return
 	}
-	if err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
+	removed, err := u.OverlayDeleteFile(entry.InfoHash, req.File)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		utils.JSONResponse(w, map[string]string{
+			"status": "not_found",
+			"reason": "no overlay record found for this file",
+		}, http.StatusOK)
 		return
 	}
 	// The overlay record is gone, but the file could still be sitting in
@@ -735,7 +743,7 @@ func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if u := s.manager.Usenet(); u != nil {
-		if err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
+		if _, err := u.OverlayDeleteFile(entry.InfoHash, req.File); err != nil {
 			s.logger.Warn().Err(err).Str("entry", req.Entry).Str("file", req.File).Msg("overlay research: failed to clear overlay state")
 		}
 		// Manual research always overrides: the re-grab this triggers must
@@ -832,8 +840,12 @@ func (s *Server) overlayOrphanScan(ctx context.Context, execute bool) (OverlayGC
 				continue
 			}
 			if execute {
-				if derr := u.OverlayDeleteFile(nzbID, file); derr != nil {
+				removed, derr := u.OverlayDeleteFile(nzbID, file)
+				if derr != nil {
 					s.logger.Warn().Err(derr).Str("entry", entry.Name).Str("file", file).Msg("overlay gc: failed to delete orphaned file record")
+					continue
+				}
+				if !removed {
 					continue
 				}
 			}
