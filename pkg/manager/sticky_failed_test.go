@@ -273,8 +273,10 @@ func TestOverlayDeleteFileRemovesPatches(t *testing.T) {
 		t.Fatal("setup: patch not readable")
 	}
 
-	if err := s.DeleteFile(nzbID, file); err != nil {
+	if removed, err := s.DeleteFile(nzbID, file); err != nil {
 		t.Fatalf("DeleteFile: %v", err)
+	} else if !removed {
+		t.Fatal("DeleteFile: expected removed=true, got false")
 	}
 
 	if _, ok := s.PatchBytes(nzbID, file, 0); ok {

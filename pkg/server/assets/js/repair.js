@@ -1439,7 +1439,11 @@ class RepairManager {
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
-            window.createToast(`Reclaimed overlay metadata for ${f.file}`, 'success');
+            if (data && data.status === 'not_found') {
+                window.createToast(`Nothing to reclaim for ${f.file}: ${data.reason || 'no overlay record found'}`, 'warning');
+            } else {
+                window.createToast(`Reclaimed overlay metadata for ${f.file}`, 'success');
+            }
             this.overlaySelected.delete(this.overlayKey(f));
             await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
         } catch (e) {
@@ -1572,7 +1576,7 @@ class RepairManager {
 
     async runOverlayBulkReclaim(items) {
         window.createToast(`Reclaiming ${items.length} file(s)…`, 'info');
-        let ok = 0, fail = 0;
+        let ok = 0, notFound = 0, fail = 0;
         for (const f of items) {
             try {
                 const res = await fetch(`${this.api}/overlay/reclaim`, {
@@ -1580,15 +1584,23 @@ class RepairManager {
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({entry: f.entry, file: f.file}),
                 });
-                if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
-                ok++;
+                const data = await this.parseJSONSafe(res);
+                if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+                if (data && data.status === 'not_found') {
+                    notFound++;
+                } else {
+                    ok++;
+                }
                 this.overlaySelected.delete(this.overlayKey(f));
             } catch (e) {
                 fail++;
                 console.error('Bulk reclaim failed for', f.file, e);
             }
         }
-        window.createToast(`Reclaim: ${ok} done, ${fail} failed`, fail ? 'warning' : 'success');
+        const parts = [`${ok} done`];
+        if (notFound) parts.push(`${notFound} nothing to reclaim`);
+        if (fail) parts.push(`${fail} failed`);
+        window.createToast(`Reclaim: ${parts.join(', ')}`, (fail || notFound) ? 'warning' : 'success');
         await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
     }
 
