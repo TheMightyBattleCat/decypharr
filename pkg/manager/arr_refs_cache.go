@@ -33,17 +33,30 @@ import (
 )
 
 const (
-	arrRefsCacheTTL       = 60 * time.Second
-	arrRefsRefreshTimeout = 5 * time.Second
+	// arrRefsCacheTTL is set well above arrRefsRefreshTimeout so a
+	// successful build settles into a real idle window before the next one
+	// is due, rather than the fan-out running back-to-back forever.
+	arrRefsCacheTTL = 5 * time.Minute
+
+	// arrRefsRefreshTimeout bounds the background build. This refresh never
+	// blocks a request (see get, below), so the only cost of a generous
+	// budget is how long a stale reference set is served before a
+	// successful fetch replaces it - measured whole-library fan-out cost
+	// against a real Sonarr/Radarr was ~59s (494 series, sequential
+	// episodefile+episode calls per series), so 120s leaves headroom
+	// without raising the TTL needlessly high.
+	arrRefsRefreshTimeout = 120 * time.Second
 
 	// arrRefsFailedRetryInterval is the minimum time between background
 	// refresh attempts when the cache is cold or the last attempt failed.
-	// Without this gate, every overlay request arriving while the Arrs are
-	// down would spawn (a deduplicated, but still repeatedly-scheduled) new
-	// refresh the instant the in-flight one finishes. Reusing
-	// arrRefsRefreshTimeout as this interval keeps behaviour simple: at most
-	// one build attempt in flight or freshly failed per timeout window.
-	arrRefsFailedRetryInterval = arrRefsRefreshTimeout
+	// Deliberately much shorter than arrRefsRefreshTimeout: it only governs
+	// how soon a fresh attempt is scheduled after one ends (success or
+	// failure), not how many run concurrently - the singleflight group in
+	// get already collapses any overlapping attempts into the single
+	// in-flight build, so a short interval here just means a genuinely-down
+	// Arr is retried promptly rather than waiting a full 120s, without
+	// risking a second concurrent fan-out.
+	arrRefsFailedRetryInterval = 5 * time.Second
 )
 
 // arrRefsCache holds the most recently built Arr reference set for the
