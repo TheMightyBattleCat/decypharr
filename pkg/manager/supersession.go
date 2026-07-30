@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -119,7 +120,21 @@ func classifySupersession(h *storage.EntryHealth, refs map[string]map[string]str
 // calls this on every request.
 func (r *Repair) BuildArrReferencedSet(ctx context.Context) (map[string]map[string]string, error) {
 	refs := r.arrRefs.get(func(cacheCtx context.Context) (map[string]map[string]string, error) {
-		return r.buildArrReferencedSet(cacheCtx)
+		start := time.Now()
+		v, err := r.buildArrReferencedSet(cacheCtx)
+		dur := time.Since(start)
+		if err != nil {
+			r.logger.Warn().Err(err).Dur("duration", dur).
+				Msg("Overlay: background Arr reference set refresh failed or timed out")
+			return v, err
+		}
+		refCount := 0
+		for _, files := range v {
+			refCount += len(files)
+		}
+		r.logger.Info().Dur("duration", dur).Int("entries", len(v)).Int("refs", refCount).
+			Msg("Overlay: background Arr reference set refresh completed")
+		return v, err
 	})
 	return refs, nil
 }
