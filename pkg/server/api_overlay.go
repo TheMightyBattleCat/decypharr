@@ -890,3 +890,48 @@ func (s *Server) handleOverlayOrphanCount(w http.ResponseWriter, r *http.Request
 		RefsAvailable: scan.RefsAvailable,
 	}, http.StatusOK)
 }
+
+// overlayReapRequest is the body shape for handleOverlayReap. Unlike the
+// other overlay action handlers above (see overlayFileRequest), this
+// operates directly on the overlay nzbID rather than resolving through an
+// entry name, matching Manager.ReapOverlay / OverlayReapVerdict's signature.
+// Execute defaults to false so a bare {nzb_id, file} body is always a dry
+// run.
+type overlayReapRequest struct {
+	NzbID   string `json:"nzb_id"`
+	File    string `json:"file"`
+	Execute bool   `json:"execute"`
+}
+
+// handleOverlayReap resolves (nzb_id, file) against Manager.ReapOverlay and,
+// only when execute=true and the verdict allows it, deletes the stale
+// overlay record - see ReapOverlay's WouldReap=false guard, which refuses to
+// touch a record that's still the live owner of its slot even in execute
+// mode. Distinct from handleOverlayReclaim: reclaim operates on a live
+// entry's own file by design, reap is the opposite - it only ever acts on a
+// record the live index has already moved on from. API-only for now, no GUI
+// entry point until the dry-run mode has been exercised against live data.
+func (s *Server) handleOverlayReap(w http.ResponseWriter, r *http.Request) {
+	var req overlayReapRequest
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.NzbID = strings.TrimSpace(req.NzbID)
+	req.File = strings.TrimSpace(req.File)
+	if req.NzbID == "" || req.File == "" {
+		http.Error(w, "nzb_id and file are required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.manager.ReapOverlay(req.NzbID, req.File, req.Execute)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{
+		"mode":    result.Mode,
+		"removed": result.Removed,
+		"verdict": result.Verdict,
+	}, http.StatusOK)
+}
