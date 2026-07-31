@@ -321,6 +321,13 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 
+			// A repair that has actually fetched the recovery data and been marked
+			// terminal is the authoritative word on whether this file can be fixed;
+			// it overrides the cheap pre-flight estimate that set of.Repairable.
+			if of.Par2Terminal {
+				of.Repairable = false
+			}
+
 			switch {
 			case running:
 				of.RepairStatus = OverlayRepairRunning
