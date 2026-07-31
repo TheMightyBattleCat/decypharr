@@ -728,6 +728,11 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 	// it so the next read re-verifies from scratch instead of
 	// short-circuiting on a stale cause.
 	u.ClearFailedFile(entry.InfoHash, req.File)
+	if removed {
+		if _, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder()); ok {
+			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("removed cached copy for reclaimed file")
+		}
+	}
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
 }
 

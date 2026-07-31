@@ -689,6 +689,16 @@ func (r *Repair) removeStaleNZBCacheDir(entryName string) (int64, bool) {
 	return allocated, true
 }
 
+// RemoveEntryCacheDir removes the DFS cache directory for a single entry,
+// identified by its folder name. It reuses the stale-NZB cleanup path, so it
+// keeps the same two safeguards: it will not remove the cache while another
+// healthy entry still shares the folder name, and it only ever removes a
+// directory inside the configured cache location. Returns the bytes freed and
+// whether anything was removed.
+func (r *Repair) RemoveEntryCacheDir(entryName string) (int64, bool) {
+	return r.removeStaleNZBCacheDir(entryName)
+}
+
 // staleNZBCacheDirPath resolves and validates the DFS cache directory for
 // entryName. ok=false whenever DFS caching isn't in play at all (rclone
 // mode, cache dir unset) or the resolved path would land outside the
