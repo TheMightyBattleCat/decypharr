@@ -81,6 +81,7 @@ var par2TerminalSubstrings = []string{
 	"no posted file matched the PAR2 recovery set",
 	"match posted files:",
 	"is not part of any matched posted file",
+	"no posted-file fetcher for file",
 	"map dead segment",
 	"exceeds the",
 	"recovery slices fetched/available",
