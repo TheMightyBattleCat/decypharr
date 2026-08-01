@@ -794,6 +794,12 @@ func (p *Par2Repair) urgentWorker() {
 			return
 		}
 		if !config.Get().Repair.Par2RepairEnabled() {
+			// The job was dequeued but PAR2 is now disabled, so runJob will not
+			// run and would otherwise strand a handler claim inherited from a
+			// preempted batch job. Free it so the entry is not blocked until TTL.
+			if p.repair != nil && p.repair.handlers != nil {
+				p.repair.handlers.Release(nzbID)
+			}
 			continue
 		}
 		p.runJob(nzbID, laneUrgent)
@@ -882,13 +888,19 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	// automatic claims until a manual action clears it) or simply frees the
 	// slot for whatever runs next.
 	terminal := false
+	preempted := false
 	defer func() {
 		if p.repair == nil || p.repair.handlers == nil {
 			return
 		}
-		if terminal {
+		switch {
+		case terminal:
 			p.repair.handlers.MarkTerminal(nzbID)
-		} else {
+		case preempted:
+			// Superseded by an urgent-lane job for the same entry, which will
+			// claim and release the handler slot itself. Releasing here would
+			// briefly hand the entry back to another caller mid-flight.
+		default:
 			p.repair.handlers.Release(nzbID)
 		}
 	}()
@@ -967,6 +979,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	var slicesRepaired int
 	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, progress); err != nil {
 		if job.preempted.Load() {
+			preempted = true
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
 			return
 		}
