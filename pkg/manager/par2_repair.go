@@ -720,6 +720,14 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 		proximity = 0
 	}
 
+	// An urgent request must obey the same repairability gate as the batch
+	// path: if the entry is marked unrepairable or is still inside its
+	// backoff window, do not preempt a running job or queue a new one.
+	// Playback padding already covers the viewing experience meanwhile.
+	if !p.par2ShouldAutoEnqueue(nzbID) {
+		return
+	}
+
 	p.runningMu.Lock()
 	if job, ok := p.running[nzbID]; ok && job.lane == laneBatch {
 		job.preempted.Store(true)
