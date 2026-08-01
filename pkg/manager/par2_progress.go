@@ -87,6 +87,27 @@ func (s *par2JobProgressState) touch() {
 	s.updatedAt.Store(time.Now().UnixNano())
 }
 
+// LastUpdate reports the time of the most recent progress touch. Lock-free
+// (updatedAt is atomic), safe to poll from a watchdog while fetch
+// goroutines are writing.
+func (s *par2JobProgressState) LastUpdate() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	return time.Unix(0, s.updatedAt.Load())
+}
+
+// Phase reports the current phase under a read lock. Writes (SetPhase) are
+// infrequent, so this is cheap enough to poll.
+func (s *par2JobProgressState) Phase() Par2JobPhase {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.phase
+}
+
 // Every setter below is a nil-safe no-op on a nil receiver: callers thread
 // *par2JobProgressState through plain fields (e.g. cacheSlicedSource.progress)
 // that unit tests and some construction paths deliberately leave nil rather

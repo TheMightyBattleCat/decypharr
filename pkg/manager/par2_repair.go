@@ -79,6 +79,14 @@ const (
 	// par2ArticleFetchTimeout bounds a single article fetch within a job.
 	par2ArticleFetchTimeout = 60 * time.Second
 
+	// par2JobIdleTimeout cancels a repair that has made no forward progress
+	// for this long WHILE in a network phase (fetching recovery or streaming
+	// intact data). It intentionally does not apply during queued, solving
+	// (pure CPU) or writing phases, where progress timestamps do not move for
+	// legitimate reasons. Comfortably above par2ArticleFetchTimeout so a
+	// single slow-but-valid article never trips it.
+	par2JobIdleTimeout = 120 * time.Second
+
 	// md5_16kSize is the PAR2-defined sample size for tie-breaking a
 	// posted-file/FileDesc length match.
 	md5_16kSize = 16384
@@ -971,6 +979,11 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		jobCancel()
 	}()
 
+	// Idle watchdog: cancel a repair that stalls with no forward progress
+	// during a network phase. Exits cleanly when the job ends (timeoutCtx is
+	// cancelled by the defers above / the job timeout / preemption / shutdown).
+	go p.watchIdle(timeoutCtx, jobCancel, progress)
+
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
 	if err != nil || len(pending) == 0 {
 		progress.SetPhase(Par2PhaseCompleted) // nothing pending - not a failure, just nothing to do
@@ -1722,4 +1735,37 @@ func extractPostedRange(idx *par2.Index, repairedByIndex map[int64][]byte, fileI
 		pos += n
 	}
 	return out, nil
+}
+
+// watchIdle cancels the repair job if it makes no progress for
+// par2JobIdleTimeout while in a network-bound phase. It reads the progress
+// timestamp (lock-free) and phase on a ticker and only accrues idle time in
+// fetching_recovery / streaming_intact; any other phase resets the idle
+// reference, so a long CPU solve or a queued wait can never trip it. Stops
+// as soon as ctx is done (normal completion, timeout, preemption, shutdown).
+func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, progress *par2JobProgressState) {
+	if progress == nil {
+		return
+	}
+	const pollInterval = 15 * time.Second
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			switch progress.Phase() {
+			case Par2PhaseFetchingRecovery, Par2PhaseStreamingIntact:
+				if time.Since(progress.LastUpdate()) >= par2JobIdleTimeout {
+					p.logger.Warn().
+						Str("phase", string(progress.Phase())).
+						Dur("idle_for", time.Since(progress.LastUpdate())).
+						Msg("par2 repair cancelled: no progress in a network phase")
+					cancel()
+					return
+				}
+			}
+		}
+	}
 }
