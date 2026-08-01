@@ -729,7 +729,7 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 	// short-circuiting on a stale cause.
 	u.ClearFailedFile(entry.InfoHash, req.File)
 	if removed {
-		if _, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder()); ok {
+		if _, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
 			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("removed cached copy for reclaimed file")
 		}
 	}

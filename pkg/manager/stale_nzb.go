@@ -583,7 +583,7 @@ func (r *Repair) deleteStaleNZBEntry(entry *storage.Entry, exclude map[string]st
 		return freed, fmt.Errorf("failed to delete entry record: %w", err)
 	}
 
-	if cacheBytes, ok := r.removeStaleNZBCacheDir(entryName); ok {
+	if cacheBytes, ok := r.removeStaleNZBCacheDir(entryName, ""); ok {
 		freed.Cache = cacheBytes
 	}
 	freed.Total = freed.NZBMeta + freed.Cache
@@ -663,13 +663,19 @@ func (r *Repair) peekStaleNZBCacheBytesLogged(entryName string) int64 {
 // ok=false (0 bytes, nothing removed) covers every "not safe" and "nothing
 // there" case alike - this must never be treated as a failure; not removing
 // a directory is always safe, removing the wrong one is not.
-func (r *Repair) removeStaleNZBCacheDir(entryName string) (int64, bool) {
+func (r *Repair) removeStaleNZBCacheDir(entryName, excludeInfoHash string) (int64, bool) {
 	if item, err := r.manager.GetEntryItem(entryName); err == nil && item != nil {
 		for _, f := range item.Files {
-			if f != nil && !f.Deleted {
-				r.logger.Debug().Str("entry", entryName).Msg("StaleNZB: cache dir still claimed by another entry sharing this name; leaving it")
-				return 0, false
+			if f == nil || f.Deleted {
+				continue
 			}
+			// A file belonging to the entry we're reclaiming is not a twin;
+			// only a genuinely different same-name entry should hold the cache.
+			if excludeInfoHash != "" && f.InfoHash == excludeInfoHash {
+				continue
+			}
+			r.logger.Debug().Str("entry", entryName).Msg("StaleNZB: cache dir still claimed by another entry sharing this name; leaving it")
+			return 0, false
 		}
 	}
 
@@ -695,8 +701,8 @@ func (r *Repair) removeStaleNZBCacheDir(entryName string) (int64, bool) {
 // healthy entry still shares the folder name, and it only ever removes a
 // directory inside the configured cache location. Returns the bytes freed and
 // whether anything was removed.
-func (r *Repair) RemoveEntryCacheDir(entryName string) (int64, bool) {
-	return r.removeStaleNZBCacheDir(entryName)
+func (r *Repair) RemoveEntryCacheDir(entryName, infoHash string) (int64, bool) {
+	return r.removeStaleNZBCacheDir(entryName, infoHash)
 }
 
 // staleNZBCacheDirPath resolves and validates the DFS cache directory for
