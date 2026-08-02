@@ -802,6 +802,40 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		return
 	}
 
+	// Try a cache-only PAR2 pass before ever touching the Arr: it's free (no
+	// provider bandwidth for intact data - see warmSweepRepair) whenever it
+	// applies, so it's always worth trying first. Files it actually fixes
+	// are dropped from h right here, exactly as if the probe had never
+	// flagged them broken - the remainder falls through to the unchanged
+	// delete + blocklist + re-search heal below.
+	if fixed := r.warmSweepRepair(ctx, h.BrokenFiles); len(fixed) > 0 {
+		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
+		for _, bf := range h.BrokenFiles {
+			if _, ok := fixed[bf.InfoHash]; !ok {
+				remaining = append(remaining, bf)
+			}
+		}
+		filesFixed := len(h.BrokenFiles) - len(remaining)
+		h.BrokenFiles = remaining
+		h.BrokenCount = len(remaining)
+
+		statsMu.Lock()
+		run.Stats.Repaired++
+		r.saveRun(run)
+		statsMu.Unlock()
+		r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
+			Msg("Repair: resolved via warm PAR2 sweep (cache-only, no re-grab needed)")
+
+		if len(remaining) == 0 {
+			h.Status = storage.HealthHealthy
+			h.FailureReason = ""
+			h.LastRepairAt = time.Now()
+			h.LastOKAt = time.Now()
+			r.saveHealth(h)
+			return
+		}
+	}
+
 	// An entry's broken files normally all belong to one Arr, but a merged
 	// candidate can span more — group defensively.
 	byArr := make(map[string][]arr.ContentFile)
