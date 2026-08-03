@@ -24,9 +24,11 @@
 # and restarts the service. It does NOT revert config.json - this script
 # never writes config.json, so there is nothing there to revert.
 #
-# Hard rule: this script must never enable PrecacheReadAhead ("Fast
-# read-ahead"). It never touches config.json at all, and it verifies that
-# invariant held after every run (see verify_precache_still_off).
+# Hard rule: PrecacheReadAhead ("Fast read-ahead") MAY be enabled - this
+# script never touches config.json either way - but unbounded read-ahead is
+# bandwidth/cache-aggressive, so this script refuses to leave a deploy
+# standing if read-ahead is on with PrecacheMaxBytes unset/0 or above the
+# 256GiB ceiling (see verify_precache_bounded).
 
 set -euo pipefail
 
@@ -50,6 +52,8 @@ SERVICE="${DEPLOY_SERVICE:-decypharr_beta}"
 MOUNT_PATH="${DEPLOY_MOUNT_PATH:?set DEPLOY_MOUNT_PATH in scripts/deploy.env}"
 HEALTH_PORT="8686"
 KEEP_BACKUPS=5
+# 256 GiB - must match internal/config/precache.go's precacheMaxBytesCeiling
+PRECACHE_MAX_BYTES_CEILING=274877906944
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 ${REMOTE_HOST}"
 
@@ -267,13 +271,17 @@ else
     echo "FAIL overlay_repair_progress: HTTP \$code"
 fi
 
-# /api/precache/status - must respond AND report the feature disabled
+# /api/precache/status - must respond and report read-ahead + its bound.
+# Does not assert read_ahead_enabled=False anymore: read-ahead may
+# legitimately be on now. The bound is enforced by verify_precache_bounded
+# (step 8), not here - this check just needs the endpoint to answer sanely.
 body=\$(curl -s --max-time 5 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/precache/status" 2>/dev/null || true)
 enabled=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('read_ahead_enabled', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
-if [ "\$enabled" = "False" ]; then
-    echo "PASS precache_status: read_ahead_enabled=False"
+max_bytes=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('max_bytes', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
+if [ "\$enabled" != "PARSE_ERROR" ] && [ "\$enabled" != "MISSING" ]; then
+    echo "PASS precache_status: read_ahead_enabled=\$enabled max_bytes=\$max_bytes"
 else
-    echo "FAIL precache_status: read_ahead_enabled=\$enabled (response: \$body)"
+    echo "FAIL precache_status: could not parse read_ahead_enabled/max_bytes (response: \$body)"
 fi
 REMOTE
 )"
@@ -301,16 +309,30 @@ $failing_checks"
 }
 
 # ---------------------------------------------------------------------------
-# Step 8 - verify the hard rule (PrecacheReadAhead never enabled by this script)
+# Step 8 - verify the hard rule (PrecacheReadAhead, if on, stays bounded)
 # ---------------------------------------------------------------------------
 
-verify_precache_still_off() {
-    local after
+verify_precache_bounded() {
+    local after max_bytes
     after="$($SSH "python3 -c \"import json; print(json.load(open('${REMOTE_DEPLOY_DIR}/config.json')).get('repair',{}).get('precache_read_ahead_enabled', False))\"" 2>/dev/null || echo "False")"
-    if [ "$after" = "True" ]; then
-        rollback "hard_rule_violation: PrecacheReadAhead is enabled after deploy (was $PRECACHE_BEFORE before) - this script never enables it, something else did. Rolled back."
+
+    if [ "$after" != "True" ]; then
+        PRECACHE_SUMMARY="off (was $PRECACHE_BEFORE before)"
+        log "PrecacheReadAhead is off after deploy (config.json untouched by this script)"
+        return
     fi
-    log "PrecacheReadAhead confirmed still off after deploy (config.json untouched by this script)"
+
+    max_bytes="$($SSH "python3 -c \"import json; print(json.load(open('${REMOTE_DEPLOY_DIR}/config.json')).get('precache',{}).get('precache_max_bytes'))\"" 2>/dev/null || echo "None")"
+
+    if [ "$max_bytes" = "None" ] || [ "$max_bytes" = "0" ]; then
+        rollback "hard_rule_violation: PrecacheReadAhead is enabled after deploy (was $PRECACHE_BEFORE before) but precache_max_bytes is $max_bytes (unset/0 = unbounded) - read-ahead must be bounded by a sane PrecacheMaxBytes. Rolled back."
+    fi
+    if [ "$max_bytes" -gt "$PRECACHE_MAX_BYTES_CEILING" ] 2>/dev/null; then
+        rollback "hard_rule_violation: PrecacheReadAhead is enabled after deploy with precache_max_bytes=$max_bytes bytes, exceeding the 256GiB ceiling ($PRECACHE_MAX_BYTES_CEILING). Rolled back."
+    fi
+
+    PRECACHE_SUMMARY="on, bounded by precache_max_bytes=${max_bytes} bytes (<= 256GiB ceiling)"
+    log "PrecacheReadAhead is on after deploy, bounded by precache_max_bytes=$max_bytes bytes"
 }
 
 # ---------------------------------------------------------------------------
@@ -333,7 +355,7 @@ main() {
         rollback "$failing"
     fi
 
-    verify_precache_still_off
+    verify_precache_bounded
 
     local passed
     passed="$(echo "$health_output" | grep '^PASS' | sed 's/^PASS //')"
@@ -346,7 +368,7 @@ main() {
     echo "Backup:        ${REMOTE_DEPLOY_DIR}/${BACKUP_NAME}"
     echo "Checks passed:"
     echo "$passed" | sed 's/^/  - /'
-    echo "PrecacheReadAhead: off (untouched)"
+    echo "PrecacheReadAhead: $PRECACHE_SUMMARY"
 }
 
 main "$@"
