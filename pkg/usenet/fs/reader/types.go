@@ -324,6 +324,35 @@ func PaddingDisabled(ctx context.Context) bool {
 	return paddingDisabled(ctx)
 }
 
+// burstNoFillCtxKey marks a context as a precache next-episode burst
+// download (see pkg/manager.Precache.precacheEpisodeFile, which drives
+// pkg/usenet.Usenet.ReadAhead) - deliberately distinct from noPadCtxKey.
+// ContextWithoutPadding also suppresses overlay damage recording, which is
+// right for a one-off ffprobe/sweep verification read but wrong here: the
+// burst's whole purpose is to detect damage and queue repair ahead of
+// playback (see Precache.recordReadiness), so Decide/EnqueueRepair must
+// still run on a confirmed-dead segment. What must NOT happen is
+// SegmentFetcher.doFetch fabricating zero-fill bytes for it - the burst has
+// no viewer waiting for an instant response, and any bytes it writes can
+// end up durably persisted into the DFS cache (see
+// pkg/manager.persistDurableRanges), so a dead article must surface as a
+// real fetch failure instead of looking like genuine cached data.
+type burstNoFillCtxKey struct{}
+
+// ContextForBurstDownload marks ctx so a confirmed-dead segment is still
+// recorded in the overlay and queued for repair exactly as a live read
+// would, but SegmentFetcher.doFetch never zero-fills it into the cache -
+// see burstNoFillCtxKey.
+func ContextForBurstDownload(ctx context.Context) context.Context {
+	return context.WithValue(ctx, burstNoFillCtxKey{}, true)
+}
+
+// burstNoFill reports whether ctx was marked by ContextForBurstDownload.
+func burstNoFill(ctx context.Context) bool {
+	v, _ := ctx.Value(burstNoFillCtxKey{}).(bool)
+	return v
+}
+
 // PrefetchableReaderAt extends io.ReaderAt with prefetch capability.
 // This allows callers to trigger segment downloads before starting reads.
 type PrefetchableReaderAt interface {

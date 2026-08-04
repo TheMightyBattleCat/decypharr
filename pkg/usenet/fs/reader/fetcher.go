@@ -314,7 +314,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// can never look healthy by way of the padding that makes it
 		// playable.
 		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) && !paddingDisabled(ctx) {
-			if sf.handleConfirmedMissing(segIdx, messageID) {
+			if sf.handleConfirmedMissing(ctx, segIdx, messageID) {
 				sf.stats.Downloads.Add(1)
 				return nil
 			}
@@ -332,10 +332,12 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 // fetch has permanently failed across every provider. Returns true if it
 // wrote replacement bytes into the cache (patch or pad), in which case the
 // caller treats the fetch as a success; false means the overlay declined
-// (FAIL verdict, or an I/O error saving overlay state) and the original
+// (FAIL verdict, or an I/O error saving overlay state), or ctx is a
+// burst-download read that must not have zero-fill bytes fabricated for it
+// (see ContextForBurstDownload) - either way, the original
 // article-not-found error should propagate exactly as it did before this
 // feature existed.
-func (sf *SegmentFetcher) handleConfirmedMissing(segIdx int, messageID string) bool {
+func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int, messageID string) bool {
 	overlayHandle := sf.config.Overlay
 	file := sf.config.OverlayFile
 
@@ -357,6 +359,17 @@ func (sf *SegmentFetcher) handleConfirmedMissing(segIdx int, messageID string) b
 		return false
 	}
 
+	// The segment is recorded dead and a repair gets queued regardless of
+	// whether this particular read is allowed to fabricate replacement
+	// bytes - a burst download still needs its own damage-detection to see
+	// this (see Precache.recordReadiness), it just must not receive
+	// zero-fill bytes that could be mistaken for genuine cached data.
+	overlayHandle.EnqueueRepair()
+
+	if burstNoFill(ctx) {
+		return false
+	}
+
 	if overlayHandle.ShouldLogPad(file, segIdx) {
 		sf.logger.Info().
 			Str("entry", overlayHandle.NzbID()).
@@ -364,7 +377,6 @@ func (sf *SegmentFetcher) handleConfirmedMissing(segIdx int, messageID string) b
 			Int("segment", segIdx).
 			Msg("segment padded")
 	}
-	overlayHandle.EnqueueRepair()
 
 	if err := sf.cache.Put(segIdx, make([]byte, logicalLen)); err != nil {
 		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write zero-fill padding into cache")

@@ -16,6 +16,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 const (
@@ -171,16 +172,23 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	concurrency := p.cfg().ReadAheadConcurrency()
 	p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Msg("burst-downloading next episode ahead of playback")
 
-	if err := p.manager.usenet.ReadAhead(ctx, nextEntry.InfoHash, filename, 0, concurrency); err != nil {
+	// No viewer is waiting on this read, so a dead article must surface as a
+	// real fetch failure instead of being zero-filled - the fabricated bytes
+	// could otherwise end up durably persisted into the DFS cache below as if
+	// they were genuine data. The overlay still records the damage and queues
+	// its repair exactly as a live read would - see ContextForBurstDownload.
+	burstCtx := usenet.ContextForBurstDownload(ctx)
+
+	if err := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency); err != nil {
 		p.logger.Debug().Err(err).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
 	}
 
 	// Durably persist whatever came back CLEAN into the DFS cache now, before
 	// waiting on repair - see persistCleanRanges for why damaged segments are
 	// deliberately excluded rather than persisted as padding.
-	p.persistCleanRanges(ctx, nextEntry, filename, next.Size)
+	p.persistCleanRanges(burstCtx, nextEntry, filename, next.Size)
 
-	p.recordReadiness(ctx, nextEntry, filename, next.Size)
+	p.recordReadiness(burstCtx, nextEntry, filename, next.Size)
 
 	if p.cfg().PrecacheEvictAfterWatched {
 		p.markPrecached(nextEntry.InfoHash, filename, next.Size)

@@ -1387,6 +1387,21 @@ func IsVerificationRead(ctx context.Context) bool {
 	return reader.PaddingDisabled(ctx)
 }
 
+// ContextForBurstDownload marks ctx so the segment fetcher still records a
+// confirmed-dead segment in the overlay and queues its repair, but never
+// fabricates zero-fill bytes for it - see reader.ContextForBurstDownload.
+// Deliberately NOT the same marker ContextForVerificationRead uses: a
+// verification read must suppress overlay recording entirely, while a
+// precache burst still needs its own damage-detection to see the dead
+// segment. Callers pass the returned context into ReadAhead for the
+// next-episode pre-cache burst (see pkg/manager.Precache.precacheEpisodeFile),
+// which has no viewer waiting and would rather fail a dead segment outright
+// than risk zero-fill bytes being durably persisted into the DFS cache as if
+// they were genuine data.
+func ContextForBurstDownload(ctx context.Context) context.Context {
+	return reader.ContextForBurstDownload(ctx)
+}
+
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
 	if start < 0 {
