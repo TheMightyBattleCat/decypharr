@@ -1379,6 +1379,14 @@ func ContextForVerificationRead(ctx context.Context) context.Context {
 	return reader.ContextWithoutPadding(ctx)
 }
 
+// IsVerificationRead reports whether ctx was marked by ContextForVerificationRead.
+// Callers outside this package (pkg/manager) use this to skip triggering
+// behavior meant only for real client playback - e.g. read-ahead precache -
+// on decypharr's own internal ffprobe/sweep reads.
+func IsVerificationRead(ctx context.Context) bool {
+	return reader.PaddingDisabled(ctx)
+}
+
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
 	if start < 0 {
