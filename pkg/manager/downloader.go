@@ -163,12 +163,42 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 		return err
 	}
 	if err := d.ffprobeImportGate(entry); err != nil {
+		// By this point processSymlink/processDownload/processStrm has
+		// already created the symlink tree (or downloaded the file) and,
+		// for symlink NZB entries, warmed the DFS cache for it. The
+		// rejection path this error feeds into (processAction ->
+		// entry.MarkAsError) only ever flips the entry's error state, so
+		// without this both would be left behind as permanent orphans.
+		d.cleanupRejectedImport(entry)
 		return err
 	}
 	d.markAsCompleted(entry)
 	d.notifyCompleted(entry)
 	d.triggerArrRefresh(entry)
 	return nil
+}
+
+// cleanupRejectedImport removes the on-disk artifacts a confirmed-broken
+// ffprobe import leaves behind: the symlink tree (or downloaded file) at
+// entry.DownloadPath(), and, if one was warmed, the DFS cache dir backing
+// it. RemoveEntryCacheDir carries its own safety checks (DFS mode + a
+// configured cache dir, resolved path contained within it, and no other
+// live entry still sharing the folder name), so it's always safe to call
+// here even when there's nothing to remove.
+func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
+	symlinkPath := entry.DownloadPath()
+	if err := os.RemoveAll(symlinkPath); err != nil {
+		d.logger.Warn().Err(err).Str("entry", entry.Name).Str("path", symlinkPath).
+			Msg("Import: failed to remove files for ffprobe-rejected import")
+	} else {
+		d.logger.Info().Str("entry", entry.Name).Str("path", symlinkPath).
+			Msg("Import: removed files for ffprobe-rejected import")
+	}
+
+	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
+		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
+			Msg("Import: removed DFS cache dir for ffprobe-rejected import")
+	}
 }
 
 // importFFProbeChecker returns the shared ffprobe checker for the import
