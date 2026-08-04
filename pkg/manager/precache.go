@@ -72,6 +72,12 @@ type Precache struct {
 	readinessMu sync.Mutex
 	readiness   map[string]EpisodeReadiness
 
+	// cachePopulateOnce guards populateFromCache, the "Tier 1" restart fix
+	// that seeds readiness rows from the DFS cache's on-disk state - run
+	// lazily on the first Summary() call rather than from NewPrecache, so it
+	// never races the mount not being ready yet at process startup.
+	cachePopulateOnce sync.Once
+
 	// plexChecker gates read-ahead bursts behind an active Plex playing
 	// session for the file being read - see isPlexWatching's doc comment.
 	// Always non-nil; a no-op (allows everything) when config.PlexConfig.URL
@@ -362,14 +368,34 @@ func (p *Precache) Summary() PrecacheSummary {
 	if p == nil {
 		return PrecacheSummary{}
 	}
+	p.cachePopulateOnce.Do(p.populateFromCache)
 	cfg := p.cfg()
 
 	p.readinessMu.Lock()
+	keys := make([]string, 0, len(p.readiness))
 	readiness := make([]EpisodeReadiness, 0, len(p.readiness))
-	for _, r := range p.readiness {
+	for k, r := range p.readiness {
+		keys = append(keys, k)
 		readiness = append(readiness, r)
 	}
 	p.readinessMu.Unlock()
+
+	// Refresh each row's cache-coverage figure from the live DFS cache
+	// outside the lock (CacheCoverage may hit disk) - see
+	// refreshCacheCoverage's doc comment for why a miss never clears an
+	// already-known figure.
+	reader := p.cacheCoverageReader()
+	for i := range readiness {
+		p.refreshCacheCoverage(reader, &readiness[i])
+	}
+	if reader != nil {
+		p.readinessMu.Lock()
+		for i, k := range keys {
+			p.readiness[k] = readiness[i]
+		}
+		p.readinessMu.Unlock()
+	}
+
 	sort.Slice(readiness, func(i, j int) bool { return readiness[i].ReadyAt.After(readiness[j].ReadyAt) })
 	if len(readiness) > precacheReadinessDisplayLimit {
 		readiness = readiness[:precacheReadinessDisplayLimit]

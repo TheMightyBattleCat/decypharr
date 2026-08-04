@@ -252,6 +252,25 @@ func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p
 	return err
 }
 
+// CacheCoverage returns filename's cache coverage under entryName: cached
+// bytes against the file's total declared size. Tries the live in-memory
+// item first (Cache.PeekItem / CacheItem.Coverage) - the freshest source,
+// current mid-download state included - and falls back to the on-disk
+// metadata sidecar (Cache.DiskCoverage) for a file cached in a prior run
+// that hasn't been reopened yet this process. ok=false means neither source
+// has anything.
+func (m *Manager) CacheCoverage(entryName, filename string) (cached, total int64, ok bool) {
+	if m.cache == nil {
+		return 0, 0, false
+	}
+	if item, found := m.cache.PeekItem(entryName, filename); found {
+		if c, t, ok := item.Coverage(); ok {
+			return c, t, true
+		}
+	}
+	return m.cache.DiskCoverage(entryName, filename)
+}
+
 func buildFileKey(parent, name string) string {
 	if parent == "" {
 		return name

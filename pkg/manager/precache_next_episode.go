@@ -43,6 +43,15 @@ type EpisodeReadiness struct {
 	Clean            bool      `json:"clean"`             // no damage found at all
 	SegmentsRepaired int       `json:"segments_repaired"` // > 0 only when damage was found AND fully repaired before the wait timed out
 	SegmentsPending  int       `json:"segments_pending"`  // still-damaged segments left when the wait gave up (0 if clean or fully repaired)
+
+	// CachedBytes/TotalBytes/CacheCoverage are a live snapshot of the DFS
+	// cache's coverage for this file - refreshed on every Summary() call
+	// (see Precache.refreshCacheCoverage), not just set once at pre-cache
+	// time, so the GUI bar tracks eviction/re-caching too. Zero until the
+	// first successful CacheCoverage query for this row.
+	CachedBytes   int64   `json:"cached_bytes"`
+	TotalBytes    int64   `json:"total_bytes"`
+	CacheCoverage float64 `json:"cache_coverage"` // 0.0-1.0
 }
 
 // maybePrecacheNextEpisodes resolves the Sonarr series/episode context for a

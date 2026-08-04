@@ -938,6 +938,7 @@ class RepairManager {
                 <td class="font-mono text-sm">${readyAt}</td>
                 <td>${r.entry_name || '-'}</td>
                 <td class="text-xs opacity-70">${r.filename || '-'}</td>
+                <td>${this.renderCacheCoverageBar(r.cached_bytes || 0, r.total_bytes || 0)}</td>
                 <td>${outcome}</td>
             `;
             tbody.appendChild(tr);
@@ -1116,6 +1117,20 @@ class RepairManager {
             return `<div class="absolute top-0 bottom-0 ${cls}" style="left:${left}%;width:${width}%" title="${this.escapeAttr(r.status)} ${r.start}-${r.end}"></div>`;
         }).join('');
         return `<div class="relative w-24 h-3 bg-base-300/40 rounded overflow-hidden">${bars}</div>`;
+    }
+
+    renderCacheCoverageBar(cached, total) {
+        if (!total || total <= 0) {
+            return '<span class="opacity-40 text-xs">-</span>';
+        }
+        const pct = Math.min(Math.max((cached / total) * 100, 0), 100);
+        return `
+            <div class="flex items-center gap-2">
+                <div class="relative w-24 h-3 bg-base-300/40 rounded overflow-hidden">
+                    <div class="absolute top-0 bottom-0 left-0 bg-success" style="width:${pct}%"></div>
+                </div>
+                <span class="text-xs opacity-70">${Math.round(pct)}%</span>
+            </div>`;
     }
 
     overlayVerdictBadge(v) {
