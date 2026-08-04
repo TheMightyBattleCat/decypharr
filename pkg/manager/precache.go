@@ -71,16 +71,23 @@ type Precache struct {
 
 	readinessMu sync.Mutex
 	readiness   map[string]EpisodeReadiness
+
+	// plexChecker gates read-ahead bursts behind an active Plex playing
+	// session for the file being read - see isPlexWatching's doc comment.
+	// Always non-nil; a no-op (allows everything) when config.PlexConfig.URL
+	// is unset.
+	plexChecker *plexSessionChecker
 }
 
 // NewPrecache builds the precache service.
 func NewPrecache(m *Manager) *Precache {
 	return &Precache{
-		manager:   m,
-		logger:    logger.New("precache"),
-		triggered: make(map[string]time.Time),
-		precached: make(map[string]int64),
-		readiness: make(map[string]EpisodeReadiness),
+		manager:     m,
+		logger:      logger.New("precache"),
+		triggered:   make(map[string]time.Time),
+		precached:   make(map[string]int64),
+		readiness:   make(map[string]EpisodeReadiness),
+		plexChecker: newPlexSessionChecker(m),
 	}
 }
 
@@ -109,6 +116,12 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		// master toggle being off, so no read-ahead burst starts either, not
 		// just next-episode bursts (which reserveBudget already gates on its
 		// own).
+		return
+	}
+	if !p.plexChecker.isPlexWatching(entry, filename) {
+		// Plex gate configured and this file isn't part of an active
+		// playing session (e.g. a library scan or thumbnail-generation
+		// read) - don't let it trigger a read-ahead burst.
 		return
 	}
 	threshold := int64(cfg.ThresholdPercent())

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	json "github.com/bytedance/sonic"
 )
@@ -466,6 +467,10 @@ type Config struct {
 	// PrecacheConfig.
 	Precache PrecacheConfig `json:"precache,omitzero"`
 
+	// Plex gates Precache's read-ahead/next-episode bursts behind an active
+	// Plex playing session - see PlexConfig.
+	Plex PlexConfig `json:"plex,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }
@@ -847,6 +852,13 @@ func (c *Config) setDefaults() {
 
 	c.applyRepairDefaults()
 	c.applyPrecacheDefaults()
+	c.applyPlexDefaults()
+}
+
+func (c *Config) applyPlexDefaults() {
+	if c.Plex.SessionCacheTTL <= 0 {
+		c.Plex.SessionCacheTTL = 10 * time.Second
+	}
 }
 
 func (c *Config) applyPrecacheDefaults() {
