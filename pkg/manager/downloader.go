@@ -157,9 +157,21 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // directly (independent of padding), which is what a front-loaded-damage
 // grab needs, since the ffprobe gate below reads through the same shared
 // padding path real playback uses and can otherwise be fooled by a
-// container whose only damage is a zero-filled hole.
+// container whose only damage is a zero-filled hole. A non-nil error from
+// it is only ever returned after the release has already been blocklisted
+// and re-grabbed (see importAvailabilityGate's doc comment) - a probe that
+// merely failed to run is not conclusive and is swallowed internally rather
+// than surfaced here - so cleaning up here is always cleaning up a release
+// that's been given up on, never one that just couldn't be checked.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
+		// By this point processSymlink/processDownload/processStrm has
+		// already created the symlink tree (or downloaded the file) and,
+		// for symlink NZB entries, warmed the DFS cache for it. The
+		// rejection path this error feeds into (processAction ->
+		// entry.MarkAsError) only ever flips the entry's error state, so
+		// without this both would be left behind as permanent orphans.
+		d.cleanupRejectedImport(entry)
 		return err
 	}
 	if err := d.ffprobeImportGate(entry); err != nil {
@@ -178,26 +190,28 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 	return nil
 }
 
-// cleanupRejectedImport removes the on-disk artifacts a confirmed-broken
-// ffprobe import leaves behind: the symlink tree (or downloaded file) at
-// entry.DownloadPath(), and, if one was warmed, the DFS cache dir backing
-// it. RemoveEntryCacheDir carries its own safety checks (DFS mode + a
-// configured cache dir, resolved path contained within it, and no other
-// live entry still sharing the folder name), so it's always safe to call
-// here even when there's nothing to remove.
+// cleanupRejectedImport removes the on-disk artifacts a confirmed-rejected
+// import leaves behind - whether rejected by importAvailabilityGate
+// (confirmed-missing segments) or ffprobeImportGate (unplayable container):
+// the symlink tree (or downloaded file) at entry.DownloadPath(), and, if one
+// was warmed, the DFS cache dir backing it. RemoveEntryCacheDir carries its
+// own safety checks (DFS mode + a configured cache dir, resolved path
+// contained within it, and no other live entry still sharing the folder
+// name), so it's always safe to call here even when there's nothing to
+// remove.
 func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	symlinkPath := entry.DownloadPath()
 	if err := os.RemoveAll(symlinkPath); err != nil {
 		d.logger.Warn().Err(err).Str("entry", entry.Name).Str("path", symlinkPath).
-			Msg("Import: failed to remove files for ffprobe-rejected import")
+			Msg("Import: failed to remove files for rejected import")
 	} else {
 		d.logger.Info().Str("entry", entry.Name).Str("path", symlinkPath).
-			Msg("Import: removed files for ffprobe-rejected import")
+			Msg("Import: removed files for rejected import")
 	}
 
 	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
 		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
-			Msg("Import: removed DFS cache dir for ffprobe-rejected import")
+			Msg("Import: removed DFS cache dir for rejected import")
 	}
 }
 
