@@ -409,9 +409,12 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			},
 			retry.Context(ctx),
 			retry.Attempts(uint(c.retries)+1),
-			retry.Delay(config.DefaultRetryDelay),
-			retry.MaxDelay(config.DefaultRetryDelayMax),
-			retry.DelayType(retry.BackOffDelay),
+			// Retriable errors (connection reset, timeout, server-busy) resolve
+			// immediately on a fresh connection — exponential backoff just adds
+			// visible stalls during playback and wasted wall-clock during burst
+			// precache with no corresponding benefit.
+			retry.Delay(10 * time.Millisecond),
+			retry.DelayType(retry.FixedDelay),
 			retry.LastErrorOnly(true),
 		)
 
