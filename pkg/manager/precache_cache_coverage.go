@@ -87,17 +87,24 @@ func (p *Precache) populateFromCache() {
 			}
 
 			key := entry.InfoHash + ":" + filename
+			pc, ok := p.overlayPendingCount(entry, filename)
+			clean := ok && pc == 0
+			segPending := 0
+			if ok && pc > 0 {
+				segPending = pc
+			}
 			p.readinessMu.Lock()
 			_, exists := p.readiness[key]
 			if !exists {
 				p.readiness[key] = EpisodeReadiness{
-					EntryName:     entry.Name,
-					Filename:      filename,
-					ReadyAt:       modTime,
-					CachedBytes:   cached,
-					TotalBytes:    total,
-					CacheCoverage: float64(cached) / float64(total),
-					Clean:         p.overlayIsClean(entry, filename),
+					EntryName:       entry.Name,
+					Filename:        filename,
+					ReadyAt:         modTime,
+					CachedBytes:     cached,
+					TotalBytes:      total,
+					CacheCoverage:   float64(cached) / float64(total),
+					Clean:           clean,
+					SegmentsPending: segPending,
 				}
 			}
 			p.readinessMu.Unlock()
@@ -111,9 +118,19 @@ func (p *Precache) populateFromCache() {
 // pendingCount uses, reused here so a disk-discovered readiness row's Clean
 // flag means the same thing a live one's does.
 func (p *Precache) overlayIsClean(entry *storage.Entry, filename string) bool {
+	c, ok := p.overlayPendingCount(entry, filename)
+	return ok && c == 0
+}
+
+// overlayPendingCount returns filename's still-damaged segment count under
+// entry per the overlay's pending-repair map, and ok=false if the overlay
+// lookup itself failed (as opposed to a genuine zero-damage answer) - so
+// callers can tell "known clean" apart from "unknown" instead of collapsing
+// both into false/0.
+func (p *Precache) overlayPendingCount(entry *storage.Entry, filename string) (int, bool) {
 	pending, err := p.manager.usenet.OverlayPendingRepair(entry.InfoHash)
 	if err != nil {
-		return false
+		return 0, false
 	}
-	return len(pending[filename]) == 0
+	return len(pending[filename]), true
 }
