@@ -28,6 +28,9 @@ class RepairManager {
         this.overlayFilesRepairFilter = 'all';
         this.overlayHistorySearch = '';
         this.overlayHistoryOutcomeFilter = 'all';
+        this.precacheReadiness = [];
+        this.precacheSearch = '';
+        this.precacheSort = 'ready_at';
         // Per-row live-progress poll timers, keyed by overlayKey() - see
         // pollOverlayProgress. Cleared and rebuilt on every renderOverlayFiles
         // pass so a stale row never keeps polling after the table's rebuilt.
@@ -95,6 +98,14 @@ class RepairManager {
         $('overlayHistoryOutcomeFilter')?.addEventListener('change', (e) => {
             this.overlayHistoryOutcomeFilter = e.target.value;
             this.renderOverlayHistory();
+        });
+        this.bindDebouncedInput($('precacheSearchInput'), (v) => {
+            this.precacheSearch = v.trim().toLowerCase();
+            this.renderPrecacheReadiness();
+        });
+        $('precacheSortSelect')?.addEventListener('change', (e) => {
+            this.precacheSort = e.target.value;
+            this.renderPrecacheReadiness();
         });
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
@@ -908,19 +919,62 @@ class RepairManager {
             const n = status.next_episodes || 0;
             nextEpisodes.textContent = n > 0 ? `${n} ahead${status.evict_after_watched ? ' · evict after watched' : ''}` : 'off';
         }
-        this.renderPrecacheReadiness(status.readiness || []);
+        this.precacheReadiness = status.readiness || [];
+        this.renderPrecacheReadiness();
     }
 
-    renderPrecacheReadiness(readiness) {
+    // filteredSortedPrecacheReadiness applies the search box and sort
+    // dropdown (see bind()) to the loaded readiness rows, client-side -
+    // same idiom as filteredOverlayFiles.
+    filteredSortedPrecacheReadiness() {
+        const search = this.precacheSearch;
+        const list = (this.precacheReadiness || []).filter((r) => {
+            if (!search) return true;
+            return `${r.entry_name || ''} ${r.filename || ''}`.toLowerCase().includes(search);
+        });
+        switch (this.precacheSort) {
+            case 'cache_coverage':
+                list.sort((a, b) => (b.cache_coverage || 0) - (a.cache_coverage || 0));
+                break;
+            case 'outcome':
+                list.sort((a, b) => this.precacheOutcomeRank(a) - this.precacheOutcomeRank(b));
+                break;
+            case 'ready_at':
+            default:
+                list.sort((a, b) => new Date(b.ready_at || 0) - new Date(a.ready_at || 0));
+                break;
+        }
+        return list;
+    }
+
+    // precacheOutcomeRank orders rows for the "Outcome" sort: still-damaged
+    // first (most actionable), then repaired-ahead-of-time, then clean, then
+    // unknown - mirrors the badge precedence in renderPrecacheReadiness.
+    precacheOutcomeRank(r) {
+        if (r.segments_pending > 0) return 0;
+        if (r.segments_repaired > 0) return 1;
+        if (r.clean) return 2;
+        return 3;
+    }
+
+    renderPrecacheReadiness() {
         const tbody = document.getElementById('precacheReadinessBody');
         const empty = document.getElementById('noPrecacheMessage');
+        const noMatch = document.getElementById('precacheNoMatch');
         if (!tbody) return;
         tbody.innerHTML = '';
-        if (!readiness.length) {
+        if (!(this.precacheReadiness || []).length) {
             empty?.classList.remove('hidden');
+            noMatch?.classList.add('hidden');
             return;
         }
         empty?.classList.add('hidden');
+        const readiness = this.filteredSortedPrecacheReadiness();
+        if (!readiness.length) {
+            noMatch?.classList.remove('hidden');
+            return;
+        }
+        noMatch?.classList.add('hidden');
         for (const r of readiness) {
             const tr = document.createElement('tr');
             const readyAt = r.ready_at ? new Date(r.ready_at).toLocaleString() : '-';

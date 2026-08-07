@@ -369,6 +369,16 @@
 
             <div class="divider my-2"></div>
 
+            <div class="flex flex-wrap items-center gap-2 mb-2">
+                <input type="text" class="input input-sm flex-1 min-w-48" id="precacheSearchInput"
+                       placeholder="Filter by entry or filename...">
+                <select class="select select-sm" id="precacheSortSelect" title="Sort by">
+                    <option value="ready_at">Sort: Ready date</option>
+                    <option value="cache_coverage">Sort: Cache coverage</option>
+                    <option value="outcome">Sort: Outcome</option>
+                </select>
+            </div>
+
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="table table-sm table-hover">
                     <thead class="bg-base-200 sticky top-0 z-10">
@@ -385,6 +395,10 @@
                 <div id="noPrecacheMessage" class="text-center py-8 hidden text-base-content/70">
                     <i class="bi bi-hourglass-split text-2xl block mb-2"></i>
                     Nothing pre-cached yet.
+                </div>
+                <div id="precacheNoMatch" class="text-center py-8 hidden text-base-content/70">
+                    <i class="bi bi-search text-2xl block mb-2"></i>
+                    No entries match the current search.
                 </div>
             </div>
         </div>
