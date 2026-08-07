@@ -3,9 +3,11 @@
 // being read, so a library scan, thumbnail-generation pass, or metadata
 // analysis pass - which issue the same ranged reads through the mount -
 // can't spuriously trigger precache. Disabled entirely when
-// config.PlexConfig.URL is unset (see PlexConfig's doc comment); on any
-// Plex API error, degrades to allowing precache rather than blocking it
-// (see refresh).
+// config.PlexConfig.URL is unset (see PlexConfig's doc comment). Once
+// enabled, a failed poll is retried a few times before being treated as a
+// failure, and a short grace window lets a momentary Plex blip keep serving
+// the last known sessions; only once Plex has stayed unreachable past the
+// grace window does the gate fail closed and deny precache (see refresh).
 package manager
 
 import (
@@ -36,6 +38,21 @@ const plexSessionFetchTimeout = 5 * time.Second
 // otherwise spam the log for as long as Plex stays down.
 const plexWarnInterval = 5 * time.Minute
 
+// plexSessionFetchRetries bounds how many times refresh retries a failed
+// /status/sessions poll, within one refresh call, before treating it as a
+// failure - a single dropped connection or transient 5xx shouldn't be
+// enough to move the gate toward fail-closed.
+const plexSessionFetchRetries = 3
+
+// plexSessionRetryDelay separates retry attempts within one refresh call.
+// Kept short since plexSessionFetchTimeout already bounds each attempt and
+// Observe runs inline in the ranged-read path.
+const plexSessionRetryDelay = 250 * time.Millisecond
+
+// plexSessionGraceMinimum floors the grace window (see refresh) so a very
+// short SessionCacheTTL doesn't shrink the window to nearly nothing.
+const plexSessionGraceMinimum = 30 * time.Second
+
 // plexSessionsResponse is the subset of Plex's /status/sessions payload
 // this checker needs: the file path backing each currently-playing item.
 type plexSessionsResponse struct {
@@ -59,10 +76,11 @@ type plexSessionChecker struct {
 	logger  zerolog.Logger
 	client  *http.Client
 
-	mu       sync.Mutex
-	fetched  time.Time
-	degraded bool                // true when the last fetch failed; isPlexWatching allows everything while degraded
-	resolved map[string]struct{} // resolved absolute file paths of files in active sessions
+	mu          sync.Mutex
+	fetched     time.Time
+	lastSuccess time.Time           // last time a poll succeeded; zero if it never has
+	degraded    bool                // true once a failed poll has exceeded the grace window; isPlexWatching denies everything while degraded
+	resolved    map[string]struct{} // resolved absolute file paths of files in active sessions, from the last successful poll
 
 	lastWarnMu sync.Mutex
 	lastWarn   time.Time
@@ -79,7 +97,9 @@ func newPlexSessionChecker(m *Manager) *plexSessionChecker {
 
 // isPlexWatching reports whether filename, as resolved for entry, is part
 // of an active Plex playing session. Always true when the gate is disabled
-// (PlexConfig.URL unset) or degraded (Plex unreachable) - see refresh.
+// (PlexConfig.URL unset). Once enabled, false whenever degraded - Plex has
+// stayed unreachable past the grace window in refresh - so an unreachable
+// Plex server denies precache rather than firing on background activity.
 func (c *plexSessionChecker) isPlexWatching(entry *storage.Entry, filename string) bool {
 	cfg := config.Get().Plex
 	if !cfg.Enabled() {
@@ -92,14 +112,19 @@ func (c *plexSessionChecker) isPlexWatching(entry *storage.Entry, filename strin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.degraded {
-		return true
+		return false
 	}
 	_, ok := c.resolved[expected]
 	return ok
 }
 
 // refresh re-fetches and re-resolves Plex's session list if the cached one
-// is older than cfg.SessionTTL().
+// is older than cfg.SessionTTL(). A failing poll is retried up to
+// plexSessionFetchRetries times before being treated as a failure; if every
+// attempt fails, the checker keeps serving the last resolved session list
+// as though healthy until time.Since(lastSuccess) exceeds the grace window
+// (max(2*cfg.SessionTTL(), plexSessionGraceMinimum)), at which point it
+// flips degraded so isPlexWatching starts denying precache.
 func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 	c.mu.Lock()
 	stale := time.Since(c.fetched) >= cfg.SessionTTL()
@@ -108,13 +133,27 @@ func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 		return
 	}
 
-	files, err := c.fetchSessions(cfg)
+	var files []string
+	var err error
+	for attempt := 0; attempt < plexSessionFetchRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(plexSessionRetryDelay)
+		}
+		files, err = c.fetchSessions(cfg)
+		if err == nil {
+			break
+		}
+	}
 	now := time.Now()
 
 	if err != nil {
+		grace := 2 * cfg.SessionTTL()
+		if grace < plexSessionGraceMinimum {
+			grace = plexSessionGraceMinimum
+		}
 		c.mu.Lock()
 		c.fetched = now
-		c.degraded = true
+		c.degraded = c.lastSuccess.IsZero() || time.Since(c.lastSuccess) >= grace
 		c.mu.Unlock()
 		c.warnDebounced(err)
 		return
@@ -123,6 +162,7 @@ func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 	resolved := resolvePlexSessionPaths(files)
 	c.mu.Lock()
 	c.fetched = now
+	c.lastSuccess = now
 	c.degraded = false
 	c.resolved = resolved
 	c.mu.Unlock()
@@ -211,5 +251,5 @@ func (c *plexSessionChecker) warnDebounced(err error) {
 		return
 	}
 	c.lastWarn = time.Now()
-	c.logger.Warn().Err(err).Msg("failed to fetch Plex sessions; precache session gate degraded to allow")
+	c.logger.Warn().Err(err).Msg("failed to fetch Plex sessions after retries; precache session gate will deny once the grace window elapses")
 }
