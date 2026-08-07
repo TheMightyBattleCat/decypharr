@@ -107,6 +107,7 @@ class RepairManager {
             this.precacheSort = e.target.value;
             this.renderPrecacheReadiness();
         });
+        $('precacheRefreshBtn')?.addEventListener('click', () => this.loadPrecacheStatus());
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
             () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
@@ -896,8 +897,20 @@ class RepairManager {
             console.error('Failed to load precache status', e);
         } finally {
             if (this.precacheTimer) clearTimeout(this.precacheTimer);
-            this.precacheTimer = setTimeout(() => this.loadPrecacheStatus(), 15000);
+            this.precacheTimer = null;
+            // Keep polling only while something is still in flight - idle/
+            // complete rows are static until the user hits Refresh.
+            if (this.hasInFlightPrecacheEntries()) {
+                this.precacheTimer = setTimeout(() => this.loadPrecacheStatus(), 15000);
+            }
         }
+    }
+
+    // hasInFlightPrecacheEntries reports whether any loaded readiness row is
+    // still short of full cache coverage - see loadPrecacheStatus's polling
+    // gate above.
+    hasInFlightPrecacheEntries() {
+        return (this.precacheReadiness || []).some((r) => (r.cache_coverage || 0) < 1);
     }
 
     renderPrecache(status) {
