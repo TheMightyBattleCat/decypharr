@@ -87,6 +87,12 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/precache/config", s.handleGetPrecacheConfig)
 			r.Put("/precache/config", s.handleUpdatePrecacheConfig)
 
+			// Plex server settings - gates Precache's read-ahead behind an
+			// active "now playing" session (see PlexConfig's doc comment)
+			r.Get("/plex/config", s.handleGetPlexConfig)
+			r.Put("/plex/config", s.handleUpdatePlexConfig)
+			r.Post("/plex/test", s.handlePlexTestConnection)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

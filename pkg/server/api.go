@@ -680,6 +680,84 @@ func (s *Server) handleUpdatePrecacheConfig(w http.ResponseWriter, r *http.Reque
 	utils.JSONResponse(w, cfg.Precache, http.StatusOK)
 }
 
+// plexTokenPlaceholder stands in for config.PlexConfig.Token in every
+// response that leaves the server, so the token itself is never sent back
+// to the browser. handleUpdatePlexConfig and handlePlexTestConnection both
+// treat it (or a blank field) as "unchanged - use the saved token".
+const plexTokenPlaceholder = "********"
+
+// handleGetPlexConfig returns config.Plex (see PlexConfig's doc comment)
+// with Token shadowed by plexTokenPlaceholder when set, so the repair page
+// can render "token is set" without the token ever reaching the browser.
+func (s *Server) handleGetPlexConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get().Plex
+	if cfg.Token != "" {
+		cfg.Token = plexTokenPlaceholder
+	}
+	utils.JSONResponse(w, cfg, http.StatusOK)
+}
+
+// handleUpdatePlexConfig saves config.Plex - its own dedicated endpoint,
+// like repair/precache, rather than a field on the general settings form,
+// so an unrelated settings save can't silently reset it (same bug class as
+// the Repair/Precache preserve block in handleUpdateConfig). Token is
+// write-only: a blank field or the plexTokenPlaceholder echoed back by
+// handleGetPlexConfig leaves the saved token untouched, mirroring Auth's
+// preserve-on-blank handling above.
+func (s *Server) handleUpdatePlexConfig(w http.ResponseWriter, r *http.Request) {
+	var req config.PlexConfig
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cfg := config.Get()
+	if req.Token == "" || req.Token == plexTokenPlaceholder {
+		req.Token = cfg.Plex.Token
+	}
+	cfg.Plex = req
+	if err := cfg.Save(); err != nil {
+		s.logger.Error().Err(err).Msg("Failed to save plex config")
+		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := cfg.Plex
+	if resp.Token != "" {
+		resp.Token = plexTokenPlaceholder
+	}
+	utils.JSONResponse(w, resp, http.StatusOK)
+}
+
+// handlePlexTestConnection probes a Plex server's /status/sessions endpoint
+// with the url/token from the request body (not the saved config, mirroring
+// handleSpeedTest) so the repair page's "Test connection" button can
+// validate settings before they're saved. A plexTokenPlaceholder token
+// falls back to the saved one so "Test" works without re-typing it.
+func (s *Server) handlePlexTestConnection(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL   string `json:"url"`
+		Token string `json:"token"`
+	}
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if req.Token == "" || req.Token == plexTokenPlaceholder {
+		req.Token = config.Get().Plex.Token
+	}
+
+	if err := manager.TestPlexConnection(config.PlexConfig{URL: req.URL, Token: req.Token}); err != nil {
+		utils.JSONResponse(w, map[string]any{"ok": false, "error": err.Error()}, http.StatusOK)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"ok": true}, http.StatusOK)
+}
+
 func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 	svc := s.manager.Repair()
 	if svc == nil {

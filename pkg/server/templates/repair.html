@@ -407,6 +407,57 @@
         </div>
     </div>
 
+    <!-- Plex -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <h3 class="card-title text-xl">
+                <i class="bi bi-play-btn-fill mr-2 text-primary"></i>Plex server
+            </h3>
+            <p class="text-sm opacity-70 mt-1">
+                Gates pre-caching's read-ahead behind an active Plex "now playing" session for the file being read,
+                so a library scan or thumbnail pass can't spuriously trigger it. Leave the URL blank to disable the
+                gate - pre-caching then fires unconditionally, as if this were unset.
+            </p>
+
+            <form id="plexConfigForm" class="mt-4 space-y-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div class="form-control">
+                        <label class="label py-1" for="plexUrl">
+                            <span class="label-text font-medium">Server URL</span>
+                        </label>
+                        <input type="text" class="input input-bordered" id="plexUrl" placeholder="http://localhost:32400">
+                        <span class="label-text-alt opacity-60 mt-1">Blank disables the gate entirely.</span>
+                    </div>
+                    <div class="form-control">
+                        <label class="label py-1" for="plexToken">
+                            <span class="label-text font-medium">Token</span>
+                        </label>
+                        <input type="password" class="input input-bordered" id="plexToken" placeholder="unchanged">
+                        <span class="label-text-alt opacity-60 mt-1">Write-only - left blank, the saved token is kept as-is.</span>
+                    </div>
+                </div>
+
+                <div class="form-control sm:w-1/2 sm:pr-1.5">
+                    <label class="label py-1" for="plexSessionTtl">
+                        <span class="label-text font-medium">Session cache TTL (seconds)</span>
+                    </label>
+                    <input type="number" class="input input-bordered" id="plexSessionTtl" min="1" step="1">
+                    <span class="label-text-alt opacity-60 mt-1">How long a fetched Plex session list is reused before being refreshed.</span>
+                </div>
+
+                <div class="flex flex-wrap justify-end items-center gap-3">
+                    <span id="plexTestResult" class="text-sm"></span>
+                    <button type="button" class="btn btn-outline" id="plexTestBtn">
+                        <i class="bi bi-broadcast mr-1"></i>Test connection
+                    </button>
+                    <button type="submit" class="btn btn-primary" id="plexConfigSaveBtn">
+                        <i class="bi bi-save mr-1"></i>Save
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Overlay files -->
     <div class="card bg-base-100 shadow-xl">
         <div class="card-header">

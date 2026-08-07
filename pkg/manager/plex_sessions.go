@@ -174,6 +174,16 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 	return files, nil
 }
 
+// TestPlexConnection performs an ad-hoc /status/sessions probe against cfg,
+// for the repair page's "Test connection" button - independent of the
+// long-lived plexSessionChecker cache newPlexSessionChecker builds for
+// Precache.Observe, so a test never disturbs the live session cache.
+func TestPlexConnection(cfg config.PlexConfig) error {
+	c := &plexSessionChecker{client: &http.Client{Timeout: plexSessionFetchTimeout}}
+	_, err := c.fetchSessions(cfg)
+	return err
+}
+
 // resolvePlexSessionPaths resolves each Plex session file path to the
 // underlying location precache tracks entries by: readSymlinkTarget first
 // (the DownloadActionSymlink setup collectArrFiles/the repair sweep already

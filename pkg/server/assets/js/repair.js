@@ -4,6 +4,11 @@
 // status, run/stop, and history. Polls /api/repair/status while a run is
 // active so the UI reflects live progress.
 const PRECACHE_GIB = 1024 * 1024 * 1024;
+// PlexConfig.SessionCacheTTL is a Go time.Duration - it round-trips through
+// JSON as plain nanoseconds (no custom marshaller), while the "Session cache
+// TTL" input is in seconds for a human to read.
+const NS_PER_SECOND = 1e9;
+const PLEX_TOKEN_PLACEHOLDER = '********';
 
 class RepairManager {
     constructor() {
@@ -14,6 +19,7 @@ class RepairManager {
         this.repairConfig = {};
         this.repairConfigDefaults = {};
         this.precacheConfig = {};
+        this.plexConfig = {};
         this.latestStatus = {};
         this.overlayFiles = [];
         this.overlaySelected = new Set();
@@ -77,6 +83,11 @@ class RepairManager {
             e.preventDefault();
             this.savePrecacheConfig();
         });
+        $('plexConfigForm')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.savePlexConfig();
+        });
+        $('plexTestBtn')?.addEventListener('click', () => this.testPlexConnection());
         $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
         $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
         $('overlayGCOrphansBtn')?.addEventListener('click', () => this.handleOverlayGCOrphans());
@@ -124,9 +135,10 @@ class RepairManager {
     }
 
     async loadAll() {
-        await Promise.all([this.loadRepairConfig(), this.loadPrecacheConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
+        await Promise.all([this.loadRepairConfig(), this.loadPrecacheConfig(), this.loadPlexConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
         this.populateOverlayConfigForm();
         this.populatePrecacheConfigForm();
+        this.populatePlexConfigForm();
     }
 
     async loadRepairConfig() {
@@ -147,6 +159,15 @@ class RepairManager {
         } catch (e) {
             console.error('Failed to load precache config', e);
             this.precacheConfig = {};
+        }
+    }
+
+    async loadPlexConfig() {
+        try {
+            this.plexConfig = await this.fetchJSON(`${this.api}/plex/config`) || {};
+        } catch (e) {
+            console.error('Failed to load plex config', e);
+            this.plexConfig = {};
         }
     }
 
@@ -1898,6 +1919,115 @@ class RepairManager {
             window.createToast('Pre-cache config saved', 'success');
         } catch (e) {
             window.createToast(`Save failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    populatePlexConfigForm() {
+        const p = this.plexConfig || {};
+        const $ = (id) => document.getElementById(id);
+        if ($('plexUrl')) $('plexUrl').value = p.plex_url || '';
+        if ($('plexToken')) {
+            $('plexToken').value = '';
+            $('plexToken').placeholder = p.plex_token ? 'unchanged (set)' : '';
+        }
+        if ($('plexSessionTtl')) {
+            const ttlSeconds = p.plex_session_cache_ttl ? Math.round(p.plex_session_cache_ttl / NS_PER_SECOND) : '';
+            $('plexSessionTtl').value = ttlSeconds;
+            $('plexSessionTtl').placeholder = '10';
+        }
+        if ($('plexTestResult')) $('plexTestResult').textContent = '';
+    }
+
+    async savePlexConfig() {
+        const $ = (id) => document.getElementById(id);
+        const btn = $('plexConfigSaveBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const ttlSeconds = parseInt($('plexSessionTtl')?.value, 10);
+            const payload = {
+                plex_url: $('plexUrl')?.value.trim() || '',
+                // Blank leaves the saved token as-is - see handleUpdatePlexConfig's
+                // preserve-on-blank handling.
+                plex_token: $('plexToken')?.value || '',
+                plex_session_cache_ttl: Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds * NS_PER_SECOND : 0,
+            };
+
+            const res = await fetch(`${this.api}/plex/config`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const text = await res.text();
+            let data = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch { /* leave null */
+            }
+            if (!res.ok) {
+                throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+            }
+
+            this.plexConfig = data || payload;
+            this.populatePlexConfigForm();
+            window.createToast('Plex config saved', 'success');
+        } catch (e) {
+            window.createToast(`Save failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    async testPlexConnection() {
+        const $ = (id) => document.getElementById(id);
+        const btn = $('plexTestBtn');
+        const result = $('plexTestResult');
+        const url = $('plexUrl')?.value.trim() || '';
+        // Blank token falls back to the saved one server-side - see
+        // handlePlexTestConnection.
+        const typedToken = $('plexToken')?.value || '';
+        if (!url) {
+            if (result) {
+                result.textContent = 'Enter a server URL first';
+                result.className = 'text-sm text-warning';
+            }
+            return;
+        }
+        if (btn) btn.disabled = true;
+        if (result) {
+            result.textContent = 'Testing…';
+            result.className = 'text-sm opacity-70';
+        }
+        try {
+            const res = await fetch(`${this.api}/plex/test`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url, token: typedToken || PLEX_TOKEN_PLACEHOLDER}),
+            });
+            const text = await res.text();
+            let data = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch { /* leave null */
+            }
+            if (!res.ok) {
+                throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+            }
+            if (result) {
+                if (data && data.ok) {
+                    result.textContent = 'Connected';
+                    result.className = 'text-sm text-success';
+                } else {
+                    result.textContent = `Unreachable: ${(data && data.error) || 'unknown error'}`;
+                    result.className = 'text-sm text-error';
+                }
+            }
+        } catch (e) {
+            if (result) {
+                result.textContent = `Unreachable: ${e.message}`;
+                result.className = 'text-sm text-error';
+            }
         } finally {
             if (btn) btn.disabled = false;
         }
