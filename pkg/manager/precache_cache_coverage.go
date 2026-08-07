@@ -1,6 +1,8 @@
 package manager
 
 import (
+	"time"
+
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -16,10 +18,10 @@ import (
 // whatever was last known.
 type dfsCacheCoverageReader interface {
 	// CacheCoverage returns filename's cache coverage under entryName:
-	// cached bytes against the file's total declared size. ok=false means
-	// neither a live in-memory cache item nor an on-disk metadata sidecar
-	// has an answer.
-	CacheCoverage(entryName, filename string) (cached, total int64, ok bool)
+	// cached bytes against the file's total declared size, plus the cache
+	// item's last write time (modTime). ok=false means neither a live
+	// in-memory cache item nor an on-disk metadata sidecar has an answer.
+	CacheCoverage(entryName, filename string) (cached, total int64, modTime time.Time, ok bool)
 }
 
 // cacheCoverageReader resolves the DFS cache-coverage seam via the same
@@ -44,7 +46,7 @@ func (p *Precache) refreshCacheCoverage(reader dfsCacheCoverageReader, r *Episod
 	if reader == nil {
 		return
 	}
-	cached, total, ok := reader.CacheCoverage(r.EntryName, r.Filename)
+	cached, total, _, ok := reader.CacheCoverage(r.EntryName, r.Filename)
 	if !ok || total <= 0 {
 		return
 	}
@@ -56,11 +58,11 @@ func (p *Precache) refreshCacheCoverage(reader dfsCacheCoverageReader, r *Episod
 // populateFromCache is the "Tier 1" restart fix: on the first call (see
 // Precache.Summary's cachePopulateOnce), walk every usenet-backed storage
 // entry's media files and check whether the DFS cache already has bytes for
-// it from a prior run - if so, seed a readiness row for it (ReadyAt left
-// zero: this wasn't pre-cached by this process, just discovered already on
-// disk), so the precache table isn't empty again after every restart.
-// Best-effort and silent throughout: any entry/file this can't resolve is
-// simply skipped, never surfaced as an error.
+// it from a prior run - if so, seed a readiness row for it (ReadyAt taken
+// from the cache item's own last-write time, since this wasn't pre-cached
+// by this process), so the precache table isn't empty again after every
+// restart. Best-effort and silent throughout: any entry/file this can't
+// resolve is simply skipped, never surfaced as an error.
 func (p *Precache) populateFromCache() {
 	reader := p.cacheCoverageReader()
 	if reader == nil || p.manager.usenet == nil {
@@ -79,7 +81,7 @@ func (p *Precache) populateFromCache() {
 			if !utils.IsMediaFile(filename) {
 				continue
 			}
-			cached, total, ok := reader.CacheCoverage(entry.Name, filename)
+			cached, total, modTime, ok := reader.CacheCoverage(entry.Name, filename)
 			if !ok || cached <= 0 || total <= 0 {
 				continue
 			}
@@ -91,6 +93,7 @@ func (p *Precache) populateFromCache() {
 				p.readiness[key] = EpisodeReadiness{
 					EntryName:     entry.Name,
 					Filename:      filename,
+					ReadyAt:       modTime,
 					CachedBytes:   cached,
 					TotalBytes:    total,
 					CacheCoverage: float64(cached) / float64(total),

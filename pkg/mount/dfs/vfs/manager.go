@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -253,19 +254,19 @@ func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p
 }
 
 // CacheCoverage returns filename's cache coverage under entryName: cached
-// bytes against the file's total declared size. Tries the live in-memory
-// item first (Cache.PeekItem / CacheItem.Coverage) - the freshest source,
-// current mid-download state included - and falls back to the on-disk
-// metadata sidecar (Cache.DiskCoverage) for a file cached in a prior run
-// that hasn't been reopened yet this process. ok=false means neither source
-// has anything.
-func (m *Manager) CacheCoverage(entryName, filename string) (cached, total int64, ok bool) {
+// bytes against the file's total declared size, plus the item's last write
+// time (modTime). Tries the live in-memory item first (Cache.PeekItem /
+// CacheItem.Coverage) - the freshest source, current mid-download state
+// included - and falls back to the on-disk metadata sidecar
+// (Cache.DiskCoverage) for a file cached in a prior run that hasn't been
+// reopened yet this process. ok=false means neither source has anything.
+func (m *Manager) CacheCoverage(entryName, filename string) (cached, total int64, modTime time.Time, ok bool) {
 	if m.cache == nil {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
 	if item, found := m.cache.PeekItem(entryName, filename); found {
-		if c, t, ok := item.Coverage(); ok {
-			return c, t, true
+		if c, t, mt, ok := item.Coverage(); ok {
+			return c, t, mt, true
 		}
 	}
 	return m.cache.DiskCoverage(entryName, filename)

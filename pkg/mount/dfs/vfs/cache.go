@@ -235,13 +235,13 @@ func (c *Cache) PeekItem(entryName, filename string) (*CacheItem, bool) {
 // what lets a cache-coverage query find bytes a prior run already cached,
 // before anything reopens the file this run. ok=false if no metadata file
 // exists or its declared size is 0.
-func (c *Cache) DiskCoverage(entryName, filename string) (cached, total int64, ok bool) {
+func (c *Cache) DiskCoverage(entryName, filename string) (cached, total int64, modTime time.Time, ok bool) {
 	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
 	var info ItemInfo
 	if err := decodeJSONFile(metaPath, &info); err != nil || info.Size == 0 {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
-	return info.Rs.Size(), info.Size, true
+	return info.Rs.Size(), info.Size, info.ModTime, true
 }
 
 func (c *Cache) scanDiskCandidates() diskScanResult {
@@ -1349,15 +1349,16 @@ func (item *CacheItem) ReadCachedRange(p []byte, off int64) bool {
 }
 
 // Coverage returns how many bytes of this item's file are currently cached
-// (cached) against its total declared size (total). ok=false when the size
-// isn't known yet (a just-created item whose first write hasn't landed).
-func (item *CacheItem) Coverage() (cached, total int64, ok bool) {
+// (cached) against its total declared size (total), plus the item's last
+// write time (modTime). ok=false when the size isn't known yet (a
+// just-created item whose first write hasn't landed).
+func (item *CacheItem) Coverage() (cached, total int64, modTime time.Time, ok bool) {
 	item.metaMu.RLock()
 	defer item.metaMu.RUnlock()
 	if item.info.Size == 0 {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
-	return item.info.Rs.Size(), item.info.Size, true
+	return item.info.Rs.Size(), item.info.Size, item.info.ModTime, true
 }
 
 // FindMissing returns portion of r not yet downloaded

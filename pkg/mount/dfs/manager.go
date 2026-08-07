@@ -163,12 +163,12 @@ func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p
 }
 
 // CacheCoverage returns filename's cache coverage under entryName - cached
-// bytes against the file's total declared size - see
-// vfs.Manager.CacheCoverage. ok=false means there is nothing to report (no
-// VFS mount, or the file has never been cached).
-func (m *Manager) CacheCoverage(entryName, filename string) (cached, total int64, ok bool) {
+// bytes against the file's total declared size, plus its last write time -
+// see vfs.Manager.CacheCoverage. ok=false means there is nothing to report
+// (no VFS mount, or the file has never been cached).
+func (m *Manager) CacheCoverage(entryName, filename string) (cached, total int64, modTime time.Time, ok bool) {
 	if m.vfs == nil {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
 	return m.vfs.CacheCoverage(entryName, filename)
 }
