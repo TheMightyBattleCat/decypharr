@@ -950,6 +950,20 @@ func (c *Config) applyRepairDefaults() {
 	}
 }
 
+// RepairPolicyDefaults returns the resolved padding/PAR2 policy defaults
+// applyRepairDefaults falls back to when a field is left unset, for display
+// (e.g. as GUI placeholder text) so it can never drift from the real
+// fallback logic above.
+func RepairPolicyDefaults() RepairConfig {
+	return RepairConfig{
+		PadMaxRunSegments:     defaultPadMaxRunSegments,
+		PadMaxTotalSegments:   defaultPadMaxTotalSegments,
+		PadMaxByteRatio:       defaultPadMaxByteRatio,
+		Par2RepairMode:        Par2RepairModeAutoAll,
+		Par2RepairMinSegments: defaultPar2RepairMinSegs,
+	}
+}
+
 func (c *Config) Save() error {
 	c.setDefaults()
 	data, err := json.MarshalIndent(c, "", "  ")

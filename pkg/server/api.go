@@ -585,7 +585,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
-	utils.JSONResponse(w, config.Get().Repair, http.StatusOK)
+	utils.JSONResponse(w, map[string]any{
+		"repair":   config.Get().Repair,
+		"defaults": config.RepairPolicyDefaults(),
+	}, http.StatusOK)
 }
 
 func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request) {

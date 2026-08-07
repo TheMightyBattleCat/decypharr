@@ -12,6 +12,7 @@ class RepairManager {
         this.activeRunId = null;
         this.brokenState = {items: [], page: 1, pageSize: 25};
         this.repairConfig = {};
+        this.repairConfigDefaults = {};
         this.precacheConfig = {};
         this.latestStatus = {};
         this.overlayFiles = [];
@@ -130,10 +131,13 @@ class RepairManager {
 
     async loadRepairConfig() {
         try {
-            this.repairConfig = await this.fetchJSON(`${this.api}/repair/config`) || {};
+            const data = await this.fetchJSON(`${this.api}/repair/config`) || {};
+            this.repairConfig = data.repair || {};
+            this.repairConfigDefaults = data.defaults || {};
         } catch (e) {
             console.error('Failed to load repair config', e);
             this.repairConfig = {};
+            this.repairConfigDefaults = {};
         }
     }
 
@@ -1766,14 +1770,27 @@ class RepairManager {
 
     populateOverlayConfigForm() {
         const c = this.repairConfig || {};
+        const d = this.repairConfigDefaults || {};
         const $ = (id) => document.getElementById(id);
         if ($('overlayPlaybackPadding')) $('overlayPlaybackPadding').checked = c.playback_padding !== false;
         if ($('overlayPar2Repair')) $('overlayPar2Repair').checked = c.par2_repair !== false;
-        if ($('overlayPadMaxRun')) $('overlayPadMaxRun').value = c.pad_max_run_segments || 4;
-        if ($('overlayPadMaxTotal')) $('overlayPadMaxTotal').value = c.pad_max_total_segments || 64;
-        if ($('overlayPadMaxRatio')) $('overlayPadMaxRatio').value = c.pad_max_byte_ratio || 0.02;
+        if ($('overlayPadMaxRun')) {
+            $('overlayPadMaxRun').placeholder = d.pad_max_run_segments ?? '';
+            $('overlayPadMaxRun').value = c.pad_max_run_segments ?? '';
+        }
+        if ($('overlayPadMaxTotal')) {
+            $('overlayPadMaxTotal').placeholder = d.pad_max_total_segments ?? '';
+            $('overlayPadMaxTotal').value = c.pad_max_total_segments ?? '';
+        }
+        if ($('overlayPadMaxRatio')) {
+            $('overlayPadMaxRatio').placeholder = d.pad_max_byte_ratio ?? '';
+            $('overlayPadMaxRatio').value = c.pad_max_byte_ratio ?? '';
+        }
         if ($('overlayPar2Mode')) $('overlayPar2Mode').value = c.par2_repair_mode || 'auto_all';
-        if ($('overlayPar2MinSegments')) $('overlayPar2MinSegments').value = c.par2_repair_min_segments || 1;
+        if ($('overlayPar2MinSegments')) {
+            $('overlayPar2MinSegments').placeholder = d.par2_repair_min_segments ?? '';
+            $('overlayPar2MinSegments').value = c.par2_repair_min_segments ?? '';
+        }
     }
 
     async saveOverlayConfig() {
