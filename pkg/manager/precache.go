@@ -360,7 +360,7 @@ type PrecacheSummary struct {
 // precacheReadinessDisplayLimit bounds how many EpisodeReadiness records
 // Summary returns, so a long-running process with many pre-cached episodes
 // doesn't grow an unbounded response.
-const precacheReadinessDisplayLimit = 25
+const precacheReadinessDisplayLimit = 500
 
 // Summary returns a snapshot of the precache feature's live config and
 // state, for the overlay/repair GUI and API. Safe to call on a nil Precache.
