@@ -1027,11 +1027,11 @@ class RepairManager {
                 outcome = '<span class="badge badge-ghost">unknown</span>';
             }
             tr.innerHTML = `
-                <td class="font-mono text-sm">${readyAt}</td>
-                <td>${r.entry_name || '-'}</td>
-                <td class="text-xs opacity-70">${r.filename || '-'}</td>
-                <td>${this.renderCacheCoverageBar(r.cached_bytes || 0, r.total_bytes || 0)}</td>
-                <td>${outcome}</td>
+                <td class="font-mono text-sm whitespace-nowrap">${readyAt}</td>
+                <td class="break-all">${r.entry_name || '-'}</td>
+                <td class="text-xs opacity-70 break-all">${r.filename || '-'}</td>
+                <td class="whitespace-nowrap">${this.renderCacheCoverageBar(r.cached_bytes || 0, r.total_bytes || 0)}</td>
+                <td class="whitespace-nowrap">${outcome}</td>
             `;
             tbody.appendChild(tr);
         }
