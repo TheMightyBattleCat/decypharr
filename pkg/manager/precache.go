@@ -72,6 +72,19 @@ type Precache struct {
 	readinessMu sync.Mutex
 	readiness   map[string]EpisodeReadiness
 
+	// inflightMu/inflight tracks which (infoHash,filename) pairs currently
+	// have a burst actively writing into the DFS cache - either the
+	// currently-playing read-ahead burst (readAhead) or a next-episode burst
+	// (precacheEpisodeFile), keyed the same as triggered/precached. A
+	// refcount rather than a bool since the same key can be entered by more
+	// than one caller in rare overlapping-trigger races; the key is only
+	// considered idle once every entrant has left. Consulted by future
+	// cache-cleanup logic so it never deletes a cache dir a burst is still
+	// writing into (see InflightHas) - not used for any dedup/gating
+	// decision itself, that's triggered's job.
+	inflightMu sync.Mutex
+	inflight   map[string]int
+
 	// cachePopulateOnce guards populateFromCache, the "Tier 1" restart fix
 	// that seeds readiness rows from the DFS cache's on-disk state - run
 	// lazily on the first Summary() call rather than from NewPrecache, so it
@@ -93,6 +106,7 @@ func NewPrecache(m *Manager) *Precache {
 		triggered:   make(map[string]time.Time),
 		precached:   make(map[string]int64),
 		readiness:   make(map[string]EpisodeReadiness),
+		inflight:    make(map[string]int),
 		plexChecker: newPlexSessionChecker(m),
 	}
 }
@@ -166,6 +180,10 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	if p.manager.usenet == nil {
 		return
 	}
+	key := entry.InfoHash + ":" + filename
+	p.markInflight(key)
+	defer p.unmarkInflight(key)
+
 	concurrency := p.cfg().ReadAheadConcurrency()
 
 	ctx, cancel := context.WithTimeout(context.Background(), precacheReadAheadTimeout)
@@ -329,6 +347,40 @@ func (p *Precache) evictIfWatched(entry *storage.Entry, filename string, start, 
 		p.logger.Info().Str("entry", entry.Name).Str("file", filename).Msg("evicted pre-cached episode after it was watched")
 	}
 	p.releaseBudget(bytes)
+}
+
+// markInflight records that a burst has started writing into the DFS cache
+// for (infoHash,filename), identified by the same "infoHash:filename" key
+// triggered/precached use. Pair with a deferred unmarkInflight in the same
+// burst-owning function (readAhead, precacheEpisodeFile) so the key is held
+// for the entire span between the first write and the last, on every exit
+// path.
+func (p *Precache) markInflight(key string) {
+	p.inflightMu.Lock()
+	p.inflight[key]++
+	p.inflightMu.Unlock()
+}
+
+// unmarkInflight reverses a prior markInflight call for key, dropping the
+// entry once its refcount reaches zero so the map can't grow without bound.
+func (p *Precache) unmarkInflight(key string) {
+	p.inflightMu.Lock()
+	if p.inflight[key] <= 1 {
+		delete(p.inflight, key)
+	} else {
+		p.inflight[key]--
+	}
+	p.inflightMu.Unlock()
+}
+
+// InflightHas reports whether (infoHash,filename) currently has a burst
+// actively writing into the DFS cache - the guard future cache-cleanup logic
+// must consult before deleting a partially-cached entry's cache dir.
+func (p *Precache) InflightHas(infoHash, filename string) bool {
+	key := infoHash + ":" + filename
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	return p.inflight[key] > 0
 }
 
 // estimatePlaybackGap converts a byte gap into an estimated playback-time

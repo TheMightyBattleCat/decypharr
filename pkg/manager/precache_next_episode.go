@@ -160,6 +160,9 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	}
 
 	key := nextEntry.InfoHash + ":" + filename
+	p.markInflight(key)
+	defer p.unmarkInflight(key)
+
 	p.mu.Lock()
 	_, already := p.triggered[key]
 	p.triggered[key] = time.Now()
