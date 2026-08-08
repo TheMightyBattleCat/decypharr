@@ -774,6 +774,34 @@ func (s *Server) handlePrecacheStatus(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, s.manager.PrecacheStatus(), http.StatusOK)
 }
 
+// PrecachePurgeResult is the response for handlePurgeIncompletePrecache -
+// see Precache.PurgeIncomplete.
+type PrecachePurgeResult struct {
+	Deleted         []string `json:"deleted"`
+	SkippedInflight []string `json:"skipped_inflight"`
+	FreedBytes      int64    `json:"freed_bytes"`
+}
+
+// handlePurgeIncompletePrecache clears precache entries whose DFS cache
+// coverage never reached 1.0 (abandoned read-aheads, episodes precached but
+// never watched, etc). Defaults to a dry run - pass ?execute=true to actually
+// delete. Entries with a burst currently writing into them are always
+// skipped (see Precache.InflightHas), dry-run or not, so the preview matches
+// what an execute=true call would really do.
+func (s *Server) handlePurgeIncompletePrecache(w http.ResponseWriter, r *http.Request) {
+	execute, _ := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("execute")))
+	deleted, skippedInflight, freedBytes, err := s.manager.PurgeIncompletePrecache(execute)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, PrecachePurgeResult{
+		Deleted:         deleted,
+		SkippedInflight: skippedInflight,
+		FreedBytes:      freedBytes,
+	}, http.StatusOK)
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`

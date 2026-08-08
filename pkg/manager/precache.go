@@ -14,7 +14,10 @@ package manager
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -463,4 +466,79 @@ func (p *Precache) Summary() PrecacheSummary {
 		MaxBytes:             cfg.MaxBytes(),
 		Readiness:            readiness,
 	}
+}
+
+// PurgeIncomplete finds every readiness row whose DFS cache coverage is
+// still short of 1.0 (see EpisodeReadiness.CacheCoverage) and, when execute
+// is true, removes each one's cache directory via Repair.RemoveEntryCacheDir
+// - the same path the stale-NZB sweep already uses, so it keeps that path's
+// safeguards (won't touch a directory another healthy entry still shares,
+// won't leave the configured cache root). Rows with a burst actively writing
+// into them (see InflightHas) are always skipped, dry-run or not, so this is
+// safe to call while precache/read-ahead is running.
+//
+// execute=false previews what would be deleted without touching disk -
+// freedBytes is then the candidates' last-known CachedBytes rather than what
+// RemoveEntryCacheDir would actually free.
+func (p *Precache) PurgeIncomplete(execute bool) (deleted, skippedInflight []string, freedBytes int64, err error) {
+	if p == nil {
+		return nil, nil, 0, nil
+	}
+	type candidate struct {
+		key         string
+		infoHash    string
+		filename    string
+		entryName   string
+		cachedBytes int64
+	}
+
+	p.readinessMu.Lock()
+	candidates := make([]candidate, 0, len(p.readiness))
+	for key, r := range p.readiness {
+		if r.CacheCoverage >= 1.0 {
+			continue
+		}
+		infoHash, filename, ok := strings.Cut(key, ":")
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, candidate{
+			key:         key,
+			infoHash:    infoHash,
+			filename:    filename,
+			entryName:   r.EntryName,
+			cachedBytes: r.CachedBytes,
+		})
+	}
+	p.readinessMu.Unlock()
+
+	var errs []error
+	for _, c := range candidates {
+		if p.InflightHas(c.infoHash, c.filename) {
+			skippedInflight = append(skippedInflight, c.entryName)
+			continue
+		}
+		if !execute {
+			deleted = append(deleted, c.entryName)
+			freedBytes += c.cachedBytes
+			continue
+		}
+		if p.manager.repair == nil {
+			errs = append(errs, fmt.Errorf("removing cache dir for %q: repair service unavailable", c.entryName))
+			continue
+		}
+		freed, ok := p.manager.repair.RemoveEntryCacheDir(c.entryName, c.infoHash)
+		if !ok {
+			errs = append(errs, fmt.Errorf("failed to remove cache dir for %q", c.entryName))
+			continue
+		}
+		deleted = append(deleted, c.entryName)
+		freedBytes += freed
+
+		p.readinessMu.Lock()
+		delete(p.readiness, c.key)
+		p.readinessMu.Unlock()
+	}
+
+	return deleted, skippedInflight, freedBytes, errors.Join(errs...)
 }

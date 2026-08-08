@@ -28,6 +28,12 @@ func (m *Manager) PrecacheStatus() PrecacheSummary {
 	return m.precache.Summary()
 }
 
+// PurgeIncompletePrecache reaps part-cached precache entries - see
+// Precache.PurgeIncomplete.
+func (m *Manager) PurgeIncompletePrecache(execute bool) (deleted, skippedInflight []string, freedBytes int64, err error) {
+	return m.precache.PurgeIncomplete(execute)
+}
+
 func (m *Manager) Scheduler() gocron.Scheduler {
 	return m.scheduler
 }

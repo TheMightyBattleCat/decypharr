@@ -120,6 +120,7 @@ class RepairManager {
             this.renderPrecacheReadiness();
         });
         $('precacheRefreshBtn')?.addEventListener('click', () => this.loadPrecacheStatus());
+        $('precachePurgeIncompleteBtn')?.addEventListener('click', () => this.handlePurgeIncompletePrecache());
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
             () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
@@ -936,6 +937,39 @@ class RepairManager {
     // gate above.
     hasInFlightPrecacheEntries() {
         return (this.precacheReadiness || []).some((r) => (r.cache_coverage || 0) < 1);
+    }
+
+    // handlePurgeIncompletePrecache dry-runs the delete first so the confirm
+    // dialog can show an accurate count/size, then re-runs for real on
+    // confirmation. Entries still being burst-downloaded into are always
+    // skipped server-side (see Precache.InflightHas), so the preview matches
+    // what the real pass will do.
+    async handlePurgeIncompletePrecache() {
+        const btn = document.getElementById('precachePurgeIncompleteBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const previewRes = await fetch(`${this.api}/precache/purge-incomplete?execute=false`, {method: 'POST'});
+            const preview = await this.parseJSONSafe(previewRes);
+            if (!previewRes.ok) throw new Error((preview && (preview.error || preview.message)) || `HTTP ${previewRes.status}`);
+            const deleted = preview?.deleted || [];
+            const skipped = preview?.skipped_inflight || [];
+            if (!deleted.length) {
+                window.createToast('No incomplete precache entries to delete', 'info');
+                return;
+            }
+            const skippedNote = skipped.length ? `\n\n${skipped.length} still downloading will be skipped.` : '';
+            if (!confirm(`Delete ${deleted.length} incomplete precache entr${deleted.length === 1 ? 'y' : 'ies'} (~${this.formatBytes(preview?.freed_bytes || 0)})?${skippedNote}`)) return;
+
+            const res = await fetch(`${this.api}/precache/purge-incomplete?execute=true`, {method: 'POST'});
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            window.createToast(`Deleted ${(data?.deleted || []).length} incomplete entr${(data?.deleted || []).length === 1 ? 'y' : 'ies'}, freed ${this.formatBytes(data?.freed_bytes || 0)}`, 'success');
+            await this.loadPrecacheStatus();
+        } catch (e) {
+            window.createToast(`Delete incomplete failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
     }
 
     renderPrecache(status) {
