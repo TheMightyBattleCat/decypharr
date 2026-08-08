@@ -777,9 +777,16 @@ func (s *Server) handlePrecacheStatus(w http.ResponseWriter, r *http.Request) {
 // PrecachePurgeResult is the response for handlePurgeIncompletePrecache -
 // see Precache.PurgeIncomplete.
 type PrecachePurgeResult struct {
-	Deleted         []string `json:"deleted"`
-	SkippedInflight []string `json:"skipped_inflight"`
-	FreedBytes      int64    `json:"freed_bytes"`
+	Deleted         []string          `json:"deleted"`
+	SkippedInflight []string          `json:"skipped_inflight"`
+	Failed          []PurgeFailureDTO `json:"failed"`
+	FreedBytes      int64             `json:"freed_bytes"`
+}
+
+// PurgeFailureDTO mirrors manager.PurgeFailure for the API response.
+type PurgeFailureDTO struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // handlePurgeIncompletePrecache clears precache entries whose DFS cache
@@ -790,14 +797,19 @@ type PrecachePurgeResult struct {
 // what an execute=true call would really do.
 func (s *Server) handlePurgeIncompletePrecache(w http.ResponseWriter, r *http.Request) {
 	execute, _ := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("execute")))
-	deleted, skippedInflight, freedBytes, err := s.manager.PurgeIncompletePrecache(execute)
+	deleted, skippedInflight, failed, freedBytes, err := s.manager.PurgeIncompletePrecache(execute)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	failedDTO := make([]PurgeFailureDTO, 0, len(failed))
+	for _, f := range failed {
+		failedDTO = append(failedDTO, PurgeFailureDTO{Name: f.Name, Reason: f.Reason})
+	}
 	utils.JSONResponse(w, PrecachePurgeResult{
 		Deleted:         deleted,
 		SkippedInflight: skippedInflight,
+		Failed:          failedDTO,
 		FreedBytes:      freedBytes,
 	}, http.StatusOK)
 }

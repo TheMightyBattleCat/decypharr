@@ -30,7 +30,7 @@ func (m *Manager) PrecacheStatus() PrecacheSummary {
 
 // PurgeIncompletePrecache reaps part-cached precache entries - see
 // Precache.PurgeIncomplete.
-func (m *Manager) PurgeIncompletePrecache(execute bool) (deleted, skippedInflight []string, freedBytes int64, err error) {
+func (m *Manager) PurgeIncompletePrecache(execute bool) (deleted, skippedInflight []string, failed []PurgeFailure, freedBytes int64, err error) {
 	return m.precache.PurgeIncomplete(execute)
 }
 

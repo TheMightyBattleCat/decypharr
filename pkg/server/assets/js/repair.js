@@ -963,7 +963,13 @@ class RepairManager {
             const res = await fetch(`${this.api}/precache/purge-incomplete?execute=true`, {method: 'POST'});
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
-            window.createToast(`Deleted ${(data?.deleted || []).length} incomplete entr${(data?.deleted || []).length === 1 ? 'y' : 'ies'}, freed ${this.formatBytes(data?.freed_bytes || 0)}`, 'success');
+            const deletedCount = (data?.deleted || []).length;
+            const skippedCount = (data?.skipped_inflight || []).length;
+            const failedCount = (data?.failed || []).length;
+            let msg = `Deleted ${deletedCount} (freed ${this.formatBytes(data?.freed_bytes || 0)})`;
+            if (skippedCount) msg += `, ${skippedCount} in-flight skipped`;
+            if (failedCount) msg += `, ${failedCount} couldn't be removed`;
+            window.createToast(msg, failedCount ? 'warning' : 'success');
             await this.loadPrecacheStatus();
         } catch (e) {
             window.createToast(`Delete incomplete failed: ${e.message}`, 'error');
