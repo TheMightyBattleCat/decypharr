@@ -59,7 +59,10 @@ type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
 			RatingKey string `json:"ratingKey"`
-			Media     []struct {
+			Player    struct {
+				State string `json:"state"`
+			} `json:"Player"`
+			Media []struct {
 				Part []struct {
 					File string `json:"file"`
 				} `json:"Part"`
@@ -214,6 +217,13 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 
 	var files []string
 	for _, meta := range parsed.MediaContainer.Metadata {
+		// Only a genuinely-playing session should open the precache gate. Plex
+		// also lists paused/buffering sessions and, during a library scan, items
+		// being analysed - none of which are real playback, and all of which
+		// would otherwise trigger read-ahead on a scan/metadata read.
+		if meta.Player.State != "playing" {
+			continue
+		}
 		before := len(files)
 		for _, media := range meta.Media {
 			for _, part := range media.Part {

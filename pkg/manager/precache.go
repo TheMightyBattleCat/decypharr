@@ -190,6 +190,13 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	if start*100 < size*threshold {
 		return
 	}
+	// Near the end of the file there's nothing meaningful left to pull ahead, so
+	// don't start a read-ahead burst - this also stops a metadata/footer read
+	// (which lands at ~99% of the file) from tripping read-ahead the way a real
+	// playback position would.
+	if start*100 > size*98 {
+		return
+	}
 
 	now := time.Now()
 
