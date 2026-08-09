@@ -61,6 +61,13 @@ type EpisodeReadiness struct {
 // for one that isn't. No-op for movies (no Sonarr context resolves), when
 // NextEpisodes is 0, or when arrs are unreachable.
 func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename string) {
+	// Next-episode precache only applies to series. Resolve the Arr this entry
+	// came from and bail unless it's a Sonarr instance - a movie (Radarr) has no
+	// next episode, and running the lookup for one wastes a call against every
+	// Sonarr instance just to fail the filename match.
+	if a := p.manager.arr.GetOrCreate(entry.Category); a == nil || a.Type != arr.Sonarr {
+		return
+	}
 	n := p.cfg().NextEpisodes()
 	if n <= 0 || p.manager.usenet == nil {
 		return
