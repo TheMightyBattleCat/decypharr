@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -58,7 +59,8 @@ const plexSessionGraceMinimum = 30 * time.Second
 type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
-			Media []struct {
+			RatingKey int `json:"ratingKey"`
+			Media     []struct {
 				Part []struct {
 					File string `json:"file"`
 				} `json:"Part"`
@@ -168,47 +170,77 @@ func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 	c.mu.Unlock()
 }
 
-// fetchSessions queries Plex's /status/sessions and returns the raw file
-// path of each currently-playing item's media part.
-func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, error) {
-	url, err := utils.JoinURL(cfg.URL, "/status/sessions")
+// plexGET issues an authenticated GET against a Plex endpoint and decodes the
+// response into out. Both the live-sessions poll and the per-session metadata
+// fallback go through here, so their request shape - auth header, Accept,
+// client, and timeout - is guaranteed identical and can't silently diverge.
+func (c *plexSessionChecker) plexGET(ctx context.Context, cfg config.PlexConfig, path string, out interface{}) error {
+	url, err := utils.JoinURL(cfg.URL, path)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Plex-Token", cfg.Token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("plex sessions request failed: %s", resp.Status)
+		return fmt.Errorf("plex: unexpected status %d from %s", resp.StatusCode, path)
 	}
+	return json.ConfigDefault.NewDecoder(resp.Body).Decode(out)
+}
+
+// fetchSessions queries Plex's /status/sessions and returns the raw file
+// path of each currently-playing item's media part. Direct-play sessions
+// carry the source file directly. Transcoding sessions don't - Plex omits
+// the file on a transcode-decision part and only describes the transcode
+// output - so for those we fall back to the item's library metadata, which
+// still reports the real source path regardless of playback decision.
+func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
+	defer cancel()
 
 	var parsed plexSessionsResponse
-	dec := json.ConfigDefault.NewDecoder(resp.Body)
-	if err := dec.Decode(&parsed); err != nil {
+	if err := c.plexGET(ctx, cfg, "/status/sessions", &parsed); err != nil {
 		return nil, err
 	}
 
 	var files []string
-	for _, m := range parsed.MediaContainer.Metadata {
-		for _, media := range m.Media {
+	for _, meta := range parsed.MediaContainer.Metadata {
+		before := len(files)
+		for _, media := range meta.Media {
 			for _, part := range media.Part {
 				if part.File != "" {
 					files = append(files, part.File)
 				}
 			}
+		}
+
+		if len(files) == before && meta.RatingKey != 0 {
+			mctx, mcancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
+			var detail plexSessionsResponse
+			if err := c.plexGET(mctx, cfg, "/library/metadata/"+strconv.Itoa(meta.RatingKey), &detail); err != nil {
+				c.logger.Debug().Err(err).Int("ratingKey", meta.RatingKey).Msg("plex: transcode-session metadata lookup failed; leaving title ungated this cycle")
+			} else {
+				for _, media := range detail.MediaContainer.Metadata {
+					for _, part := range media.Media {
+						for _, p := range part.Part {
+							if p.File != "" {
+								files = append(files, p.File)
+							}
+						}
+					}
+				}
+			}
+			mcancel()
 		}
 	}
 	return files, nil
