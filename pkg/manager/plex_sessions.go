@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -54,12 +55,17 @@ const plexSessionRetryDelay = 250 * time.Millisecond
 const plexSessionGraceMinimum = 30 * time.Second
 
 // plexSessionsResponse is the subset of Plex's /status/sessions payload
-// this checker needs: the file path backing each currently-playing item.
+// this checker needs: the file path backing each currently-playing item, and
+// its playback progress. ViewOffset/Duration are decoded as strings, not
+// int64 - like RatingKey, Plex sends these numeric fields quoted (see the
+// earlier RatingKey int/string decode regression this mirrors).
 type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
-			RatingKey string `json:"ratingKey"`
-			Player    struct {
+			RatingKey  string `json:"ratingKey"`
+			ViewOffset string `json:"viewOffset"`
+			Duration   string `json:"duration"`
+			Player     struct {
 				State string `json:"state"`
 			} `json:"Player"`
 			Media []struct {
@@ -69,6 +75,22 @@ type plexSessionsResponse struct {
 			} `json:"Media"`
 		} `json:"Metadata"`
 	} `json:"MediaContainer"`
+}
+
+// plexSessionFile is one playing file discovered by fetchSessions, paired
+// with its session's playback progress.
+type plexSessionFile struct {
+	path       string
+	viewOffset int64
+	duration   int64
+}
+
+// sessionProgress is a session's live playback position (milliseconds), as
+// resolved for one file path in plexSessionChecker.resolved. duration is 0
+// if Plex didn't report it or it failed to parse.
+type sessionProgress struct {
+	viewOffset int64
+	duration   int64
 }
 
 // plexSessionChecker answers "is this entry+filename part of an active Plex
@@ -82,9 +104,9 @@ type plexSessionChecker struct {
 
 	mu          sync.Mutex
 	fetched     time.Time
-	lastSuccess time.Time           // last time a poll succeeded; zero if it never has
-	degraded    bool                // true once a failed poll has exceeded the grace window; isPlexWatching denies everything while degraded
-	resolved    map[string]struct{} // resolved absolute file paths of files in active sessions, from the last successful poll
+	lastSuccess time.Time                  // last time a poll succeeded; zero if it never has
+	degraded    bool                       // true once a failed poll has exceeded the grace window; isPlexWatching denies everything while degraded
+	resolved    map[string]sessionProgress // resolved absolute file path -> playback progress of files in active sessions, from the last successful poll
 
 	lastWarnMu sync.Mutex
 	lastWarn   time.Time
@@ -95,7 +117,7 @@ func newPlexSessionChecker(m *Manager) *plexSessionChecker {
 		manager:  m,
 		logger:   logger.New("plex-sessions"),
 		client:   &http.Client{Timeout: plexSessionFetchTimeout},
-		resolved: make(map[string]struct{}),
+		resolved: make(map[string]sessionProgress),
 	}
 }
 
@@ -122,6 +144,20 @@ func (c *plexSessionChecker) isPlexWatching(entry *storage.Entry, filename strin
 	return ok
 }
 
+// sessionProgress returns a snapshot of every active session's resolved path
+// and playback progress, from the last successful poll. Returns a copy so
+// the caller (progressTriggerLoop) can iterate, reverse-lookup entries, and
+// spawn goroutines without holding c.mu.
+func (c *plexSessionChecker) sessionProgress() map[string]sessionProgress {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]sessionProgress, len(c.resolved))
+	for k, v := range c.resolved {
+		out[k] = v
+	}
+	return out
+}
+
 // refresh re-fetches and re-resolves Plex's session list if the cached one
 // is older than cfg.SessionTTL(). A failing poll is retried up to
 // plexSessionFetchRetries times before being treated as a failure; if every
@@ -137,7 +173,7 @@ func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 		return
 	}
 
-	var files []string
+	var files []plexSessionFile
 	var err error
 	for attempt := 0; attempt < plexSessionFetchRetries; attempt++ {
 		if attempt > 0 {
@@ -206,7 +242,7 @@ func (c *plexSessionChecker) plexGET(ctx context.Context, cfg config.PlexConfig,
 // the file on a transcode-decision part and only describes the transcode
 // output - so for those we fall back to the item's library metadata, which
 // still reports the real source path regardless of playback decision.
-func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, error) {
+func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSessionFile, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
 	defer cancel()
 
@@ -215,7 +251,7 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 		return nil, err
 	}
 
-	var files []string
+	var files []plexSessionFile
 	for _, meta := range parsed.MediaContainer.Metadata {
 		// Only a genuinely-playing session should open the precache gate. Plex
 		// also lists paused/buffering sessions and, during a library scan, items
@@ -224,11 +260,16 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 		if meta.Player.State != "playing" {
 			continue
 		}
+		// A parse failure just leaves progress at 0 - checkSessionProgress's
+		// duration<=0 guard skips it rather than treating it as 0% watched.
+		viewOffset, _ := strconv.ParseInt(meta.ViewOffset, 10, 64)
+		duration, _ := strconv.ParseInt(meta.Duration, 10, 64)
+
 		before := len(files)
 		for _, media := range meta.Media {
 			for _, part := range media.Part {
 				if part.File != "" {
-					files = append(files, part.File)
+					files = append(files, plexSessionFile{path: part.File, viewOffset: viewOffset, duration: duration})
 				}
 			}
 		}
@@ -243,7 +284,7 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 					for _, part := range media.Media {
 						for _, p := range part.Part {
 							if p.File != "" {
-								files = append(files, p.File)
+								files = append(files, plexSessionFile{path: p.File, viewOffset: viewOffset, duration: duration})
 							}
 						}
 					}
@@ -270,14 +311,14 @@ func TestPlexConnection(cfg config.PlexConfig) error {
 // (the DownloadActionSymlink setup collectArrFiles/the repair sweep already
 // trust), falling back to the raw path itself when it isn't a symlink
 // (Plex mounted directly on the DFS/rclone mount, no symlink layer).
-func resolvePlexSessionPaths(files []string) map[string]struct{} {
-	resolved := make(map[string]struct{}, len(files))
+func resolvePlexSessionPaths(files []plexSessionFile) map[string]sessionProgress {
+	resolved := make(map[string]sessionProgress, len(files))
 	for _, f := range files {
-		target := readSymlinkTarget(f)
+		target := readSymlinkTarget(f.path)
 		if target == "" {
-			target = filepath.Clean(f)
+			target = filepath.Clean(f.path)
 		}
-		resolved[target] = struct{}{}
+		resolved[target] = sessionProgress{viewOffset: f.viewOffset, duration: f.duration}
 	}
 	return resolved
 }

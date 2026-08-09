@@ -14,6 +14,7 @@ package manager
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -110,6 +111,12 @@ type Precache struct {
 	// Always non-nil; a no-op (allows everything) when config.PlexConfig.URL
 	// is unset.
 	plexChecker *plexSessionChecker
+
+	// ctx/cancel/wg govern progressTriggerLoop, the Plex playback-progress
+	// poll loop - see Start/Stop.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewPrecache builds the precache service.
@@ -128,6 +135,132 @@ func NewPrecache(m *Manager) *Precache {
 
 func (p *Precache) cfg() config.PrecacheConfig {
 	return config.Get().Precache
+}
+
+// precacheProgressPollInterval is the progressTriggerLoop tick cadence -
+// ~1.5x the default Plex SessionCacheTTL (10s, see PlexConfig.SessionTTL) so
+// most ticks land on a live Plex fetch under default config, but decoupled
+// from the user's TTL setting rather than tied to it. Playback progress
+// isn't latency-sensitive, so this doesn't need to be tighter.
+const precacheProgressPollInterval = 15 * time.Second
+
+// Start launches progressTriggerLoop, cancellable via ctx or Stop.
+func (p *Precache) Start(ctx context.Context) {
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.wg.Add(1)
+	go p.progressTriggerLoop()
+}
+
+// Stop cancels progressTriggerLoop and waits for it to exit.
+func (p *Precache) Stop() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+}
+
+// progressTriggerLoop periodically checks every active Plex "now playing"
+// session's playback progress against PrecacheThresholdPercent - see
+// checkSessionProgress's doc comment for why this exists alongside Observe.
+// Exits when ctx (passed to Start) is cancelled.
+func (p *Precache) progressTriggerLoop() {
+	defer p.wg.Done()
+	ticker := time.NewTicker(precacheProgressPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.checkSessionProgress()
+		}
+	}
+}
+
+// checkSessionProgress drives next-episode read-ahead from Plex playback
+// PROGRESS rather than from cache-miss reads. This is deliberate: the
+// next-episode burst is only reachable from Observe, and Observe only runs on
+// a cache MISS (Manager.Stream is invoked solely for a missing byte range).
+// A current episode that is already fully cached - including by the DFS
+// mount's own unconditional read-ahead - produces no misses, so Observe never
+// fires and the next episode never warms. Polling playback progress decouples
+// the trigger from the miss, so "current episode already warm" still advances
+// the next one.
+func (p *Precache) checkSessionProgress() {
+	cfg := config.Get()
+	if !cfg.Plex.Enabled() {
+		return
+	}
+	if !cfg.Repair.PrecacheReadAheadEnabled() {
+		return
+	}
+	pc := p.cfg()
+	if pc.MaxBytes() <= 0 {
+		return
+	}
+	threshold := int64(pc.ThresholdPercent())
+
+	p.plexChecker.refresh(cfg.Plex)
+	for path, prog := range p.plexChecker.sessionProgress() {
+		if prog.duration <= 0 {
+			continue
+		}
+		pct := prog.viewOffset * 100 / prog.duration
+		if pct < threshold || pct > 98 {
+			continue
+		}
+		entry, filename, ok := p.resolvedPathToEntry(path)
+		if !ok {
+			continue
+		}
+		f, ok := entry.Files[filename]
+		if !ok || f.Size <= 0 {
+			continue
+		}
+		key := entry.InfoHash + ":" + filename
+		if !p.tryMarkTriggered(key) {
+			continue
+		}
+		// viewOffset/duration are milliseconds; readAhead wants a byte offset.
+		from := f.Size * prog.viewOffset / prog.duration
+		go p.readAhead(entry, filename, from, f.Size)
+	}
+}
+
+// resolvedPathToEntry reverses GetTorrentMountPath - a flat
+// <MountPath>/<EntryAllFolder>/<folder>/<nested/file> - back to the owning
+// entry and the entry.Files key. filename is the full nested remainder,
+// "/"-joined, matching the FUSE path resolver's derivation so the dedup key
+// and entry.Files lookup align with Observe's. (Note: WebDAV serving passes a
+// bare basename to Observe instead; that FUSE-vs-WebDAV split is pre-existing
+// and only affects WebDAV-served nested files, harmlessly double-firing.)
+func (p *Precache) resolvedPathToEntry(resolvedPath string) (*storage.Entry, string, bool) {
+	base := filepath.Join(p.manager.config.Mount.MountPath, EntryAllFolder)
+	rel, err := filepath.Rel(base, resolvedPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil, "", false
+	}
+	parts := strings.SplitN(rel, string(filepath.Separator), 2)
+	if len(parts) != 2 {
+		return nil, "", false
+	}
+	folder, filename := parts[0], parts[1]
+
+	if config.Get().FolderNaming == config.WebdavUseHash {
+		entry, err := p.manager.storage.Get(folder)
+		if err != nil {
+			return nil, "", false
+		}
+		return entry, filename, true
+	}
+
+	entries, err := p.manager.storage.List(func(e *storage.Entry) bool {
+		return e.GetFolder() == folder
+	})
+	if err != nil || len(entries) == 0 {
+		return nil, "", false
+	}
+	return entries[0], filename, true
 }
 
 // logGateDeny logs a read-ahead gate denial at most once per entry:file, so a
@@ -198,18 +331,28 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		return
 	}
 
-	now := time.Now()
-
-	p.mu.Lock()
-	if _, done := p.triggered[key]; done {
-		p.mu.Unlock()
+	if !p.tryMarkTriggered(key) {
 		return
+	}
+
+	go p.readAhead(entry, filename, start, size)
+}
+
+// tryMarkTriggered atomically checks-and-marks key ("infoHash:filename") in
+// p.triggered, deduping Observe's byte-offset trigger against the Plex
+// progress-poll trigger so the same file never starts two concurrent
+// read-ahead bursts. Returns true if this call claimed key (caller should
+// proceed); false if another caller already claimed it.
+func (p *Precache) tryMarkTriggered(key string) bool {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, done := p.triggered[key]; done {
+		return false
 	}
 	p.triggered[key] = now
 	p.pruneLocked(now)
-	p.mu.Unlock()
-
-	go p.readAhead(entry, filename, start, size)
+	return true
 }
 
 // pruneLocked drops dedup entries older than precacheTriggeredTTL. Caller

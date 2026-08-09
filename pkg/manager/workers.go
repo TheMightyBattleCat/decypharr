@@ -206,6 +206,13 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		m.par2Repair.Start(ctx)
 	}
 
+	// Start the precache playback-progress poll loop. Always started (it's a
+	// no-op consumer otherwise): whether it does anything is gated live per-
+	// tick by config.Plex/config.Repair, not by whether it was started.
+	if m.precache != nil {
+		m.precache.Start(ctx)
+	}
+
 	// Start the scheduler
 	m.scheduler.Start()
 	m.cetScheduler.Start()

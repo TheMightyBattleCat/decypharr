@@ -499,6 +499,12 @@ func (m *Manager) Stop() error {
 		m.par2Repair.Stop()
 	}
 
+	// Stop the precache progress-poll loop before closing usenet, same
+	// reason - it can call into usenet via readAhead.
+	if m.precache != nil {
+		m.precache.Stop()
+	}
+
 	// Close usenet connection manager if active
 	if m.usenet != nil {
 		m.logger.Info().Msg("Closing usenet connections")
