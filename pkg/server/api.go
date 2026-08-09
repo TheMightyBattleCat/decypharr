@@ -544,6 +544,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// silently reset to defaults on every unrelated settings save, same bug
 	// class as the Repair fields preserved above.
 	newConfig.Precache = currentConfig.Precache
+	// Plex has a dedicated endpoint (handleUpdatePlexConfig); preserve it here so
+	// an unrelated settings save (e.g. editing an Arr) can't zero the Plex URL and
+	// token, which silently opens the precache session gate. Same bug class as the
+	// Precache/Repair preserves above.
+	newConfig.Plex = currentConfig.Plex
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
