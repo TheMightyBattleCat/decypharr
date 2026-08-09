@@ -54,17 +54,48 @@ const plexSessionRetryDelay = 250 * time.Millisecond
 // short SessionCacheTTL doesn't shrink the window to nearly nothing.
 const plexSessionGraceMinimum = 30 * time.Second
 
+// flexInt64 decodes a JSON value that may arrive as either a bare number
+// (e.g. "viewOffset":443142) or a quoted string (e.g. "ratingKey":"208698").
+// Plex mixes both forms field-by-field within the same /status/sessions
+// object, and the strict decoder fails the WHOLE response on any single
+// mismatch - which, behind the fail-closed session gate, silently disables
+// precache fleet-wide. Decoding the numeric fields tolerantly contains a
+// wire-form surprise to "that value is 0" instead of a total gate outage.
+// Empty or absent decodes to 0.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = 0
+		return nil
+	}
+	// Strip surrounding quotes if present.
+	if b[0] == '"' && b[len(b)-1] == '"' {
+		b = b[1 : len(b)-1]
+	}
+	if len(b) == 0 {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return fmt.Errorf("flexInt64: %q: %w", string(b), err)
+	}
+	*f = flexInt64(n)
+	return nil
+}
+
 // plexSessionsResponse is the subset of Plex's /status/sessions payload
 // this checker needs: the file path backing each currently-playing item, and
-// its playback progress. ViewOffset/Duration are decoded as strings, not
-// int64 - like RatingKey, Plex sends these numeric fields quoted (see the
-// earlier RatingKey int/string decode regression this mirrors).
+// its playback progress. ViewOffset/Duration decode via flexInt64 - Plex
+// sends these as bare numbers, unlike RatingKey's quoted string form (see
+// flexInt64's doc comment for why tolerant decoding matters here).
 type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
-			RatingKey  string `json:"ratingKey"`
-			ViewOffset string `json:"viewOffset"`
-			Duration   string `json:"duration"`
+			RatingKey  string    `json:"ratingKey"`
+			ViewOffset flexInt64 `json:"viewOffset"`
+			Duration   flexInt64 `json:"duration"`
 			Player     struct {
 				State string `json:"state"`
 			} `json:"Player"`
@@ -260,10 +291,11 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSession
 		if meta.Player.State != "playing" {
 			continue
 		}
-		// A parse failure just leaves progress at 0 - checkSessionProgress's
-		// duration<=0 guard skips it rather than treating it as 0% watched.
-		viewOffset, _ := strconv.ParseInt(meta.ViewOffset, 10, 64)
-		duration, _ := strconv.ParseInt(meta.Duration, 10, 64)
+		// An unparseable value already decoded to 0 in flexInt64.UnmarshalJSON -
+		// checkSessionProgress's duration<=0 guard skips it rather than
+		// treating it as 0% watched.
+		viewOffset := int64(meta.ViewOffset)
+		duration := int64(meta.Duration)
 
 		before := len(files)
 		for _, media := range meta.Media {
