@@ -54,6 +54,12 @@ type Precache struct {
 	mu        sync.Mutex
 	triggered map[string]time.Time // "infoHash:filename" -> when work on it was kicked off (read-ahead or next-episode burst)
 
+	// denyLogged records entry:file keys for which a read-ahead gate-denial has
+	// already been logged, so a diagnostic deny (disabled / no budget / Plex gate)
+	// is logged once per file rather than on every ranged read. Guarded by mu.
+	// Never consulted by gating logic - purely to rate-limit the deny log.
+	denyLogged map[string]struct{}
+
 	// precachedBytes is a running total of bytes this feature has
 	// deliberately pulled ahead of need (Sonarr next-episode bursts only -
 	// see PrecacheMaxBytes), checked/reserved before starting a new burst so
@@ -112,6 +118,7 @@ func NewPrecache(m *Manager) *Precache {
 		manager:     m,
 		logger:      logger.New("precache"),
 		triggered:   make(map[string]time.Time),
+		denyLogged:  make(map[string]struct{}),
 		precached:   make(map[string]int64),
 		readiness:   make(map[string]EpisodeReadiness),
 		inflight:    make(map[string]int),
@@ -121,6 +128,28 @@ func NewPrecache(m *Manager) *Precache {
 
 func (p *Precache) cfg() config.PrecacheConfig {
 	return config.Get().Precache
+}
+
+// logGateDeny logs a read-ahead gate denial at most once per entry:file, so a
+// standing denial (toggle off, no budget, or the Plex session gate not
+// matching) is visible in the log without repeating on every ranged read.
+// reason is a short stable tag (disabled / max_bytes / plex_gate).
+// Behaviour-free: the denyLogged set is never read by the gating path.
+func (p *Precache) logGateDeny(key, reason, entry, filename string) {
+	p.mu.Lock()
+	_, seen := p.denyLogged[key]
+	if !seen {
+		p.denyLogged[key] = struct{}{}
+	}
+	p.mu.Unlock()
+	if seen {
+		return
+	}
+	p.logger.Debug().
+		Str("reason", reason).
+		Str("entry", entry).
+		Str("file", filename).
+		Msg("read-ahead precache skipped")
 }
 
 // Observe is called on every usenet stream range request with the file's
@@ -134,7 +163,10 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	}
 	p.evictIfWatched(entry, filename, start, size)
 
+	key := entry.InfoHash + ":" + filename
+
 	if !config.Get().Repair.PrecacheReadAheadEnabled() {
+		p.logGateDeny(key, "disabled", entry.Name, filename)
 		return
 	}
 	cfg := p.cfg()
@@ -144,12 +176,14 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		// master toggle being off, so no read-ahead burst starts either, not
 		// just next-episode bursts (which reserveBudget already gates on its
 		// own).
+		p.logGateDeny(key, "max_bytes", entry.Name, filename)
 		return
 	}
 	if !p.plexChecker.isPlexWatching(entry, filename) {
 		// Plex gate configured and this file isn't part of an active
 		// playing session (e.g. a library scan or thumbnail-generation
 		// read) - don't let it trigger a read-ahead burst.
+		p.logGateDeny(key, "plex_gate", entry.Name, filename)
 		return
 	}
 	threshold := int64(cfg.ThresholdPercent())
@@ -157,7 +191,6 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		return
 	}
 
-	key := entry.InfoHash + ":" + filename
 	now := time.Now()
 
 	p.mu.Lock()
@@ -186,6 +219,8 @@ func (p *Precache) pruneLocked(now time.Time) {
 // for damage it may have surfaced.
 func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size int64) {
 	if p.manager.usenet == nil {
+		p.logger.Debug().Str("entry", entry.Name).Str("file", filename).
+			Msg("read-ahead precache skipped: usenet client not ready")
 		return
 	}
 	key := entry.InfoHash + ":" + filename

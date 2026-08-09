@@ -71,6 +71,7 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 
 	a, seriesId, seasonNumber, episodeNumber, ok := p.resolveSonarrEpisode(ctx, entry, filename)
 	if !ok {
+		p.logger.Debug().Str("entry", entry.Name).Msg("next-episode precache: no matching Sonarr episode resolved")
 		return
 	}
 
@@ -79,8 +80,13 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 			return
 		}
 		next, found, err := a.NextEpisode(ctx, seriesId, seasonNumber, episodeNumber)
-		if err != nil || !found {
-			return // season boundary (or beyond), or arr unreachable
+		if err != nil {
+			p.logger.Debug().Err(err).Str("series", entry.Name).Msg("next-episode precache: NextEpisode lookup failed (Arr unreachable?)")
+			return
+		}
+		if !found {
+			p.logger.Debug().Str("series", entry.Name).Msg("next-episode precache: no next episode (season boundary)")
+			return
 		}
 		episodeNumber = next.EpisodeNumber
 
@@ -119,6 +125,7 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 		}
 		media, err := cand.GetMedia(ctx, "")
 		if err != nil {
+			p.logger.Debug().Err(err).Str("arr", cand.Name).Msg("next-episode precache: Sonarr media lookup failed")
 			continue
 		}
 		for _, content := range media {
@@ -149,6 +156,7 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) {
 	target := readSymlinkTarget(next.Path)
 	if target == "" {
+		p.logger.Debug().Str("file", next.Path).Msg("next-episode precache: next episode is not a local symlink")
 		return // not a decypharr-managed symlink (e.g. imported directly)
 	}
 	dir, filename := filepath.Split(target)
@@ -168,6 +176,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	p.triggered[key] = time.Now()
 	p.mu.Unlock()
 	if already {
+		p.logger.Debug().Str("key", key).Msg("next-episode precache: already triggered for this file")
 		return
 	}
 
