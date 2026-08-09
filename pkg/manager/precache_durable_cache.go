@@ -97,6 +97,9 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		}
 	}
 
+	var bytesWritten, segmentsWritten, writeFailures, readFailures int64
+	firstByteZero := false
+
 	var buf []byte
 	for idx, seg := range file.Segments {
 		if dead[idx] {
@@ -113,13 +116,36 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		buf = buf[:size]
 		n, err := src.ReadCachedAt(ctx, infoHash, filename, buf, start)
 		if err != nil || int64(n) != size {
+			readFailures++
+			log.Debug().Err(err).Str("entry", entryName).Str("file", filename).Int("segment", idx).Int64("offset", start).
+				Msg("next-episode pre-cache: durable read failed")
 			continue // not actually available right now - a later pass picks it up
 		}
 		if err := writer.WriteCachedRange(entryName, filename, fileSize, buf, start); err != nil {
+			writeFailures++
 			log.Debug().Err(err).Str("entry", entryName).Str("file", filename).Int("segment", idx).
 				Msg("next-episode pre-cache: durable write failed")
+			continue
+		}
+		bytesWritten += size
+		segmentsWritten++
+		if start == 0 {
+			// Front-of-file zero-fill canary: burst zero-fill is already fixed
+			// upstream, so this is a belt-and-suspenders alarm, not the
+			// primary guard against it.
+			firstByteZero = len(buf) > 0 && buf[0] == 0x00
 		}
 	}
+
+	evt := log.Info()
+	if firstByteZero || writeFailures > 0 || readFailures > 0 {
+		evt = log.Warn()
+	}
+	evt.Str("entry", entryName).Str("file", filename).
+		Int64("bytes", bytesWritten).Int64("segments", segmentsWritten).
+		Int64("writeFailures", writeFailures).Int64("readFailures", readFailures).
+		Bool("firstByteZero", firstByteZero).
+		Msg("durable persist complete")
 }
 
 // persistCleanRanges is the real-world entry point for persistDurableRanges,

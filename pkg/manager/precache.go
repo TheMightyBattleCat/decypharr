@@ -249,6 +249,11 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 
 	if err := p.manager.usenet.ReadAhead(ctx, entry.InfoHash, filename, from, concurrency); err != nil {
 		p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("read-ahead precache ended early")
+		p.logger.Warn().Str("entry", entry.Name).Str("file", filename).Int64("from", from).Err(err).
+			Msg("read-ahead incomplete")
+	} else {
+		p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
+			Msg("read-ahead complete")
 	}
 
 	p.repairAhead(entry, filename, from)
