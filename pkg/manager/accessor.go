@@ -34,6 +34,11 @@ func (m *Manager) PurgeIncompletePrecache(execute bool) (deleted, skippedInfligh
 	return m.precache.PurgeIncomplete(execute)
 }
 
+// RescanPrecache re-runs the on-disk cache scan - see Precache.Rescan.
+func (m *Manager) RescanPrecache() {
+	m.precache.Rescan()
+}
+
 func (m *Manager) Scheduler() gocron.Scheduler {
 	return m.scheduler
 }

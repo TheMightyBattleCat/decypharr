@@ -814,6 +814,15 @@ func (s *Server) handlePurgeIncompletePrecache(w http.ResponseWriter, r *http.Re
 	}, http.StatusOK)
 }
 
+// handleRescanPrecache re-runs the on-disk cache scan so entries cached
+// after startup - a fresh import, or Plex reading a file during intro
+// detection or a library scan - show up in the readiness table without
+// waiting for a restart. See Precache.Rescan.
+func (s *Server) handleRescanPrecache(w http.ResponseWriter, r *http.Request) {
+	s.manager.RescanPrecache()
+	utils.JSONResponse(w, map[string]bool{"ok": true}, http.StatusOK)
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`

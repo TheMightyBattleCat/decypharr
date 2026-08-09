@@ -119,7 +119,7 @@ class RepairManager {
             this.precacheSort = e.target.value;
             this.renderPrecacheReadiness();
         });
-        $('precacheRefreshBtn')?.addEventListener('click', () => this.loadPrecacheStatus());
+        $('precacheRefreshBtn')?.addEventListener('click', () => this.loadPrecacheStatus(true));
         $('precachePurgeIncompleteBtn')?.addEventListener('click', () => this.handlePurgeIncompletePrecache());
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
@@ -915,7 +915,14 @@ class RepairManager {
 
     // === Pre-cache summary (read-ahead + Sonarr next-episode) ===
 
-    async loadPrecacheStatus() {
+    async loadPrecacheStatus(rescan = false) {
+        if (rescan) {
+            try {
+                await fetch(`${this.api}/precache/rescan`, {method: 'POST'});
+            } catch (e) {
+                console.error('Failed to rescan precache cache', e);
+            }
+        }
         try {
             const status = await this.fetchJSON(`${this.api}/precache/status`);
             this.renderPrecache(status || {});

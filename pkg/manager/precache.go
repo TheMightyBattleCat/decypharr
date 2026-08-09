@@ -92,6 +92,13 @@ type Precache struct {
 	// never races the mount not being ready yet at process startup.
 	cachePopulateOnce sync.Once
 
+	// rescanMu/rescanning single-flight Rescan(), the on-demand counterpart
+	// to cachePopulateOnce for cache entries that appear after the initial
+	// populate (a fresh import, or Plex reading a file during intro
+	// detection or a library scan) - see Rescan's doc comment.
+	rescanMu   sync.Mutex
+	rescanning bool
+
 	// plexChecker gates read-ahead bursts behind an active Plex playing
 	// session for the file being read - see isPlexWatching's doc comment.
 	// Always non-nil; a no-op (allows everything) when config.PlexConfig.URL
@@ -464,6 +471,29 @@ func (p *Precache) Summary() PrecacheSummary {
 		MaxBytes:             cfg.MaxBytes(),
 		Readiness:            readiness,
 	}
+}
+
+// Rescan re-runs the on-disk cache scan so entries cached after startup - a
+// fresh import, or Plex reading a file during intro detection or a library
+// scan - become visible in the readiness table without waiting for a
+// restart. populateFromCache only inserts rows it doesn't already have,
+// under readinessMu, so re-running it can't disturb a row the live tracker
+// is mid-write on. Single-flighted so two overlapping refreshes don't launch
+// two disk walks.
+func (p *Precache) Rescan() {
+	p.rescanMu.Lock()
+	if p.rescanning {
+		p.rescanMu.Unlock()
+		return
+	}
+	p.rescanning = true
+	p.rescanMu.Unlock()
+	defer func() {
+		p.rescanMu.Lock()
+		p.rescanning = false
+		p.rescanMu.Unlock()
+	}()
+	p.populateFromCache()
 }
 
 // PurgeFailure describes a cache directory PurgeIncomplete tried and failed
