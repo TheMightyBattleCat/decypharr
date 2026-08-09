@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
@@ -59,7 +58,7 @@ const plexSessionGraceMinimum = 30 * time.Second
 type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
-			RatingKey int `json:"ratingKey"`
+			RatingKey string `json:"ratingKey"`
 			Media     []struct {
 				Part []struct {
 					File string `json:"file"`
@@ -224,11 +223,11 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]string, err
 			}
 		}
 
-		if len(files) == before && meta.RatingKey != 0 {
+		if len(files) == before && meta.RatingKey != "" {
 			mctx, mcancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
 			var detail plexSessionsResponse
-			if err := c.plexGET(mctx, cfg, "/library/metadata/"+strconv.Itoa(meta.RatingKey), &detail); err != nil {
-				c.logger.Debug().Err(err).Int("ratingKey", meta.RatingKey).Msg("plex: transcode-session metadata lookup failed; leaving title ungated this cycle")
+			if err := c.plexGET(mctx, cfg, "/library/metadata/"+meta.RatingKey, &detail); err != nil {
+				c.logger.Debug().Err(err).Str("ratingKey", meta.RatingKey).Msg("plex: transcode-session metadata lookup failed; leaving title ungated this cycle")
 			} else {
 				for _, media := range detail.MediaContainer.Metadata {
 					for _, part := range media.Media {
