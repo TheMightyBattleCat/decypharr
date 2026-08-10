@@ -98,6 +98,7 @@ func (p *Precache) populateFromCache() {
 			if !exists {
 				p.readiness[key] = EpisodeReadiness{
 					EntryName:       entry.Name,
+					InfoHash:        entry.InfoHash,
 					Filename:        filename,
 					ReadyAt:         modTime,
 					CachedBytes:     cached,

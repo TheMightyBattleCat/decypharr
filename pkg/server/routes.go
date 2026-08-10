@@ -88,6 +88,8 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Put("/precache/config", s.handleUpdatePrecacheConfig)
 			r.Post("/precache/purge-incomplete", s.handlePurgeIncompletePrecache)
 			r.Post("/precache/rescan", s.handleRescanPrecache)
+			r.Post("/precache/pause", s.handlePausePrecache)
+			r.Post("/precache/entry-pause", s.handlePausePrecacheEntry)
 
 			// Plex server settings - gates Precache's read-ahead behind an
 			// active "now playing" session (see PlexConfig's doc comment)

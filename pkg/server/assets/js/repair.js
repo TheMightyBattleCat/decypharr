@@ -36,6 +36,7 @@ class RepairManager {
         this.overlayHistorySearch = '';
         this.overlayHistoryOutcomeFilter = 'all';
         this.precacheReadiness = [];
+        this.precachePaused = false;
         this.precacheSearch = '';
         this.precacheSort = 'ready_at';
         // Per-row live-progress poll timers, keyed by overlayKey() - see
@@ -120,6 +121,7 @@ class RepairManager {
             this.renderPrecacheReadiness();
         });
         $('precacheRefreshBtn')?.addEventListener('click', () => this.loadPrecacheStatus(true));
+        $('precachePauseBtn')?.addEventListener('click', () => this.handleTogglePrecachePaused());
         $('precachePurgeIncompleteBtn')?.addEventListener('click', () => this.handlePurgeIncompletePrecache());
         this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
@@ -985,6 +987,47 @@ class RepairManager {
         }
     }
 
+    // handleTogglePrecachePaused flips the global runtime pause (in-memory
+    // only, clears on restart - see Precache.SetPaused). Halts new
+    // read-ahead/next-episode bursts from starting; anything already
+    // downloading finishes on its own.
+    async handleTogglePrecachePaused() {
+        const btn = document.getElementById('precachePauseBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const res = await fetch(`${this.api}/precache/pause`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({paused: !this.precachePaused}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            await this.loadPrecacheStatus();
+        } catch (e) {
+            window.createToast(`Pause precache failed: ${e.message}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // handleTogglePrecacheEntryPaused flips the runtime pause for one
+    // readiness row, keyed by (info_hash, filename) - see
+    // Precache.SetKeyPaused.
+    async handleTogglePrecacheEntryPaused(row) {
+        try {
+            const res = await fetch(`${this.api}/precache/entry-pause`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({info_hash: row.info_hash, filename: row.filename, paused: !row.paused}),
+            });
+            const data = await this.parseJSONSafe(res);
+            if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            await this.loadPrecacheStatus();
+        } catch (e) {
+            window.createToast(`Pause entry failed: ${e.message}`, 'error');
+        }
+    }
+
     renderPrecache(status) {
         const line = document.getElementById('precacheStatusLine');
         if (line) {
@@ -1003,6 +1046,15 @@ class RepairManager {
         if (nextEpisodes) {
             const n = status.next_episodes || 0;
             nextEpisodes.textContent = n > 0 ? `${n} ahead${status.evict_after_watched ? ' · evict after watched' : ''}` : 'off';
+        }
+        this.precachePaused = !!status.paused;
+        const pauseBtn = document.getElementById('precachePauseBtn');
+        if (pauseBtn) {
+            pauseBtn.innerHTML = this.precachePaused
+                ? '<i class="bi bi-play-fill mr-1"></i>Resume precache'
+                : '<i class="bi bi-pause-fill mr-1"></i>Pause precache';
+            pauseBtn.classList.toggle('btn-warning', this.precachePaused);
+            pauseBtn.classList.toggle('btn-outline', !this.precachePaused);
         }
         this.precacheReadiness = status.readiness || [];
         this.renderPrecacheReadiness();
@@ -1062,6 +1114,7 @@ class RepairManager {
         noMatch?.classList.add('hidden');
         for (const r of readiness) {
             const tr = document.createElement('tr');
+            if (r.paused) tr.classList.add('opacity-50');
             const readyAt = r.ready_at ? new Date(r.ready_at).toLocaleString() : '-';
             let outcome;
             if (r.clean) {
@@ -1073,13 +1126,24 @@ class RepairManager {
             } else {
                 outcome = '<span class="badge badge-ghost">unknown</span>';
             }
+            if (r.paused) {
+                outcome += ' <span class="badge badge-outline">paused</span>';
+            }
             tr.innerHTML = `
                 <td class="font-mono text-sm whitespace-nowrap">${readyAt}</td>
                 <td class="break-all">${r.entry_name || '-'}</td>
                 <td class="text-xs opacity-70 break-all">${r.filename || '-'}</td>
                 <td class="whitespace-nowrap">${this.renderCacheCoverageBar(r.cached_bytes || 0, r.total_bytes || 0)}</td>
                 <td class="whitespace-nowrap">${outcome}</td>
+                <td class="whitespace-nowrap"></td>
             `;
+            const toggleCell = tr.lastElementChild;
+            const toggleBtn = document.createElement('button');
+            toggleBtn.className = 'btn btn-ghost btn-xs';
+            toggleBtn.title = r.paused ? 'Resume this entry' : 'Pause this entry';
+            toggleBtn.innerHTML = r.paused ? '<i class="bi bi-play-fill"></i>' : '<i class="bi bi-pause-fill"></i>';
+            toggleBtn.addEventListener('click', () => this.handleTogglePrecacheEntryPaused(r));
+            toggleCell.appendChild(toggleBtn);
             tbody.appendChild(tr);
         }
     }

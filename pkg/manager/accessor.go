@@ -39,6 +39,18 @@ func (m *Manager) RescanPrecache() {
 	m.precache.Rescan()
 }
 
+// SetPrecachePaused sets or clears the precache feature's global runtime
+// pause - see Precache.SetPaused.
+func (m *Manager) SetPrecachePaused(paused bool) {
+	m.precache.SetPaused(paused)
+}
+
+// SetPrecacheEntryPaused sets or clears the runtime pause for one
+// (infoHash,filename) pair - see Precache.SetKeyPaused.
+func (m *Manager) SetPrecacheEntryPaused(infoHash, filename string, paused bool) {
+	m.precache.SetKeyPaused(infoHash, filename, paused)
+}
+
 func (m *Manager) Scheduler() gocron.Scheduler {
 	return m.scheduler
 }

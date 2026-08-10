@@ -55,6 +55,14 @@ type Precache struct {
 	mu        sync.Mutex
 	triggered map[string]time.Time // "infoHash:filename" -> when work on it was kicked off (read-ahead or next-episode burst)
 
+	// paused/pausedKeys are runtime-only pause controls (SetPaused/
+	// SetKeyPaused), guarded by mu alongside triggered. Neither is
+	// persisted - they reset to false/empty on restart. The durable switch
+	// remains config.Repair.PrecacheReadAheadEnabled(); this is purely an
+	// operator's "hold off for now" toggle on top of it - see keyPaused.
+	paused     bool
+	pausedKeys map[string]struct{} // "infoHash:filename" -> paused
+
 	// denyLogged records entry:file keys for which a read-ahead gate-denial has
 	// already been logged, so a diagnostic deny (disabled / no budget / Plex gate)
 	// is logged once per file rather than on every ranged read. Guarded by mu.
@@ -125,6 +133,7 @@ func NewPrecache(m *Manager) *Precache {
 		manager:     m,
 		logger:      logger.New("precache"),
 		triggered:   make(map[string]time.Time),
+		pausedKeys:  make(map[string]struct{}),
 		denyLogged:  make(map[string]struct{}),
 		precached:   make(map[string]int64),
 		readiness:   make(map[string]EpisodeReadiness),
@@ -196,6 +205,9 @@ func (p *Precache) checkSessionProgress() {
 	}
 	pc := p.cfg()
 	if pc.MaxBytes() <= 0 {
+		return
+	}
+	if p.Paused() {
 		return
 	}
 	threshold := int64(pc.ThresholdPercent())
@@ -365,12 +377,61 @@ func (p *Precache) pruneLocked(now time.Time) {
 	}
 }
 
+// SetPaused sets or clears the global runtime pause - see the paused field's
+// doc comment. Halts new read-ahead and next-episode bursts from starting;
+// anything already running finishes. Runtime-only, not persisted.
+func (p *Precache) SetPaused(paused bool) {
+	p.mu.Lock()
+	p.paused = paused
+	p.mu.Unlock()
+}
+
+// Paused reports the current global runtime pause state.
+func (p *Precache) Paused() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paused
+}
+
+// SetKeyPaused sets or clears the runtime pause for one (infoHash,filename)
+// pair, keyed the same as triggered/precached/inflight. Runtime-only, not
+// persisted.
+func (p *Precache) SetKeyPaused(infoHash, filename string, paused bool) {
+	key := infoHash + ":" + filename
+	p.mu.Lock()
+	if paused {
+		p.pausedKeys[key] = struct{}{}
+	} else {
+		delete(p.pausedKeys, key)
+	}
+	p.mu.Unlock()
+}
+
+// keyPaused reports whether (infoHash,filename) should be held back from
+// starting a new burst - true if the global pause is on, or that specific
+// key was paused individually.
+func (p *Precache) keyPaused(infoHash, filename string) bool {
+	key := infoHash + ":" + filename
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.paused {
+		return true
+	}
+	_, ok := p.pausedKeys[key]
+	return ok
+}
+
 // readAhead runs the aggressive read-ahead burst for one file, then checks
 // for damage it may have surfaced.
 func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size int64) {
 	if p.manager.usenet == nil {
 		p.logger.Debug().Str("entry", entry.Name).Str("file", filename).
 			Msg("read-ahead precache skipped: usenet client not ready")
+		return
+	}
+	if p.keyPaused(entry.InfoHash, filename) {
+		p.logger.Debug().Str("entry", entry.Name).Str("file", filename).
+			Msg("read-ahead precache skipped: paused")
 		return
 	}
 	key := entry.InfoHash + ":" + filename
@@ -602,6 +663,9 @@ type PrecacheSummary struct {
 	EvictAfterWatched    bool  `json:"evict_after_watched"`
 	PrecachedBytes       int64 `json:"precached_bytes"`
 	MaxBytes             int64 `json:"max_bytes"`
+	// Paused is the global runtime pause toggle - see Precache.SetPaused.
+	// Runtime-only, not persisted.
+	Paused bool `json:"paused"`
 	// Readiness lists the most recent next-episode pre-cache outcomes
 	// (newest first), capped at precacheReadinessDisplayLimit.
 	Readiness []EpisodeReadiness `json:"readiness"`
@@ -621,6 +685,16 @@ func (p *Precache) Summary() PrecacheSummary {
 	p.cachePopulateOnce.Do(p.populateFromCache)
 	cfg := p.cfg()
 
+	// Snapshot pause state under mu and release it before taking readinessMu
+	// below, so the two locks are never held nested.
+	p.mu.Lock()
+	globalPaused := p.paused
+	pausedSnap := make(map[string]struct{}, len(p.pausedKeys))
+	for k := range p.pausedKeys {
+		pausedSnap[k] = struct{}{}
+	}
+	p.mu.Unlock()
+
 	p.readinessMu.Lock()
 	keys := make([]string, 0, len(p.readiness))
 	readiness := make([]EpisodeReadiness, 0, len(p.readiness))
@@ -637,6 +711,8 @@ func (p *Precache) Summary() PrecacheSummary {
 	reader := p.cacheCoverageReader()
 	for i := range readiness {
 		p.refreshCacheCoverage(reader, &readiness[i])
+		_, keyPaused := pausedSnap[readiness[i].InfoHash+":"+readiness[i].Filename]
+		readiness[i].Paused = globalPaused || keyPaused
 	}
 	if reader != nil {
 		p.readinessMu.Lock()
@@ -659,6 +735,7 @@ func (p *Precache) Summary() PrecacheSummary {
 		EvictAfterWatched:    cfg.PrecacheEvictAfterWatched,
 		PrecachedBytes:       p.precachedBytes.Load(),
 		MaxBytes:             cfg.MaxBytes(),
+		Paused:               globalPaused,
 		Readiness:            readiness,
 	}
 }

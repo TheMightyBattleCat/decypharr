@@ -828,6 +828,45 @@ func (s *Server) handleRescanPrecache(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, map[string]bool{"ok": true}, http.StatusOK)
 }
 
+// handlePausePrecache sets or clears the precache feature's global runtime
+// pause (see Manager.SetPrecachePaused) - halting new read-ahead/next-episode
+// bursts from starting without touching the saved read-ahead setting.
+// Anything already downloading finishes; the pause itself is in-memory only
+// and clears on restart.
+func (s *Server) handlePausePrecache(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Paused bool `json:"paused"`
+	}
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.manager.SetPrecachePaused(req.Paused)
+	utils.JSONResponse(w, map[string]bool{"paused": req.Paused}, http.StatusOK)
+}
+
+// handlePausePrecacheEntry sets or clears the runtime pause for one
+// (info_hash,filename) pair (see Manager.SetPrecacheEntryPaused).
+func (s *Server) handlePausePrecacheEntry(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InfoHash string `json:"info_hash"`
+		Filename string `json:"filename"`
+		Paused   bool   `json:"paused"`
+	}
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.InfoHash = strings.TrimSpace(req.InfoHash)
+	req.Filename = strings.TrimSpace(req.Filename)
+	if req.InfoHash == "" || req.Filename == "" {
+		http.Error(w, "info_hash and filename are required", http.StatusBadRequest)
+		return
+	}
+	s.manager.SetPrecacheEntryPaused(req.InfoHash, req.Filename, req.Paused)
+	utils.JSONResponse(w, map[string]bool{"paused": req.Paused}, http.StatusOK)
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`

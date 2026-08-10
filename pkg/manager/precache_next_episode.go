@@ -38,11 +38,18 @@ const (
 // to notifications/GUI (see Commit D).
 type EpisodeReadiness struct {
 	EntryName        string    `json:"entry_name"`
+	InfoHash         string    `json:"info_hash"` // paired with Filename, forms the "infoHash:filename" key SetKeyPaused/keyPaused use
 	Filename         string    `json:"filename"`
 	ReadyAt          time.Time `json:"ready_at"`
 	Clean            bool      `json:"clean"`             // no damage found at all
 	SegmentsRepaired int       `json:"segments_repaired"` // > 0 only when damage was found AND fully repaired before the wait timed out
 	SegmentsPending  int       `json:"segments_pending"`  // still-damaged segments left when the wait gave up (0 if clean or fully repaired)
+
+	// Paused reports whether this specific (info_hash,filename) is
+	// currently held back from starting a new burst - either individually
+	// (SetKeyPaused) or via the global pause (SetPaused). Computed fresh in
+	// Summary(), not stored alongside the rest of the row.
+	Paused bool `json:"paused"`
 
 	// CachedBytes/TotalBytes/CacheCoverage are a live snapshot of the DFS
 	// cache's coverage for this file - refreshed on every Summary() call
@@ -174,6 +181,12 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 		return // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
 	}
 
+	if p.keyPaused(nextEntry.InfoHash, filename) {
+		p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
+			Msg("next-episode precache skipped: paused")
+		return
+	}
+
 	key := nextEntry.InfoHash + ":" + filename
 	p.markInflight(key)
 	defer p.unmarkInflight(key)
@@ -229,7 +242,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 // through the live playback-failure policy if so, waits (bounded) for a
 // PAR2 repair to land, and stores the outcome for Commit D.
 func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, filename string, fileSize int64) {
-	readiness := EpisodeReadiness{EntryName: entry.Name, Filename: filename, ReadyAt: time.Now()}
+	readiness := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}
 	defer func() {
 		p.readinessMu.Lock()
 		p.readiness[entry.InfoHash+":"+filename] = readiness
