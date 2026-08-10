@@ -1073,6 +1073,9 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 		}
 		r.logger.Info().Str("entry", name).Str("infohash", hash).Msg("Repair: deleted fully-broken entry after re-search")
 	}
+	// Entry fully removed: drop any lingering health record so a
+	// cut-short sweep can't try to re-heal a torrent that's gone.
+	r.markBrokenHealthCleared(h, now)
 }
 
 // === Candidate enumeration ===
