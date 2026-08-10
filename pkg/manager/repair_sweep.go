@@ -808,6 +808,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	// are dropped from h right here, exactly as if the probe had never
 	// flagged them broken - the remainder falls through to the unchanged
 	// delete + blocklist + re-search heal below.
+	parRepaired := false
 	if fixed := r.warmSweepRepair(ctx, h.BrokenFiles); len(fixed) > 0 {
 		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
 		for _, bf := range h.BrokenFiles {
@@ -821,6 +822,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 
 		statsMu.Lock()
 		run.Stats.Repaired++
+		parRepaired = true
 		r.saveRun(run)
 		statsMu.Unlock()
 		r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
@@ -858,6 +860,8 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	}
 
 	succeeded := make(map[string]struct{}, len(byArr))
+	anyActioned := false
+	attempted := false
 	for arrName, files := range byArr {
 		if ctx != nil && ctx.Err() != nil {
 			return
@@ -866,18 +870,34 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		if a == nil {
 			continue
 		}
-		if r.repairArrFiles(ctx, run, statsMu, a, files) {
-			succeeded[arrName] = struct{}{}
+		actioned, cancelled := r.repairArrFiles(ctx, run, statsMu, a, files)
+		if cancelled {
+			return
+		}
+		succeeded[arrName] = struct{}{}
+		attempted = true
+		if actioned {
+			anyActioned = true
 		}
 	}
 
-	// Repaired counts entries, not files, to match Broken/Probed/Healthy's
-	// granularity - a season pack with three broken episodes that all get
-	// blocklisted + re-searched is one repaired entry, not three, exactly
-	// like it's one broken entry above, not three.
-	if len(succeeded) > 0 {
+	// Repaired counts entries whose repair genuinely did something - at least
+	// one Arr delete/blocklist/re-search call actually succeeded - not merely
+	// attempted, so a heal where every download-client call errored lands in
+	// RepairFailed instead. An entry already credited by the warm PAR2 pass
+	// above is excluded from RepairFailed here even if its Arr-side remainder
+	// comes back empty-handed - it was still repaired this run, just not by
+	// this path. Granularity stays per-entry to match Broken/Probed/Healthy:
+	// a season pack with three broken episodes that all get blocklisted +
+	// re-searched is one repaired entry, not three.
+	if anyActioned {
 		statsMu.Lock()
 		run.Stats.Repaired++
+		r.saveRun(run)
+		statsMu.Unlock()
+	} else if attempted && !parRepaired {
+		statsMu.Lock()
+		run.Stats.RepairFailed++
 		r.saveRun(run)
 		statsMu.Unlock()
 	}
@@ -942,7 +962,7 @@ func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
 // bounded by the sweep's worker count; Sonarr/Radarr handle that many in-flight
 // API calls fine, and the actual search/grab work is paced by the Arr's own
 // command queue regardless of how the calls arrive.
-func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile) bool {
+func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile) (actioned bool, cancelled bool) {
 	// Look up the grab history per broken file. Files whose grab record exists
 	// get blocklisted via MarkHistoryFailed (which Sonarr/Radarr auto-re-searches
 	// when "Redownload Failed" is on — the default). Files with no grab record
@@ -954,7 +974,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	needSearch := make([]arr.ContentFile, 0)
 	for _, f := range files {
 		if ctx != nil && ctx.Err() != nil {
-			return false
+			return false, true
 		}
 		var mediaID int
 		switch a.Type {
@@ -987,6 +1007,8 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	if err := a.DeleteFiles(ctx, files); err != nil {
 		r.logger.Warn().Err(err).Str("arr", a.Name).
 			Msg("Repair: DeleteFiles failed (continuing to blocklist + re-search anyway)")
+	} else {
+		actioned = true
 	}
 
 	// Blocklist each unique grab. Errors here are non-fatal: a missing blocklist
@@ -998,6 +1020,8 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 		}
 		if err := a.MarkHistoryFailed(id); err != nil {
 			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("Repair: MarkHistoryFailed failed")
+		} else {
+			actioned = true
 		}
 	}
 
@@ -1007,6 +1031,8 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	if len(needSearch) > 0 {
 		if err := a.SearchMissing(ctx, needSearch); err != nil {
 			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: SearchMissing fallback failed")
+		} else {
+			actioned = true
 		}
 	}
 
@@ -1017,7 +1043,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	statsMu.Lock()
 	r.saveRun(run)
 	statsMu.Unlock()
-	return true
+	return actioned, false
 }
 
 // finalizeEntryRepair stamps LastRepairAt and, when the entry is fully broken
