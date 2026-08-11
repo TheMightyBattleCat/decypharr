@@ -347,11 +347,14 @@ type builtPar2File struct {
 // it (segmentsConsistentWithPostingSize) and, if consistent, its refs are
 // built for free (par2SegmentRefsFromPostingSize) - no network round trip.
 // Only a file whose geometry doesn't match gets its own real probe. Past
-// par2ProbeMaxFailedFetches failed fetches in one release, probing stops
-// entirely (aborted=true) and every remaining file falls back to the plain
-// XML-bytes estimate: this many dead articles means the release is going to
-// be rejected by the availability check regardless, so further probing only
-// spends more round trips confirming what's already known.
+// par2ProbeMaxFailedFetches genuinely not-found fetches (nntp.
+// IsArticleNotFoundError - see realPar2SegmentRefs) in one release, probing
+// stops entirely (aborted=true) and every remaining file falls back to the
+// plain XML-bytes estimate: this many confirmed-missing articles means the
+// release is going to be rejected by the availability check regardless, so
+// further probing only spends more round trips confirming what's already
+// known. A probe that fails for a transient reason (timeout, connection
+// drop) never counts toward this threshold - see realPar2SegmentRefs.
 func buildPar2RefsWithFetch(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -397,20 +400,23 @@ func buildPar2RefsWithFetch(
 	var postingSegmentSize int64
 	// Per-release counters for the single summary log below, replacing what
 	// used to be one WARN per probed file (observed: 4297 in one live
-	// import window). filesProbed/filesFailed count real fetch attempts
+	// import window). filesProbed/filesNotFound count real fetch attempts
 	// only - the posting-size reuse path is deliberately excluded, since it
 	// costs no network round trip and isn't a fallback. fellBack counts
 	// every file whose final result came from the plain XML-bytes estimate,
 	// whichever path reached it (a failed/inconsistent probe, or a
-	// post-abort skip).
-	var filesProbed, filesFailed, fellBack int32
+	// post-abort skip); filesTransient is the subset of fellBack that used
+	// the estimate for a reason OTHER than a confirmed-missing article
+	// (timeout, connection drop, transport failure) - these never move the
+	// abort counter below.
+	var filesProbed, filesNotFound, filesTransient, fellBack int32
 
 	if seedIdx >= 0 {
 		file, segs := eligible[seedIdx], sortedSegs[seedIdx]
-		refs, total, fetchFailed, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
+		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
 		atomic.AddInt32(&filesProbed, 1)
-		if fetchFailed {
-			atomic.AddInt32(&filesFailed, 1)
+		if notFound {
+			atomic.AddInt32(&filesNotFound, 1)
 			if atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
 				atomic.StoreInt32(&abortedFlag, 1)
 			}
@@ -422,6 +428,9 @@ func buildPar2RefsWithFetch(
 			postingSegmentSize = refs[0].Bytes
 		} else {
 			atomic.AddInt32(&fellBack, 1)
+			if !notFound {
+				atomic.AddInt32(&filesTransient, 1)
+			}
 		}
 		results[seedIdx] = &builtPar2File{
 			name: file.Filename, size: total, segments: refs,
@@ -452,16 +461,19 @@ func buildPar2RefsWithFetch(
 			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 		}
 
-		refs, total, fetchFailed, real := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
+		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
 		atomic.AddInt32(&filesProbed, 1)
-		if fetchFailed {
-			atomic.AddInt32(&filesFailed, 1)
+		if notFound {
+			atomic.AddInt32(&filesNotFound, 1)
 			if atomic.AddInt32(&failedProbes, 1) >= par2ProbeMaxFailedFetches {
 				atomic.StoreInt32(&abortedFlag, 1)
 			}
 		}
 		if !real {
 			atomic.AddInt32(&fellBack, 1)
+			if !notFound {
+				atomic.AddInt32(&filesTransient, 1)
+			}
 		}
 		return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 	})
@@ -485,7 +497,8 @@ func buildPar2RefsWithFetch(
 	logEvt.
 		Int("files_total", len(eligible)).
 		Int32("files_probed", filesProbed).
-		Int32("files_failed", filesFailed).
+		Int32("files_not_found", filesNotFound).
+		Int32("files_transient", filesTransient).
 		Int32("fell_back_to_estimate", fellBack).
 		Bool("aborted", aborted).
 		Msg("PAR2 source-size probing complete")
@@ -597,17 +610,23 @@ func (p *NZBParser) fetchYencHeaderFast(ctx context.Context, messageID string) (
 // approximate, but PAR2 support for this one file is best-effort
 // bookkeeping, not something worth failing the whole NZB parse over.
 //
-// Returns fetchFailed=true only when the fetch itself errored (a genuine
-// network/article-not-found failure - the signal buildPar2RefsWithFetch
-// counts toward its early-abort threshold), and real=true only when refs
-// came from actual per-segment yEnc data rather than any fallback estimate -
-// the signal buildPar2RefsWithFetch uses to seed the shared posting size.
-func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) (refs []storage.Par2SegmentRef, total int64, fetchFailed, real bool) {
+// Returns notFound=true only when the fetch failed because the article is
+// genuinely absent from the provider (nntp.IsArticleNotFoundError) - the
+// signal buildPar2RefsWithFetch counts toward its early-abort threshold. A
+// fetch that fails for any other reason (timeout, connection drop, transport
+// parse failure) also falls back to the estimate below, but leaves notFound
+// false: par2ProbeTimeout is short and non-negotiable by design (see
+// fetchYencHeaderFast), so a transient hiccup on this one probe says nothing
+// about whether the article actually exists, and must not count toward
+// declaring the whole release unavailable. real=true only when refs came
+// from actual per-segment yEnc data rather than any fallback estimate - the
+// signal buildPar2RefsWithFetch uses to seed the shared posting size.
+func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) (refs []storage.Par2SegmentRef, total int64, notFound, real bool) {
 	yencData, err := fetch(ctx, segs[0].Id)
 	if err != nil || yencData == nil || yencData.Size <= 0 {
 		logger.Debug().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
 		refs, total = par2SegmentRefsFallback(segs)
-		return refs, total, true, false
+		return refs, total, err != nil && nntp.IsArticleNotFoundError(err), false
 	}
 
 	fileSize := yencData.Size

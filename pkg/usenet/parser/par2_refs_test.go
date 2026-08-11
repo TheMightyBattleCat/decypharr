@@ -371,13 +371,13 @@ func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
 	var calls int32
 	fetch := func(_ context.Context, _ string) (*nntp.YencMetadata, error) {
 		atomic.AddInt32(&calls, 1)
-		return nil, errors.New("simulated dead article")
+		return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "simulated dead article"}
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
 	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
 	if aborted != true {
-		t.Fatal("aborted = false, want true after par2ProbeMaxFailedFetches failures")
+		t.Fatal("aborted = false, want true after par2ProbeMaxFailedFetches genuinely-not-found failures")
 	}
 	if len(par2Files) != 0 || len(source) != 6 {
 		t.Fatalf("par2Files/source = %d/%d, want 0/6", len(par2Files), len(source))
@@ -387,6 +387,49 @@ func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
 	}
 	// Every file - probed-and-failed or skipped post-abort - falls back to
 	// the same XML-bytes estimate, so all 6 results are consistent.
+	want := int64(float64(1000) * yencOverheadEstimate)
+	for _, f := range source {
+		if len(f.Segments) != 1 || f.Segments[0].Bytes != want {
+			t.Errorf("%s Segments = %+v, want one segment of %d bytes", f.Name, f.Segments, want)
+		}
+	}
+}
+
+// TestBuildPar2RefsTransientErrorsDontAbort proves the fix: a probe fetch
+// that fails for a reason OTHER than a confirmed-missing article (here, a
+// connection error - the same nntp.Error type a dropped connection or
+// "invalid response code" transport failure produces) must never move the
+// early-abort counter, no matter how many of them occur. Every file still
+// falls back to the XML-bytes estimate (unchanged behavior), but the release
+// itself must not come back aborted - a transient hiccup on this one probe
+// says nothing about whether the article actually exists.
+func TestBuildPar2RefsTransientErrorsDontAbort(t *testing.T) {
+	files := make(nzbparser.NzbFiles, 0, 6)
+	for i := 0; i < 6; i++ {
+		id := "<seg" + string(rune('0'+i)) + ">"
+		files = append(files, nzbparser.NzbFile{
+			Filename: "file" + string(rune('0'+i)) + ".rar",
+			Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: id}},
+		})
+	}
+
+	var calls int32
+	fetch := func(_ context.Context, _ string) (*nntp.YencMetadata, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, nntp.NewConnectionError(errors.New("simulated dropped connection"))
+	}
+
+	p := &NZBParser{logger: zerolog.Nop()}
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	if aborted {
+		t.Fatal("aborted = true, want false (every failure was a transient connection error, not a confirmed-missing article)")
+	}
+	if len(par2Files) != 0 || len(source) != 6 {
+		t.Fatalf("par2Files/source = %d/%d, want 0/6", len(par2Files), len(source))
+	}
+	if got := atomic.LoadInt32(&calls); got != 6 {
+		t.Fatalf("fetch called %d times, want 6 (transient errors never trip early-abort, so every file gets its own probe)", got)
+	}
 	want := int64(float64(1000) * yencOverheadEstimate)
 	for _, f := range source {
 		if len(f.Segments) != 1 || f.Segments[0].Bytes != want {
