@@ -550,6 +550,9 @@ func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
 	if !config.Get().Repair.Par2RepairEnabled() {
 		return false, "par2 repair disabled"
 	}
+	if state, err := p.manager.storage.GetPar2RepairState(nzbID); err == nil && state != nil && state.Terminal {
+		return false, state.TerminalReason
+	}
 	nzb, err := p.manager.usenet.GetNZB(nzbID)
 	if err != nil {
 		return false, "nzb record not found"
