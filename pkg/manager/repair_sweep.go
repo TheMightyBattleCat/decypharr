@@ -515,10 +515,17 @@ func (r *Repair) routeAutoRepair(entry *storage.Entry, res fileResult) fileResul
 	nzbID := entry.InfoHash
 
 	if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
-		// Already being handled (an in-flight re-grab from another
-		// candidate, or a rare race with a manual action) - defer to it.
-		res.reason = "usenet_segment_missing_deferred"
-		return res
+		if state, err := r.manager.storage.GetPar2RepairState(nzbID); err == nil && state != nil && state.Terminal {
+			// PAR2 already proved this release unrepairable - reclaim the
+			// stuck terminal claim for the sweep's own regrab path instead of
+			// deferring to it forever (Set clears terminal atomically).
+			r.handlers.Set(nzbID, handlerRegrab)
+		} else {
+			// Already being handled (an in-flight re-grab from another
+			// candidate, or a rare race with a manual action) - defer to it.
+			res.reason = "usenet_segment_missing_deferred"
+			return res
+		}
 	}
 	// Released once healBrokenEntry has processed this candidate's broken
 	// files - see probeAndHealCandidates.
