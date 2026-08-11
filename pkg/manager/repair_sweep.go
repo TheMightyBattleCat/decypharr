@@ -297,6 +297,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			// regrab claim routeAutoRepair took while probing.
 			if h.Status == storage.HealthBroken {
 				r.finalizeBrokenEntry(gctx, run, &runMu, name, h, autoRepair)
+				if autoRepair {
+					run.MarkHealed(name)
+				}
 			}
 
 			runMu.Lock()
@@ -743,6 +746,9 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 	healths.Range(func(name string, h *storage.EntryHealth) bool {
 		if ctx != nil && ctx.Err() != nil {
 			return false
+		}
+		if run.WasHealed(name) {
+			return true
 		}
 		if automatic {
 			r.healBrokenEntryGuarded(ctx, run, &statsMu, name, h)

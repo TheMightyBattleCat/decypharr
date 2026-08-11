@@ -7,9 +7,11 @@ import (
 	"maps"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	json "github.com/bytedance/sonic"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 )
@@ -72,6 +74,31 @@ type RepairRun struct {
 	Error        string           `json:"error,omitempty"`
 	CancelReason string           `json:"cancel_reason,omitempty"`
 	Source       string           `json:"source,omitempty"`
+
+	healedThisRun *xsync.Map[string, struct{}]
+	healedOnce    sync.Once
+}
+
+func (run *RepairRun) initHealed() {
+	run.healedOnce.Do(func() {
+		run.healedThisRun = xsync.NewMap[string, struct{}]()
+	})
+}
+
+// MarkHealed records an entry healed inline by this run's probe pass, so a
+// later pass over the same run doesn't repair (and count) it again.
+func (run *RepairRun) MarkHealed(name string) {
+	run.initHealed()
+	run.healedThisRun.Store(name, struct{}{})
+}
+
+// WasHealed reports whether this run's probe pass already healed name.
+func (run *RepairRun) WasHealed(name string) bool {
+	if run.healedThisRun == nil {
+		return false
+	}
+	_, ok := run.healedThisRun.Load(name)
+	return ok
 }
 
 // NormalizeRepairStrategy maps user-supplied values to a known strategy.
