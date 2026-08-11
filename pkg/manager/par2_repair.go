@@ -361,7 +361,10 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 			return
 		}
 	}
-	p.Enqueue(nzbID)
+	// proximity=0: damage was just found by warming/scanning right now, the
+	// same "playhead is already here" urgency as repair_sweep.go's playback
+	// caller passes.
+	p.EnqueueUrgent(nzbID, 0)
 }
 
 // Enqueue schedules nzbID for a BATCH-lane PAR2 repair pass. Deduped: a burst

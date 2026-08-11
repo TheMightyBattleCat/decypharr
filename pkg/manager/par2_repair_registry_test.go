@@ -125,11 +125,11 @@ func TestPar2RepairAutoEnqueueNoOpsWhenPar2RepairDisabled(t *testing.T) {
 	}
 }
 
-// TestPar2RepairAutoEnqueueQueuesWhenPar2RepairEnabled is the control case
-// for the fix above: proves AutoEnqueue still queues normally once
-// Par2Repair is enabled.
-func TestPar2RepairAutoEnqueueQueuesWhenPar2RepairEnabled(t *testing.T) {
-	p, repair := newTestPar2Repair(t)
+// TestPar2RepairAutoEnqueueUsesTheUrgentLane is the control case for the fix
+// above: proves AutoEnqueue routes through the urgent lane once Par2Repair is
+// enabled, same as a direct EnqueueUrgent call.
+func TestPar2RepairAutoEnqueueUsesTheUrgentLane(t *testing.T) {
+	p, _ := newTestPar2Repair(t)
 
 	cfg := config.Get()
 	enabled := true
@@ -138,11 +138,11 @@ func TestPar2RepairAutoEnqueueQueuesWhenPar2RepairEnabled(t *testing.T) {
 
 	p.AutoEnqueue("nzb1", 5)
 
-	if len(p.queue) != 1 {
-		t.Fatalf("AutoEnqueue queued %d items while Par2Repair is enabled, want 1", len(p.queue))
+	if !p.handledByUrgent("nzb1") {
+		t.Fatalf("AutoEnqueue must land nzb1 on the URGENT lane (handledByUrgent should report true)")
 	}
-	if kind, _, exists := repair.handlers.State("nzb1"); !exists || kind != handlerPar2Queued {
-		t.Fatalf("AutoEnqueue must claim the registry when Par2Repair is enabled: kind=%v exists=%v", kind, exists)
+	if len(p.queue) != 0 {
+		t.Fatalf("queue has %d items, want 0 - AutoEnqueue must use the urgent lane", len(p.queue))
 	}
 }
 
