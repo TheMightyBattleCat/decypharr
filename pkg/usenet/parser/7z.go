@@ -16,6 +16,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
+	"github.com/sourcegraph/conc/iter"
 )
 
 // SevenZParser parses 7z archives from NNTP segments
@@ -181,34 +182,31 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		return nil, fmt.Errorf("unknown RAR format in 7z")
 	}
 
-	// Parse headers from volumes to find file info
-	// Strategy: Files may have their primary header in either the logical first volume
-	// (.rar by naming convention) OR the physical first volume (lowest offset)
-	// We'll check both approaches and aggregate
-	var allRawFiles []*RARFileEntry
-
-	// Find logical first volume (.rar)
-	logicalFirst := -1
-	for i, rf := range rarFiles {
-		if strings.HasSuffix(strings.ToLower(rf.Name), ".rar") {
-			logicalFirst = i
-			break
-		}
+	// Parse headers from every volume in the 7z archive, in parallel (bounded
+	// by maxConcurrent, mirroring RARParser.parseArchive's worker pool).
+	//
+	// Each RAR volume in a split archive carries its own local file header for
+	// the piece of data physically stored in that volume — there is no central
+	// manifest in the first volume describing every other volume's parts — so
+	// every volume must be read to discover a file's full VolumeParts. A file's
+	// name/metadata being visible in the first volume scanned says nothing
+	// about how many other volumes also hold pieces of that same file.
+	type volumeHeaderResult struct {
+		index int
+		files []*RARFileEntry
 	}
 
-	// Scan order: logical first (.rar), then physical first (.r00), then next few
-	volumesToScan := make([]int, 0, 6)
-	if logicalFirst >= 0 {
-		volumesToScan = append(volumesToScan, logicalFirst)
+	maxWorkers := min(len(rarFiles), p.maxConcurrent)
+	mapper := iter.Mapper[int, volumeHeaderResult]{
+		MaxGoroutines: maxWorkers,
 	}
-	// Add first 3 by physical order if not already added
-	for i := 0; i < min(3, len(rarFiles)); i++ {
-		if i != logicalFirst {
-			volumesToScan = append(volumesToScan, i)
-		}
+	indices := make([]int, len(rarFiles))
+	for i := range rarFiles {
+		indices[i] = i
 	}
 
-	for _, volIndex := range volumesToScan {
+	results := mapper.Map(indices, func(input *int) volumeHeaderResult {
+		volIndex := *input
 		rarFile := rarFiles[volIndex]
 
 		// Optimization: RAR headers are small - 64KB is usually enough
@@ -217,7 +215,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		headerData := make([]byte, headerSize)
 		n, err := readerAt.ReadAt(headerData, rarFile.Offset)
 		if err != nil && !errors.Is(err, io.EOF) {
-			continue
+			return volumeHeaderResult{index: volIndex}
 		}
 		headerData = headerData[:n]
 
@@ -229,21 +227,15 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		case RARVersion4:
 			volumeFiles, _ = p.rarParser.parseRAR4Headers(headerData, volIndex, filepath.Base(rarFile.Name))
 		}
+		return volumeHeaderResult{index: volIndex, files: volumeFiles}
+	})
 
-		allRawFiles = append(allRawFiles, volumeFiles...)
-
-		// Optimization: If we found files with names, we can stop scanning
-		// (first volume should have all file headers)
-		hasNamedFiles := false
-		for _, f := range allRawFiles {
-			if f.Name != "" {
-				hasNamedFiles = true
-				break
-			}
-		}
-		if hasNamedFiles {
-			break
-		}
+	// iter.Mapper.Map returns results positionally aligned with the input
+	// slice, so this preserves physical volume order regardless of which
+	// goroutine finished first.
+	var allRawFiles []*RARFileEntry
+	for _, result := range results {
+		allRawFiles = append(allRawFiles, result.files...)
 	}
 
 	if len(allRawFiles) == 0 {
@@ -323,6 +315,28 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 ) ([]storage.NZBSegment, error) {
 	if len(rarEntry.VolumeParts) == 0 {
 		return nil, fmt.Errorf("no volume parts for file %s", rarEntry.Name)
+	}
+
+	// Ensure volume parts are ordered by volume index and data offset (mirrors
+	// RARParser.buildSegmentsForFile). Header scanning runs in parallel across
+	// volumes now, so parts can arrive in any order.
+	partsSorted := true
+	for i := 1; i < len(rarEntry.VolumeParts); i++ {
+		prev := rarEntry.VolumeParts[i-1]
+		cur := rarEntry.VolumeParts[i]
+		if cur.PartNumber < prev.PartNumber ||
+			(cur.PartNumber == prev.PartNumber && cur.DataOffset < prev.DataOffset) {
+			partsSorted = false
+			break
+		}
+	}
+	if !partsSorted {
+		sort.Slice(rarEntry.VolumeParts, func(i, j int) bool {
+			if rarEntry.VolumeParts[i].PartNumber == rarEntry.VolumeParts[j].PartNumber {
+				return rarEntry.VolumeParts[i].DataOffset < rarEntry.VolumeParts[j].DataOffset
+			}
+			return rarEntry.VolumeParts[i].PartNumber < rarEntry.VolumeParts[j].PartNumber
+		})
 	}
 
 	var fileSegments []storage.NZBSegment
