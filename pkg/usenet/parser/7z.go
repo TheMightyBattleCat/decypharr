@@ -192,8 +192,11 @@ func (p *SevenZParser) processRARFilesFromPositions(
 	// name/metadata being visible in the first volume scanned says nothing
 	// about how many other volumes also hold pieces of that same file.
 	type volumeHeaderResult struct {
-		index int
-		files []*RARFileEntry
+		index  int
+		files  []*RARFileEntry
+		num    int  // true 0-based volume number from RAR5 main header
+		hasNum bool // whether num was parsed
+		ok     bool // header read + parse succeeded (no ReadAt error)
 	}
 
 	maxWorkers := min(len(rarFiles), p.maxConcurrent)
@@ -221,13 +224,15 @@ func (p *SevenZParser) processRARFilesFromPositions(
 
 		// Parse headers from this volume
 		var volumeFiles []*RARFileEntry
+		var num int
+		var hasNum bool
 		switch version {
 		case RARVersion5:
-			volumeFiles, _ = p.rarParser.parseRAR5Headers(headerData, volIndex, filepath.Base(rarFile.Name), password)
+			volumeFiles, num, hasNum, _ = p.rarParser.parseRAR5Headers(headerData, volIndex, filepath.Base(rarFile.Name), password)
 		case RARVersion4:
-			volumeFiles, _ = p.rarParser.parseRAR4Headers(headerData, volIndex, filepath.Base(rarFile.Name))
+			volumeFiles, num, hasNum, _ = p.rarParser.parseRAR4Headers(headerData, volIndex, filepath.Base(rarFile.Name))
 		}
-		return volumeHeaderResult{index: volIndex, files: volumeFiles}
+		return volumeHeaderResult{index: volIndex, files: volumeFiles, num: num, hasNum: hasNum, ok: true}
 	})
 
 	// iter.Mapper.Map returns results positionally aligned with the input
@@ -244,6 +249,31 @@ func (p *SevenZParser) processRARFilesFromPositions(
 
 	// Aggregate file parts across volumes (files spanning multiple volumes will have multiple entries)
 	rarFileEntries := p.rarParser.aggregateFileParts(allRawFiles)
+
+	// If the RAR volumes were posted out of true content order under
+	// obfuscated filenames — physical offset in the 7z no longer matches RAR
+	// volume sequence — recover the true order from RAR5 main-header volume
+	// numbers (mirrors RARParser.Process's handling for the plain
+	// multi-volume path) and renumber VolumeParts.PartNumber so
+	// buildSegmentsForRARFile's (PartNumber, DataOffset) sort stitches
+	// content in the right order. A nil result (ordering unknown, or already
+	// in posting order) is a no-op, leaving the already-working non-obfuscated
+	// case untouched.
+	volEntries := make([]volEntry, 0, len(results))
+	for _, r := range results {
+		if !r.ok {
+			continue
+		}
+		volEntries = append(volEntries, volEntry{idx: r.index, num: r.num, hasNum: r.hasNum})
+	}
+	if volumeOrder := p.rarParser.resolveVolumeOrder(volEntries, len(results)); volumeOrder != nil {
+		if inverse := buildInversePermutation(volumeOrder, len(rarFiles)); inverse != nil {
+			p.rarParser.renumberVolumeParts(rarFileEntries, inverse)
+			p.logger.Debug().
+				Int("volumes", len(rarFiles)).
+				Msg("RAR volumes in 7z reordered to true volume sequence for assembly")
+		}
+	}
 
 	// Build a map of RAR filename -> offset in 7z
 	rarFileOffsets := make(map[string]int64)
