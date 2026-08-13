@@ -2,8 +2,10 @@ package parser
 
 import (
 	"io"
+	"strings"
 	"testing"
 
+	"github.com/javi11/sevenzip"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
@@ -183,6 +185,61 @@ func TestObfuscated7zVolumeOrder_StitchesContentOrder(t *testing.T) {
 		if segments[i].MessageID != id {
 			t.Errorf("segment %d: got MessageID %q at StartOffset %d, want %q (obfuscated volumes were not stitched in true content order)",
 				i, segments[i].MessageID, segments[i].StartOffset, id)
+		}
+	}
+}
+
+// TestSortRARFilesByVolumeOrder_ZeroNumberedObfuscated_OrdersByFilename
+// reproduces the real-world case that shipped uncaught in 9a461bc: an
+// obfuscated posting where EVERY volume's RAR5 main-header volume number is
+// stripped (confirmed live on Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL —
+// 16/16 volumes hasNum=false), so resolveVolumeOrder has no signal at all and
+// declines (canOrder=false at the entry gate, since numbered==0), leaving
+// whatever baseline order processRARFilesFromPositions established. Before
+// this fix that baseline was raw physical/posting offset — for this release,
+// .r00..r14 physically precede .rar (opposite of RAR's logical order, per the
+// package comment on sortRARFilesByVolumeOrder) — so the file assembled in
+// the wrong order and failed ffprobe on import ("EBML header parsing
+// failed"). This test proves sortRARFilesByVolumeOrder itself, the exact
+// function processRARFilesFromPositions now calls, fixes the baseline: with
+// the old offset-only sort this assertion fails (order stays r00..r14,rar);
+// with getRARVolumeOrder driving the sort it passes (.rar first, then
+// r00..r14 ascending) — matching the offline harness proof against the real
+// NZB (PartNumber 0->.rar, 1->.r00, ..., 15->.r14).
+func TestSortRARFilesByVolumeOrder_ZeroNumberedObfuscated_OrdersByFilename(t *testing.T) {
+	// Physical/posting order: .r00..r14 (ascending offset), then .rar last —
+	// exactly the live posting's layout. No RAR5 volume numbers are involved;
+	// sortRARFilesByVolumeOrder never looks at them — it runs before any
+	// header is even read.
+	rarFiles := []sevenzip.FileInfo{
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r00", Offset: 65286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r01", Offset: 215286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r02", Offset: 365286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r03", Offset: 515286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r04", Offset: 665286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r05", Offset: 815286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r06", Offset: 965286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r07", Offset: 1115286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r08", Offset: 1265286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r09", Offset: 1415286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r10", Offset: 1565286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r11", Offset: 1715286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r12", Offset: 1865286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r13", Offset: 2015286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.r14", Offset: 2165286963},
+		{Name: "Coast.of.Windmere.S01E01.1080p.WEB.h264-ETHEL/coast.of.windmere.s01e01.1080p.web.h264-ethel.rar", Offset: 2201369905},
+	}
+
+	sortRARFilesByVolumeOrder(rarFiles)
+
+	want := []string{"rar", "r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10", "r11", "r12", "r13", "r14"}
+	if len(rarFiles) != len(want) {
+		t.Fatalf("got %d volumes, want %d", len(rarFiles), len(want))
+	}
+	for i, wantExt := range want {
+		got := rarFiles[i].Name
+		if !strings.HasSuffix(got, "."+wantExt) {
+			t.Errorf("position %d: got volume %q, want one ending in .%s (posting order was kept instead of content order — the baseline-order fix regressed)", i, got, wantExt)
 		}
 	}
 }

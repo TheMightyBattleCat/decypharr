@@ -15,10 +15,16 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 )
 
+var numericExtPattern = regexp.MustCompile(`^\.(\d+)$`)
+
 // getRARVolumeOrder returns a sort key for RAR volume ordering.
 // .rar or .part01.rar = 0 (first volume)
 // .r00 = 1, .r01 = 2, etc.
 // .part02.rar = 2, .part03.rar = 3, etc.
+// .001, .002, ... = 1, 2, ... (numeric-suffix split scheme; forms its own
+// monotonic run keyed on the number — this scheme is never mixed with
+// .rar/.rNN/.partNN.rar within one real release, so no collision with those
+// ordinals is possible in practice).
 func getRARVolumeOrder(filename string) int {
 	lower := strings.ToLower(filename)
 	ext := filepath.Ext(lower)
@@ -41,6 +47,14 @@ func getRARVolumeOrder(filename string) int {
 		numStr := ext[2:]
 		if num, err := strconv.Atoi(numStr); err == nil {
 			return num + 1 // .r00 = 1, .r01 = 2, etc.
+		}
+	}
+
+	// Purely numeric extension (.001, .002, ...) — e.g. a RAR set split with
+	// the generic numeric-suffix convention rather than .rNN.
+	if matches := numericExtPattern.FindStringSubmatch(ext); len(matches) == 2 {
+		if num, err := strconv.Atoi(matches[1]); err == nil {
+			return num
 		}
 	}
 

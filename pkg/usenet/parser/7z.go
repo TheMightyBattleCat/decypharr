@@ -150,6 +150,25 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password s
 	return files, nil
 }
 
+// sortRARFilesByVolumeOrder sorts RAR volumes by volume-name order (.rar
+// first, then .r00, .r01, etc. — mirrors RARParser.Process's plain-path
+// sort), falling back to physical offset within the 7z for names that don't
+// match a known scheme. Physical offset alone is NOT content order:
+// 7z-embedded RAR volumes are typically posted .r00, .r01, ..., .r51, .rar —
+// opposite of RAR's logical naming — and some obfuscated postings strip
+// every volume's RAR5 header volume number (see resolveVolumeOrder), leaving
+// filename as the only signal.
+func sortRARFilesByVolumeOrder(rarFiles []sevenzip.FileInfo) {
+	sort.Slice(rarFiles, func(i, j int) bool {
+		oi := getRARVolumeOrder(filepath.Base(rarFiles[i].Name))
+		oj := getRARVolumeOrder(filepath.Base(rarFiles[j].Name))
+		if oi != oj {
+			return oi < oj
+		}
+		return rarFiles[i].Offset < rarFiles[j].Offset
+	})
+}
+
 // processRARFilesFromPositions creates volume descriptors for RAR files based on their positions
 // within the 7z archive and passes them to the RAR parser
 func (p *SevenZParser) processRARFilesFromPositions(
@@ -165,12 +184,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		return nil, nil
 	}
 
-	// Sort RAR files by their offset within the 7z archive
-	// This is the PHYSICAL order of the data, which for 7z-embedded RAR is typically:
-	// .r00, .r01, ..., .r51, .rar (opposite of RAR's logical naming!)
-	sort.Slice(rarFiles, func(i, j int) bool {
-		return rarFiles[i].Offset < rarFiles[j].Offset
-	})
+	sortRARFilesByVolumeOrder(rarFiles)
 	// Detect RAR version from first volume (by logical order)
 	firstRAR := rarFiles[0]
 	versionBuf := make([]byte, 8)
