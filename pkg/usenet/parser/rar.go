@@ -1089,9 +1089,16 @@ func (p *RARParser) parseRAR5FileHeader(data []byte, volumeIndex int, volumeName
 			Name:         volumeName,
 			DataOffset:   dataOffset,
 			PackedSize:   packedSize,
-			UnpackedSize: packedSize, // Use PackedSize - represents data IN THIS VOLUME PART, not full file
-			Stored:       isStored,
-			PartNumber:   volumeIndex, // Set part number to volume index
+			UnpackedSize: packedSize, // Use PackedSize (stored files only, so packed == unpacked). NOTE:
+			// despite the field name, PackedSize is the RAR5 header's whole-file data
+			// size, not this volume's own share of it. The plain multi-volume path gets
+			// away with that because each volume is read through its own separate
+			// reader, which runs out of bytes at that volume's real EOF regardless of
+			// what PackedSize claims. buildSegmentsForRARFile (7z.go), reading every
+			// volume out of one flat 7z byte stream with no such self-limiting boundary,
+			// must clip each part's read itself instead of trusting PackedSize.
+			Stored:     isStored,
+			PartNumber: volumeIndex, // Set part number to volume index
 		}},
 	}
 }

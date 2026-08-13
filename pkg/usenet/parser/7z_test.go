@@ -2,6 +2,7 @@ package parser
 
 import (
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,6 +37,11 @@ func TestBuildSegmentsForRARFile_OutOfOrderVolumeParts(t *testing.T) {
 		"archive.r01": 1000,
 		"archive.r02": 2000,
 	}
+	rarFileSizes := map[string]int64{
+		"archive.r00": 1000,
+		"archive.r01": 1000,
+		"archive.r02": 1000,
+	}
 
 	rarEntry := &RARFileEntry{
 		Name:             "movie.mkv",
@@ -48,7 +54,7 @@ func TestBuildSegmentsForRARFile_OutOfOrderVolumeParts(t *testing.T) {
 		},
 	}
 
-	segments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, baseSegments, volumeInfos)
+	segments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, rarFileSizes, baseSegments, volumeInfos)
 	if err != nil {
 		t.Fatalf("buildSegmentsForRARFile returned error: %v", err)
 	}
@@ -126,6 +132,11 @@ func TestObfuscated7zVolumeOrder_StitchesContentOrder(t *testing.T) {
 		"archive.r01": 1000,
 		"archive.r02": 2000,
 	}
+	rarFileSizes := map[string]int64{
+		"archive.r00": 1000,
+		"archive.r01": 1000,
+		"archive.r02": 1000,
+	}
 
 	// VolumeParts as parseRAR5Headers would stamp them: PartNumber = physical
 	// posting index (0, 1, 2), i.e. the pre-fix state — content order not yet
@@ -172,7 +183,7 @@ func TestObfuscated7zVolumeOrder_StitchesContentOrder(t *testing.T) {
 
 	rp.renumberVolumeParts([]*RARFileEntry{rarEntry}, inverse)
 
-	segments, err := (&SevenZParser{logger: zerolog.New(io.Discard)}).buildSegmentsForRARFile(rarEntry, rarFileOffsets, baseSegments, volumeInfos)
+	segments, err := (&SevenZParser{logger: zerolog.New(io.Discard)}).buildSegmentsForRARFile(rarEntry, rarFileOffsets, rarFileSizes, baseSegments, volumeInfos)
 	if err != nil {
 		t.Fatalf("buildSegmentsForRARFile returned error: %v", err)
 	}
@@ -242,4 +253,131 @@ func TestSortRARFilesByVolumeOrder_ZeroNumberedObfuscated_OrdersByFilename(t *te
 			t.Errorf("position %d: got volume %q, want one ending in .%s (posting order was kept instead of content order — the baseline-order fix regressed)", i, got, wantExt)
 		}
 	}
+}
+
+// TestBuildSegmentsForRARFile_ClipsPackedSizeToVolumePhysicalSize proves the
+// running-budget clip in buildSegmentsForRARFile. Real RAR5 postings stamp
+// every volume's VolumeParts.PackedSize with the WHOLE FILE's size, not that
+// volume's own physical share of it (see the note on RARVolumePart.PackedSize
+// in rar.go) — this fixture reproduces that exact encoding: 3 volumes, each
+// 1000 bytes physically, of a single 3000-byte stored file, with every part
+// declaring PackedSize: 3000.
+//
+// Two things are checked against the SAME fixture:
+//
+//  1. The naive/pre-fix computation — slicing directly with the uncapped
+//     part.PackedSize, exactly what buildSegmentsForRARFile did before this
+//     fix — is shown to duplicate data: since all 3 volumes sit back-to-back
+//     in one flat 7z byte stream with no per-volume read boundary, each part
+//     reads past its own volume into the next one(s). Total bytes returned
+//     (6000) overshoots the file's real size (3000), and two of the three
+//     source segments are each claimed by more than one part.
+//  2. buildSegmentsForRARFile itself (post-fix, clipping every part's read to
+//     min(bytes physically left in its own volume, bytes left of the file's
+//     advertised total)) is shown to produce exactly the file's 3000 bytes,
+//     each of the 3 source segments claimed exactly once, source ranges
+//     disjoint.
+func TestBuildSegmentsForRARFile_ClipsPackedSizeToVolumePhysicalSize(t *testing.T) {
+	baseSegments := []storage.NZBSegment{
+		{Number: 1, MessageID: "vol0-data", Bytes: 1000},
+		{Number: 2, MessageID: "vol1-data", Bytes: 1000},
+		{Number: 3, MessageID: "vol2-data", Bytes: 1000},
+	}
+	volumeInfos := []storage.ArchiveVolumeInfo{
+		{Name: "archive", Size: 3000, SegmentStart: 0, SegmentEnd: 3},
+	}
+	rarFileOffsets := map[string]int64{
+		"archive.r00": 0,
+		"archive.r01": 1000,
+		"archive.r02": 2000,
+	}
+	rarFileSizes := map[string]int64{
+		"archive.r00": 1000,
+		"archive.r01": 1000,
+		"archive.r02": 1000,
+	}
+
+	// The real-world encoding: every part's PackedSize is the WHOLE FILE's
+	// size (3000), not this volume's own 1000-byte share of it.
+	volumeParts := []*types.RARVolumePart{
+		{Name: "archive.r00", DataOffset: 0, PackedSize: 3000, UnpackedSize: 3000, Stored: true, PartNumber: 0},
+		{Name: "archive.r01", DataOffset: 0, PackedSize: 3000, UnpackedSize: 3000, Stored: true, PartNumber: 1},
+		{Name: "archive.r02", DataOffset: 0, PackedSize: 3000, UnpackedSize: 3000, Stored: true, PartNumber: 2},
+	}
+	const uncompressedSize = 3000
+
+	t.Run("pre-clip arithmetic duplicates data", func(t *testing.T) {
+		// Exactly what buildSegmentsForRARFile did before this fix: slice
+		// using the raw, uncapped part.PackedSize.
+		counts := make(map[string]int)
+		var total int64
+		for _, part := range volumeParts {
+			absoluteDataOffset := rarFileOffsets[filepath.Base(part.Name)] + part.DataOffset
+			segs, err := sliceSegmentsForRange(baseSegments, volumeInfos, absoluteDataOffset, part.PackedSize)
+			if err != nil {
+				t.Fatalf("sliceSegmentsForRange: %v", err)
+			}
+			for _, s := range segs {
+				counts[s.MessageID]++
+				total += s.Bytes
+			}
+		}
+
+		if total <= uncompressedSize {
+			t.Fatalf("expected the naive computation to OVERSHOOT the file size (duplication), got total=%d, file size=%d", total, uncompressedSize)
+		}
+		dup := 0
+		for id, c := range counts {
+			if c > 1 {
+				dup++
+				t.Logf("source segment %q claimed by %d parts (duplicated)", id, c)
+			}
+		}
+		if dup == 0 {
+			t.Fatalf("expected at least one source segment to be claimed by more than one part when PackedSize isn't clipped")
+		}
+	})
+
+	t.Run("buildSegmentsForRARFile clips and assembles cleanly", func(t *testing.T) {
+		p := &SevenZParser{logger: zerolog.New(io.Discard)}
+		rarEntry := &RARFileEntry{
+			Name:             "movie.mkv",
+			UncompressedSize: uncompressedSize,
+			IsStored:         true,
+			VolumeParts:      volumeParts,
+		}
+
+		segments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, rarFileSizes, baseSegments, volumeInfos)
+		if err != nil {
+			t.Fatalf("buildSegmentsForRARFile returned error: %v", err)
+		}
+
+		var total int64
+		seen := make(map[string]int)
+		for _, s := range segments {
+			total += s.Bytes
+			seen[s.MessageID]++
+		}
+		if total != uncompressedSize {
+			t.Fatalf("total bytes = %d, want exactly %d (the file's advertised size, no duplication/overshoot)", total, uncompressedSize)
+		}
+		for id, c := range seen {
+			if c != 1 {
+				t.Errorf("source segment %q claimed by %d parts, want exactly 1 (source ranges must be disjoint)", id, c)
+			}
+		}
+
+		want := []string{"vol0-data", "vol1-data", "vol2-data"}
+		if len(segments) != len(want) {
+			t.Fatalf("got %d segments, want %d", len(segments), len(want))
+		}
+		for i, id := range want {
+			if segments[i].MessageID != id {
+				t.Errorf("segment %d: got MessageID %q, want %q", i, segments[i].MessageID, id)
+			}
+			if segments[i].Bytes != 1000 {
+				t.Errorf("segment %d: got Bytes %d, want 1000 (each volume's own share)", i, segments[i].Bytes)
+			}
+		}
+	})
 }

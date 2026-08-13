@@ -289,10 +289,17 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		}
 	}
 
-	// Build a map of RAR filename -> offset in 7z
+	// Build a map of RAR filename -> offset in 7z, and -> the volume's own
+	// physical size in the 7z. The size map lets buildSegmentsForRARFile clip
+	// each part's read to what actually physically exists in that volume,
+	// rather than trusting PackedSize (see the comment on RARVolumePart.PackedSize
+	// in rar.go for why that field can't be used directly here).
 	rarFileOffsets := make(map[string]int64)
+	rarFileSizes := make(map[string]int64)
 	for _, rarFile := range rarFiles {
-		rarFileOffsets[filepath.Base(rarFile.Name)] = rarFile.Offset
+		base := filepath.Base(rarFile.Name)
+		rarFileOffsets[base] = rarFile.Offset
+		rarFileSizes[base] = int64(rarFile.Size)
 	}
 
 	// Build NZBFile list
@@ -313,7 +320,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		}
 
 		// get segments for this file by processing all its volume parts
-		fileSegments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, baseSegments, volumeInfos)
+		fileSegments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, rarFileSizes, baseSegments, volumeInfos)
 		if err != nil {
 			p.logger.Warn().
 				Err(err).
@@ -354,6 +361,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 func (p *SevenZParser) buildSegmentsForRARFile(
 	rarEntry *RARFileEntry,
 	rarFileOffsets map[string]int64,
+	rarFileSizes map[string]int64,
 	baseSegments []storage.NZBSegment,
 	volumeInfos []storage.ArchiveVolumeInfo,
 ) ([]storage.NZBSegment, error) {
@@ -386,9 +394,24 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 	var fileSegments []storage.NZBSegment
 	var currentFileOffset int64 // Offset within the final extracted file
 
+	// part.PackedSize is the RAR-internal packed size of the file's data as
+	// recorded in the volume's own local header — it is NOT clipped to what
+	// physically remains in this volume (see the note on
+	// RARVolumePart.PackedSize in rar.go). In the plain multi-volume path
+	// each volume is read through its own reader, so an oversized PackedSize
+	// harmlessly runs out of bytes at that volume's EOF. Here every volume
+	// lives back-to-back inside one flat 7z byte stream, so an oversized
+	// PackedSize silently reads on into the next volume's bytes instead of
+	// stopping - duplicating data instead of erroring. Clip every part's read
+	// to two independent budgets: what's physically left in its own volume
+	// (avail), and what's left of the file's total advertised size
+	// (remainingBudget) so the parts collectively can never emit more than
+	// UncompressedSize bytes.
+	remainingBudget := rarEntry.UncompressedSize
+
 	// Parse each volume part of this file
 	for partIdx, part := range rarEntry.VolumeParts {
-		if part.PackedSize <= 0 {
+		if part.PackedSize <= 0 || remainingBudget <= 0 {
 			continue
 		}
 
@@ -403,6 +426,21 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 			continue
 		}
 
+		volPhysical, ok := rarFileSizes[rarVolumeName]
+		if !ok {
+			p.logger.Warn().
+				Str("part_name", part.Name).
+				Str("file", rarEntry.Name).
+				Msg("RAR volume size not found in 7z file list")
+			continue
+		}
+
+		avail := volPhysical - part.DataOffset
+		if avail <= 0 {
+			continue
+		}
+		clipLen := min(avail, remainingBudget)
+
 		// The file data starts at: rarVolumeOffset (in 7z) + part.DataOffset (in RAR volume)
 		absoluteDataOffset := rarVolumeOffset + part.DataOffset
 
@@ -411,18 +449,19 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 			baseSegments,
 			volumeInfos,
 			absoluteDataOffset,
-			part.PackedSize,
+			clipLen,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to slice segments for part %d of %s: %w", partIdx, rarEntry.Name, err)
 		}
+		remainingBudget -= clipLen
 
 		if len(partSegments) == 0 {
 			p.logger.Warn().
 				Str("file", rarEntry.Name).
 				Int("part_index", partIdx).
 				Int64("offset", absoluteDataOffset).
-				Int64("size", part.PackedSize).
+				Int64("size", clipLen).
 				Msg("No segments found for RAR part")
 			continue
 		}
