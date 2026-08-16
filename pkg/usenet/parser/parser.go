@@ -398,6 +398,8 @@ func buildPar2RefsWithFetch(
 	var failedProbes int32
 	var abortedFlag int32
 	var postingSegmentSize int64
+	var seedLastSegBytes int64
+	var seedSegCount int
 	// Per-release counters for the single summary log below, replacing what
 	// used to be one WARN per probed file (observed: 4297 in one live
 	// import window). filesProbed/filesNotFound count real fetch attempts
@@ -426,6 +428,8 @@ func buildPar2RefsWithFetch(
 			// size (see realPar2SegmentRefs) - a meaningful sample only when
 			// there's more than one segment, guaranteed by seedIdx's choice.
 			postingSegmentSize = refs[0].Bytes
+			seedLastSegBytes = refs[len(refs)-1].Bytes
+			seedSegCount = len(refs)
 		} else {
 			atomic.AddInt32(&fellBack, 1)
 			if !notFound {
@@ -451,7 +455,7 @@ func buildPar2RefsWithFetch(
 		isPar2 := detectFileType(c.file.Filename) == storage.NZBFileTypePar2
 
 		if segmentsConsistentWithPostingSize(c.segs, postingSegmentSize) {
-			refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize)
+			refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
 			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 		}
 
@@ -538,14 +542,18 @@ func segmentsConsistentWithPostingSize(segs nzbparser.NzbSegments, postingSegmen
 // final (possibly partial) segment uses the same XML-bytes estimate
 // par2SegmentRefsFallback does, since a real per-file fetch is the only way
 // to learn that exactly.
-func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64) ([]storage.Par2SegmentRef, int64) {
+func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64, seedLastSegBytes int64, seedSegCount int) ([]storage.Par2SegmentRef, int64) {
 	n := len(segs)
 	refs := make([]storage.Par2SegmentRef, n)
 	var total int64
 	for i, seg := range segs {
 		b := postingSegmentSize
 		if i == n-1 {
-			b = int64(float64(seg.Bytes) * yencOverheadEstimate)
+			if n == seedSegCount && seedLastSegBytes > 0 {
+				b = seedLastSegBytes // exact: identical geometry to the real-fetched seed
+			} else {
+				b = int64(float64(seg.Bytes) * yencOverheadEstimate) // residual: consistent-but-different-count geometry
+			}
 		}
 		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
 		total += b
