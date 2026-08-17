@@ -1240,7 +1240,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(ctx, fetch, file, cacheSource)
+		f := newPostedFileFetcher(ctx, fetch, file, cacheSource, idx.Files[m.FileID].Length)
 		fetchers[m.FileID] = f
 		var off int64
 		for _, seg := range file.Segments {
@@ -1538,7 +1538,7 @@ func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.P
 // hash its first 16KB (or the whole file, if shorter) - MatchFiles only
 // calls this for a file whose length ties with another candidate.
 func computeMD5_16k(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
-	fetcher := newPostedFileFetcher(ctx, fetch, f, nil)
+	fetcher := newPostedFileFetcher(ctx, fetch, f, nil, 0)
 	n := int64(md5_16kSize)
 	if f.Size < n {
 		n = f.Size
@@ -1586,14 +1586,25 @@ type postedFileFetcher struct {
 	cacheData []byte
 }
 
-func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource) *postedFileFetcher {
+// trueLen, when greater than the posted file's own declared Size, overrides
+// it as the fetcher's readable bound. The posted-file Size is a yEnc-decoded
+// estimate that can under-count the final article by a few KB; when that
+// happens ReadRange treats real trailing bytes as past-EOF and zero-pads
+// them, corrupting whichever intact slice they fall in. Pass 0 to keep the
+// declared estimate (e.g. computeMD5_16k, which only ever reads the leading
+// 16KB and has no FileDesc to compare against).
+func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64) *postedFileFetcher {
 	base := make([]int64, len(f.Segments))
 	var off int64
 	for i, s := range f.Segments {
 		base[i] = off
 		off += s.Bytes
 	}
-	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: f.Size, segs: f.Segments, base: base, cacheSource: cacheSource, cacheIdx: -1}
+	length := f.Size
+	if trueLen > length {
+		length = trueLen
+	}
+	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, cacheSource: cacheSource, cacheIdx: -1}
 }
 
 func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {

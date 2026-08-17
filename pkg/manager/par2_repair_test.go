@@ -131,7 +131,7 @@ func TestPostedFileFetcherReadRangeSingleSegment(t *testing.T) {
 		Name: "f", Size: 1000,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 1000}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0)
 
 	got, err := pf.ReadRange(100, 200)
 	if err != nil {
@@ -159,7 +159,7 @@ func TestPostedFileFetcherReadRangeCrossesSegments(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0)
 
 	got, err := pf.ReadRange(90, 20) // 10 bytes from seg1, 10 from seg2
 	if err != nil {
@@ -187,7 +187,7 @@ func TestPostedFileFetcherReadRangeZeroPadsPastEOF(t *testing.T) {
 		Name: "f", Size: 90,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0)
 
 	got, err := pf.ReadRange(0, 100) // slice size 100, file only has 90 real bytes
 	if err != nil {
@@ -205,6 +205,61 @@ func TestPostedFileFetcherReadRangeZeroPadsPastEOF(t *testing.T) {
 	}
 }
 
+func TestPostedFileFetcherTrueLenServesRealTailBytes(t *testing.T) {
+	fetcher := newFakeFetcher(map[string][]byte{
+		"<seg1>": repeatByte(0x55, 100),
+	})
+	// Same shape as TestPostedFileFetcherReadRangeZeroPadsPastEOF (declared
+	// Size of 90 undercounts the real 100 decoded bytes), but this time a
+	// trueLen of 100 is supplied - as runRepair does via
+	// idx.Files[m.FileID].Length. The real trailing bytes must now be
+	// served instead of zero-padded, or they get treated as past-EOF and
+	// silently dropped from whichever intact slice they belong to.
+	file := storage.PostedFileRef{
+		Name: "f", Size: 90,
+		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
+	}
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 100)
+
+	got, err := pf.ReadRange(0, 100)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if got[i] != 0x55 {
+			t.Errorf("byte %d = %#x, want 0x55 (real tail byte, not zero-padded)", i, got[i])
+		}
+	}
+}
+
+func TestPostedFileFetcherTrueLenIgnoredWhenSmaller(t *testing.T) {
+	fetcher := newFakeFetcher(map[string][]byte{
+		"<seg1>": repeatByte(0x55, 100),
+	})
+	file := storage.PostedFileRef{
+		Name: "f", Size: 90,
+		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
+	}
+	// trueLen (80) smaller than the declared Size (90) must not shrink the
+	// bound - only ever raises it to correct an under-estimate.
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 80)
+
+	got, err := pf.ReadRange(0, 100)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	for i := 0; i < 90; i++ {
+		if got[i] != 0x55 {
+			t.Errorf("byte %d = %#x, want 0x55", i, got[i])
+		}
+	}
+	for i := 90; i < 100; i++ {
+		if got[i] != 0 {
+			t.Errorf("byte %d = %#x, want 0 (past declared EOF padding)", i, got[i])
+		}
+	}
+}
+
 func TestPostedFileFetcherCachesLastSegment(t *testing.T) {
 	fetcher := newFakeFetcher(map[string][]byte{
 		"<seg1>": repeatByte(0x01, 100),
@@ -217,7 +272,7 @@ func TestPostedFileFetcherCachesLastSegment(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil)
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0)
 
 	// Read from seg1 three times in a row - should only fetch it once.
 	for i := 0; i < 3; i++ {
@@ -393,8 +448,8 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 	src := &jobSliceSource{
 		idx: idx,
 		fetchers: map[[16]byte]*postedFileFetcher{
-			fileA: newPostedFileFetcher(context.Background(), fetcherA.fetch, fileARef, nil),
-			fileB: newPostedFileFetcher(context.Background(), fetcherB.fetch, fileBRef, nil),
+			fileA: newPostedFileFetcher(context.Background(), fetcherA.fetch, fileARef, nil, 0),
+			fileB: newPostedFileFetcher(context.Background(), fetcherB.fetch, fileBRef, nil, 0),
 		},
 	}
 
