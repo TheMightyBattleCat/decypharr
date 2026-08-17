@@ -201,3 +201,60 @@ func TestMatchFilesNoMatchIsNotAnError(t *testing.T) {
 		t.Fatalf("MatchFiles = %v, want no matches", matches)
 	}
 }
+
+func TestMatchFilesResidualMD5MatchesLengthMiss(t *testing.T) {
+	fidExact := [16]byte{1}
+	fidTail := [16]byte{2}
+	md5Exact := [16]byte{0xAA}
+	md5Tail := [16]byte{0xBB}
+	idx := &Index{
+		Files: map[[16]byte]*FileDesc{
+			fidExact: {FileID: fidExact, MD5_16k: md5Exact, Length: 1000, Name: "vol.001"},
+			fidTail:  {FileID: fidTail, MD5_16k: md5Tail, Length: 331614074, Name: "vol.010"},
+		},
+		FileOrder: [][16]byte{fidExact, fidTail},
+	}
+	posted := []PostedFile{
+		{Name: "vol.001", Length: 1000, MD5_16k: func() ([16]byte, error) { return md5Exact, nil }},
+		{Name: "vol.010", Length: 331600499, MD5_16k: func() ([16]byte, error) { return md5Tail, nil }},
+	}
+	matches, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	got := map[int][16]byte{}
+	for _, m := range matches {
+		got[m.PostedIndex] = m.FileID
+	}
+	if got[0] != fidExact {
+		t.Errorf("posted 0 (exact length) FileID = %x, want %x", got[0], fidExact)
+	}
+	if got[1] != fidTail {
+		t.Errorf("posted 1 (tail volume) FileID = %x, want %x - residual MD5-16k pass did not match the length-miss tail volume", got[1], fidTail)
+	}
+}
+
+func TestMatchFilesResidualNoMatchOnMD5Mismatch(t *testing.T) {
+	fidExact := [16]byte{1}
+	fidTail := [16]byte{2}
+	idx := &Index{
+		Files: map[[16]byte]*FileDesc{
+			fidExact: {FileID: fidExact, MD5_16k: [16]byte{0xAA}, Length: 1000, Name: "vol.001"},
+			fidTail:  {FileID: fidTail, MD5_16k: [16]byte{0xBB}, Length: 331614074, Name: "vol.010"},
+		},
+		FileOrder: [][16]byte{fidExact, fidTail},
+	}
+	posted := []PostedFile{
+		{Name: "vol.001", Length: 1000, MD5_16k: func() ([16]byte, error) { return [16]byte{0xAA}, nil }},
+		{Name: "vol.010", Length: 331600499, MD5_16k: func() ([16]byte, error) { return [16]byte{0xCC}, nil }},
+	}
+	matches, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	for _, m := range matches {
+		if m.PostedIndex == 1 {
+			t.Errorf("posted 1 must stay unmatched (no equal MD5-16k) but matched FileID %x", m.FileID)
+		}
+	}
+}

@@ -93,6 +93,55 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
 			}
 		}
 	}
+	// Residual MD5-16k match for posted files that matched no FileDesc by
+	// length. A posted file's Length can be an ESTIMATE: the final segment's
+	// decoded size is only known exactly after a real fetch (see
+	// par2SegmentRefsFromPostingSize's last-segment branch), so a
+	// unique-geometry tail volume can miss its own FileDesc's exact length by
+	// a few KB and fall out of every length bucket above, even though its
+	// content is intact and PAR2 fully describes it. Length is only a cheap
+	// bucketing heuristic here; MD5-16k is the real identity signal - it hashes
+	// the first 16KB (the first segment), wholly independent of the last-segment
+	// length estimate. For each still-unmatched posted file, hash its first 16KB
+	// and match it to any still-unmatched FileDesc with an equal MD5-16k, single
+	// unambiguous hit only. Best-effort and purely additive: a nil hasher, a
+	// fetch error, no equal FileDesc, or a >1 collision all leave the file
+	// unmatched exactly as before (the caller surfaces the same terminal), so
+	// this can only turn a former miss into a rigorously-verified match, never
+	// break an existing one. A wrong match is still caught downstream by
+	// par2.Repair's per-slice IFSC verification, which never fabricates.
+	matchedPosted := make(map[int]bool, len(matches))
+	matchedFID := make(map[[16]byte]bool, len(matches))
+	for _, m := range matches {
+		matchedPosted[m.PostedIndex] = true
+		matchedFID[m.FileID] = true
+	}
+	for pi := range posted {
+		if matchedPosted[pi] || posted[pi].MD5_16k == nil {
+			continue
+		}
+		sum, err := posted[pi].MD5_16k()
+		if err != nil {
+			continue
+		}
+		var cand [16]byte
+		found := 0
+		for _, fid := range idx.FileOrder {
+			if matchedFID[fid] {
+				continue
+			}
+			fd := idx.Files[fid]
+			if fd == nil || fd.MD5_16k != sum {
+				continue
+			}
+			cand = fid
+			found++
+		}
+		if found == 1 {
+			matches = append(matches, newMatch(idx, posted, pi, cand))
+			matchedFID[cand] = true
+		}
+	}
 	return matches, nil
 }
 
