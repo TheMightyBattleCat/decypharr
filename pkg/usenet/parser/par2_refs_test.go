@@ -344,9 +344,14 @@ func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
 		t.Errorf("b.rar = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", b, wantBLast)
 	}
 	c := byName["c.rar"]
-	wantCLast := int64(float64(900) * yencOverheadEstimate)
+	// c.rar's own first segment (1080) differs from the seed's (1000), so its
+	// residual overhead ratio is now derived per-file - postingSegmentSize
+	// (970) over c.rar's OWN segs[0].Bytes (1080) - not the global 0.97
+	// constant.
+	postingSize, cFirstSegBytes := int64(970), int64(1080)
+	wantCLast := int64(float64(900) * (float64(postingSize) / float64(cFirstSegBytes)))
 	if c.Size != 970+wantCLast || !equalInt64(segBytesOf(c), []int64{970, wantCLast}) {
-		t.Errorf("c.rar = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", c, wantCLast)
+		t.Errorf("c.rar = %+v, want segBytes=[970 %d] (shared size + per-file-ratio-estimated last segment)", c, wantCLast)
 	}
 }
 
@@ -435,6 +440,73 @@ func TestBuildPar2RefsTransientErrorsDontAbort(t *testing.T) {
 		if len(f.Segments) != 1 || f.Segments[0].Bytes != want {
 			t.Errorf("%s Segments = %+v, want one segment of %d bytes", f.Name, f.Segments, want)
 		}
+	}
+}
+
+// TestPostingSizeTailUsesPerFileOverhead proves par2SegmentRefsFromPostingSize's
+// residual (final-segment) branch derives its overhead ratio from THIS file's
+// own segs[0].Bytes against the already-known-good postingSegmentSize, not
+// the hardcoded global yencOverheadEstimate (0.97) - the same fix as
+// TestBuildPar2RefsReusesPostingSizeAcrossFiles's c.rar case, exercised
+// directly against the function under test instead of through the full
+// buildPar2Refs pipeline.
+func TestPostingSizeTailUsesPerFileOverhead(t *testing.T) {
+	postingSegmentSize := int64(970)
+	segs := nzbparser.NzbSegments{
+		{Number: 1, Bytes: 1080, Id: "<seg1>"}, // this file's own first segment - 970/1080, not 970/1000
+		{Number: 2, Bytes: 900, Id: "<seg2>"},  // residual/tail segment
+	}
+	// seedSegCount deliberately doesn't match len(segs), so the exact
+	// identical-geometry branch never fires and the residual branch (the one
+	// under test) is guaranteed to run.
+	refs, total := par2SegmentRefsFromPostingSize(segs, postingSegmentSize, 0, 0)
+
+	hardcoded := int64(float64(900) * yencOverheadEstimate)
+	perFileRatio := float64(postingSegmentSize) / float64(1080)
+	wantTail := int64(float64(900) * perFileRatio)
+
+	if wantTail == hardcoded {
+		t.Fatal("test setup invalid: per-file ratio and the hardcoded 0.97 estimate coincide, can't distinguish them")
+	}
+	if refs[1].Bytes != wantTail {
+		t.Errorf("tail segment Bytes = %d, want %d (per-file ratio %v)", refs[1].Bytes, wantTail, perFileRatio)
+	}
+	if refs[1].Bytes == hardcoded {
+		t.Errorf("tail segment Bytes = %d matches the hardcoded 0.97 estimate - per-file ratio not applied", refs[1].Bytes)
+	}
+	if refs[0].Bytes != postingSegmentSize {
+		t.Errorf("refs[0].Bytes = %d, want shared postingSegmentSize %d", refs[0].Bytes, postingSegmentSize)
+	}
+	if wantTotal := postingSegmentSize + wantTail; total != wantTotal {
+		t.Errorf("total = %d, want %d", total, wantTotal)
+	}
+}
+
+// TestPostingSizeTailFallsBackWhenRatioInvalid proves the guard around the
+// per-file ratio: when it can't be trusted (segs[0].Bytes is zero, or the
+// implied ratio is out of the valid (0,1] range), the residual branch falls
+// back to the global yencOverheadEstimate exactly as before this change.
+func TestPostingSizeTailFallsBackWhenRatioInvalid(t *testing.T) {
+	cases := []struct {
+		name               string
+		firstSegBytes      int
+		postingSegmentSize int64
+	}{
+		{"zero first segment bytes", 0, 970},
+		{"ratio above 1 (posting size exceeds declared first segment)", 500, 970},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			segs := nzbparser.NzbSegments{
+				{Number: 1, Bytes: c.firstSegBytes, Id: "<seg1>"},
+				{Number: 2, Bytes: 900, Id: "<seg2>"},
+			}
+			refs, _ := par2SegmentRefsFromPostingSize(segs, c.postingSegmentSize, 0, 0)
+			want := int64(float64(900) * yencOverheadEstimate)
+			if refs[1].Bytes != want {
+				t.Errorf("tail segment Bytes = %d, want fallback %d (yencOverheadEstimate)", refs[1].Bytes, want)
+			}
+		})
 	}
 }
 

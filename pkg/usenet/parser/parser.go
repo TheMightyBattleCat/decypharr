@@ -544,6 +544,23 @@ func segmentsConsistentWithPostingSize(segs nzbparser.NzbSegments, postingSegmen
 // to learn that exactly.
 func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64, seedLastSegBytes int64, seedSegCount int) ([]storage.Par2SegmentRef, int64) {
 	n := len(segs)
+	// residualOverhead is the decoded/wire ratio implied by this file's own
+	// already-known-good posting size against segs[0]'s XML-declared (wire)
+	// byte count. yencOverheadEstimate is a fixed global constant (0.97) that
+	// doesn't track how any one release was actually yEnc-encoded - poster
+	// tooling and line-length choices shift the real ratio per file, so a
+	// per-file ratio derived from a segment we've already confirmed decodes
+	// to postingSegmentSize is a strictly better estimate for this file's own
+	// residual (final, possibly partial) segment than the global constant.
+	// Guarded to (0, 1]: a ratio outside that range means segs[0].Bytes is
+	// missing/bogus or the posting size doesn't correspond to a normal yEnc
+	// encoding, so fall back to the global estimate rather than trust it.
+	residualOverhead := yencOverheadEstimate
+	if segs[0].Bytes > 0 {
+		if r := float64(postingSegmentSize) / float64(segs[0].Bytes); r > 0 && r <= 1 {
+			residualOverhead = r
+		}
+	}
 	refs := make([]storage.Par2SegmentRef, n)
 	var total int64
 	for i, seg := range segs {
@@ -552,7 +569,7 @@ func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSi
 			if n == seedSegCount && seedLastSegBytes > 0 {
 				b = seedLastSegBytes // exact: identical geometry to the real-fetched seed
 			} else {
-				b = int64(float64(seg.Bytes) * yencOverheadEstimate) // residual: consistent-but-different-count geometry
+				b = int64(float64(seg.Bytes) * residualOverhead) // residual: consistent-but-different-count geometry
 			}
 		}
 		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
