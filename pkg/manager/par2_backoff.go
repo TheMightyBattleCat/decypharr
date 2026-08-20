@@ -93,6 +93,12 @@ var par2TerminalSubstrings = []string{
 	// cover - see runRepair's retry loop. No amount of retrying fixes a
 	// genuinely-gone article; only new PAR2/source data posted later could.
 	"more damage than recorded",
+	// Same failure, but caught when a transient (non-notFound) repairErr
+	// aborts the round first while genuine not-found slices had already
+	// accumulated in this or a prior round - see the round-cap return in
+	// runRepair. The typed nntp.IsArticleNotFoundError check above can't
+	// see this case because repairErr itself isn't an nntp.Error here.
+	"confirmed missing across every provider",
 }
 
 // classifyPar2Failure decides whether err (a runRepair failure) should back

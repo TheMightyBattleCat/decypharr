@@ -1392,6 +1392,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			}
 		}
 		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
+			if len(notFound) > 0 {
+				return fmt.Errorf("repair: %d intact slice(s) confirmed missing across every provider: %w", len(notFound), repairErr)
+			}
 			return fmt.Errorf("repair: %w", repairErr)
 		}
 		p.logger.Info().
