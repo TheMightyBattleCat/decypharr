@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
 
@@ -49,6 +50,18 @@ func TestClassifyPar2FailureChecksumMismatchIsTerminal(t *testing.T) {
 	}
 	if class.reason == "" {
 		t.Fatalf("classifyPar2Failure(checksum mismatch).reason is empty")
+	}
+}
+
+func TestClassifyPar2FailureArticleNotFoundIsTerminal(t *testing.T) {
+	nntpErr := &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430}
+	err := fmt.Errorf("repair: par2: read intact slice 42: %w", nntpErr)
+	class := classifyPar2Failure(err)
+	if !class.terminal {
+		t.Fatalf("classifyPar2Failure(article not found).terminal = false, want true")
+	}
+	if class.reason == "" {
+		t.Fatalf("classifyPar2Failure(article not found).reason is empty")
 	}
 }
 

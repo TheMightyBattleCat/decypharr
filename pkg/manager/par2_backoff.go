@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
@@ -108,6 +109,9 @@ func classifyPar2Failure(err error) par2FailureClass {
 	}
 	if errors.Is(err, par2.ErrChecksumMismatch) {
 		return par2FailureClass{terminal: true, reason: "checksum verification failed (CRC canary) - retained recovery/intact data can't be trusted"}
+	}
+	if nntp.IsArticleNotFoundError(err) {
+		return par2FailureClass{terminal: true, reason: "source article(s) confirmed missing across every provider"}
 	}
 	msg := err.Error()
 	for _, s := range par2TerminalSubstrings {
