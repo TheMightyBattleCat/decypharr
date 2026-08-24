@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -356,19 +357,20 @@ func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
 }
 
 // TestBuildPar2RefsEarlyAbortAfterKFailures proves the early-abort behavior:
-// once par2ProbeMaxFailedFetches real fetches have failed, probing stops for
-// every remaining file in the release - no further fetch calls - and the
-// release is reported aborted. maxConcurrent=1 makes candidate processing
-// deterministic (strictly in input order) so the exact fetch count is
-// assertable.
+// once par2ProbeMaxFailedFetches (20) confirmed-missing articles are seen,
+// probing stops for every remaining file in the release - no further fetch
+// calls - and the release is reported aborted. maxConcurrent=1 makes
+// candidate processing deterministic (strictly in input order) so the exact
+// fetch count is assertable.
 func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
+	const nFiles = 25 // > par2ProbeMaxFailedFetches so abort fires with files left over
 	// All single-segment files, so none qualifies as a multi-segment seed -
 	// every file goes through the same per-candidate probe path in order.
-	files := make(nzbparser.NzbFiles, 0, 6)
-	for i := 0; i < 6; i++ {
-		id := "<seg" + string(rune('0'+i)) + ">"
+	files := make(nzbparser.NzbFiles, 0, nFiles)
+	for i := 0; i < nFiles; i++ {
+		id := fmt.Sprintf("<seg%d>", i)
 		files = append(files, nzbparser.NzbFile{
-			Filename: "file" + string(rune('0'+i)) + ".rar",
+			Filename: fmt.Sprintf("file%02d.rar", i),
 			Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: id}},
 		})
 	}
@@ -381,22 +383,53 @@ func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
 
 	p := &NZBParser{logger: zerolog.Nop()}
 	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
-	if aborted != true {
+	if !aborted {
 		t.Fatal("aborted = false, want true after par2ProbeMaxFailedFetches genuinely-not-found failures")
 	}
-	if len(par2Files) != 0 || len(source) != 6 {
-		t.Fatalf("par2Files/source = %d/%d, want 0/6", len(par2Files), len(source))
+	if len(par2Files) != 0 || len(source) != nFiles {
+		t.Fatalf("par2Files/source = %d/%d, want 0/%d", len(par2Files), len(source), nFiles)
 	}
 	if got := atomic.LoadInt32(&calls); got != par2ProbeMaxFailedFetches {
 		t.Fatalf("fetch called %d times, want exactly %d (probing stops once the threshold trips)", got, par2ProbeMaxFailedFetches)
 	}
 	// Every file - probed-and-failed or skipped post-abort - falls back to
-	// the same XML-bytes estimate, so all 6 results are consistent.
+	// the same XML-bytes estimate, so all results are consistent.
 	want := int64(float64(1000) * yencOverheadEstimate)
 	for _, f := range source {
 		if len(f.Segments) != 1 || f.Segments[0].Bytes != want {
 			t.Errorf("%s Segments = %+v, want one segment of %d bytes", f.Name, f.Segments, want)
 		}
+	}
+}
+
+// TestBuildPar2RefsBelowThresholdNoAbort proves that fewer than
+// par2ProbeMaxFailedFetches confirmed-missing articles do NOT trigger abort.
+// Every file is dead, but the total count (19) is below the threshold (20),
+// so all 19 are probed and aborted stays false.
+func TestBuildPar2RefsBelowThresholdNoAbort(t *testing.T) {
+	const nFiles = 19 // par2ProbeMaxFailedFetches - 1
+	files := make(nzbparser.NzbFiles, 0, nFiles)
+	for i := 0; i < nFiles; i++ {
+		id := fmt.Sprintf("<seg%d>", i)
+		files = append(files, nzbparser.NzbFile{
+			Filename: fmt.Sprintf("file%02d.rar", i),
+			Segments: nzbparser.NzbSegments{{Number: 1, Bytes: 1000, Id: id}},
+		})
+	}
+
+	var calls int32
+	fetch := func(_ context.Context, _ string) (*nntp.YencMetadata, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "simulated dead article"}
+	}
+
+	p := &NZBParser{logger: zerolog.Nop()}
+	_, _, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	if aborted {
+		t.Fatal("aborted = true, want false (19 < threshold of 20)")
+	}
+	if got := atomic.LoadInt32(&calls); got != nFiles {
+		t.Fatalf("fetch called %d times, want %d (every file probed, no abort)", got, nFiles)
 	}
 }
 

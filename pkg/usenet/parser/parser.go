@@ -54,14 +54,15 @@ const (
 	// fail fast into that fallback rather than eating the connection's full
 	// StreamBodyTimeout.
 	par2ProbeTimeout = 5 * time.Second
-	// par2ProbeMaxFailedFetches is how many failed real yEnc fetches
-	// buildPar2RefsWithFetch tolerates before giving up on PAR2 probing for
-	// the rest of the release. Past this many dead articles in one release,
-	// the post-parse availability check is going to reject it anyway, so
-	// further probing only spends more round trips confirming what's already
-	// known; the release is marked aborted and every remaining file falls
-	// back to the XML-bytes estimate with no further fetches.
-	par2ProbeMaxFailedFetches = 3
+	// par2ProbeMaxFailedFetches is how many confirmed-missing articles
+	// (genuine 430/423) buildPar2RefsWithFetch tolerates before giving up
+	// on PAR2 probing for the rest of the release. At 20, partial source
+	// decay (a handful of dead files in a large release) is fully probed
+	// so recovery volumes get accurate geometry for repair. A fully-DMCA'd
+	// release still short-circuits rather than wasting 70+ probe round
+	// trips. The abort is informational (remaining files fall to estimate);
+	// it no longer hard-rejects the release at parse time.
+	par2ProbeMaxFailedFetches = 20
 	// postingSizeToleranceFrac bounds how far a file's own non-final segment
 	// byte count (as declared in the NZB XML) may deviate, as a fraction of
 	// the expected value, from the release's shared posting article size
@@ -257,11 +258,7 @@ func availabilityThenPar2Refs(
 	// RAR/7z/zip grouping and extraction decides to do with these files
 	// afterwards. Only reached once the release has passed the availability
 	// check above.
-	var aborted bool
-	par2Files, source, aborted = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
-	if aborted {
-		return nil, nil, fmt.Errorf("PAR2 source-file probing aborted after %d failed article fetches; release likely damaged: %w", par2ProbeMaxFailedFetches, ErrReleaseUnavailable)
-	}
+	par2Files, source, _ = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
 	return par2Files, source, nil
 }
 
