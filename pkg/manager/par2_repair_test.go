@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -232,7 +233,7 @@ func TestPostedFileFetcherTrueLenServesRealTailBytes(t *testing.T) {
 	}
 }
 
-func TestPostedFileFetcherTrueLenIgnoredWhenSmaller(t *testing.T) {
+func TestPostedFileFetcherTrueLenLowersBoundWhenSmaller(t *testing.T) {
 	fetcher := newFakeFetcher(map[string][]byte{
 		"<seg1>": repeatByte(0x55, 100),
 	})
@@ -240,22 +241,83 @@ func TestPostedFileFetcherTrueLenIgnoredWhenSmaller(t *testing.T) {
 		Name: "f", Size: 90,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
 	}
-	// trueLen (80) smaller than the declared Size (90) must not shrink the
-	// bound - only ever raises it to correct an under-estimate.
+	// trueLen (80) smaller than the declared Size (90) must now shrink the
+	// bound too - trueLen (the FileDesc length) is authoritative in both
+	// directions, not only when it raises an under-estimate. See
+	// TestReadRangeBoundsOverstampedTailByTrueLen for the live scenario
+	// (Riders seg58) this corrects.
 	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 80)
 
 	got, err := pf.ReadRange(0, 100)
 	if err != nil {
 		t.Fatalf("ReadRange: %v", err)
 	}
-	for i := 0; i < 90; i++ {
+	for i := 0; i < 80; i++ {
 		if got[i] != 0x55 {
 			t.Errorf("byte %d = %#x, want 0x55", i, got[i])
 		}
 	}
-	for i := 90; i < 100; i++ {
+	for i := 80; i < 100; i++ {
 		if got[i] != 0 {
-			t.Errorf("byte %d = %#x, want 0 (past declared EOF padding)", i, got[i])
+			t.Errorf("byte %d = %#x, want 0 (past trueLen-bounded EOF padding)", i, got[i])
+		}
+	}
+}
+
+// TestReadRangeBoundsOverstampedTailByTrueLen reproduces Riders S01E08
+// seg58: the posted file's own records (Size, and the tail segment's
+// Par2SegmentRef.Bytes) claimed 470905 bytes for the final segment, but the
+// real fetched article was only 469845 bytes. Before this fix,
+// newPostedFileFetcher only let trueLen *raise* its bound (trueLen >
+// length), so an over-stamped declared length stuck around unchanged and
+// ReadRange, once the real 469845 bytes were exhausted, went on to treat the
+// leftover 1060 bytes of the declared-but-never-posted tail as a second,
+// still-unread chunk of the same segment - which fails as "segment shorter
+// than its recorded size" instead of cleanly zero-padding. trueLen must
+// override the declared length whenever it's known, so ReadRange's f.length
+// bound matches reality: real bytes, then zero-padding, no error.
+func TestReadRangeBoundsOverstampedTailByTrueLen(t *testing.T) {
+	const (
+		segSize      = 716800
+		numFullSegs  = 58
+		declaredTail = 470905 // over-stamped: what the posted file's records claim
+		realTail     = 469845 // what the article actually decodes to
+	)
+
+	segs := make([]storage.Par2SegmentRef, 0, numFullSegs+1)
+	fetcherData := make(map[string][]byte, 1)
+	for i := 0; i < numFullSegs; i++ {
+		segs = append(segs, storage.Par2SegmentRef{MessageID: fmt.Sprintf("<seg%d>", i), Bytes: segSize})
+	}
+	segs = append(segs, storage.Par2SegmentRef{MessageID: "<seg58>", Bytes: declaredTail})
+	fetcherData["<seg58>"] = repeatByte(0x77, realTail)
+	fetcher := newFakeFetcher(fetcherData)
+
+	trueLen := int64(numFullSegs*segSize + realTail)
+	file := storage.PostedFileRef{
+		Name: "f",
+		// Size mirrors the same over-stamped estimate as the tail segment's
+		// declared Bytes, exactly as the yEnc-decoded Size record did live.
+		Size:     int64(numFullSegs*segSize + declaredTail),
+		Segments: segs,
+	}
+	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, trueLen)
+
+	got, err := pf.ReadRange(numFullSegs*segSize, segSize)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if len(got) != segSize {
+		t.Fatalf("ReadRange returned %d bytes, want %d", len(got), segSize)
+	}
+	for i := 0; i < realTail; i++ {
+		if got[i] != 0x77 {
+			t.Fatalf("byte %d = %#x, want 0x77 (real tail byte)", i, got[i])
+		}
+	}
+	for i := realTail; i < segSize; i++ {
+		if got[i] != 0 {
+			t.Fatalf("byte %d = %#x, want 0 (zero-padded past the real, trueLen-bounded EOF)", i, got[i])
 		}
 	}
 }

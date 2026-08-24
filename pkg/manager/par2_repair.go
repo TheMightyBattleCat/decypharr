@@ -1632,7 +1632,7 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64) (bases, size
 func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64) *postedFileFetcher {
 	base, segSizes := exactSegGeometry(f.Segments, trueLen)
 	length := f.Size
-	if trueLen > length {
+	if trueLen > 0 {
 		length = trueLen
 	}
 	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, segSizes: segSizes, cacheSource: cacheSource, cacheIdx: -1}
