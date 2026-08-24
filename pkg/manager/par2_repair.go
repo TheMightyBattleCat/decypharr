@@ -1242,10 +1242,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		file := nzb.Par2Source[m.PostedIndex]
 		f := newPostedFileFetcher(ctx, fetch, file, cacheSource, idx.Files[m.FileID].Length)
 		fetchers[m.FileID] = f
-		var off int64
-		for _, seg := range file.Segments {
-			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: off, end: off + seg.Bytes}
-			off += seg.Bytes
+		for i, seg := range file.Segments {
+			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
 		}
 	}
 
@@ -1564,7 +1562,8 @@ type postedFileFetcher struct {
 	fetch  articleFetchFunc
 	length int64
 	segs   []storage.Par2SegmentRef
-	base   []int64 // base[i] = starting byte offset of segs[i] within the file
+	base     []int64 // base[i] = starting byte offset of segs[i] within the file
+	segSizes []int64 // segSizes[i] = exact decoded byte count for segs[i]
 
 	// cacheSource, when non-nil, is tried before every Usenet fetch below -
 	// see cacheSlicedSource.readCached. Misses (no mapping, dead range, not
@@ -1593,25 +1592,54 @@ type postedFileFetcher struct {
 // them, corrupting whichever intact slice they fall in. Pass 0 to keep the
 // declared estimate (e.g. computeMD5_16k, which only ever reads the leading
 // 16KB and has no FileDesc to compare against).
-func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64) *postedFileFetcher {
-	base := make([]int64, len(f.Segments))
-	var off int64
-	for i, s := range f.Segments {
-		base[i] = off
-		off += s.Bytes
+// exactSegGeometry returns per-segment base offsets and decoded sizes.
+// When trueLen (FileDesc.Length) is available and the seed segment's
+// persisted Bytes is positive, interior offsets use exact arithmetic
+// (i * seedSize, with the final segment = trueLen - (n-1)*seedSize),
+// eliminating the cumulative drift of the yEnc 0.97 overhead estimate.
+// Otherwise the persisted Par2SegmentRef.Bytes estimates are accumulated
+// as before - a graceful fallback for callers that lack FileDesc
+// (computeMD5_16k passes trueLen=0).
+func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64) (bases, sizes []int64) {
+	n := len(segs)
+	bases = make([]int64, n)
+	sizes = make([]int64, n)
+	if n == 0 {
+		return
 	}
+	seedSeg := segs[0].Bytes
+	lastSeg := trueLen - int64(n-1)*seedSeg
+	if trueLen > 0 && seedSeg > 0 && lastSeg > 0 {
+		for i := range segs {
+			bases[i] = int64(i) * seedSeg
+			sizes[i] = seedSeg
+		}
+		sizes[n-1] = lastSeg
+	} else {
+		var off int64
+		for i, s := range segs {
+			bases[i] = off
+			sizes[i] = s.Bytes
+			off += s.Bytes
+		}
+	}
+	return
+}
+
+func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64) *postedFileFetcher {
+	base, segSizes := exactSegGeometry(f.Segments, trueLen)
 	length := f.Size
 	if trueLen > length {
 		length = trueLen
 	}
-	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, cacheSource: cacheSource, cacheIdx: -1}
+	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, segSizes: segSizes, cacheSource: cacheSource, cacheIdx: -1}
 }
 
 func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
 	lo, hi := 0, len(f.base)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if f.base[mid]+f.segs[mid].Bytes <= offset {
+		if f.base[mid]+f.segSizes[mid] <= offset {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -1675,7 +1703,7 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 		// cache-vs-fetch decision below can be made before ever fetching
 		// anything; the fetch path re-derives the same bound off the actual
 		// fetched length, exactly as before this cache-sourcing existed.
-		declaredAvail := f.segs[segIdx].Bytes - withinSeg
+		declaredAvail := f.segSizes[segIdx] - withinSeg
 		if declaredAvail <= 0 {
 			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
 		}
