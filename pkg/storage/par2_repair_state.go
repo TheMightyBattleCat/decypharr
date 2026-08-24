@@ -27,6 +27,12 @@ type Par2RepairState struct {
 	Terminal       bool   `json:"terminal,omitempty"`
 	TerminalReason string `json:"terminal_reason,omitempty"`
 
+	// DeadSegmentsDiscovered is the total count of distinct dead (unrecoverable)
+	// slices the repair engine found across all rounds of the most recent
+	// attempt - independent of, and typically larger than, the playback-time
+	// RecordDead count, since the repair engine probes far more of the file.
+	DeadSegmentsDiscovered int `json:"dead_segments_discovered,omitempty"`
+
 	// NextRetryAt is the earliest time the automatic path may re-enqueue
 	// after a transient failure (exponential backoff). Zero means no backoff
 	// in effect (never attempted, or the last attempt succeeded).

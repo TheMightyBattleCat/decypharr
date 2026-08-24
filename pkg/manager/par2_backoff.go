@@ -158,7 +158,7 @@ func (p *Par2Repair) par2ShouldAutoEnqueue(nzbID string) bool {
 // future AUTOMATIC attempts resume). A nil err (success) clears all
 // backoff/terminal state entirely - best-effort, logged not returned, since
 // a state-tracking failure must never affect the repair pass itself.
-func (p *Par2Repair) recordPar2Outcome(nzbID string, err error) {
+func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDiscovered int) {
 	if err == nil {
 		if derr := p.manager.storage.DeletePar2RepairState(nzbID); derr != nil {
 			p.logger.Debug().Err(derr).Str("entry", nzbID).Msg("par2 repair: failed to clear repair state after success")
@@ -173,6 +173,7 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error) {
 	state.LastAttempt = time.Now()
 	state.AttemptCount++
 	state.LastError = err.Error()
+	state.DeadSegmentsDiscovered = deadSegmentsDiscovered
 
 	class := classifyPar2Failure(err)
 	state.Terminal = class.terminal

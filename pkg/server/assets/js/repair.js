@@ -1342,7 +1342,7 @@ class RepairManager {
     }
 
     overlayRepairableBadge(f) {
-        const pending = (f.dead_segments || 0) + (f.padded_segments || 0) > 0;
+        const pending = Math.max(f.dead_segments || 0, f.par2_dead_segments_discovered || 0) + (f.padded_segments || 0) > 0;
         if (!pending) return '<span class="badge badge-ghost badge-sm">n/a</span>';
         if (f.repairable) return '<span class="badge badge-success badge-sm" title="PAR2 repair is available">repairable</span>';
         const reason = f.not_repairable_reason || '';
@@ -1562,6 +1562,7 @@ class RepairManager {
             // entry/file names can contain characters (spaces, brackets, ...)
             // that are unsafe to embed directly in an id attribute.
             const progressDomId = `overlayProgress-row-${i}`;
+            const deadCount = Math.max(f.dead_segments || 0, f.par2_dead_segments_discovered || 0);
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td onclick="event.stopPropagation();">
@@ -1574,7 +1575,7 @@ class RepairManager {
                 </td>
                 <td>${this.overlayVerdictBadge(f.verdict)}</td>
                 <td class="text-xs whitespace-nowrap">
-                    <span class="text-error" title="dead">D:${f.dead_segments || 0}</span>
+                    <span class="text-error" title="dead (${f.dead_segments || 0} recorded, ${f.par2_dead_segments_discovered || 0} found by repair)">D:${deadCount}</span>
                     <span class="text-warning ml-1" title="padded">P:${f.padded_segments || 0}</span>
                     <span class="text-success ml-1" title="patched">F:${f.patched_segments || 0}</span>
                 </td>

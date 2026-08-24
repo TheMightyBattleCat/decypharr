@@ -97,6 +97,12 @@ type OverlayFile struct {
 	Par2LastError    string     `json:"par2_last_error,omitempty"`
 	Par2NextRetryAt  *time.Time `json:"par2_next_retry_at,omitempty"`
 
+	// Par2DeadSegmentsDiscovered is the distinct dead-slice count the repair
+	// engine itself found across all rounds of its last attempt - typically
+	// larger than DeadSegments, which only reflects what playback (RecordDead)
+	// has recorded. The UI badge shows the max of the two.
+	Par2DeadSegmentsDiscovered int `json:"par2_dead_segments_discovered,omitempty"`
+
 	// PatchBytes and Par2RetainedMetaBytes are real on-disk sizes; their sum,
 	// OverlayDiskBytes, is what this file's overlay state actually costs
 	// locally. Par2ProtectedReleaseBytes is NOT a disk figure at all: it's
@@ -315,6 +321,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 				of.Par2Terminal = repairState.Terminal
 				of.Par2AttemptCount = repairState.AttemptCount
 				of.Par2LastError = repairState.LastError
+				of.Par2DeadSegmentsDiscovered = repairState.DeadSegmentsDiscovered
 				if !repairState.NextRetryAt.IsZero() {
 					t := repairState.NextRetryAt
 					of.Par2NextRetryAt = &t

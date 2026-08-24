@@ -958,7 +958,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			Outcome:    storage.Par2RepairOutcomeUnavailable,
 			FailReason: terminalErr.Error(),
 		})
-		p.recordPar2Outcome(nzbID, terminalErr)
+		p.recordPar2Outcome(nzbID, terminalErr, 0)
 		terminal = true
 		return
 	}
@@ -1004,7 +1004,8 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
 	var slicesRepaired int
-	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, progress); err != nil {
+	var deadSlicesDiscovered int // distinct dead slices the repair engine found across all rounds, beyond what the overlay already recorded
+	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress); err != nil {
 		if job.preempted.Load() {
 			preempted = true
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
@@ -1028,7 +1029,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			FailReason: err.Error(),
 			CRCCanary:  canary,
 		})
-		p.recordPar2Outcome(nzbID, err)
+		p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.notifyFailed(entryName, err, canary)
 		// A terminal failure - one backoff can never fix - marks the entry
 		// unrepairable (see the deferred release above) instead of falling
@@ -1065,7 +1066,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		SlicesRepaired:  slicesRepaired,
 		SegmentsPatched: deadSegments,
 	})
-	p.recordPar2Outcome(nzbID, nil)
+	p.recordPar2Outcome(nzbID, nil, 0)
 	p.notifyCompleted(entryName, deadSegments, time.Since(start))
 }
 
@@ -1116,7 +1117,7 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, progress *par2JobProgressState) error {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, deadDiscovered *int, progress *par2JobProgressState) error {
 	u := p.manager.usenet
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 
@@ -1390,6 +1391,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			if _, already := damagedPos[ni]; !already {
 				newlyDamaged = append(newlyDamaged, ni)
 			}
+		}
+		if len(newlyDamaged) > 0 && deadDiscovered != nil {
+			// Rounds never overlap (each round's damagedPos guards against
+			// re-adding an already-known slice), so a running sum across
+			// rounds is exactly the distinct-slice count - no set needed.
+			*deadDiscovered += len(newlyDamaged)
 		}
 		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
 			if len(notFound) > 0 {
