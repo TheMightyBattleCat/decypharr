@@ -28,6 +28,7 @@ const (
 	ffprobeReasonNoDuration      = "ffprobe_no_duration"
 	ffprobeReasonRuntimeMismatch = "ffprobe_runtime_mismatch"
 	ffprobeReasonAbsurdDuration  = "ffprobe_absurd_duration"
+	ffprobeReasonDecodeError     = "ffprobe_decode_error"
 )
 
 const (
@@ -55,6 +56,13 @@ const (
 	// (as-aired combined runtime, extended-cut listing) rather than the file.
 	ffprobeTooShortRatio    = 0.5
 	ffprobeTooShortMinUnder = 15 * time.Minute
+
+	// ffprobeDecodeWindowCount is the number of evenly-spaced sample windows
+	// the decode check opens across the file's duration.
+	ffprobeDecodeWindowCount = 15
+
+	// ffprobeDecodeWindowSpan is how long each decode window reads.
+	ffprobeDecodeWindowSpan = 2 * time.Second
 
 	// ffprobeTailWindow is the span of stream tail demuxed by tailIntact to
 	// corroborate a too-short verdict: packets are read starting this long
@@ -265,7 +273,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		if duration > ceiling {
 			return false, ffprobeReasonAbsurdDuration
 		}
-		return true, ""
+		return f.decodeWindows(ctx, entryFolder, fileName, duration)
 	}
 
 	expectedDur := time.Duration(expected.Seconds) * time.Second
@@ -290,7 +298,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Int("probe_minutes", int(duration.Minutes())).
 				Int("expected_minutes", int(expectedDur.Minutes())).
 				Msg("Repair: runtime shorter than Arr metadata but stream is complete to its own header duration; treating as metadata mismatch (split release or as-aired special), not marking broken")
-			return true, ""
+			return f.decodeWindows(ctx, entryFolder, fileName, duration)
 		}
 		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio)
 	}
@@ -301,7 +309,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	if ratio < 0.9 || ratio > 1.1 {
 		f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
 	}
-	return true, ""
+	return f.decodeWindows(ctx, entryFolder, fileName, duration)
 }
 
 type ffprobeTailOutput struct {
@@ -378,6 +386,75 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 		}
 	}
 	return false
+}
+
+// decodeWindows probes evenly-spaced windows of the video stream, forcing
+// actual frame decode (not just demux). The demux-only check above reads
+// container metadata and packet headers but never asks the codec to
+// reconstruct a frame, so a file with a valid container but corrupt
+// compressed data passes undetected. This method closes that gap.
+//
+// Like every other probe in this file, timeout and cancellation are
+// inconclusive (ok=true, fail-open): a slow WebDAV read must never
+// auto-delete a file that might be fine.
+func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration) (ok bool, reason string) {
+	if duration <= 0 {
+		return true, ""
+	}
+
+	n := ffprobeDecodeWindowCount
+	durSec := int(duration.Seconds())
+	if durSec < n {
+		n = durSec
+	}
+	if n <= 0 {
+		return true, ""
+	}
+
+	intervals := make([]string, n)
+	for i := 0; i < n; i++ {
+		startSec := duration * time.Duration(i) / time.Duration(n)
+		intervals[i] = fmt.Sprintf("%.0f%%+%.0f", startSec.Seconds(), ffprobeDecodeWindowSpan.Seconds())
+	}
+
+	args := f.probeArgs(entryFolder, fileName, []string{
+		"-v", "error",
+		"-read_intervals", strings.Join(intervals, ","),
+		"-select_streams", "v:0",
+		"-show_entries", "frame=pts_time",
+		"-of", "csv=p=0",
+	})
+
+	cctx, cancel := context.WithTimeout(ctx, f.timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cctx, f.binPath, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	if cctx.Err() != nil {
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
+		}
+		return true, ""
+	}
+
+	// Decode errors surface on stderr even when the exit code is 0 (ffprobe
+	// reports per-frame codec errors but still exits cleanly when it can
+	// continue demuxing). Check stderr first.
+	stderrStr := strings.TrimSpace(stderr.String())
+	if stderrStr != "" {
+		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr)
+	}
+
+	if runErr != nil {
+		return false, ffprobeReasonDecodeError
+	}
+
+	return true, ""
 }
 
 // checkConfirmed retries once before declaring a file broken: a transient
