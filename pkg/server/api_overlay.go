@@ -736,8 +736,10 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 	// short-circuiting on a stale cause.
 	u.ClearFailedFile(entry.InfoHash, req.File)
 	if removed {
-		if _, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
-			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("removed cached copy for reclaimed file")
+		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
+			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed file")
+		} else {
+			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("overlay reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
 		}
 	}
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
