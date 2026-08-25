@@ -366,7 +366,14 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	// trim already cleared.
 	names := orderedFilenames(c.item)
 	names = r.filterSupersededFiles(c.item, names, sc)
-	results := r.probeFiles(ctx, c, names, opts)
+
+	currentFP := storage.EntryItemRepairFingerprint(c.item)
+	decodeVerified := !h.DecodeVerifiedAt.IsZero() && h.DecodeVerifiedFingerprint == currentFP
+	if decodeVerified {
+		r.logger.Debug().Str("entry", c.item.Name).Msg("Sweep: decode already verified for this fingerprint, skipping decode windows")
+	}
+
+	results := r.probeFiles(ctx, c, names, opts, decodeVerified)
 	if autoRepair {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -378,7 +385,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.FileCount = len(names)
 	h.BrokenFiles = broken
 	h.BrokenCount = len(broken)
-	h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
+	h.Fingerprint = currentFP
 	h.LastCheckedAt = time.Now()
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
 	h.Dirty = false
@@ -392,9 +399,17 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	case storage.HealthHealthy:
 		h.LastOKAt = h.LastCheckedAt
 		h.FailureReason = ""
+		if !decodeVerified {
+			h.DecodeVerifiedAt = h.LastCheckedAt
+			h.DecodeVerifiedFingerprint = currentFP
+		}
 	case storage.HealthBroken:
 		h.LastFailedAt = h.LastCheckedAt
 		h.FailureReason = topReason(broken)
+	}
+	if final != storage.HealthHealthy {
+		h.DecodeVerifiedAt = time.Time{}
+		h.DecodeVerifiedFingerprint = ""
 	}
 
 	r.saveHealth(h)
@@ -403,7 +418,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
-func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions) []fileResult {
+func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) []fileResult {
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
@@ -413,7 +428,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, c, name, opts)
+			results[i] = r.probeFile(gctx, c, name, opts, skipDecode)
 			return nil
 		})
 	}
@@ -437,7 +452,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 // reports handled=true it has already fully decided this file's outcome
 // (regrabbed it, or cleared the verdict on strict evidence) - the generic
 // ffprobe re-check below is skipped for it, not run a second time.
-func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts RepairRunOptions) fileResult {
+func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts RepairRunOptions, skipDecode bool) fileResult {
 	file := c.item.Files[name]
 	res := fileResult{name: name}
 
@@ -469,7 +484,7 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 
 	if res.healthy {
 		if checker := ffprobeCheckerFromContext(ctx); checker != nil {
-			if ok, reason := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name)); !ok {
+			if ok, reason := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode); !ok {
 				res.healthy = false
 				res.broken = true
 				res.reason = reason

@@ -257,14 +257,18 @@ type BrokenFile struct {
 // updated live during a sweep — once when probing starts, once when it
 // finishes.
 type EntryHealth struct {
-	EntryName     string          `json:"entry_name"`
-	Protocol      config.Protocol `json:"protocol,omitempty"`
-	Status        HealthStatus    `json:"status"`
-	Fingerprint   string          `json:"fingerprint,omitempty"`
-	FileCount     int             `json:"file_count"`
-	BrokenCount   int             `json:"broken_count"`
-	BrokenFiles   []BrokenFile    `json:"broken_files,omitempty"`
-	FailureReason string          `json:"failure_reason,omitempty"`
+	EntryName   string          `json:"entry_name"`
+	Protocol    config.Protocol `json:"protocol,omitempty"`
+	Status      HealthStatus    `json:"status"`
+	Fingerprint string          `json:"fingerprint,omitempty"`
+
+	DecodeVerifiedAt          time.Time `json:"decode_verified_at,omitempty"`
+	DecodeVerifiedFingerprint string    `json:"decode_verified_fp,omitempty"`
+
+	FileCount     int          `json:"file_count"`
+	BrokenCount   int          `json:"broken_count"`
+	BrokenFiles   []BrokenFile `json:"broken_files,omitempty"`
+	FailureReason string       `json:"failure_reason,omitempty"`
 
 	Dirty       bool   `json:"dirty"`
 	DirtyReason string `json:"dirty_reason,omitempty"`

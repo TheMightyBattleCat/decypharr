@@ -216,7 +216,7 @@ type ffprobeOutput struct {
 // the file looks healthy. A context timeout or cancellation is treated as
 // inconclusive (ok=true) rather than broken - a slow cold read over Usenet
 // must never cause an auto-delete.
-func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime) (ok bool, reason string) {
+func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
 	cctx, cancel := context.WithTimeout(ctx, f.timeout)
@@ -273,7 +273,10 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		if duration > ceiling {
 			return false, ffprobeReasonAbsurdDuration
 		}
-		return f.decodeWindows(ctx, entryFolder, fileName, duration)
+		if !skipDecode {
+			return f.decodeWindows(ctx, entryFolder, fileName, duration)
+		}
+		return true, ""
 	}
 
 	expectedDur := time.Duration(expected.Seconds) * time.Second
@@ -298,7 +301,10 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Int("probe_minutes", int(duration.Minutes())).
 				Int("expected_minutes", int(expectedDur.Minutes())).
 				Msg("Repair: runtime shorter than Arr metadata but stream is complete to its own header duration; treating as metadata mismatch (split release or as-aired special), not marking broken")
-			return f.decodeWindows(ctx, entryFolder, fileName, duration)
+			if !skipDecode {
+				return f.decodeWindows(ctx, entryFolder, fileName, duration)
+			}
+			return true, ""
 		}
 		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio)
 	}
@@ -309,7 +315,10 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	if ratio < 0.9 || ratio > 1.1 {
 		f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
 	}
-	return f.decodeWindows(ctx, entryFolder, fileName, duration)
+	if !skipDecode {
+		return f.decodeWindows(ctx, entryFolder, fileName, duration)
+	}
+	return true, ""
 }
 
 type ffprobeTailOutput struct {
@@ -461,8 +470,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // cold-seek can fail one read and pass the next, and since a broken verdict
 // can lead to an automatic delete + re-search, a single bad read is never
 // enough. Only a second consecutive broken verdict is returned as broken.
-func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime) (ok bool, reason string) {
-	ok, reason = f.check(ctx, entryFolder, fileName, expected)
+func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string) {
+	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	if ok {
 		return true, ""
 	}
@@ -474,7 +483,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	case <-time.After(ffprobeRetryDelay):
 	}
 
-	ok, reason = f.check(ctx, entryFolder, fileName, expected)
+	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Bool("ok", ok).Str("reason", reason).Msg("Repair: ffprobe retry result")
 	if ok {
 		return true, ""

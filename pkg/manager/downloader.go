@@ -290,7 +290,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		if file == nil || file.Size < ffprobeImportMinSize || !config.IsVideoFile(file.Name) {
 			continue
 		}
-		ok, reason := checker.checkConfirmed(ctx, entryFolder, file.Name, expected)
+		ok, reason := checker.checkConfirmed(ctx, entryFolder, file.Name, expected, false)
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
