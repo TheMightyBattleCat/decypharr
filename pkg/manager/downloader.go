@@ -294,6 +294,10 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
+			if rerr := d.manager.Repair().RegrabImportGrab(ctx, entry, file.Name, reason); rerr != nil {
+				d.logger.Warn().Err(rerr).Str("entry", entry.Name).Str("file", file.Name).
+					Msg("Import: failed to blocklist + re-search via Arr")
+			}
 			return fmt.Errorf("ffprobe import check: %s", reason)
 		}
 	}
