@@ -75,6 +75,7 @@ type NZB struct {
 type Par2SegmentRef struct {
 	MessageID string `json:"message_id" msgpack:"message_id"`
 	Bytes     int64  `json:"bytes" msgpack:"bytes"`
+	Real      bool   `json:"real,omitempty" msgpack:"real,omitempty"`
 }
 
 // Par2FileRef is one retained PAR2 file (the index file or a recovery

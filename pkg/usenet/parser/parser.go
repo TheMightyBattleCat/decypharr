@@ -569,7 +569,7 @@ func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSi
 				b = int64(float64(seg.Bytes) * residualOverhead) // residual: consistent-but-different-count geometry
 			}
 		}
-		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b, Real: true}
 		total += b
 	}
 	return refs, total
@@ -682,6 +682,9 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 		}
 		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
 		total += b
+	}
+	for i := range refs {
+		refs[i].Real = true
 	}
 	return refs, total, false, true
 }
