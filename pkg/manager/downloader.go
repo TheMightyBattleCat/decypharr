@@ -163,6 +163,12 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // merely failed to run is not conclusive and is swallowed internally rather
 // than surfaced here - so cleaning up here is always cleaning up a release
 // that's been given up on, never one that just couldn't be checked.
+//
+// paddingImportGate runs last, independently of whether ffprobe passed,
+// failed to run, or timed out: padding can land outside the windows ffprobe
+// actually reads, so it's a separate, unconditional check on the overlay
+// store's padded-segment count rather than something ffprobe's verdict can
+// stand in for.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
 		// By this point processSymlink/processDownload/processStrm has
@@ -184,6 +190,11 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 		d.cleanupRejectedImport(entry)
 		return err
 	}
+	if err := d.paddingImportGate(entry); err != nil {
+		// Same cleanup rationale as the gates above.
+		d.cleanupRejectedImport(entry)
+		return err
+	}
 	d.markAsCompleted(entry)
 	d.notifyCompleted(entry)
 	d.triggerArrRefresh(entry)
@@ -192,7 +203,8 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 
 // cleanupRejectedImport removes the on-disk artifacts a confirmed-rejected
 // import leaves behind - whether rejected by importAvailabilityGate
-// (confirmed-missing segments) or ffprobeImportGate (unplayable container):
+// (confirmed-missing segments), ffprobeImportGate (unplayable container), or
+// paddingImportGate (padded/zero-filled segments):
 // the symlink tree (or downloaded file) at entry.DownloadPath(), and, if one
 // was warmed, the DFS cache dir backing it. RemoveEntryCacheDir carries its
 // own safety checks (DFS mode + a configured cache dir, resolved path
