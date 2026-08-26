@@ -201,7 +201,7 @@ class RepairManager {
         document.querySelectorAll('input[name="repair_state"]').forEach((input) => {
             input.checked = false;
         });
-        this.updateClearStateCounts(this.latestStatus.health_counts || {});
+        this.updateClearStateCounts(this.latestStatus || {});
         if (typeof modal.showModal === 'function') {
             modal.showModal();
         } else {
@@ -553,7 +553,7 @@ class RepairManager {
         if (clear) clear.disabled = !!status.active_run;
         const view = document.getElementById('viewBrokenBtn');
         if (view) view.disabled = brokenCount === 0;
-        this.updateClearStateCounts(status.health_counts || {});
+        this.updateClearStateCounts(status || {});
 
         if (status.active_run) {
             stop.disabled = false;
@@ -594,8 +594,11 @@ class RepairManager {
     updateClearStateCounts(counts) {
         document.querySelectorAll('[data-clear-state-count]').forEach((el) => {
             const status = el.getAttribute('data-clear-state-count');
-            el.textContent = counts?.[status] || 0;
+            el.textContent = counts?.health_counts?.[status] || 0;
         });
+        // Decode-verified count lives outside health_counts
+        const dvEl = document.querySelector('[data-clear-state-count="decode_verified"]');
+        if (dvEl) dvEl.textContent = counts.decode_verified_count ?? 0;
     }
 
     renderRunStats(container, stats) {

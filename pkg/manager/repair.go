@@ -28,11 +28,12 @@ import (
 
 // RepairStatus is the snapshot returned by the /api/repair/status endpoint.
 type RepairStatus struct {
-	Enabled      bool                         `json:"enabled"`
-	NextRunAt    *time.Time                   `json:"next_run_at,omitempty"`
-	ActiveRun    *storage.RepairRun           `json:"active_run,omitempty"`
-	LastRun      *storage.RepairRun           `json:"last_run,omitempty"`
-	HealthCounts map[storage.HealthStatus]int `json:"health_counts"`
+	Enabled             bool                         `json:"enabled"`
+	NextRunAt           *time.Time                   `json:"next_run_at,omitempty"`
+	ActiveRun           *storage.RepairRun           `json:"active_run,omitempty"`
+	LastRun             *storage.RepairRun           `json:"last_run,omitempty"`
+	HealthCounts        map[storage.HealthStatus]int `json:"health_counts"`
+	DecodeVerifiedCount int                          `json:"decode_verified_count"`
 }
 
 // RepairRunOptions are one-off options for a manually-started repair run.
@@ -397,8 +398,9 @@ func (r *Repair) stopActiveRepairSweep() {
 func (r *Repair) Status() RepairStatus {
 	cfg := r.cfg()
 	st := RepairStatus{
-		Enabled:      cfg.Enabled,
-		HealthCounts: r.manager.storage.CountEntryHealthByStatus(),
+		Enabled:             cfg.Enabled,
+		HealthCounts:        r.manager.storage.CountEntryHealthByStatus(),
+		DecodeVerifiedCount: r.manager.storage.CountDecodeVerified(),
 	}
 	if next := r.nextScheduledRun(); next != nil {
 		st.NextRunAt = next

@@ -430,6 +430,20 @@ func (s *Storage) ClearAllDecodeVerification() (int, error) {
 	return cleared, nil
 }
 
+// CountDecodeVerified returns the number of EntryHealth records that carry a
+// decode-clean fingerprint (DecodeVerifiedAt set), i.e. how many entries
+// ClearAllDecodeVerification would affect.
+func (s *Storage) CountDecodeVerified() int {
+	count := 0
+	_ = s.ForEachEntryHealth(func(state *EntryHealth) error {
+		if state != nil && !state.DecodeVerifiedAt.IsZero() {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
 // MarkEntryDirty flags an entry's health as out-of-date so the next sweep will
 // re-probe it. Called from the storage layer whenever the underlying file set
 // of an entry mutates.
