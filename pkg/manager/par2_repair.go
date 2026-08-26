@@ -1032,16 +1032,29 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.notifyFailed(entryName, err, canary)
 		// A terminal failure - one backoff can never fix - marks the entry
-		// unrepairable (see the deferred release above) instead of falling
-		// back to a re-grab: PAR2 being enabled is exactly the quadrant
-		// where decideAutoRepairAction never chooses autoActionRegrab, so
-		// the file waits for a manual "Delete & re-search" rather than being
-		// auto-re-grabbed out from under the user. A transient failure (a
-		// slow provider, a context deadline) instead waits out its backoff
-		// and tries PAR2 again; the file is still playable (padded) in the
-		// meantime, so there is no urgency either way.
+		// unrepairable (see the deferred release above): PAR2 being enabled
+		// is exactly the quadrant where decideAutoRepairAction never chooses
+		// autoActionRegrab, so the sweep's own re-detection (source=sweep
+		// always re-grabs a real verdict, see routeAutoRepair) remains the
+		// backstop that eventually re-grabs it, and the overlay GUI still
+		// offers a manual "Delete & re-search" in the meantime. A transient
+		// failure (a slow provider, a context deadline) instead waits out its
+		// backoff and tries PAR2 again; the file is still playable (padded)
+		// in the meantime, so there is no urgency either way.
+		//
+		// On the URGENT lane specifically, a terminal verdict also gets an
+		// immediate regrab attempt (see regrabOnTerminal) rather than waiting
+		// for the sweep's cadence: the URGENT lane exists precisely because
+		// something (a live viewer, or precache's playback-proximity
+		// estimate) needs this file usable soon, so a release the sweep
+		// won't reconsider until its next off-peak pass would otherwise sit
+		// broken in the Arr for hours. This is purely additive - it never
+		// replaces the sweep backstop above, only races ahead of it.
 		if class.terminal {
 			terminal = true
+			if lane == laneUrgent {
+				p.regrabOnTerminal(entry, entryName, pending)
+			}
 		}
 		return
 	}
@@ -1112,6 +1125,47 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 		Message: msg,
 		Error:   err,
 	})
+}
+
+// regrabOnTerminal is the URGENT lane's fast path for a PAR2 verdict that
+// classifyPar2Failure just marked terminal: an immediate blocklist +
+// re-search via the Arr, instead of leaving the file broken until the
+// sweep's own cadence-driven routeAutoRepair gets to it (see runJob's
+// terminal-handling comment above). Purely best-effort - any skip or
+// failure here just means the sweep backstop still applies, so nothing is
+// escalated above Debug.
+//
+// Goes through RegrabImportGrab, which already does its own single
+// regrabGuard.checkAndRecord - callers must never pre-check the guard
+// themselves, since checkAndRecord both checks AND records an attempt, and
+// double-calling it for one logical event would burn two of the guard's
+// 2-per-24h strikes for what is really one.
+func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pending map[string][]overlay.DeadSegment) {
+	if p.repair == nil || entry == nil {
+		return
+	}
+
+	a := p.manager.arr.GetOrCreate(entry.Category)
+	if a == nil || a.Host == "" || a.Token == "" {
+		p.logger.Debug().Str("entry", entryName).Msg("par2 repair: no arr associated with entry; skipping immediate regrab")
+		return
+	}
+
+	// RegrabImportGrab's fileName parameter is only cosmetic here (log
+	// fields + the BrokenFile record if the regrab guard trips) - a PAR2
+	// verdict is a whole-NZB outcome, not scoped to one file, so any one of
+	// pending's still-damaged files is as representative as another.
+	fileName := entryName
+	for name := range pending {
+		fileName = name
+		break
+	}
+
+	p.logger.Info().Str("entry", entryName).Str("file", fileName).
+		Msg("par2 repair: terminal verdict on urgent lane; initiating immediate regrab")
+	if rerr := p.repair.RegrabImportGrab(p.ctx, entry, fileName, "PAR2 repair terminal"); rerr != nil {
+		p.logger.Debug().Err(rerr).Str("entry", entryName).Msg("par2 repair: immediate regrab did not proceed")
+	}
 }
 
 // runRepair does the actual work; every error return means "PAR2 couldn't
