@@ -1460,6 +1460,14 @@
                                        id="repair.ffprobe_on_import" name="repair.ffprobe_on_import">
                                 <span class="label-text font-medium">Validate new imports with ffprobe (rejects broken grabs)</span>
                             </label>
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.ffprobe_decode_check" name="repair.ffprobe_decode_check">
+                                <span class="label-text font-medium tooltip tooltip-left"
+                                      data-tip="Enables frame-level decode verification during repair sweeps. Seeks to ~15 evenly-spaced positions in each file and forces ffprobe to decode actual frames, catching silent corruption that metadata checks miss. Bandwidth-heavy over WebDAV (~45s/file). Disable if sweep bandwidth or duration is a concern. Import-time checks are unaffected by this toggle.">
+                                    Decode verification during sweeps (bandwidth-heavy, ~45s/file)
+                                </span>
+                            </label>
                         </div>
                     </div>
                 </div>

@@ -334,6 +334,15 @@ func (r *Repair) ClearStates(statuses []storage.HealthStatus) (ClearRepairStateR
 	return result, nil
 }
 
+// ClearDecodeVerification zeroes the decode-clean fingerprint on every
+// EntryHealth record, so the next sweep re-runs the expensive decode
+// verification pass. Unlike ClearStates this does NOT require the sweep
+// to be idle - clearing fingerprints while a sweep is running is safe
+// (the sweep will just re-verify entries it hasn't reached yet).
+func (r *Repair) ClearDecodeVerification() (int, error) {
+	return r.manager.storage.ClearAllDecodeVerification()
+}
+
 // StopRun cancels the currently-active sweep, if any. The run record is also
 // flipped to cancelled in storage immediately so the UI sees the stop on the
 // next poll, even before the goroutine unwinds.

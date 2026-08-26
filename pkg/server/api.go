@@ -1199,6 +1199,23 @@ func (s *Server) handleClearRepairState(w http.ResponseWriter, r *http.Request) 
 	utils.JSONResponse(w, result, http.StatusOK)
 }
 
+// handleClearDecodeVerification zeroes the DecodeVerifiedAt and
+// DecodeVerifiedFingerprint fields on all EntryHealth records, forcing
+// the next sweep to re-run decode verification on every entry.
+func (s *Server) handleClearDecodeVerification(w http.ResponseWriter, r *http.Request) {
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	cleared, err := svc.ClearDecodeVerification()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"cleared": cleared}, http.StatusOK)
+}
+
 func parseRepairHealthStatus(raw string) (storage.HealthStatus, bool) {
 	switch storage.HealthStatus(strings.ToLower(strings.TrimSpace(raw))) {
 	case storage.HealthHealthy:

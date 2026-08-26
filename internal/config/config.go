@@ -297,6 +297,13 @@ type RepairConfig struct {
 	// import; requires the ffprobe binary and WebDAV. Default off.
 	FFProbeOnImport bool `json:"ffprobe_on_import,omitempty"`
 
+	// FFProbeDecodeCheck, when true, includes the expensive frame-level decode
+	// verification (decodeWindows) during repair sweeps. When false, sweeps
+	// still run metadata/duration checks but skip the bandwidth-heavy decode
+	// probe (~15 seek windows over WebDAV per file). Import-time checks are
+	// unaffected by this setting. Defaults to true when not explicitly set.
+	FFProbeDecodeCheck *bool `json:"ffprobe_decode_check,omitempty"`
+
 	// ImportAvailabilityCheck, when true, samples a newly-downloaded NZB file's segments
 	// (via the same BatchStat primitive the repair sweep uses) BEFORE it is reported
 	// complete to Sonarr/Radarr, and now reads back UNPADDED (see
@@ -375,7 +382,7 @@ func (r RepairConfig) IsZero() bool {
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" &&
 		!r.RepairOnPlaybackFailure &&
-		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport &&
+		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport && r.FFProbeDecodeCheck == nil &&
 		!r.CleanupSuperseded &&
 		r.PlaybackPadding == nil && r.Par2Repair == nil && r.ImportAvailabilityCheck == nil &&
 		r.PadMaxRunSegments == 0 && r.PadMaxTotalSegments == 0 && r.PadMaxByteRatio == 0 &&
@@ -407,6 +414,13 @@ func (r RepairConfig) ImportAvailabilityCheckEnabled() bool {
 // comment) - the opposite default from PlaybackPaddingEnabled/Par2RepairEnabled.
 func (r RepairConfig) PrecacheReadAheadEnabled() bool {
 	return r.PrecacheReadAhead != nil && *r.PrecacheReadAhead
+}
+
+// FFProbeDecodeCheckEnabled reports whether frame-decode verification runs
+// during repair sweeps, defaulting to true when unset (see
+// FFProbeDecodeCheck's doc comment).
+func (r RepairConfig) FFProbeDecodeCheckEnabled() bool {
+	return r.FFProbeDecodeCheck == nil || *r.FFProbeDecodeCheck
 }
 
 type Config struct {

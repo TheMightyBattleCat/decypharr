@@ -399,6 +399,37 @@ func (s *Storage) ClearEntryHealthByStatuses(statuses []HealthStatus) (int, erro
 	return cleared, nil
 }
 
+// ClearAllDecodeVerification zeroes DecodeVerifiedAt and
+// DecodeVerifiedFingerprint on every EntryHealth record that has them set,
+// without deleting the record itself. Returns the count of modified entries.
+func (s *Storage) ClearAllDecodeVerification() (int, error) {
+	// Collect candidates during read pass - cannot modify during ForEach.
+	var names []string
+	if err := s.ForEachEntryHealth(func(state *EntryHealth) error {
+		if state != nil && !state.DecodeVerifiedAt.IsZero() {
+			names = append(names, state.EntryName)
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	cleared := 0
+	for _, name := range names {
+		state, err := s.GetEntryHealth(name)
+		if err != nil || state == nil {
+			continue
+		}
+		state.DecodeVerifiedAt = time.Time{}
+		state.DecodeVerifiedFingerprint = ""
+		if err := s.SaveEntryHealth(state); err != nil {
+			return cleared, err
+		}
+		cleared++
+	}
+	return cleared, nil
+}
+
 // MarkEntryDirty flags an entry's health as out-of-date so the next sweep will
 // re-probe it. Called from the storage layer whenever the underlying file set
 // of an entry mutates.

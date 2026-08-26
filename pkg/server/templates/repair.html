@@ -726,6 +726,12 @@
                     <input type="checkbox" class="checkbox checkbox-primary" name="repair_state" value="unsupported">
                 </label>
             </div>
+            <div class="divider my-2 text-xs opacity-60">Decode verification</div>
+            <label class="label cursor-pointer justify-between gap-3 rounded-lg border border-base-300 px-3 py-2"
+                   title="Removes the decode-clean fingerprints stored after a successful frame-decode verification. The next repair sweep will re-run the full decode probe (~45s/file) on every entry instead of skipping previously-verified ones.">
+                <span class="label-text">Clear decode verification markers</span>
+                <input type="checkbox" class="checkbox checkbox-warning" id="clearDecodeVerification">
+            </label>
             <div id="clearStateError" class="text-error text-sm hidden"></div>
             <div class="modal-action">
                 <button type="button" class="btn btn-ghost" onclick="document.getElementById('clearStateModal').close()">Cancel</button>

@@ -418,8 +418,9 @@ class RepairManager {
     async clearState() {
         const selected = [...document.querySelectorAll('input[name="repair_state"]:checked')]
             .map((input) => input.value);
+        const clearDecode = document.getElementById('clearDecodeVerification')?.checked;
         const error = document.getElementById('clearStateError');
-        if (!selected.length) {
+        if (!selected.length && !clearDecode) {
             if (error) {
                 error.textContent = 'Select at least one state.';
                 error.classList.remove('hidden');
@@ -430,20 +431,39 @@ class RepairManager {
         const btn = document.getElementById('clearStateSubmitBtn');
         if (btn) btn.disabled = true;
         try {
-            const res = await fetch(`${this.api}/repair/clear-state`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({statuses: selected}),
-            });
-            const text = await res.text();
-            let data = null;
-            try {
-                data = text ? JSON.parse(text) : null;
-            } catch { /* leave null */
+            if (selected.length) {
+                const res = await fetch(`${this.api}/repair/clear-state`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({statuses: selected}),
+                });
+                const text = await res.text();
+                let data = null;
+                try {
+                    data = text ? JSON.parse(text) : null;
+                } catch { /* leave null */
+                }
+                if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+                if (data?.cleared > 0) {
+                    this.toast(`Cleared ${data.cleared} repair state entr${data.cleared === 1 ? 'y' : 'ies'}`, 'success');
+                }
             }
-            if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
+            if (clearDecode) {
+                try {
+                    const dres = await fetch(`${this.api}/repair/clear-decode-verification`, {method: 'POST'});
+                    const dtxt = await dres.text();
+                    let ddata = null;
+                    try {
+                        ddata = dtxt ? JSON.parse(dtxt) : null;
+                    } catch { /* leave null */
+                    }
+                    if (!dres.ok) throw new Error((ddata && (ddata.error || ddata.message)) || dtxt || `HTTP ${dres.status}`);
+                    this.toast(`Cleared decode markers on ${ddata?.cleared ?? 0} entr${ddata?.cleared === 1 ? 'y' : 'ies'}`, 'success');
+                } catch (de) {
+                    this.toast(`Decode clear failed: ${de.message}`, 'error');
+                }
+            }
             document.getElementById('clearStateModal')?.close?.();
-            this.toast(`Cleared ${data?.cleared ?? 0} repair state entr${data?.cleared === 1 ? 'y' : 'ies'}`, 'success');
             await Promise.all([this.loadStatus(), this.loadBroken()]);
         } catch (e) {
             this.toast(`Clear failed: ${e.message}`, 'error');

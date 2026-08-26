@@ -419,6 +419,11 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
 func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) []fileResult {
+	// If decode verification is disabled in config, force skip for sweeps.
+	// Import gate is unaffected - it calls checkConfirmed directly with skipDecode=false.
+	if !skipDecode && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
+		skipDecode = true
+	}
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
