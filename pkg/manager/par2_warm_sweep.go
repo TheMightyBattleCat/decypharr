@@ -222,7 +222,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(preflightCtx, noFetch, file, cacheSource, idx.Files[m.FileID].Length)
+		f := newPostedFileFetcher(preflightCtx, noFetch, file, cacheSource, idx.Files[m.FileID].Length, p.logger)
 		fetchers[m.FileID] = f
 		for i, seg := range file.Segments {
 			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}

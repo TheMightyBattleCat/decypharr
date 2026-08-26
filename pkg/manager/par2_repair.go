@@ -42,6 +42,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -1295,7 +1296,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(ctx, fetch, file, cacheSource, idx.Files[m.FileID].Length)
+		f := newPostedFileFetcher(ctx, fetch, file, cacheSource, idx.Files[m.FileID].Length, p.logger)
 		fetchers[m.FileID] = f
 		for i, seg := range file.Segments {
 			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
@@ -1600,7 +1601,7 @@ func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.P
 // hash its first 16KB (or the whole file, if shorter) - MatchFiles only
 // calls this for a file whose length ties with another candidate.
 func computeMD5_16k(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
-	fetcher := newPostedFileFetcher(ctx, fetch, f, nil, 0)
+	fetcher := newPostedFileFetcher(ctx, fetch, f, nil, 0, zerolog.Nop())
 	n := int64(md5_16kSize)
 	if f.Size < n {
 		n = f.Size
@@ -1622,10 +1623,10 @@ type postedRange struct {
 // recently fetched one - sequential slice reads during the streaming repair
 // pass repeatedly hit the same or the next segment.
 type postedFileFetcher struct {
-	ctx    context.Context
-	fetch  articleFetchFunc
-	length int64
-	segs   []storage.Par2SegmentRef
+	ctx      context.Context
+	fetch    articleFetchFunc
+	length   int64
+	segs     []storage.Par2SegmentRef
 	base     []int64 // base[i] = starting byte offset of segs[i] within the file
 	segSizes []int64 // segSizes[i] = exact decoded byte count for segs[i]
 
@@ -1657,14 +1658,19 @@ type postedFileFetcher struct {
 // declared estimate (e.g. computeMD5_16k, which only ever reads the leading
 // 16KB and has no FileDesc to compare against).
 // exactSegGeometry returns per-segment base offsets and decoded sizes.
-// When trueLen (FileDesc.Length) is available and the seed segment's
-// persisted Bytes is positive, interior offsets use exact arithmetic
-// (i * seedSize, with the final segment = trueLen - (n-1)*seedSize),
-// eliminating the cumulative drift of the yEnc 0.97 overhead estimate.
-// Otherwise the persisted Par2SegmentRef.Bytes estimates are accumulated
-// as before - a graceful fallback for callers that lack FileDesc
+// When trueLen (FileDesc.Length) is available, the seed segment's
+// persisted Bytes is positive, and the seed segment's provenance is real
+// (segs[0].Real - an actual yEnc probe, not an estimate), interior offsets
+// use exact arithmetic (i * seedSize, with the final segment =
+// trueLen - (n-1)*seedSize), eliminating the cumulative drift of the yEnc
+// 0.97 overhead estimate. When trueLen is available but provenance is only
+// estimated, sizes are accumulated from the persisted Par2SegmentRef.Bytes
+// estimates but scaled so their sum still lands on trueLen, rather than
+// trusting the raw per-segment estimates to add up correctly on their own.
+// Otherwise (no trueLen) the persisted Par2SegmentRef.Bytes estimates are
+// accumulated as-is - a graceful fallback for callers that lack FileDesc
 // (computeMD5_16k passes trueLen=0).
-func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64) (bases, sizes []int64) {
+func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerolog.Logger) (bases, sizes []int64) {
 	n := len(segs)
 	bases = make([]int64, n)
 	sizes = make([]int64, n)
@@ -1673,13 +1679,44 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64) (bases, size
 	}
 	seedSeg := segs[0].Bytes
 	lastSeg := trueLen - int64(n-1)*seedSeg
-	if trueLen > 0 && seedSeg > 0 && lastSeg > 0 {
+	if trueLen > 0 && seedSeg > 0 && lastSeg > 0 && segs[0].Real {
 		for i := range segs {
 			bases[i] = int64(i) * seedSeg
 			sizes[i] = seedSeg
 		}
 		sizes[n-1] = lastSeg
+	} else if trueLen > 0 {
+		// Scaled accumulate: anchor estimated sizes to trueLen (FileDesc.Length)
+		// to prevent cumulative drift from the 0.97 yEnc overhead estimate.
+		totalEstimated := int64(0)
+		for _, s := range segs {
+			totalEstimated += s.Bytes
+		}
+		if totalEstimated > 0 {
+			scale := float64(trueLen) / float64(totalEstimated)
+			logger.Debug().
+				Float64("scale", scale).
+				Int64("totalEstimated", totalEstimated).
+				Int64("trueLen", trueLen).
+				Msg("exactSegGeometry: using scaled accumulate (estimated provenance)")
+			var off int64
+			for i, s := range segs {
+				bases[i] = off
+				sizes[i] = int64(math.Round(float64(s.Bytes) * scale))
+				off += sizes[i]
+			}
+			// Absorb rounding residual into the last segment
+			sizes[len(segs)-1] = trueLen - bases[len(segs)-1]
+		} else {
+			var off int64
+			for i, s := range segs {
+				bases[i] = off
+				sizes[i] = s.Bytes
+				off += s.Bytes
+			}
+		}
 	} else {
+		// No trueLen anchor: plain accumulate
 		var off int64
 		for i, s := range segs {
 			bases[i] = off
@@ -1690,8 +1727,8 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64) (bases, size
 	return
 }
 
-func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64) *postedFileFetcher {
-	base, segSizes := exactSegGeometry(f.Segments, trueLen)
+func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64, logger zerolog.Logger) *postedFileFetcher {
+	base, segSizes := exactSegGeometry(f.Segments, trueLen, logger)
 	length := f.Size
 	if trueLen > 0 {
 		length = trueLen
