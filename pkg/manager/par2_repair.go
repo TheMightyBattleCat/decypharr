@@ -682,11 +682,14 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 			return computeMD5_16k(ctx, u.FetchArticle, postedRef)
 		},
 	}}
-	matches, err := par2.MatchFiles(idx, postedFiles)
+	matches, skipped, err := par2.MatchFiles(idx, postedFiles)
 	if err != nil {
 		return false, "", fmt.Errorf("match posted file against par2 index: %w", err)
 	}
 	if len(matches) == 0 {
+		if len(skipped) > 0 {
+			return false, "", fmt.Errorf("match posted file against par2 index: %w", skipped[0].Err)
+		}
 		return false, "posted file did not match any par2 FileDesc", nil
 	}
 	fd, ok := idx.Files[matches[0].FileID]
@@ -1284,12 +1287,36 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			},
 		}
 	}
-	matches, err := par2.MatchFiles(idx, posted)
+	matches, skipped, err := par2.MatchFiles(idx, posted)
 	if err != nil {
 		return fmt.Errorf("match posted files: %w", err)
 	}
 	if len(matches) == 0 {
 		return fmt.Errorf("no posted file matched the PAR2 recovery set")
+	}
+
+	// Posted files MatchFiles couldn't attempt this pass because breaking
+	// their length tie (or the residual MD5-16k pass) needed real bytes it
+	// failed to fetch/hash. Their absence from `matches` is TRANSIENT, not
+	// structural - a "no PAR2 coverage for this file" failure below that is
+	// traceable to one of these must not be classified terminal. Keyed by
+	// posted-file name (what downstream errors can name).
+	transientUnmatch := make(map[string]bool, len(skipped))
+	for _, s := range skipped {
+		name := nzb.Par2Source[s.PostedIndex].Name
+		transientUnmatch[name] = true
+		p.logger.Warn().Err(s.Err).Str("entry", entryName).Str("file", name).
+			Msg("par2 repair: posted-file match skipped this pass (transient fetch/hash failure) - file has no PAR2 coverage until retry")
+	}
+
+	// Every posted file's segments -> its own name, for ALL source files
+	// (not just matched ones) so a dead segment inside a transiently-
+	// unmatched file can be traced back to it below.
+	msgIDToPosted := make(map[string]string)
+	for i := range nzb.Par2Source {
+		for _, seg := range nzb.Par2Source[i].Segments {
+			msgIDToPosted[seg.MessageID] = nzb.Par2Source[i].Name
+		}
 	}
 
 	fetchers := make(map[[16]byte]*postedFileFetcher, len(matches))
@@ -1301,6 +1328,32 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		for i, seg := range file.Segments {
 			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
 		}
+	}
+
+	// classifyMiss explains why a FileID in the PAR2 index ended up with no
+	// posted-file fetcher, and whether that miss can ever resolve on a bare
+	// retry. A FileDesc that no retained posted file could possibly be
+	// (nothing in Par2Source shares its length or name - e.g. Outpost 5's
+	// .7z.010, described by the index but never retained) is STRUCTURAL and
+	// terminal. A FileDesc whose posted file IS in Par2Source but was
+	// skipped for a transient fetch/hash failure, or is present but
+	// unmatched for a length/tie reason, is retryable.
+	classifyMiss := func(fileID [16]byte) (reason string, terminal bool) {
+		fd := idx.Files[fileID]
+		if fd == nil {
+			return "unknown FileDesc", true
+		}
+		for i := range nzb.Par2Source {
+			ps := nzb.Par2Source[i]
+			if ps.Size != fd.Length && ps.Name != fd.Name {
+				continue
+			}
+			if transientUnmatch[ps.Name] {
+				return fmt.Sprintf("posted file %q failed to fetch/hash during matching", ps.Name), false
+			}
+			return fmt.Sprintf("posted file %q retained but unmatched (length/tie)", ps.Name), false
+		}
+		return fmt.Sprintf("no retained posted file for FileDesc %q (len %d)", fd.Name, fd.Length), true
 	}
 
 	// Map every dead segment (by message ID - NOT by the logical/extracted
@@ -1318,6 +1371,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		for _, seg := range segs {
 			rng, ok := msgIDRange[seg.MessageID]
 			if !ok {
+				if pn, isPosted := msgIDToPosted[seg.MessageID]; isPosted && transientUnmatch[pn] {
+					return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file (transient: posted file %q failed to fetch/hash during matching)", seg.MessageID, file, pn)
+				}
 				return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file)
 			}
 			slices, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
@@ -1416,7 +1472,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the whole job's deadline even with no single connection ever
 		// "stuck" forever - concurrency divides that cumulative latency by
 		// the connection limit instead.
-		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers}
+		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers, classifyMiss: classifyMiss}
 		progress.SetIntactTotal(len(intactOrder))
 		if len(intactOrder) == 0 {
 			progress.SetPhase(Par2PhaseSolving)
@@ -1840,6 +1896,11 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 type jobSliceSource struct {
 	idx      *par2.Index
 	fetchers map[[16]byte]*postedFileFetcher
+	// classifyMiss, when set, explains a fileID that has no fetcher and
+	// reports whether the miss is structural (terminal) or transient
+	// (retryable) - see the closure of the same name in runRepair. Nil is
+	// treated as structural/terminal, preserving the prior behavior.
+	classifyMiss func(fileID [16]byte) (reason string, terminal bool)
 }
 
 func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
@@ -1849,7 +1910,17 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 	}
 	f, ok := s.fetchers[fileID]
 	if !ok {
-		return nil, fmt.Errorf("no posted-file fetcher for file %x", fileID)
+		reason, terminal := "", true
+		if s.classifyMiss != nil {
+			reason, terminal = s.classifyMiss(fileID)
+		}
+		if terminal {
+			if reason != "" {
+				return nil, fmt.Errorf("no posted-file fetcher for file %x (%s)", fileID, reason)
+			}
+			return nil, fmt.Errorf("no posted-file fetcher for file %x", fileID)
+		}
+		return nil, fmt.Errorf("no posted-file fetcher for file %x (transient: %s)", fileID, reason)
 	}
 	return f.ReadRange(local*s.idx.SliceSize, s.idx.SliceSize)
 }

@@ -120,6 +120,15 @@ func classifyPar2Failure(err error) par2FailureClass {
 		return par2FailureClass{terminal: true, reason: "source article(s) confirmed missing across every provider"}
 	}
 	msg := err.Error()
+	// An error runRepair explicitly tagged "(transient: ...)" is a
+	// structurally-terminal-looking failure (no posted-file fetcher, dead
+	// segment not in any matched file) whose actual cause this pass was a
+	// fetch/hash failure during posted-file matching - retrying can fetch
+	// the bytes and match the file. This tag always wins over the terminal
+	// substring list below.
+	if strings.Contains(msg, "(transient:") {
+		return par2FailureClass{}
+	}
 	for _, s := range par2TerminalSubstrings {
 		if strings.Contains(msg, s) {
 			return par2FailureClass{terminal: true, reason: msg}

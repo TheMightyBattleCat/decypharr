@@ -93,3 +93,28 @@ func TestClassifyPar2FailureMoreDamageThanRecordedIsTerminal(t *testing.T) {
 		t.Errorf("classifyPar2Failure(more damage than recorded).terminal = false, want true")
 	}
 }
+
+// A "no posted-file fetcher" / "not part of any matched posted file"
+// failure that runRepair tagged "(transient: ...)" - the file was in
+// Par2Source but a fetch/hash error during matching left it uncovered
+// this pass - must NOT be terminal, even though the untagged variants of
+// both strings are in par2TerminalSubstrings.
+func TestClassifyPar2FailureTransientTagOverridesTerminalSubstring(t *testing.T) {
+	cases := []error{
+		errors.New(`no posted-file fetcher for file 0a1b (transient: posted file "vol.007" failed to fetch/hash during matching)`),
+		errors.New(`dead segment <x@y> (file "show.mkv") is not part of any matched posted file (transient: posted file "vol.007" failed to fetch/hash during matching)`),
+	}
+	for _, err := range cases {
+		if class := classifyPar2Failure(err); class.terminal {
+			t.Errorf("classifyPar2Failure(%v).terminal = true, want false (transient tag)", err)
+		}
+	}
+}
+
+// The untagged (structural) variant stays terminal.
+func TestClassifyPar2FailureStructuralNoFetcherStaysTerminal(t *testing.T) {
+	err := errors.New(`no posted-file fetcher for file 0a1b (no retained posted file for FileDesc "o5.7z.010" (len 51200000))`)
+	if class := classifyPar2Failure(err); !class.terminal {
+		t.Errorf("classifyPar2Failure(structural no-fetcher).terminal = false, want true")
+	}
+}
