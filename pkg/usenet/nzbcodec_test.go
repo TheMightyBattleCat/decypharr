@@ -202,3 +202,125 @@ func TestNZBCodecV2DecodesPreExistingBlobsWithoutPar2Trailer(t *testing.T) {
 		t.Fatalf("basic header fields did not round-trip: got ID=%q Name=%q", got.ID, got.Name)
 	}
 }
+
+// TestNZBCodecV2RoundTripsPar2SegmentReal checks the trailing Real-provenance
+// bitset: a mix of Real true/false across both Par2Files and Par2Source
+// segments must survive a full encode/decode in the same flattened order.
+func TestNZBCodecV2RoundTripsPar2SegmentReal(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Files[0].Segments[0].Real = true   // idx 0
+	nzb.Par2Files[1].Segments[0].Real = false  // idx 1
+	nzb.Par2Source[0].Segments[0].Real = false // idx 2
+	nzb.Par2Source[0].Segments[1].Real = true  // idx 3
+
+	data, err := encodeNZBV2(nzb)
+	if err != nil {
+		t.Fatalf("encodeNZBV2: %v", err)
+	}
+	got, err := decodeNZBV2(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2: %v", err)
+	}
+
+	if !got.Par2Files[0].Segments[0].Real || got.Par2Files[1].Segments[0].Real {
+		t.Errorf("Par2Files Real = [%v %v], want [true false]",
+			got.Par2Files[0].Segments[0].Real, got.Par2Files[1].Segments[0].Real)
+	}
+	if got.Par2Source[0].Segments[0].Real || !got.Par2Source[0].Segments[1].Real {
+		t.Errorf("Par2Source[0] Real = [%v %v], want [false true]",
+			got.Par2Source[0].Segments[0].Real, got.Par2Source[0].Segments[1].Real)
+	}
+
+	// The header-only path must decode the same trailer without consuming the
+	// segment map.
+	headerOnly, err := decodeNZBV2Header(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2Header: %v", err)
+	}
+	if !headerOnly.Par2Files[0].Segments[0].Real || !headerOnly.Par2Source[0].Segments[1].Real {
+		t.Errorf("header-only Real flags did not round-trip: %+v / %+v",
+			headerOnly.Par2Files[0].Segments[0], headerOnly.Par2Source[0].Segments[1])
+	}
+}
+
+// TestNZBCodecV2DecodesPar2BlobWithoutRealBitset reproduces a blob written
+// AFTER Par2Files/Par2Source landed but BEFORE the Real bitset trailer: the
+// PAR2 refs are present, no bitset follows. decodeHeader must accept it and
+// leave every segment's Real=false.
+func TestNZBCodecV2DecodesPar2BlobWithoutRealBitset(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Files[0].Segments[0].Real = true // ignored: not serialized here
+
+	w := &byteWriter{}
+	w.str(nzb.ID)
+	w.str(nzb.Name)
+	w.str(nzb.Title)
+	w.str(nzb.Path)
+	w.varint(nzb.TotalSize)
+	w.varint(nzb.DatePosted.Unix())
+	w.str(nzb.Category)
+	w.uvarint(uint64(len(nzb.Groups)))
+	for _, g := range nzb.Groups {
+		w.str(g)
+	}
+	w.boolean(nzb.Downloaded)
+	w.varint(nzb.AddedOn.Unix())
+	w.varint(nzb.LastActivity.Unix())
+	w.str(nzb.Status)
+	w.f64(nzb.Progress)
+	w.f64(nzb.Percentage)
+	w.varint(nzb.SizeDownloaded)
+	w.varint(nzb.ETA)
+	w.varint(nzb.Speed)
+	w.varint(nzb.CompletedOn.Unix())
+	w.boolean(nzb.IsBad)
+	w.str(nzb.Storage)
+	w.str(nzb.FailMessage)
+	w.str(nzb.Password)
+	w.uvarint(uint64(len(nzb.Files)))
+	for i := range nzb.Files {
+		f := &nzb.Files[i]
+		w.str(f.Name)
+		w.str(f.InternalPath)
+		w.varint(f.Size)
+		w.varint(f.StartOffset)
+		w.uvarint(uint64(len(f.Groups)))
+		for _, g := range f.Groups {
+			w.str(g)
+		}
+		w.str(string(f.FileType))
+		w.str(f.Password)
+		w.boolean(f.IsDeleted)
+		w.boolean(f.IsStored)
+		w.varint(f.SegmentSize)
+		w.raw(f.EncryptionKey)
+		w.raw(f.EncryptionIV)
+		w.boolean(f.IsEncrypted)
+		w.uvarint(uint64(len(f.Segments)))
+	}
+	// PAR2 refs, but deliberately NO Real bitset trailer.
+	writePar2FileRefs(w, nzb.Par2Files)
+	writePar2FileRefs(w, nzb.Par2Source)
+
+	got, _, err := decodeHeader(w.buf)
+	if err != nil {
+		t.Fatalf("decodeHeader on a par2-without-bitset blob: %v", err)
+	}
+	if len(got.Par2Files) != 2 || len(got.Par2Source) != 1 {
+		t.Fatalf("PAR2 refs did not round-trip: %d / %d", len(got.Par2Files), len(got.Par2Source))
+	}
+	for _, f := range got.Par2Files {
+		for _, s := range f.Segments {
+			if s.Real {
+				t.Errorf("Par2Files segment Real = true, want false (no bitset present)")
+			}
+		}
+	}
+	for _, f := range got.Par2Source {
+		for _, s := range f.Segments {
+			if s.Real {
+				t.Errorf("Par2Source segment Real = true, want false (no bitset present)")
+			}
+		}
+	}
+}

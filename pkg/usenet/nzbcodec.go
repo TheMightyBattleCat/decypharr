@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -255,7 +256,98 @@ func encodeHeader(nzb *storage.NZB) []byte {
 	writePar2FileRefs(w, nzb.Par2Files)
 	writePar2FileRefs(w, nzb.Par2Source)
 
+	// Real-provenance bits for every retained PAR2 segment, appended after the
+	// PAR2 refs exactly as those were appended after the original v2 layout: a
+	// blob written before this change ends above, and its segments decode with
+	// Real=false. Flattened order is Par2Files segments then Par2Source
+	// segments, each file's segments in slice order.
+	writeRealBitset(w, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...)
+
 	return w.buf
+}
+
+// par2RealTargets returns each retained PAR2 file's segment slice in the
+// canonical Real-bitset order (Par2Files first, then Par2Source). The returned
+// slices alias the stored segments, so readRealBitset can set .Real in place.
+func par2RealTargets(par2 []storage.Par2FileRef, source []storage.PostedFileRef) [][]storage.Par2SegmentRef {
+	out := make([][]storage.Par2SegmentRef, 0, len(par2)+len(source))
+	for i := range par2 {
+		out = append(out, par2[i].Segments)
+	}
+	for i := range source {
+		out = append(out, source[i].Segments)
+	}
+	return out
+}
+
+// writeRealBitset writes uvarint(total segment count) followed by
+// ceil(total/8) packed bytes: bit i (MSB-first within each byte) is set when
+// the i-th segment - counting across segLists in order, flattened
+// left-to-right - has Real=true.
+func writeRealBitset(w *byteWriter, segLists ...[]storage.Par2SegmentRef) {
+	total := 0
+	for _, l := range segLists {
+		total += len(l)
+	}
+	w.uvarint(uint64(total))
+	if total == 0 {
+		return
+	}
+	bits := make([]byte, (total+7)/8)
+	i := 0
+	for _, l := range segLists {
+		for j := range l {
+			if l[j].Real {
+				bits[i>>3] |= 1 << (7 - uint(i&7))
+			}
+			i++
+		}
+	}
+	w.buf = append(w.buf, bits...)
+}
+
+// readRealBitset reads the packed bitset written by writeRealBitset and sets
+// .Real on each retained PAR2 segment, walking segLists in the same flattened
+// order the writer used (Par2Files segments then Par2Source segments). A
+// stored count that disagrees with the actual segment total is treated as
+// schema drift: it logs a warning and leaves Real=false rather than failing
+// the whole decode.
+func readRealBitset(r *byteReader, segLists ...[]storage.Par2SegmentRef) error {
+	total, err := r.uvarint()
+	if err != nil {
+		return err
+	}
+	if total > uint64(8*len(r.buf)) {
+		return fmt.Errorf("nzbcodec: real bitset count %d implausible", total)
+	}
+	nbytes := int((total + 7) / 8)
+	if r.pos+nbytes > len(r.buf) {
+		return fmt.Errorf("nzbcodec: real bitset out of range")
+	}
+	bits := r.buf[r.pos : r.pos+nbytes]
+	r.pos += nbytes
+
+	actual := 0
+	for _, l := range segLists {
+		actual += len(l)
+	}
+	if uint64(actual) != total {
+		l := logger.Default()
+		l.Warn().
+			Uint64("bitset_count", total).
+			Int("segment_count", actual).
+			Msg("nzbcodec: PAR2 Real bitset count mismatch, leaving Real=false")
+		return nil
+	}
+
+	i := 0
+	for _, l := range segLists {
+		for j := range l {
+			l[j].Real = bits[i>>3]&(1<<(7-uint(i&7))) != 0
+			i++
+		}
+	}
+	return nil
 }
 
 // writePar2FileRefs encodes a []storage.Par2FileRef or []storage.PostedFileRef
@@ -586,6 +678,14 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 		}
 		if nzb.Par2Source, err = readPostedFileRefs(r); err != nil {
 			return nil, nil, err
+		}
+		// Real-provenance bitset, appended after the PAR2 refs. A blob written
+		// before this field ends above, leaving Real=false everywhere -
+		// identical to the pre-field behaviour.
+		if r.pos < len(buf) {
+			if err = readRealBitset(r, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	return nzb, counts, nil
