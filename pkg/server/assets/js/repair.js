@@ -267,6 +267,7 @@ class RepairManager {
             arr: $('recheckArr').value,
             media_id: mediaId,
             fix: $('recheckFix').checked,
+            force_decode: $('recheckForceDecode').checked,
         };
         const btn = $('recheckMediaBtn');
         const out = $('recheckMediaResult');
@@ -329,6 +330,7 @@ class RepairManager {
                 <div class="${stats.healthy ? 'text-success' : ''}">Healthy: <strong>${stats.healthy ?? 0}</strong></div>
                 <div class="${stats.repaired ? 'text-success' : ''}">Repaired: <strong>${stats.repaired ?? 0}</strong></div>
                 <div class="${stats.repair_failed ? 'text-error' : ''}">Repair fail: <strong>${stats.repair_failed ?? 0}</strong></div>
+                <div class="${stats.decode_skipped ? 'text-warning' : ''}" title="Entries only shallow-checked because their decode fingerprint still matched. Re-run with 'Force decode verification' to deep-check these.">Decode skipped: <strong>${stats.decode_skipped ?? 0}</strong></div>
             </div>
             ${run.error ? `<div class="mt-2 text-error text-xs">${this.escape(run.error)}</div>` : ''}
         `;

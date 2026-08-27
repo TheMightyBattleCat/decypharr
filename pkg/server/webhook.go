@@ -27,6 +27,9 @@ func (s *Server) handleTautulli(w http.ResponseWriter, r *http.Request) {
 		TvdbID  string `json:"tvdb_id,omitempty"`
 		TmdbID  string `json:"tmdb_id,omitempty"`
 		Fix     bool   `json:"fix,omitempty"`
+		// ForceDecode re-runs the full decode verification even on
+		// fingerprint-clean entries. Omitted/false keeps the previous behavior.
+		ForceDecode bool `json:"force_decode,omitempty"`
 	}
 	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&payload); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to parse webhook body")
@@ -55,7 +58,7 @@ func (s *Server) handleTautulli(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(payload.Arr), mediaID, payload.Fix)
+	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(payload.Arr), mediaID, payload.Fix, payload.ForceDecode)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {

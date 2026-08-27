@@ -1020,9 +1020,10 @@ func (s *Server) handleGetEntryHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Arr     string `json:"arr"`
-		MediaID string `json:"media_id"`
-		Fix     bool   `json:"fix"`
+		Arr         string `json:"arr"`
+		MediaID     string `json:"media_id"`
+		Fix         bool   `json:"fix"`
+		ForceDecode bool   `json:"force_decode"`
 	}
 	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -1037,7 +1038,7 @@ func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Fix)
+	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Fix, req.ForceDecode)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {

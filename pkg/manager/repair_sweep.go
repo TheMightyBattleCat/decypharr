@@ -283,7 +283,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 				return gctx.Err()
 			}
 
-			h := r.probeEntry(gctx, run.ID, c, heal, opts, autoRepair, sc)
+			h, decodeSkipped := r.probeEntry(gctx, run.ID, c, heal, opts, autoRepair, sc)
 			if h == nil {
 				// Entry vanished or had no files between enumeration and probe;
 				// skip without counting. Release any loaded body.
@@ -304,6 +304,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 
 			runMu.Lock()
 			run.Stats.Probed++
+			if decodeSkipped {
+				run.Stats.DecodeSkipped++
+			}
 			switch h.Status {
 			case storage.HealthHealthy:
 				run.Stats.Healthy++
@@ -328,7 +331,13 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // probeEntry probes one entry: marks it repairing, probes its files (≤2 in
 // parallel), runs auto-heal on broken torrents (only when autoRepair is set),
 // then persists final health.
-func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool, sc *supersessionContext) *storage.EntryHealth {
+//
+// The second return value reports whether the expensive decode-verification
+// windows were skipped for this entry because its decode fingerprint still
+// matched (see RepairRunOptions.ForceDecodeVerification). The caller folds
+// that into run.Stats.DecodeSkipped so a recheck summary shows how many
+// entries had their deep verification suppressed.
+func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool, sc *supersessionContext) (*storage.EntryHealth, bool) {
 	s := r.manager.storage
 	// Lazily load the entry body. Enumeration only recorded the name, so the
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
@@ -336,7 +345,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	if c.item == nil {
 		item, err := s.GetEntryItem(c.name)
 		if err != nil || item == nil || len(item.Files) == 0 {
-			return nil
+			return nil, false
 		}
 		c.item = item
 	}
@@ -369,8 +378,24 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	currentFP := storage.EntryItemRepairFingerprint(c.item)
 	decodeVerified := !h.DecodeVerifiedAt.IsZero() && h.DecodeVerifiedFingerprint == currentFP
+	if opts.ForceDecodeVerification && decodeVerified {
+		// Operator asked for a full re-verify of this entry despite the
+		// fingerprint match. Re-run the decode windows; a pass below refreshes
+		// DecodeVerifiedAt to now (the !decodeVerified branch), a fail clears
+		// the fingerprint so later sweeps re-check it too.
+		decodeVerified = false
+		r.logger.Info().Str("entry", c.item.Name).Msg("Repair: force-decode recheck - re-running decode verification despite fingerprint match")
+	}
+	decodeSkipped := decodeVerified
 	if decodeVerified {
-		r.logger.Debug().Str("entry", c.item.Name).Msg("Sweep: decode already verified for this fingerprint, skipping decode windows")
+		// Debug on a sweep (thousands of entries, this fires constantly);
+		// Info on a targeted recheck so the operator sees it against the few
+		// entries they asked about and doesn't read the run as "skipped".
+		evt := r.logger.Debug()
+		if opts.Recheck {
+			evt = r.logger.Info()
+		}
+		evt.Str("entry", c.item.Name).Msg("Repair: decode already verified for this fingerprint, skipping decode windows")
 	}
 
 	results := r.probeFiles(ctx, c, names, opts, decodeVerified)
@@ -413,15 +438,18 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 
 	r.saveHealth(h)
-	return h
+	return h, decodeSkipped
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
 func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) []fileResult {
-	// If decode verification is disabled in config, force skip for sweeps.
-	// Import gate is unaffected - it calls checkConfirmed directly with skipDecode=false.
-	if !skipDecode && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
+	// If decode verification is disabled in config, force skip for sweeps -
+	// unless this is an explicit operator force-decode recheck, which is a
+	// deliberate "deep-check this one thing right now" and overrides the
+	// standing config toggle. Import gate is unaffected - it calls
+	// checkConfirmed directly with skipDecode=false.
+	if !skipDecode && !opts.ForceDecodeVerification && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
 		skipDecode = true
 	}
 	results := make([]fileResult, len(names))
@@ -2213,7 +2241,7 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 			r.attachArrContext(runCtx, c)
 		}
 		heal := newHealCache()
-		final := r.probeEntry(runCtx, runID, c, heal, RepairRunOptions{}, fix, sc)
+		final, _ := r.probeEntry(runCtx, runID, c, heal, RepairRunOptions{Recheck: true}, fix, sc)
 		// probeEntry's routeAutoRepair may have claimed the handler-registry
 		// regrab slot for a segment-missing file regardless of fix - release
 		// it on every exit from here on (including the !fix early return just
@@ -2248,9 +2276,11 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 // resolves to and returns immediately with the in-progress RepairRun. The
 // actual probing + repair runs in the background so HTTP callers don't have
 // to block. With arrName="" the first eligible Arr that resolves entries
-// wins. fix runs the same delete + re-search pass a sweep would. Honors the
-// singleton run lock.
-func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix bool) (*storage.RepairRun, error) {
+// wins. fix runs the same delete + re-search pass a sweep would. forceDecode
+// re-runs the expensive frame-decode verification even on entries whose decode
+// fingerprint still matches (see RepairRunOptions.ForceDecodeVerification).
+// Honors the singleton run lock.
+func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix, forceDecode bool) (*storage.RepairRun, error) {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
 		return nil, errors.New("media_id is required")
@@ -2303,14 +2333,14 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 			r.mu.Unlock()
 			cancel()
 		}()
-		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, fix)
+		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, fix, forceDecode)
 	})
 	return run, nil
 }
 
 // executeRecheckMedia is the body of a media recheck. Mirrors executeSweep
 // but scoped to a specific media-id resolved through one or more Arrs.
-func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix bool) {
+func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix, forceDecode bool) {
 	ctx = r.attachFFProbeChecker(ctx, r.logger)
 	candidates := make(map[string]*candidate)
 	var lastErr error
@@ -2362,7 +2392,7 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	for name := range candidates {
 		mediaNames = append(mediaNames, name)
 	}
-	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, fix, sc)
+	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{Recheck: true, ForceDecodeVerification: forceDecode}, fix, sc)
 	candidates = nil
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -2385,7 +2415,9 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 		Int("candidates", run.Stats.Candidates).
 		Int("broken", run.Stats.Broken).
 		Int("repaired", run.Stats.Repaired).
+		Int("decode_skipped", run.Stats.DecodeSkipped).
 		Bool("fix", fix).
+		Bool("force_decode", forceDecode).
 		Int64("skipped_superseded_files", sc.skipped.Load()).
 		Msg("RecheckMedia: completed")
 }

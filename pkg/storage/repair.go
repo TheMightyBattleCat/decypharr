@@ -57,6 +57,12 @@ type RepairRunStats struct {
 	Repaired     int `json:"repaired"`
 	Cleared      int `json:"cleared,omitempty"`
 	RepairFailed int `json:"repair_failed"`
+	// DecodeSkipped counts probed entries whose expensive decode-verification
+	// windows were skipped because the decode fingerprint still matched. Most
+	// useful on a targeted recheck, where it tells the operator how many
+	// entries were only shallow-checked (a force-decode recheck drives this to
+	// zero).
+	DecodeSkipped int `json:"decode_skipped,omitempty"`
 }
 
 // RepairRun is the append-only history record produced by a single sweep.

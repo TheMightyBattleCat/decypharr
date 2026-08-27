@@ -100,7 +100,7 @@
                         <option value="">Auto-detect</option>
                     </select>
                 </div>
-                <div class="form-control md:col-span-5">
+                <div class="form-control md:col-span-3">
                     <label class="label py-1" for="recheckMediaId">
                         <span class="label-text font-medium">Media id</span>
                     </label>
@@ -111,6 +111,13 @@
                     <label class="label cursor-pointer justify-start gap-2 py-1">
                         <input type="checkbox" class="checkbox checkbox-primary" id="recheckFix">
                         <span class="label-text">Auto-repair</span>
+                    </label>
+                </div>
+                <div class="form-control md:col-span-2">
+                    <label class="label cursor-pointer justify-start gap-2 py-1"
+                           title="Re-run the full decode verification (bandwidth-heavy, ~45s/file) even if the file was previously verified. Useful when you suspect mid-file corruption that the regular check can't detect.">
+                        <input type="checkbox" class="checkbox checkbox-primary" id="recheckForceDecode">
+                        <span class="label-text">Force decode verification</span>
                     </label>
                 </div>
                 <div class="md:col-span-2">

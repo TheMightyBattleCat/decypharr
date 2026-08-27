@@ -43,6 +43,22 @@ type RepairRunOptions struct {
 	AutoRepair        *bool
 	UnrestrictLink    bool
 	ProtocolScope     string
+
+	// ForceDecodeVerification re-runs the expensive frame-decode verification
+	// pass even when the entry's decode fingerprint still matches (i.e. it was
+	// already decode-clean at that file set). Recheck-only: the scheduled
+	// sweep never sets this - forcing a decode on every previously-verified
+	// entry would be a multi-hour, whole-library bandwidth drain. The operator
+	// opts in per targeted recheck when they suspect mid-file rot the cheap
+	// STAT/demux checks can't see.
+	ForceDecodeVerification bool
+
+	// Recheck marks this run as an operator-initiated targeted recheck (a
+	// single entry, or one Arr media id) rather than a sweep. It only changes
+	// logging: the "decode already verified, skipping decode windows" line is
+	// promoted from Debug to Info so it's visible against the handful of
+	// entries a recheck touches (a sweep processes thousands and would flood).
+	Recheck bool
 }
 
 type ClearRepairStateResult struct {
