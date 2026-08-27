@@ -506,6 +506,19 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	}
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
 	if err == nil {
+		if r.par2TerminalWithDamage(entry.InfoHash, name) {
+			// CheckFile is a lenient STAT probe - it passes if ANY configured
+			// provider (backups included) still holds a sampled article. That
+			// papers over a release the overlay has recorded real dead/padded
+			// segments for once PAR2 has already given up on it: the entry
+			// then sits "healthy" every sweep with no automatic remediation
+			// (the playback PAR2 path won't re-try a terminal verdict, and
+			// nothing else re-grabs without a fresh probe failure). Escalate
+			// it to the same guarded re-grab a segment-missing probe gets.
+			r.logger.Info().Str("entry", entry.Name).Str("nzb_id", entry.InfoHash).Str("file", name).
+				Msg("Repair: sweep escalating PAR2-terminal entry to regrab (overlay damage recorded, STAT probe lenient-healthy)")
+			return r.routeAutoRepair(entry, res)
+		}
 		res.healthy = true
 		return res
 	}
@@ -515,6 +528,28 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	}
 	res.reason = "usenet_probe_error"
 	return res
+}
+
+// par2TerminalWithDamage reports whether nzbID's PAR2 repair state is terminal
+// (see Par2Repair.par2Usable / par2_repair.go's GetPar2RepairState().Terminal
+// read) AND the overlay store still has at least one non-patched dead segment
+// recorded for this specific file - checked via the same OverlayPendingRepair
+// accessor the padding import gate uses (see paddingImportGate). Both must
+// hold: a terminal state alone could be stale after a manual clear, and
+// overlay damage alone is still the PAR2 path's job until PAR2 gives up.
+func (r *Repair) par2TerminalWithDamage(nzbID, fileName string) bool {
+	if r.manager.usenet == nil || r.manager.storage == nil {
+		return false
+	}
+	state, err := r.manager.storage.GetPar2RepairState(nzbID)
+	if err != nil || state == nil || !state.Terminal {
+		return false
+	}
+	pending, err := r.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		return false
+	}
+	return len(pending[fileName]) > 0
 }
 
 // routeAutoRepair applies the coordinated auto-repair policy
