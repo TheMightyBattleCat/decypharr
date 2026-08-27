@@ -18,6 +18,21 @@ type PostedFile struct {
 	MD5_16k func() ([16]byte, error)
 }
 
+// MatchSkip records a posted file that MatchFiles could not even attempt
+// to pair because doing so required real bytes (its MD5-16k) that failed
+// to fetch or hash - an NNTP timeout, a connection reset, a read error
+// mid-stream. It is purely informational: the file is simply absent from
+// the returned matches, exactly as any other miss would be, and the caller
+// falls back to the legacy path for anything dead within it. The point is
+// to let the caller tell a TRANSIENT miss (this) apart from a STRUCTURAL
+// one (the file genuinely isn't in the release's retained posted-file set)
+// when it later classifies a downstream "no PAR2 coverage for this file"
+// failure as retryable vs terminal.
+type MatchSkip struct {
+	PostedIndex int
+	Err         error
+}
+
 // Match pairs one posted file (by its index in the []PostedFile given to
 // MatchFiles) with the FileID PAR2 protects it as.
 type Match struct {
@@ -44,7 +59,14 @@ type Match struct {
 // itself can distinguish, and PAR2 doesn't guarantee a name survives a
 // rename - but it is checked afterward as a sanity signal; see
 // Match.NameMismatch.
-func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
+//
+// Matching is best-effort with respect to fetch failures: if breaking a
+// length tie (or the residual MD5-16k pass) needs a posted file's real
+// bytes and that fetch/hash errors out, that ONE file is skipped and
+// recorded in the returned []MatchSkip - the rest of the set still
+// matches, and the call still succeeds. A hard error is returned only for
+// a genuinely malformed input.
+func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 	// Group FileDescs and posted files by length.
 	byLength := make(map[int64][][16]byte)
 	for id, fd := range idx.Files {
@@ -56,6 +78,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
 	}
 
 	var matches []Match
+	var skipped []MatchSkip
 	for length, fileIDs := range byLength {
 		postedIdxs, ok := postedByLength[length]
 		if !ok {
@@ -77,7 +100,12 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
 			}
 			sum, err := posted[pi].MD5_16k()
 			if err != nil {
-				return nil, fmt.Errorf("par2: computing MD5-16k for posted file %q: %w", posted[pi].Name, err)
+				// Best-effort: a fetch/hash failure for one tied posted
+				// file skips only that file's match attempt. The caller
+				// gets the rest, plus this skip record so it knows the
+				// miss was transient.
+				skipped = append(skipped, MatchSkip{PostedIndex: pi, Err: fmt.Errorf("computing MD5-16k for posted file %q: %w", posted[pi].Name, err)})
+				continue
 			}
 			md5ByPosted[pi] = sum
 		}
@@ -122,6 +150,11 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
 		}
 		sum, err := posted[pi].MD5_16k()
 		if err != nil {
+			// Same best-effort treatment as the tie-break pass: a fetch
+			// failure hashing this file's first 16KB is transient, not a
+			// structural "no such file in the recovery set" - record it so
+			// the caller can classify a later coverage failure correctly.
+			skipped = append(skipped, MatchSkip{PostedIndex: pi, Err: fmt.Errorf("residual MD5-16k for posted file %q: %w", posted[pi].Name, err)})
 			continue
 		}
 		var cand [16]byte
@@ -140,9 +173,26 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, error) {
 		if found == 1 {
 			matches = append(matches, newMatch(idx, posted, pi, cand))
 			matchedFID[cand] = true
+			matchedPosted[pi] = true
 		}
 	}
-	return matches, nil
+
+	// A posted file skipped in the tie-break pass is retried in the
+	// residual pass; drop skip records for anything that ultimately
+	// matched, and collapse duplicates to one record per posted file.
+	if len(skipped) > 0 {
+		deduped := skipped[:0]
+		seen := make(map[int]bool, len(skipped))
+		for _, s := range skipped {
+			if matchedPosted[s.PostedIndex] || seen[s.PostedIndex] {
+				continue
+			}
+			seen[s.PostedIndex] = true
+			deduped = append(deduped, s)
+		}
+		skipped = deduped
+	}
+	return matches, skipped, nil
 }
 
 func newMatch(idx *Index, posted []PostedFile, postedIndex int, fileID [16]byte) Match {

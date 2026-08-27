@@ -72,7 +72,7 @@ func TestRepairProgressEndToEndAgainstRealFixture(t *testing.T) {
 			},
 		})
 	}
-	matches, err := par2.MatchFiles(idx, posted)
+	matches, _, err := par2.MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
 	}

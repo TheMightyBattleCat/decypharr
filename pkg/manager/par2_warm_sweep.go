@@ -185,7 +185,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 			},
 		}
 	}
-	matches, err := par2.MatchFiles(idx, posted)
+	matches, _, err := par2.MatchFiles(idx, posted)
 	if err != nil || len(matches) == 0 {
 		return false
 	}

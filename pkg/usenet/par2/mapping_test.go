@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -129,9 +130,12 @@ func TestMatchFilesUnambiguousLength(t *testing.T) {
 		{Name: "a.rar", Length: 1000},
 		{Name: "b.rar", Length: 2000},
 	}
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	if len(matches) != 2 {
 		t.Fatalf("MatchFiles returned %d matches, want 2: %+v", len(matches), matches)
@@ -162,9 +166,12 @@ func TestMatchFilesTieBrokenByMD5_16k(t *testing.T) {
 		{Name: "a.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5A, nil }},
 		{Name: "b.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5B, nil }},
 	}
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	if len(matches) != 2 {
 		t.Fatalf("MatchFiles returned %d matches, want 2: %+v", len(matches), matches)
@@ -193,9 +200,12 @@ func TestMatchFilesNoMatchIsNotAnError(t *testing.T) {
 	idx := syntheticIndex(t, 4096, files, [][16]byte{fA})
 
 	posted := []PostedFile{{Name: "unrelated.nfo", Length: 999}}
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	if len(matches) != 0 {
 		t.Fatalf("MatchFiles = %v, want no matches", matches)
@@ -218,9 +228,12 @@ func TestMatchFilesResidualMD5MatchesLengthMiss(t *testing.T) {
 		{Name: "vol.001", Length: 1000, MD5_16k: func() ([16]byte, error) { return md5Exact, nil }},
 		{Name: "vol.010", Length: 331600499, MD5_16k: func() ([16]byte, error) { return md5Tail, nil }},
 	}
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	got := map[int][16]byte{}
 	for _, m := range matches {
@@ -248,13 +261,79 @@ func TestMatchFilesResidualNoMatchOnMD5Mismatch(t *testing.T) {
 		{Name: "vol.001", Length: 1000, MD5_16k: func() ([16]byte, error) { return [16]byte{0xAA}, nil }},
 		{Name: "vol.010", Length: 331600499, MD5_16k: func() ([16]byte, error) { return [16]byte{0xCC}, nil }},
 	}
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	for _, m := range matches {
 		if m.PostedIndex == 1 {
 			t.Errorf("posted 1 must stay unmatched (no equal MD5-16k) but matched FileID %x", m.FileID)
 		}
+	}
+}
+
+// A single posted file's MD5-16k fetch erroring out during tie-break must
+// skip only that file - the other tied file still matches, the call still
+// succeeds, and the skip is reported so the caller can treat the miss as
+// transient.
+func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
+	fA, fB := fid(1), fid(2)
+	md5A := [16]byte{0xAA}
+	md5B := [16]byte{0xBB}
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 5000, MD5_16k: md5A, Name: "a.rar"},
+		fB: {FileID: fB, Length: 5000, MD5_16k: md5B, Name: "b.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB})
+
+	wantErr := errors.New("nntp: connection reset")
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5A, nil }},
+		{Name: "b.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
+	}
+	if len(matches) != 1 || matches[0].PostedIndex != 0 || matches[0].FileID != fA {
+		t.Fatalf("matches = %+v, want exactly {posted 0 -> fA}", matches)
+	}
+	if len(skipped) != 1 || skipped[0].PostedIndex != 1 {
+		t.Fatalf("skipped = %+v, want exactly one entry for posted index 1", skipped)
+	}
+	if !errors.Is(skipped[0].Err, wantErr) {
+		t.Errorf("skipped[0].Err = %v, want it to wrap %v", skipped[0].Err, wantErr)
+	}
+}
+
+// The same fetch error, but this time the residual MD5-16k pass is the one
+// that hits it (the file's length missed every bucket). Still best-effort,
+// still reported as a skip.
+func TestMatchFilesPartialOnResidualFetchError(t *testing.T) {
+	fExact, fTail := fid(1), fid(2)
+	idx := &Index{
+		Files: map[[16]byte]*FileDesc{
+			fExact: {FileID: fExact, MD5_16k: [16]byte{0xAA}, Length: 1000, Name: "vol.001"},
+			fTail:  {FileID: fTail, MD5_16k: [16]byte{0xBB}, Length: 331614074, Name: "vol.010"},
+		},
+		FileOrder: [][16]byte{fExact, fTail},
+	}
+	wantErr := errors.New("nntp: timeout")
+	posted := []PostedFile{
+		{Name: "vol.001", Length: 1000, MD5_16k: func() ([16]byte, error) { return [16]byte{0xAA}, nil }},
+		{Name: "vol.010", Length: 331600499, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
+	}
+	if len(matches) != 1 || matches[0].PostedIndex != 0 {
+		t.Fatalf("matches = %+v, want exactly {posted 0 -> fExact}", matches)
+	}
+	if len(skipped) != 1 || skipped[0].PostedIndex != 1 || !errors.Is(skipped[0].Err, wantErr) {
+		t.Fatalf("skipped = %+v, want one entry for posted index 1 wrapping %v", skipped, wantErr)
 	}
 }

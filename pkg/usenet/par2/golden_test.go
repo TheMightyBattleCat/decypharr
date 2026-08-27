@@ -138,9 +138,12 @@ func loadGoldenFixture(t *testing.T) *goldenFixture {
 		postedNames = append(postedNames, name)
 	}
 
-	matches, err := MatchFiles(idx, posted)
+	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
 		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("MatchFiles skipped %d files, want 0: %+v", len(skipped), skipped)
 	}
 	if len(matches) != 3 {
 		t.Fatalf("MatchFiles found %d matches, want 3: %+v", len(matches), matches)
