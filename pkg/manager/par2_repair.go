@@ -1141,18 +1141,24 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 }
 
 // regrabOnTerminal is the URGENT lane's fast path for a PAR2 verdict that
-// classifyPar2Failure just marked terminal: an immediate blocklist +
-// re-search via the Arr, instead of leaving the file broken until the
+// classifyPar2Failure just marked terminal: an immediate Arr file delete +
+// blocklist + re-search, instead of leaving the file broken until the
 // sweep's own cadence-driven routeAutoRepair gets to it (see runJob's
 // terminal-handling comment above). Purely best-effort - any skip or
 // failure here just means the sweep backstop still applies, so nothing is
 // escalated above Debug.
 //
-// Goes through RegrabImportGrab, which already does its own single
-// regrabGuard.checkAndRecord - callers must never pre-check the guard
-// themselves, since checkAndRecord both checks AND records an attempt, and
-// double-calling it for one logical event would burn two of the guard's
-// 2-per-24h strikes for what is really one.
+// Goes through repairPlaybackFileNow, not RegrabImportGrab: on this path the
+// file is already imported into the Arr, so a bare blocklist + re-search
+// leaves the EpisodeFile/MovieFile row in place and the Arr treats the
+// episode/movie as satisfied - it re-searches but grabs nothing.
+// repairPlaybackFileNow self-resolves the ArrFileID (attachArrContext),
+// deletes the file record so the media reverts to "wanted", then blocklists
+// + re-searches. It runs its own single regrabGuard.checkAndRecord
+// (auto=true), so this caller must never pre-check the guard itself, since
+// checkAndRecord both checks AND records an attempt and double-calling it
+// for one logical event would burn two of the guard's 2-per-24h strikes for
+// what is really one.
 func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pending map[string][]overlay.DeadSegment) {
 	if p.repair == nil || entry == nil {
 		return
@@ -1164,10 +1170,10 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 		return
 	}
 
-	// RegrabImportGrab's fileName parameter is only cosmetic here (log
-	// fields + the BrokenFile record if the regrab guard trips) - a PAR2
-	// verdict is a whole-NZB outcome, not scoped to one file, so any one of
-	// pending's still-damaged files is as representative as another.
+	// A PAR2 verdict is a whole-NZB outcome, not scoped to one file, so any
+	// one of pending's still-damaged files is as representative as another
+	// for the log fields and for the single-file scoping repairPlaybackFileNow
+	// applies when the name lines up with an Arr-known file.
 	fileName := entryName
 	for name := range pending {
 		fileName = name
@@ -1176,8 +1182,17 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 
 	p.logger.Info().Str("entry", entryName).Str("file", fileName).
 		Msg("par2 repair: terminal verdict on urgent lane; initiating immediate regrab")
-	if rerr := p.repair.RegrabImportGrab(p.ctx, entry, fileName, "PAR2 repair terminal"); rerr != nil {
+
+	// No handlerRegrab claim is taken here: runJob already holds
+	// par2_running for this nzbID until it returns, so we are the exclusive
+	// handler. That is also why the old RegrabImportGrab call was inert on
+	// this path - its own TryAcquire(handlerRegrab) could never win against
+	// the running PAR2 job, so it logged "already being handled" and did
+	// nothing.
+	if _, reason, rerr := p.repair.repairPlaybackFileNow(p.ctx, entryName, fileName, true); rerr != nil {
 		p.logger.Debug().Err(rerr).Str("entry", entryName).Msg("par2 repair: immediate regrab did not proceed")
+	} else if reason != "" {
+		p.logger.Debug().Str("entry", entryName).Str("reason", reason).Msg("par2 repair: immediate regrab skipped")
 	}
 }
 
