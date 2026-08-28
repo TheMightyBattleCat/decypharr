@@ -205,12 +205,15 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 // import leaves behind - whether rejected by importAvailabilityGate
 // (confirmed-missing segments), ffprobeImportGate (unplayable container), or
 // paddingImportGate (padded/zero-filled segments):
-// the symlink tree (or downloaded file) at entry.DownloadPath(), and, if one
-// was warmed, the DFS cache dir backing it. RemoveEntryCacheDir carries its
-// own safety checks (DFS mode + a configured cache dir, resolved path
-// contained within it, and no other live entry still sharing the folder
-// name), so it's always safe to call here even when there's nothing to
-// remove.
+// the symlink tree (or downloaded file) at entry.DownloadPath(), the DFS
+// cache dir backing it (if one was warmed), and the overlay manifest dir for
+// this infohash. RemoveEntryCacheDir carries its own safety checks (DFS mode
+// + a configured cache dir, resolved path contained within it, and no other
+// live entry still sharing the folder name), so it's always safe to call
+// here even when there's nothing to remove. OverlayDeleteEntry is an
+// os.RemoveAll under a per-nzbID lock and no-ops cleanly when no overlay dir
+// exists; the reap "still the live owner?" guard is deliberately skipped
+// because the entry is confirmed broken and being discarded here.
 func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	symlinkPath := entry.DownloadPath()
 	if err := os.RemoveAll(symlinkPath); err != nil {
@@ -224,6 +227,23 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
 		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
 			Msg("Import: removed DFS cache dir for rejected import")
+	}
+
+	if d.manager.usenet != nil {
+		// OverlayDeleteEntry is an unconditional RemoveAll with no removed
+		// signal of its own, so probe the manifest first to only log when
+		// there was actually an overlay dir to reap (mirrors ReapOverlay).
+		hadOverlay := false
+		if m, _ := d.manager.usenet.OverlayManifest(entry.InfoHash); m != nil {
+			hadOverlay = true
+		}
+		if err := d.manager.usenet.OverlayDeleteEntry(entry.InfoHash); err != nil {
+			d.logger.Warn().Err(err).Str("entry", entry.Name).Str("infohash", entry.InfoHash).
+				Msg("Import: failed to remove overlay dir for rejected import")
+		} else if hadOverlay {
+			d.logger.Info().Str("entry", entry.Name).Str("infohash", entry.InfoHash).
+				Msg("Import: removed overlay dir for rejected import")
+		}
 	}
 }
 
