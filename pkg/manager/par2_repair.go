@@ -102,6 +102,14 @@ const (
 	// reason well before this, not spin.
 	maxIntactRepairRounds = 3
 
+	// par2RecoveryMaxConsecutiveNotFound aborts the recovery-volume fetch loop
+	// once this many volumes in a row come back article-not-found (430). When a
+	// PAR2 posting has expired every volume 430s, and walking all ~20-100 of
+	// them (provider rotation + timeout on each) wastes 10-20 minutes to reach a
+	// verdict the first few misses already settled. Only genuine 430s count;
+	// transient/transport errors reset the counter.
+	par2RecoveryMaxConsecutiveNotFound = 3
+
 	// par2DefaultUrgentConcurrency is used when
 	// config.Repair.Par2UrgentConcurrency is unset/non-positive.
 	par2DefaultUrgentConcurrency = 2
@@ -1273,6 +1281,27 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return fmt.Errorf("parse PAR2 index: %w", err)
 	}
 
+	// Zero recovery slices fetched - every volume 430'd (see fetchMoreVolumes'
+	// consecutive-not-found abort). The verdict is already predetermined: no
+	// recovery data means no repair. Running MatchFiles + the dead-segment
+	// mapping first would MD5-16k every posted file (~30s each while they're
+	// 430'ing too - ~9min for a 269-volume release) only to arrive at this
+	// exact terminal error. Skip straight to it. The message matches the
+	// par2TerminalSubstrings entry the solve loop's own "N damaged but only 0
+	// recovery" return uses, so par2_backoff.go classifies it terminal.
+	if fetchedSlices == 0 {
+		deadCount := 0
+		for _, segs := range pending {
+			deadCount += len(segs)
+		}
+		if deadCount == 0 {
+			deadCount = 1
+		}
+		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
+			Msg("par2: no recovery slices fetched, skipping file matching")
+		return fmt.Errorf("%d damaged slices but only 0 recovery slices fetched/available", deadCount)
+	}
+
 	// Match every posted file in the release (not just the ones with dead
 	// segments - intact slices needed for the streaming pass can belong to
 	// ANY file in the recovery set) to its PAR2 FileID.
@@ -1620,17 +1649,34 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 // The added return is how many new entries were appended to sources this
 // call - callers only need to re-parse the PAR2 index when it's non-zero.
 func fetchMoreVolumes(ctx context.Context, fetch articleFetchFunc, vols []par2Volume, nextVolIdx int, fetchedSlices, needed uint32, sources []par2.Source, entryName string, logger zerolog.Logger) (newNextVolIdx int, newFetchedSlices uint32, newSources []par2.Source, added int) {
+	consecutiveNotFound := 0
 	for nextVolIdx < len(vols) && fetchedSlices < needed {
 		v := vols[nextVolIdx]
 		nextVolIdx++
 		data, err := fetchWholePar2File(ctx, fetch, v.ref)
 		if err != nil {
 			logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
+			// An expired PAR2 posting 430s on every volume - once enough in a
+			// row come back article-not-found, stop rather than walk the whole
+			// (potentially 100-strong) volume list at ~30s each. Transient
+			// errors don't carry the same structural signal, so they reset the
+			// run instead of counting toward it.
+			if nntp.IsArticleNotFoundError(err) {
+				consecutiveNotFound++
+				if consecutiveNotFound >= par2RecoveryMaxConsecutiveNotFound {
+					logger.Info().Str("entry", entryName).
+						Msgf("par2: aborting recovery volume fetch after %d consecutive article-not-found errors", consecutiveNotFound)
+					break
+				}
+			} else {
+				consecutiveNotFound = 0
+			}
 			continue
 		}
 		sources = append(sources, par2.Source{Name: v.ref.Name, Data: data})
 		fetchedSlices += v.count
 		added++
+		consecutiveNotFound = 0
 	}
 	return nextVolIdx, fetchedSlices, sources, added
 }
