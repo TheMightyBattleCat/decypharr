@@ -129,6 +129,18 @@ func classifyPar2Failure(err error) par2FailureClass {
 	if strings.Contains(msg, "(transient:") {
 		return par2FailureClass{}
 	}
+	// A PAR2 index parse that failed on a packet MD5 mismatch (see
+	// par2.walkPackets) is far more likely a mis-served or mis-decoded
+	// article during the volume fetch than genuine structural corruption:
+	// fetchWholePar2File does no length check, no per-article retry, and
+	// caches nothing, so a bare retry re-fetches from scratch and can clear
+	// it. Genuinely structural parse failures ("no Main packet found", "no
+	// PAR2 packets found in any source", "belongs to a different recovery
+	// set") use different messages and still fall through to terminal via
+	// the "parse PAR2 index" substring below. Must precede that loop.
+	if strings.Contains(msg, "packet MD5 mismatch") {
+		return par2FailureClass{}
+	}
 	for _, s := range par2TerminalSubstrings {
 		if strings.Contains(msg, s) {
 			return par2FailureClass{terminal: true, reason: msg}

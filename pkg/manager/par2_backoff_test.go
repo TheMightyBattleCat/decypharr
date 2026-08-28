@@ -80,6 +80,30 @@ func TestClassifyPar2FailureNoDataIsTerminal(t *testing.T) {
 	}
 }
 
+// A "parse PAR2 index" failure whose cause is a packet MD5 mismatch
+// (par2.walkPackets on a mis-served/mis-decoded volume article) is
+// transient - a bare re-fetch can clear it - even though "parse PAR2
+// index" itself is in par2TerminalSubstrings.
+func TestClassifyPar2FailurePacketMD5MismatchIsTransient(t *testing.T) {
+	err := errors.New(`parse PAR2 index: par2: 243c38ce.vol000+001.par2: par2: packet MD5 mismatch at offset 0 (type "RecvSlic")`)
+	if class := classifyPar2Failure(err); class.terminal {
+		t.Errorf("classifyPar2Failure(packet MD5 mismatch).terminal = true, want false (transient)")
+	}
+}
+
+// A genuinely structural parse failure with no MD5-mismatch substring
+// stays terminal via "parse PAR2 index".
+func TestClassifyPar2FailureStructuralParseStaysTerminal(t *testing.T) {
+	for _, err := range []error{
+		errors.New("parse PAR2 index: par2: no Main packet found"),
+		errors.New("parse PAR2 index: par2: no PAR2 packets found in any source"),
+	} {
+		if class := classifyPar2Failure(err); !class.terminal {
+			t.Errorf("classifyPar2Failure(%v).terminal = false, want true", err)
+		}
+	}
+}
+
 func TestClassifyPar2FailureUnknownDefaultsTransient(t *testing.T) {
 	err := errors.New("some unexpected network hiccup")
 	if class := classifyPar2Failure(err); class.terminal {
