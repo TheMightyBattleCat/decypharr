@@ -309,7 +309,17 @@ func (c *Cache) scanDiskCandidates() diskScanResult {
 			// Verify data file exists
 			dataStat, err := os.Stat(dataPath)
 			if err != nil {
-				if os.IsNotExist(err) && !inMap && opens == 0 && info.Rs.Size() > 0 {
+				// A missing data file with no live item and no open handles is a
+				// pure orphan sidecar - reap it regardless of how many bytes its
+				// metadata claims. A zero-coverage sidecar (an item seeded by
+				// newItem that flushed metadata before any bytes landed, then
+				// lost or never got its backing file) is just as dead as one
+				// that claims cached ranges; the old `Rs.Size() > 0` gate left
+				// it on disk to re-log "cache data file missing" and bump the
+				// error count on every cleanup pass, pinning the summary to
+				// "N warning(s)". The loud warning is reserved for a live/open
+				// item that lost its file, or a stat error that isn't "not found".
+				if os.IsNotExist(err) && !inMap && opens == 0 {
 					if rmErr := os.Remove(metaPath); rmErr != nil && !os.IsNotExist(rmErr) {
 						c.logger.Warn().
 							Err(rmErr).

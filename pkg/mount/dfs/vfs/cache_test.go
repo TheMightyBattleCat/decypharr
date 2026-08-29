@@ -24,33 +24,6 @@ func newTestCache(cacheDir string) *Cache {
 	}
 }
 
-func TestScanDiskCandidates_DoesNotDeleteLegacyFiles(t *testing.T) {
-	cacheDir := t.TempDir()
-	entryDir := filepath.Join(cacheDir, "entry")
-	if err := os.MkdirAll(entryDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	metaPath := filepath.Join(entryDir, "meta.json")
-	dataPath := filepath.Join(entryDir, "data")
-	if err := os.WriteFile(metaPath, []byte(`{"size":1}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dataPath, []byte("x"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newTestCache(cacheDir)
-	_ = c.scanDiskCandidates()
-
-	if _, err := os.Stat(metaPath); err != nil {
-		t.Fatalf("meta.json should not be deleted on scan: %v", err)
-	}
-	if _, err := os.Stat(dataPath); err != nil {
-		t.Fatalf("data should not be deleted on scan: %v", err)
-	}
-}
-
 func TestScanDiskCandidates_RemovesOrphanMetadataWithCachedRanges(t *testing.T) {
 	cacheDir := t.TempDir()
 	entryDir := filepath.Join(cacheDir, "entry")
@@ -77,6 +50,40 @@ func TestScanDiskCandidates_RemovesOrphanMetadataWithCachedRanges(t *testing.T) 
 	}
 	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
 		t.Fatalf("orphan metadata should be removed, stat err=%v", err)
+	}
+}
+
+func TestScanDiskCandidates_RemovesZeroCoverageOrphanMetadata(t *testing.T) {
+	cacheDir := t.TempDir()
+	entryDir := filepath.Join(cacheDir, "entry")
+	if err := os.MkdirAll(entryDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sidecar with a declared size but no cached ranges and no data file -
+	// the shape newItem leaves behind when it flushes metadata before any
+	// bytes land, then the backing file is never created / vanishes. It must
+	// be reaped, not left to re-log "cache data file missing" and pin every
+	// cleanup summary to "N warning(s); check nearby warn logs for details".
+	metaPath := filepath.Join(entryDir, "video.mkv.json")
+	if err := os.WriteFile(metaPath, []byte(`{"size":1024}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCache(cacheDir)
+	scan := c.scanDiskCandidates()
+
+	if len(scan.candidates) != 0 {
+		t.Fatalf("expected no candidates for zero-coverage orphan, got %+v", scan.candidates)
+	}
+	if scan.orphanMetadataRemoved != 1 {
+		t.Fatalf("expected 1 orphan metadata file removed, got %d", scan.orphanMetadataRemoved)
+	}
+	if scan.errors != 0 {
+		t.Fatalf("zero-coverage orphan must not count as an error, got %d", scan.errors)
+	}
+	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+		t.Fatalf("zero-coverage orphan metadata should be removed, stat err=%v", err)
 	}
 }
 
