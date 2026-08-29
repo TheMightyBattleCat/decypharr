@@ -29,8 +29,11 @@ const (
 	maxRepairSlices = 64
 
 	// maxAccumulatorMemory caps total accumulator memory (k recovery slices
-	// x SliceSize bytes each, held for the whole streaming pass).
-	maxAccumulatorMemory = 256 << 20 // 256MB
+	// x SliceSize bytes each, held for the whole streaming pass). At 512MB
+	// this only binds ahead of the 64-slice cap once SliceSize exceeds 8MB -
+	// large-slice REMUX recovery sets whose damaged set the short-segment
+	// reclassification (ErrSegmentShort) can push wide.
+	maxAccumulatorMemory = 512 << 20 // 512MB
 
 	// maxIntactChecksumMismatches is the "small threshold" of confirmed-
 	// intact slices allowed to fail their own IFSC checksum during the
