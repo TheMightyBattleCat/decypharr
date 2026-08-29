@@ -76,7 +76,10 @@ type precacheNZBSource interface {
 // No-op if writer is nil (DFS write seam unavailable this run - rclone
 // mode, no mount, mount not ready) or the NZB/file/segments can't be
 // resolved. Best-effort throughout: a read or write failure for one
-// segment just skips it, never aborts the rest.
+// segment just skips it, never aborts the rest. A cancelled/expired ctx
+// (playhead moved on) stops the segment walk cleanly at the next
+// iteration - whatever's already durably written stays, the rest is left
+// for a later pass - and the summary log carries aborted=true.
 func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfsCacheRangeWriter, entryName, infoHash, filename string, fileSize int64, log zerolog.Logger) {
 	if writer == nil || src == nil {
 		return
@@ -97,11 +100,21 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		}
 	}
 
-	var bytesWritten, segmentsWritten, writeFailures, readFailures int64
+	var bytesWritten, segmentsWritten, writeFailures, readFailures, segmentsSeen int64
 	firstByteZero := false
+	aborted := false
 
 	var buf []byte
 	for idx, seg := range file.Segments {
+		if ctx.Err() != nil {
+			// Playhead moved on (or the run was cancelled) before we finished
+			// walking this file's segments. Stop here rather than burning read
+			// budget on bytes nobody's waiting for - a later pass picks up
+			// whatever's left, exactly like a per-segment read failure would.
+			aborted = true
+			break
+		}
+		segmentsSeen++
 		if dead[idx] {
 			continue // PENDING-REPAIR - leave absent, never persisted as padding
 		}
@@ -143,8 +156,9 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 	}
 	evt.Str("entry", entryName).Str("file", filename).
 		Int64("bytes", bytesWritten).Int64("segments", segmentsWritten).
+		Int64("segmentsSeen", segmentsSeen).Int("segmentsTotal", len(file.Segments)).
 		Int64("writeFailures", writeFailures).Int64("readFailures", readFailures).
-		Bool("firstByteZero", firstByteZero).
+		Bool("firstByteZero", firstByteZero).Bool("aborted", aborted).
 		Msg("durable persist complete")
 }
 

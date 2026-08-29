@@ -183,6 +183,80 @@ func TestPersistDurableRangesNoOpsWithoutWriter(t *testing.T) {
 	}
 }
 
+// TestPersistDurableRangesAbortsOnCancelledContext proves an expired/cancelled
+// ctx (the playhead moved on before the walk finished) stops the segment walk
+// cleanly instead of burning read budget on bytes nobody's waiting for.
+func TestPersistDurableRangesAbortsOnCancelledContext(t *testing.T) {
+	const filename = "episode.mkv"
+	src := &fakeNZBSource{
+		nzb: threeSegmentNZB(filename),
+		reads: map[int64][]byte{
+			0:   bytesOf(100, 1),
+			100: bytesOf(100, 2),
+			200: bytesOf(100, 3),
+		},
+	}
+	writer := &recordingWriter{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already done before the first segment
+
+	persistDurableRanges(ctx, src, writer, "Some.Release", "infohash1", filename, 300, zerolog.Nop())
+
+	if len(src.readCalls) != 0 {
+		t.Fatalf("expected no reads after a cancelled ctx, got %v", src.readCalls)
+	}
+	if len(writer.writes) != 0 {
+		t.Fatalf("expected no writes after a cancelled ctx, got %+v", writer.writes)
+	}
+}
+
+// TestPersistDurableRangesAbortMidWalkKeepsEarlierWrites proves the abort is a
+// clean stop, not a rollback: segments persisted before the ctx expired stay
+// durably written; the rest is left for a later pass.
+func TestPersistDurableRangesAbortMidWalkKeepsEarlierWrites(t *testing.T) {
+	const filename = "episode.mkv"
+	ctx, cancel := context.WithCancel(context.Background())
+	src := &cancellingNZBSource{
+		fakeNZBSource: fakeNZBSource{
+			nzb: threeSegmentNZB(filename),
+			reads: map[int64][]byte{
+				0:   bytesOf(100, 1),
+				100: bytesOf(100, 2),
+				200: bytesOf(100, 3),
+			},
+		},
+		cancelAfterOffset: 0, // cancel once segment 0 has been read
+		cancel:            cancel,
+	}
+	writer := &recordingWriter{}
+
+	persistDurableRanges(ctx, src, writer, "Some.Release", "infohash1", filename, 300, zerolog.Nop())
+
+	if len(writer.writes) != 1 || writer.writes[0].off != 0 {
+		t.Fatalf("writes = %+v, want exactly the pre-cancel write at offset 0", writer.writes)
+	}
+	if _, touched := src.readCalls[200]; touched {
+		t.Fatalf("segment 2 was read after the ctx was cancelled")
+	}
+}
+
+// cancellingNZBSource cancels the run's context right after ReadCachedAt is
+// called for a given offset, so a test can observe a mid-walk abort.
+type cancellingNZBSource struct {
+	fakeNZBSource
+	cancelAfterOffset int64
+	cancel            context.CancelFunc
+}
+
+func (c *cancellingNZBSource) ReadCachedAt(ctx context.Context, nzoID, filename string, p []byte, off int64) (int, error) {
+	n, err := c.fakeNZBSource.ReadCachedAt(ctx, nzoID, filename, p, off)
+	if off == c.cancelAfterOffset {
+		c.cancel()
+	}
+	return n, err
+}
+
 // TestPersistDurableRangesSkipsSegmentReadFailure proves a read failure for
 // one segment doesn't abort the rest - best-effort, matching the rest of
 // precache's philosophy.
