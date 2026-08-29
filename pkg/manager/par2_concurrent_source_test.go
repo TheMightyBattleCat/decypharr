@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -140,6 +141,25 @@ func TestConcurrentSliceSourceTracksNotFoundIndices(t *testing.T) {
 		if !want[idx] {
 			t.Errorf("NotFoundIndices() contains unexpected index %d", idx)
 		}
+	}
+}
+
+func TestConcurrentSliceSourceTracksShortSegmentAsNotFound(t *testing.T) {
+	order := []int64{0, 1, 2}
+	fetchOne := func(idx int64) ([]byte, error) {
+		if idx == 1 {
+			// Wrapped exactly as postedFileFetcher.ReadRange surfaces it.
+			return nil, fmt.Errorf("segment %d: %w", 7, ErrSegmentShort)
+		}
+		return []byte{byte(idx)}, nil
+	}
+	src := newConcurrentSliceSource(context.Background(), order, 3, fetchOne)
+	for _, idx := range order {
+		_, _ = src.ReadSlice(idx)
+	}
+	got := src.NotFoundIndices()
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("NotFoundIndices() = %v, want [1] - a truncated backing article is unrecoverable data, like a 430", got)
 	}
 }
 

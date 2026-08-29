@@ -1882,6 +1882,14 @@ func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
 	return data, nil
 }
 
+// ErrSegmentShort marks a posted-file segment whose fetched article decoded to
+// fewer bytes than the offset the repair needs from it - a truncated backing
+// post. The slice's data is effectively gone at this position, so
+// concurrentSliceSource.run records it and runRepair's retry loop folds it into
+// the damaged set for recovery-slice reconstruction, instead of aborting the
+// pass with an unclassifiable string that retries forever.
+var ErrSegmentShort = errors.New("segment data shorter than its recorded size")
+
 // ReadRange returns exactly length bytes starting at start, zero-padded past
 // the file's real length (the PAR2 final-slice padding convention).
 func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
@@ -1927,7 +1935,13 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 		}
 		avail := int64(len(data)) - withinSeg
 		if avail <= 0 {
-			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
+			// The fetched article decoded to fewer bytes than the offset this
+			// slice needs from it - a truncated backing post. The slice's data
+			// is unreadable here, so surface a typed error runRepair's retry
+			// loop can fold into the damaged set for recovery-slice
+			// reconstruction, instead of a plain string that aborts the whole
+			// pass non-terminally forever (see concurrentSliceSource.run).
+			return nil, fmt.Errorf("segment %d: %w", segIdx, ErrSegmentShort)
 		}
 		n = min(avail, length-written, f.length-pos)
 		copy(out[written:written+n], data[withinSeg:withinSeg+n])

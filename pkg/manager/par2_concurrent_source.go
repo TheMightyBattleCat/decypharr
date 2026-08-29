@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -71,15 +72,19 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 	for _, idx := range order {
 		p.Go(func(ctx context.Context) error {
 			data, err := fetchOne(idx)
-			if err != nil && nntp.IsArticleNotFoundError(err) {
-				// Confirmed missing across every provider (ExecuteWithFailover
-				// already exhausted them all before returning this) - this
-				// slice's data is genuinely gone, not a transient hiccup.
-				// Recorded regardless of whether ReadSlice ever gets asked for
-				// this exact index: par2.Repair aborts on the FIRST error it
-				// sees, so a later index's not-found here would otherwise be
-				// silently lost - see runRepair's retry loop, which reclassifies
-				// every index collected here into the damaged set at once.
+			if err != nil && (nntp.IsArticleNotFoundError(err) || errors.Is(err, ErrSegmentShort)) {
+				// This slice's backing data is gone at this position: either a
+				// hard 430 confirmed across every provider (ExecuteWithFailover
+				// already exhausted them all before returning it), or a
+				// truncated backing article (ErrSegmentShort) that decoded too
+				// short to serve the bytes the slice needs. Either way it's not
+				// a transient hiccup - retrying the same fetch yields the same
+				// result. Recorded regardless of whether ReadSlice ever gets
+				// asked for this exact index: par2.Repair aborts on the FIRST
+				// error it sees, so a later index's failure here would otherwise
+				// be silently lost - see runRepair's retry loop, which
+				// reclassifies every index collected here into the damaged set
+				// at once for recovery-slice reconstruction.
 				s.notFoundMu.Lock()
 				s.notFound[idx] = struct{}{}
 				s.notFoundMu.Unlock()
