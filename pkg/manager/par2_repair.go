@@ -1180,6 +1180,104 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 	}
 }
 
+// earlyDamagedSliceCheck computes a lower bound on the number of damaged PAR2
+// slices using only the PAR2 index and persisted segment geometry - no
+// network. It matches pending (damaged) files against idx.Files by unique
+// FileDesc.Length only, exactly replicating MatchFiles' free-match path (one
+// FileDesc AND one posted file of that length); files whose length ties on
+// either side would need an MD5-16k fetch to disambiguate and are skipped.
+// The result is a lower bound: skipped files (ties, or names absent from
+// par2Source) can only ADD more damaged slices, never remove them. Returns 0
+// with no error if no pending file could be cheaply matched.
+func earlyDamagedSliceCheck(
+	idx *par2.Index,
+	pending map[string][]overlay.DeadSegment, // filename -> dead segments
+	par2Source []storage.PostedFileRef, // the NZB's Par2Source
+	logger zerolog.Logger,
+) int {
+	if idx == nil || len(pending) == 0 {
+		return 0
+	}
+
+	// length -> FileID, retaining only lengths carried by exactly one
+	// FileDesc. MatchFiles buckets idx.Files by FileDesc.Length and takes the
+	// free path only when a bucket holds a single FileID; a multi-FileDesc
+	// bucket needs the MD5-16k tie-break, which this network-free check skips.
+	lengthToFile := make(map[int64][16]byte)
+	lengthTied := make(map[int64]bool)
+	for id, fd := range idx.Files {
+		if fd == nil {
+			continue
+		}
+		if lengthTied[fd.Length] {
+			continue
+		}
+		if _, seen := lengthToFile[fd.Length]; seen {
+			delete(lengthToFile, fd.Length)
+			lengthTied[fd.Length] = true
+			continue
+		}
+		lengthToFile[fd.Length] = id
+	}
+
+	// Par2Source indexed by name (the pending map's keys are posted-file
+	// names), plus a per-length posted-file count: MatchFiles' free path also
+	// requires exactly one POSTED file of the length, comparing
+	// PostedFileRef.Size directly against FileDesc.Length with no tolerance.
+	srcByName := make(map[string]storage.PostedFileRef, len(par2Source))
+	postedLenCount := make(map[int64]int, len(par2Source))
+	for _, s := range par2Source {
+		srcByName[s.Name] = s
+		postedLenCount[s.Size]++
+	}
+
+	damagedSet := make(map[int64]struct{})
+	for fname, deadSegs := range pending {
+		src, ok := srcByName[fname]
+		if !ok {
+			continue // not in Par2Source -> can't cheaply match; lower bound stays safe
+		}
+		fileID, ok := lengthToFile[src.Size]
+		if !ok {
+			continue // no unique-length FileDesc for this size (tie or absent)
+		}
+		if postedLenCount[src.Size] != 1 {
+			continue // >1 posted file of this length -> MatchFiles needs MD5-16k
+		}
+		fd := idx.Files[fileID]
+		if fd == nil {
+			continue
+		}
+
+		// Replicate newPostedFileFetcher's network-free geometry: per-segment
+		// byte bases/sizes from persisted Par2SegmentRef.Bytes anchored to
+		// FileDesc.Length.
+		base, segSizes := exactSegGeometry(src.Segments, fd.Length, logger)
+		if len(base) != len(src.Segments) || len(segSizes) != len(src.Segments) {
+			continue
+		}
+		pos := make(map[string]int, len(src.Segments))
+		for i, sg := range src.Segments {
+			pos[sg.MessageID] = i
+		}
+
+		for _, ds := range deadSegs {
+			i, ok := pos[ds.MessageID]
+			if !ok {
+				continue
+			}
+			slices, err := idx.DamagedSlices(fileID, base[i], base[i]+segSizes[i])
+			if err != nil {
+				continue
+			}
+			for _, s := range slices {
+				damagedSet[s] = struct{}{}
+			}
+		}
+	}
+	return len(damagedSet)
+}
+
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
@@ -1264,6 +1362,30 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			continue
 		}
 		sources = append(sources, par2.Source{Name: f.Name, Data: data})
+	}
+
+	// Early arithmetic-impossibility gate. The Main/FileDesc/IFSC packets are
+	// duplicated into every PAR2 file, so the index (non-volume) files alone
+	// yield SliceSize + every FileDesc.Length - enough to parse a usable
+	// index before a single recovery volume is fetched. From that index plus
+	// persisted segment geometry we compute a LOWER-BOUND damaged-slice count
+	// (see earlyDamagedSliceCheck). If even the lower bound already exceeds
+	// the repair cap or the name-only recovery census, the exact count can
+	// only be worse: skip the entire recovery-volume fetch (many minutes of
+	// 430s for a large release) and declare terminal now. The authoritative
+	// exact gate in the solve loop below is unchanged.
+	if earlyIdx, perr := par2.ParseIndex(sources); perr == nil {
+		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, p.logger); earlyK > 0 {
+			if earlyK > par2.MaxRepairSlices || uint32(earlyK) > available {
+				p.logger.Info().
+					Int("early_k", earlyK).
+					Int("max_repair_slices", par2.MaxRepairSlices).
+					Uint32("available", available).
+					Str("entry", entryName).
+					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
+				return fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", earlyK, par2.MaxRepairSlices, available)
+			}
+		}
 	}
 
 	needed := estimateNeededSlices(pending)
