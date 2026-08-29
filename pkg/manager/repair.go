@@ -730,6 +730,17 @@ func (s *repairStopState) get() bool {
 }
 
 func (r *Repair) saveRun(run *storage.RepairRun) {
+	if run.StartedAt.IsZero() {
+		// A pseudo run (playback-triggered repair or a manual single-entry
+		// recheck-and-fix) - both build a bare &storage.RepairRun{} purely to
+		// reuse healBrokenEntry's Stats bookkeeping, never a real sweep pass,
+		// and never set StartedAt. Persisting it anyway wrote a ghost history
+		// row: zero StartedAt (rendered client-side as an LMT-offset garbage
+		// date), empty Status/Trigger/Stage, and Stats.Repaired=1 with
+		// everything else 0. Every genuine run sets StartedAt at construction
+		// before ever reaching here, so this is a safe, precise filter.
+		return
+	}
 	if err := r.manager.storage.SaveRepairRun(run); err != nil {
 		r.logger.Trace().Err(err).Str("run_id", run.ID).Msg("Failed to persist run progress")
 	}
