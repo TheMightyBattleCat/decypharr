@@ -1578,6 +1578,29 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// and a manual "repair now" (RunNow runs this exact same path).
 		u.ClearFailedFile(nzbID, dr.file)
 	}
+
+	// The failedFiles un-poison above only clears the in-memory permanent-
+	// failure record. Two caches can still hold a stale zero-fill copy of the
+	// ranges just patched, from a prior playback that padded them before this
+	// repair produced real bytes - and neither consults the overlay patch on
+	// a plain cache hit (PatchBytes is only reached on a live article-fetch
+	// failure):
+	//   1. The persistent DFS mount cache - drop the patched output ranges so
+	//      the next read re-streams them (now served from the patch).
+	//   2. Any warm usenet streaming reader whose in-memory segment cache
+	//      still has the padded segment OnDisk - tear it down so the next
+	//      Stream builds a fresh reader. Idle-safe: a no-op while a viewer
+	//      still holds the file.
+	if fw := p.dfsCacheForgetter(); fw != nil {
+		for file, rngs := range buildDeadOutputRanges(nzb, pending) {
+			for _, r := range rngs {
+				fw.ForgetCachedRange(entryName, file, r.start, r.end-r.start)
+			}
+		}
+	}
+	for file := range pending {
+		u.EvictCache(nzbID, file)
+	}
 	return nil
 }
 

@@ -1333,6 +1333,61 @@ func (item *CacheItem) onBufferEvict(off, length int64) {
 	item.markMetadataDirty()
 }
 
+// ForgetRange drops [off, off+length) from this item's tracked ranges and
+// punches it from the backing buffer, so a subsequent read treats the range
+// as missing and re-downloads (overwriting) it. Same mechanism as
+// onBufferEvict, but caller-initiated for when the on-disk bytes are known
+// stale rather than reclaimed - e.g. a PAR2 repair produced corrected bytes
+// for a range a prior playback had zero-fill padded.
+func (item *CacheItem) ForgetRange(off, length int64) {
+	if item.buf == nil || length <= 0 {
+		return
+	}
+	item.metaMu.Lock()
+	item.info.Rs.Remove(ranges.Range{Pos: off, Size: length})
+	item.metaMu.Unlock()
+	_ = item.buf.Discard(off, length)
+	item.markMetadataDirty()
+}
+
+// forgetDiskRange drops [off, off+length) from filename's on-disk metadata
+// sidecar under entryName, for an item that is NOT currently open (nothing
+// in c.items - the common case, since items are closed after
+// itemIdleTimeout while a PAR2 repair can run much later). A no-op if the
+// sidecar is missing, unreadable, or already excludes the range. The data
+// file is left as-is: the dropped range reads back as missing on the next
+// open, so it is re-downloaded and overwritten.
+func (c *Cache) forgetDiskRange(entryName, filename string, off, length int64) {
+	if length <= 0 {
+		return
+	}
+	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
+	var info ItemInfo
+	if err := decodeJSONFile(metaPath, &info); err != nil {
+		return
+	}
+	before := info.Rs.Size()
+	info.Rs.Remove(ranges.Range{Pos: off, Size: length})
+	if info.Rs.Size() == before {
+		return
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return
+	}
+	// Atomic write (temp + rename), matching flushMetadata, so a concurrent
+	// scanDiskCandidates never sees a half-written sidecar.
+	tmpPath := metaPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rewrite cache metadata after par2 repair range-forget")
+		return
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
+		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rename cache metadata after par2 repair range-forget")
+		_ = os.Remove(tmpPath)
+	}
+}
+
 // HasRange returns true if entire range is on disk
 func (item *CacheItem) HasRange(r ranges.Range) bool {
 	item.metaMu.RLock()

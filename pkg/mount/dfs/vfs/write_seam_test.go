@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -150,5 +151,89 @@ func TestWriteCachedRangeSkipsAlreadyPresentBytes(t *testing.T) {
 	}
 	if string(got) != string(first) {
 		t.Fatalf("second write clobbered existing bytes: got %q, want %q (original)", got, first)
+	}
+}
+
+// TestForgetCachedRangeOpenItem proves ForgetCachedRange drops the range
+// from a live in-memory item so a subsequent read treats it as missing -
+// and that the range can then be rewritten with different bytes (the stale
+// zero-fill a PAR2 repair needs to replace).
+func TestForgetCachedRangeOpenItem(t *testing.T) {
+	c := newWritableTestCache(t)
+	m := &Manager{cache: c}
+
+	const entryName, filename = "Some.Release", "episode.mkv"
+	const fileSize = 1024
+	item := newWritableTestItem(t, c, entryName, filename, fileSize)
+
+	stale := []byte("\x00\x00\x00\x00\x00\x00\x00\x00")
+	if err := m.WriteCachedRange(entryName, filename, fileSize, stale, 200); err != nil {
+		t.Fatalf("WriteCachedRange: %v", err)
+	}
+	if !item.HasRange(ranges.Range{Pos: 200, Size: int64(len(stale))}) {
+		t.Fatalf("precondition: range should be present after write")
+	}
+
+	m.ForgetCachedRange(entryName, filename, 200, int64(len(stale)))
+
+	if item.HasRange(ranges.Range{Pos: 200, Size: int64(len(stale))}) {
+		t.Fatalf("ForgetCachedRange left the range present in the tracker")
+	}
+	if miss := item.FindMissing(ranges.Range{Pos: 200, Size: int64(len(stale))}); miss.IsEmpty() {
+		t.Fatalf("FindMissing should report the forgotten range as missing")
+	}
+	if m.PeekCachedRange(entryName, filename, make([]byte, len(stale)), 200) {
+		t.Fatalf("PeekCachedRange should miss on a forgotten range")
+	}
+
+	// The range is now writable again with corrected bytes.
+	fixed := []byte("REALDATA!")[:len(stale)]
+	if err := m.WriteCachedRange(entryName, filename, fileSize, fixed, 200); err != nil {
+		t.Fatalf("WriteCachedRange (rewrite): %v", err)
+	}
+	got := make([]byte, len(fixed))
+	if !m.PeekCachedRange(entryName, filename, got, 200) {
+		t.Fatalf("PeekCachedRange: rewritten range should read back present")
+	}
+	if string(got) != string(fixed) {
+		t.Fatalf("rewrite after forget returned %q, want %q", got, fixed)
+	}
+}
+
+// TestForgetCachedRangeClosedItem proves ForgetCachedRange rewrites the
+// on-disk .json sidecar directly when no item is open (the common case: a
+// PAR2 repair runs long after the item was closed on itemIdleTimeout), so a
+// later reopen does not re-seed the stale range.
+func TestForgetCachedRangeClosedItem(t *testing.T) {
+	c := newWritableTestCache(t)
+	m := &Manager{cache: c}
+
+	const entryName, filename = "Some.Release", "episode.mkv"
+	const fileSize = 1024
+	item := newWritableTestItem(t, c, entryName, filename, fileSize)
+
+	stale := make([]byte, 16)
+	if err := m.WriteCachedRange(entryName, filename, fileSize, stale, 300); err != nil {
+		t.Fatalf("WriteCachedRange: %v", err)
+	}
+	item.flushMetadata(true)
+
+	// Simulate the janitor closing the idle item.
+	c.items.Delete(buildCacheKey(entryName, filename))
+
+	m.ForgetCachedRange(entryName, filename, 300, int64(len(stale)))
+
+	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
+	f, err := os.Open(metaPath)
+	if err != nil {
+		t.Fatalf("open sidecar: %v", err)
+	}
+	defer f.Close()
+	var info ItemInfo
+	if err := json.NewDecoder(f).Decode(&info); err != nil {
+		t.Fatalf("decode sidecar: %v", err)
+	}
+	if info.Rs.Present(ranges.Range{Pos: 300, Size: int64(len(stale))}) {
+		t.Fatalf("on-disk sidecar still claims the forgotten range as present: %+v", info.Rs)
 	}
 }

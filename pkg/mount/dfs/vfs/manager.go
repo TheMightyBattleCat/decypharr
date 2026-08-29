@@ -253,6 +253,24 @@ func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p
 	return err
 }
 
+// ForgetCachedRange drops [off, off+length) from filename's cache item
+// under entryName so a later read treats it as missing and re-downloads it
+// - see CacheItem.ForgetRange. Routes to the live in-memory item if one is
+// open, otherwise rewrites the on-disk metadata sidecar directly (items are
+// closed after itemIdleTimeout, so a PAR2 repair completing later usually
+// finds nothing open). No-op when there is no VFS cache or the file was
+// never cached. Never creates a cache item.
+func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int64) {
+	if m.cache == nil || length <= 0 {
+		return
+	}
+	if item, ok := m.cache.PeekItem(entryName, filename); ok {
+		item.ForgetRange(off, length)
+		return
+	}
+	m.cache.forgetDiskRange(entryName, filename, off, length)
+}
+
 // CacheCoverage returns filename's cache coverage under entryName: cached
 // bytes against the file's total declared size, plus the item's last write
 // time (modTime). Tries the live in-memory item first (Cache.PeekItem /

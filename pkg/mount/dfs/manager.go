@@ -162,6 +162,17 @@ func (m *Manager) WriteCachedRange(entryName, filename string, fileSize int64, p
 	return m.vfs.WriteCachedRange(entryName, filename, fileSize, p, off)
 }
 
+// ForgetCachedRange drops [off, off+length) from filename's cache item
+// under entryName so a later read re-downloads it - see
+// vfs.Manager.ForgetCachedRange. No-op when there is no VFS mount or the
+// file was never cached.
+func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int64) {
+	if m.vfs == nil {
+		return
+	}
+	m.vfs.ForgetCachedRange(entryName, filename, off, length)
+}
+
 // CacheCoverage returns filename's cache coverage under entryName - cached
 // bytes against the file's total declared size, plus its last write time -
 // see vfs.Manager.CacheCoverage. ok=false means there is nothing to report

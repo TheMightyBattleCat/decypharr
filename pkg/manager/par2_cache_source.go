@@ -22,6 +22,34 @@ type dfsCacheRangeReader interface {
 	PeekCachedRange(entryName, filename string, p []byte, off int64) bool
 }
 
+// dfsCacheRangeForgetter is satisfied by the same DFS mount MountManager as
+// dfsCacheRangeReader (same type-assertion seam - a direct import would
+// cycle). A failed assertion (rclone mode, no mount) just means there is no
+// durable cache to invalidate this run.
+type dfsCacheRangeForgetter interface {
+	// ForgetCachedRange drops [off, off+length) from filename's cache item
+	// under entryName so a subsequent read re-downloads (and overwrites)
+	// it. No-op if the file was never cached. Used after a PAR2 repair
+	// produces corrected bytes for a range a prior playback zero-fill
+	// padded - nothing else invalidates that stale copy, since the overlay
+	// patch is only consulted on a live article-fetch failure, which a
+	// cache hit skips entirely.
+	ForgetCachedRange(entryName, filename string, off, length int64)
+}
+
+// dfsCacheForgetter resolves the DFS range-invalidation seam via the same
+// MountManager() type-assertion dfsCacheRangeReader uses. nil when no DFS
+// mount is available - callers treat that as "no durable cache to
+// invalidate" and do nothing.
+func (p *Par2Repair) dfsCacheForgetter() dfsCacheRangeForgetter {
+	mgr := p.manager.MountManager()
+	if mgr == nil {
+		return nil
+	}
+	fw, _ := mgr.(dfsCacheRangeForgetter)
+	return fw
+}
+
 // cacheMapEntry records one extracted, uncompressed (IsStored) file's claim
 // on part of one posted article's decoded body: the article-local byte
 // range [DataStart, DataEnd) that article contributes to the extracted
