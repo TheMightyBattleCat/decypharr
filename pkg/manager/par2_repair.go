@@ -53,6 +53,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"github.com/sourcegraph/conc/pool"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
@@ -1391,7 +1392,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	needed := estimateNeededSlices(pending)
 	var fetchedSlices uint32
 	var nextVolIdx int
-	nextVolIdx, fetchedSlices, sources, _ = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, needed, sources, entryName, p.logger)
+	nextVolIdx, fetchedSlices, sources, _, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, needed, fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
+	if err != nil {
+		return fmt.Errorf("fetch recovery volumes: %w", err)
+	}
 	progress.SetRecoveryVolsFetched(nextVolIdx)
 	progress.SetRecoverySlices(int(fetchedSlices), int(needed))
 	if len(sources) == 0 {
@@ -1571,7 +1575,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// were actually added.
 		if uint32(k) > fetchedSlices {
 			var added int
-			nextVolIdx, fetchedSlices, sources, added = fetchMoreVolumes(ctx, fetch, vols, nextVolIdx, fetchedSlices, uint32(k), sources, entryName, p.logger)
+			nextVolIdx, fetchedSlices, sources, added, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, uint32(k), fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
+			if err != nil {
+				return fmt.Errorf("fetch recovery volumes: %w", err)
+			}
 			progress.SetRecoveryVolsFetched(nextVolIdx)
 			progress.SetRecoverySlices(int(fetchedSlices), k)
 			if added > 0 {
@@ -1785,45 +1792,162 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 	return vols, indexFiles
 }
 
-// fetchMoreVolumes fetches additional recovery volumes from vols (already
-// sorted smallest-first), continuing from nextVolIdx, until fetchedSlices
-// covers needed or vols is exhausted. Returns the updated position/count/
-// sources so a later call - after discovering MORE damage than originally
-// estimated (see runRepair's retry loop) - can pick up exactly where an
-// earlier call left off, without re-fetching anything already in sources.
-// The added return is how many new entries were appended to sources this
-// call - callers only need to re-parse the PAR2 index when it's non-zero.
-func fetchMoreVolumes(ctx context.Context, fetch articleFetchFunc, vols []par2Volume, nextVolIdx int, fetchedSlices, needed uint32, sources []par2.Source, entryName string, logger zerolog.Logger) (newNextVolIdx int, newFetchedSlices uint32, newSources []par2.Source, added int) {
-	consecutiveNotFound := 0
-	for nextVolIdx < len(vols) && fetchedSlices < needed {
-		v := vols[nextVolIdx]
-		nextVolIdx++
-		data, err := fetchWholePar2File(ctx, fetch, v.ref)
-		if err != nil {
-			logger.Debug().Err(err).Str("entry", entryName).Str("file", v.ref.Name).Msg("par2: recovery volume fetch failed")
-			// An expired PAR2 posting 430s on every volume - once enough in a
-			// row come back article-not-found, stop rather than walk the whole
-			// (potentially 100-strong) volume list at ~30s each. Transient
-			// errors don't carry the same structural signal, so they reset the
-			// run instead of counting toward it.
-			if nntp.IsArticleNotFoundError(err) {
-				consecutiveNotFound++
-				if consecutiveNotFound >= par2RecoveryMaxConsecutiveNotFound {
-					logger.Info().Str("entry", entryName).
-						Msgf("par2: aborting recovery volume fetch after %d consecutive article-not-found errors", consecutiveNotFound)
-					break
-				}
-			} else {
-				consecutiveNotFound = 0
-			}
-			continue
-		}
-		sources = append(sources, par2.Source{Name: v.ref.Name, Data: data})
-		fetchedSlices += v.count
-		added++
-		consecutiveNotFound = 0
+// volumeFetchResult holds one parallel recovery-volume fetch outcome.
+type volumeFetchResult struct {
+	source   par2.Source
+	count    uint32 // slice count from the par2Volume
+	err      error
+	notFound bool // true when err is article-not-found
+}
+
+// computeRecoveryBatch selects the smallest prefix of vols whose cumulative
+// slice count >= shortfall, plus one slack volume when available.
+func computeRecoveryBatch(vols []par2Volume, shortfall uint32) []par2Volume {
+	if len(vols) == 0 || shortfall == 0 {
+		return nil
 	}
-	return nextVolIdx, fetchedSlices, sources, added
+	var cum uint32
+	end := 0
+	for i, v := range vols {
+		cum += v.count
+		end = i + 1
+		if cum >= shortfall {
+			if i+1 < len(vols) {
+				end = i + 2
+			}
+			break
+		}
+	}
+	return vols[:end]
+}
+
+// fetchMoreVolumes fetches recovery volumes in waves of up to maxConc
+// parallel goroutines. Pre-computes the smallest target batch whose
+// cumulative slice count satisfies the shortfall plus one slack volume,
+// then processes it in maxConc-sized waves. Between waves, results are
+// walked in volume order to maintain a consecutive-not-found streak:
+// when the streak reaches par2RecoveryMaxConsecutiveNotFound the remaining
+// waves are skipped. Transport/transient errors reset the streak,
+// matching the prior sequential implementation's semantics.
+//
+// Returns the updated position/count/sources so a later call - after
+// discovering MORE damage than originally estimated (see runRepair's retry
+// loop) - can pick up exactly where an earlier call left off, without
+// re-fetching anything already in sources. The added return is how many new
+// entries were appended to sources this call - callers only need to
+// re-parse the PAR2 index when it's non-zero.
+func fetchMoreVolumes(
+	ctx context.Context,
+	logger zerolog.Logger,
+	fetch articleFetchFunc,
+	vols []par2Volume,
+	nextVolIdx int,
+	needed uint32,
+	fetchedSlices uint32,
+	sources []par2.Source,
+	entryName string,
+	maxConc int,
+) (int, uint32, []par2.Source, int, error) {
+	remaining := vols[nextVolIdx:]
+	var shortfall uint32
+	if needed > fetchedSlices {
+		shortfall = needed - fetchedSlices
+	}
+	batch := computeRecoveryBatch(remaining, shortfall)
+	if len(batch) == 0 {
+		return nextVolIdx, fetchedSlices, sources, 0, nil
+	}
+
+	if maxConc < 1 {
+		maxConc = 1
+	}
+
+	start := time.Now()
+	consecutiveNotFound := 0
+	added := 0
+	var volsAttempted, volsNotFound, volsErrored int
+
+	for waveStart := 0; waveStart < len(batch); {
+		waveEnd := waveStart + maxConc
+		if waveEnd > len(batch) {
+			waveEnd = len(batch)
+		}
+		wave := batch[waveStart:waveEnd]
+		volsAttempted += len(wave)
+
+		results := make([]volumeFetchResult, len(wave))
+		p := pool.New().WithMaxGoroutines(maxConc)
+
+		for i, v := range wave {
+			p.Go(func() {
+				if ctx.Err() != nil {
+					results[i] = volumeFetchResult{count: v.count, err: ctx.Err()}
+					return
+				}
+				data, err := fetchWholePar2File(ctx, fetch, v.ref)
+				if err != nil {
+					if nntp.IsArticleNotFoundError(err) {
+						results[i] = volumeFetchResult{count: v.count, err: err, notFound: true}
+						return
+					}
+					results[i] = volumeFetchResult{count: v.count, err: err}
+					return
+				}
+				results[i] = volumeFetchResult{
+					source: par2.Source{Name: v.ref.Name, Data: data},
+					count:  v.count,
+				}
+			})
+		}
+
+		p.Wait()
+
+		// Walk results in volume order: maintain the consecutive-not-found
+		// streak across wave boundaries, same semantics as the prior
+		// sequential loop.
+		abort := false
+		for _, r := range results {
+			if abort {
+				break
+			}
+			switch {
+			case r.notFound:
+				consecutiveNotFound++
+				volsNotFound++
+				if consecutiveNotFound >= par2RecoveryMaxConsecutiveNotFound {
+					abort = true
+				}
+			case r.err != nil:
+				consecutiveNotFound = 0
+				volsErrored++
+			default:
+				consecutiveNotFound = 0
+				sources = append(sources, r.source)
+				fetchedSlices += r.count
+				added++
+			}
+		}
+
+		waveStart = waveEnd
+		nextVolIdx += len(wave)
+
+		if abort || fetchedSlices >= needed {
+			break
+		}
+	}
+
+	logger.Info().
+		Str("entry", entryName).
+		Dur("duration", time.Since(start)).
+		Int("volumes_attempted", volsAttempted).
+		Int("volumes_fetched", added).
+		Int("volumes_not_found", volsNotFound).
+		Int("volumes_errored", volsErrored).
+		Uint32("slices_fetched", fetchedSlices).
+		Uint32("needed", needed).
+		Msg("par2: recovery volume fetch complete")
+
+	return nextVolIdx, fetchedSlices, sources, added, nil
 }
 
 // fetchWholePar2File downloads and concatenates every segment of a retained
