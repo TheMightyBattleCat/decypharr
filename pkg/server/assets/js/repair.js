@@ -1696,7 +1696,7 @@ class RepairManager {
             const res = await fetch(`${this.api}/overlay/reclaim`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({entry: f.entry, file: f.file}),
+                body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
@@ -1718,7 +1718,7 @@ class RepairManager {
             const res = await fetch(`${this.api}/overlay/research`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({entry: f.entry, file: f.file}),
+                body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
@@ -1821,7 +1821,7 @@ class RepairManager {
                 const res = await fetch(`${this.api}/overlay/research`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({entry: f.entry, file: f.file}),
+                    body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
                 });
                 if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
                 ok++;
@@ -1843,7 +1843,7 @@ class RepairManager {
                 const res = await fetch(`${this.api}/overlay/reclaim`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({entry: f.entry, file: f.file}),
+                    body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
                 });
                 const data = await this.parseJSONSafe(res);
                 if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);

@@ -501,10 +501,15 @@ func (s *Server) handleClearPar2RepairHistory(w http.ResponseWriter, r *http.Req
 }
 
 // overlayFileRequest is the common body shape for every overlay action
-// handler below: which file, in which entry, to act on.
+// handler below: which file, in which entry, to act on. NzbID is optional -
+// the GUI row carries the nzbID the overlay record is actually stored under,
+// so handlers that would otherwise resolve by name (see resolveOverlayEntry)
+// can fall back to it when name resolution has followed a re-grab to a
+// different InfoHash. Empty for callers that don't send it - no breakage.
 type overlayFileRequest struct {
 	Entry string `json:"entry"`
 	File  string `json:"file"`
+	NzbID string `json:"nzb_id"`
 }
 
 func decodeOverlayFileRequest(r *http.Request) (overlayFileRequest, error) {
@@ -514,6 +519,7 @@ func decodeOverlayFileRequest(r *http.Request) (overlayFileRequest, error) {
 	}
 	req.Entry = strings.TrimSpace(req.Entry)
 	req.File = strings.TrimSpace(req.File)
+	req.NzbID = strings.TrimSpace(req.NzbID)
 	return req, nil
 }
 
@@ -701,8 +707,26 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	entry, err := s.resolveOverlayEntry(req)
-	if err != nil || entry == nil {
+
+	entry, resolveErr := s.resolveOverlayEntry(req)
+
+	// nzbID-direct path: the GUI row carries the nzbID this overlay record is
+	// actually stored under. When name resolution can't reach that same nzbID
+	// - it failed outright, or it followed the live folder->file link to a
+	// DIFFERENT InfoHash because a re-grabbed replacement took over the slot -
+	// the record the user is pointing at is stale/orphaned, and the name path
+	// below would silently no-op against the wrong nzbID (see
+	// followup: overlay reclaim silent no-op on orphans). Delete it directly
+	// by its own ID. The name/InfoHash mismatch is itself the "not the live
+	// owner" proof, so no extra live-owner guard is needed here; a
+	// correctly-linked live entry (resolved InfoHash == req.NzbID) still takes
+	// the unchanged name path.
+	if req.NzbID != "" && (resolveErr != nil || entry == nil || entry.InfoHash != req.NzbID) {
+		s.reclaimOverlayByNzbID(w, req.NzbID, req.File)
+		return
+	}
+
+	if resolveErr != nil || entry == nil {
 		http.Error(w, "Entry not found", http.StatusNotFound)
 		return
 	}
@@ -743,6 +767,63 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
+}
+
+// reclaimOverlayByNzbID deletes an overlay record addressed directly by the
+// nzbID it is stored under, for the case handleOverlayReclaim's name path
+// can't serve: name resolution no longer reaches this nzbID because the
+// folder->file link moved to a re-grabbed replacement (or the entry is gone
+// entirely). It mirrors the name path's response shape and post-delete
+// cleanup - failed-file un-poison, then DFS cache eviction, resolving the
+// folder name for that step from the nzbID's own still-present entry. No
+// live-owner guard: the caller only routes here once it has already proven
+// req.NzbID is not the live owner of the slot.
+func (s *Server) reclaimOverlayByNzbID(w http.ResponseWriter, nzbID, file string) {
+	if file == "" {
+		http.Error(w, "file is required", http.StatusBadRequest)
+		return
+	}
+
+	if par2Repair := s.manager.Par2Repair(); par2Repair != nil &&
+		(par2Repair.IsRunning(nzbID) || par2Repair.IsQueued(nzbID)) {
+		http.Error(w, "a par2 repair is in-flight for this entry", http.StatusConflict)
+		return
+	}
+
+	u := s.manager.Usenet()
+	if u == nil {
+		http.Error(w, "Usenet client not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	removed, err := u.OverlayDeleteFile(nzbID, file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		utils.JSONResponse(w, map[string]string{
+			"status": "not_found",
+			"reason": "no overlay record found for this nzb id",
+		}, http.StatusOK)
+		return
+	}
+
+	u.ClearFailedFile(nzbID, file)
+
+	// Evict the DFS cache dir when the superseded entry is still in storage
+	// (present, just no longer the live owner of this slot) - its folder name
+	// comes from the nzbID's own entry. If GetEntry fails the entry is gone
+	// entirely and its cache dir was torn down with it; nothing to evict.
+	if entry, gerr := s.manager.GetEntry(nzbID); gerr == nil && entry != nil {
+		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
+			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed superseded overlay record")
+		} else {
+			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Msg("superseded overlay record reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
+		}
+	}
+
+	utils.JSONResponse(w, map[string]string{"status": "reclaimed", "nzb_id": nzbID}, http.StatusOK)
 }
 
 // handleOverlayResearch is the "give up, get a clean copy" action: it clears
