@@ -142,6 +142,17 @@ func (s *par2JobProgressState) SetLastError(err string) {
 	s.touch()
 }
 
+// Touch marks progress as advanced without changing any counter - for a
+// network phase that does real work but has no natural field to bump (e.g.
+// the recovery-volume STAT pre-census), so watchIdle doesn't mistake it
+// for a stall.
+func (s *par2JobProgressState) Touch() {
+	if s == nil {
+		return
+	}
+	s.touch()
+}
+
 func (s *par2JobProgressState) SetRecoveryVolsFetched(n int) {
 	if s == nil {
 		return

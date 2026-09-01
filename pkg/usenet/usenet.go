@@ -1969,6 +1969,24 @@ func (u *Usenet) SaveNZBPar2Match(nzoID string, refs []storage.Par2MatchRef) err
 	return nil
 }
 
+// StatSegments batch-STATs the given message IDs (header-only, no body
+// download) across every configured provider and returns the per-ID result.
+// A thin exported wrapper over the NNTP client's exhaustive
+// BatchStatComplete, for repair-path callers that already hold a specific
+// segment list (e.g. the PAR2 recovery-volume pre-census) rather than a
+// whole file. Order of the returned slice is not guaranteed to match the
+// input - callers should key on StatResult.MessageID.
+func (u *Usenet) StatSegments(ctx context.Context, messageIDs []string) ([]nntp.StatResult, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	res, err := u.nntp.BatchStatComplete(ctx, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	return res.Results, nil
+}
+
 func (u *Usenet) Delete(nzoID string) error {
 	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
 	if err != nil {

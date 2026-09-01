@@ -114,6 +114,13 @@ const (
 	// par2DefaultUrgentConcurrency is used when
 	// config.Repair.Par2UrgentConcurrency is unset/non-positive.
 	par2DefaultUrgentConcurrency = 2
+
+	// par2RecoveryStatTimeout bounds the recovery-volume STAT pre-census (see
+	// statRecoveryVolumes). Kept below par2JobIdleTimeout so a stalled STAT
+	// batch can't itself trip the idle watchdog before its own deadline fires
+	// - the pre-census is header-only and probes at most ~MaxRepairSlices
+	// volumes, so a healthy run finishes in a few seconds.
+	par2RecoveryStatTimeout = 90 * time.Second
 )
 
 // repairLane distinguishes the two Par2Repair worker lanes - see the package
@@ -1453,6 +1460,18 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
+
+	// Replace the filename-derived paper count with what the provider will
+	// actually serve right now: STAT the smallest recovery volumes and drop
+	// any that have themselves expired, so the capacity gates below (the
+	// early arithmetic gate and the per-round k>available check) terminate a
+	// borderline repair before spending minutes of 430s fetching volumes
+	// that are gone. Best-effort - a STAT failure leaves vols untouched.
+	statCtx, statCancel := context.WithTimeout(ctx, par2RecoveryStatTimeout)
+	vols = statRecoveryVolumes(statCtx, p.logger, u.StatSegments, vols, entryName)
+	statCancel()
+	progress.Touch()
+
 	var available uint32
 	for _, v := range vols {
 		available += v.count
@@ -1921,6 +1940,113 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].ref.Size < vols[j].ref.Size })
 	return vols, indexFiles
+}
+
+// statRecoveryVolumes replaces censusPar2Volumes' filename-derived paper
+// count with what the provider will actually serve: it STATs the segments of
+// the smallest recovery volumes - header only, no body download - and drops
+// any volume with a confirmed-missing article from the returned list. A
+// volume is unusable if ANY of its articles is gone (a partial RecvSlic
+// packet can't be parsed), so one 430 condemns the whole volume.
+//
+// Only the volumes that could actually be reached before the MaxRepairSlices
+// cap (smallest-first, plus one slack volume) are probed - fetchMoreVolumes
+// walks the same order and stops at the cap, so STAT-ing the long tail would
+// be wasted round trips. Volumes past that prefix keep their paper count, so
+// the returned total stays a valid upper bound overall while being accurate
+// for the part a repair would actually use.
+//
+// Best-effort: a whole-batch STAT error returns vols unchanged; an ambiguous
+// per-article error (connection issue, never a definitive not-found) leaves
+// its volume in place. Only a definitive article-not-found removes one.
+func statRecoveryVolumes(
+	ctx context.Context,
+	logger zerolog.Logger,
+	stat func(context.Context, []string) ([]nntp.StatResult, error),
+	vols []par2Volume,
+	entryName string,
+) []par2Volume {
+	if len(vols) == 0 {
+		return vols
+	}
+
+	var cum uint32
+	cut := 0
+	for i, v := range vols {
+		cum += v.count
+		cut = i + 1
+		if cum >= uint32(par2.MaxRepairSlices) {
+			if i+1 < len(vols) {
+				cut = i + 2 // one slack volume
+			}
+			break
+		}
+	}
+	candidates := vols[:cut]
+
+	var msgIDs []string
+	for _, v := range candidates {
+		for _, seg := range v.ref.Segments {
+			msgIDs = append(msgIDs, seg.MessageID)
+		}
+	}
+	if len(msgIDs) == 0 {
+		return vols
+	}
+
+	start := time.Now()
+	results, err := stat(ctx, msgIDs)
+	if err != nil {
+		logger.Warn().Err(err).Str("entry", entryName).
+			Msg("par2: recovery-volume STAT pre-census failed; using name-only census")
+		return vols
+	}
+
+	byID := make(map[string]nntp.StatResult, len(results))
+	for _, r := range results {
+		byID[r.MessageID] = r
+	}
+	dead := make(map[string]struct{})
+	for _, v := range candidates {
+		for _, seg := range v.ref.Segments {
+			if r, ok := byID[seg.MessageID]; ok && !r.Available && nntp.IsArticleNotFoundError(r.Error) {
+				dead[v.ref.Name] = struct{}{}
+				break
+			}
+		}
+	}
+
+	var availBefore, availAfter uint32
+	for _, v := range vols {
+		availBefore += v.count
+	}
+	if len(dead) == 0 {
+		logger.Debug().Str("entry", entryName).
+			Int("volumes_probed", len(candidates)).
+			Uint32("available", availBefore).
+			Dur("duration", time.Since(start)).
+			Msg("par2: recovery-volume STAT pre-census - every probed volume alive")
+		return vols
+	}
+
+	alive := make([]par2Volume, 0, len(vols)-len(dead))
+	for _, v := range vols {
+		if _, gone := dead[v.ref.Name]; gone {
+			continue
+		}
+		availAfter += v.count
+		alive = append(alive, v)
+	}
+	logger.Info().
+		Str("entry", entryName).
+		Int("volumes_probed", len(candidates)).
+		Int("volumes_dead", len(dead)).
+		Int("volumes_alive", len(candidates)-len(dead)).
+		Uint32("available_before", availBefore).
+		Uint32("available_after", availAfter).
+		Dur("duration", time.Since(start)).
+		Msg("par2: recovery-volume STAT pre-census dropped expired volumes")
+	return alive
 }
 
 // volumeFetchResult holds one parallel recovery-volume fetch outcome.
