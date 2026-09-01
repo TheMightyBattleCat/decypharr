@@ -684,24 +684,42 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 	}
 
 	postedRef := *posted
-	postedFiles := []par2.PostedFile{{
-		Name:   postedRef.Name,
-		Length: postedRef.Size,
-		MD5_16k: func() ([16]byte, error) {
-			return computeMD5_16k(ctx, u.FetchArticle, postedRef)
-		},
-	}}
-	matches, skipped, err := par2.MatchFiles(idx, postedFiles)
-	if err != nil {
-		return false, "", fmt.Errorf("match posted file against par2 index: %w", err)
-	}
-	if len(matches) == 0 {
-		if len(skipped) > 0 {
-			return false, "", fmt.Errorf("match posted file against par2 index: %w", skipped[0].Err)
+
+	// Resolve this posted file to its FileID from the persisted match cache
+	// when it covers the release - saves the MD5-16k fetch MatchFiles would
+	// do to break a length tie. Falls through to a real match otherwise.
+	var matchedFileID [16]byte
+	haveMatch := false
+	if cached, ok := par2MatchFromCache(idx, nzb.Par2Source, nzb.Par2Match); ok {
+		for _, m := range cached {
+			if nzb.Par2Source[m.PostedIndex].Name == postedRef.Name {
+				matchedFileID = m.FileID
+				haveMatch = true
+				break
+			}
 		}
-		return false, "posted file did not match any par2 FileDesc", nil
 	}
-	fd, ok := idx.Files[matches[0].FileID]
+	if !haveMatch {
+		postedFiles := []par2.PostedFile{{
+			Name:   postedRef.Name,
+			Length: postedRef.Size,
+			MD5_16k: func() ([16]byte, error) {
+				return computeMD5_16k(ctx, u.FetchArticle, postedRef)
+			},
+		}}
+		matches, skipped, err := par2.MatchFiles(idx, postedFiles)
+		if err != nil {
+			return false, "", fmt.Errorf("match posted file against par2 index: %w", err)
+		}
+		if len(matches) == 0 {
+			if len(skipped) > 0 {
+				return false, "", fmt.Errorf("match posted file against par2 index: %w", skipped[0].Err)
+			}
+			return false, "posted file did not match any par2 FileDesc", nil
+		}
+		matchedFileID = matches[0].FileID
+	}
+	fd, ok := idx.Files[matchedFileID]
 	if !ok {
 		return false, "", fmt.Errorf("no FileDesc for matched posted file")
 	}
@@ -1196,23 +1214,96 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 	}
 }
 
+// par2MatchFromCache reconstructs par2.MatchFiles' output from the persisted
+// Par2Match cache (see storage.Par2MatchRef), with no network. It returns
+// ok=false unless the cache pairs EVERY posted file in par2Source with a
+// FileID that still exists in idx - a partial or drifted cache falls through
+// to a real MatchFiles run rather than silently dropping a posted file from
+// the repair (an unmatched file must stay visible so classifyMiss can reason
+// about it).
+func par2MatchFromCache(idx *par2.Index, par2Source []storage.PostedFileRef, cache []storage.Par2MatchRef) ([]par2.Match, bool) {
+	if idx == nil || len(cache) == 0 || len(cache) != len(par2Source) {
+		return nil, false
+	}
+	nameToIdx := make(map[string]int, len(par2Source))
+	for i := range par2Source {
+		nameToIdx[par2Source[i].Name] = i
+	}
+	seen := make([]bool, len(par2Source))
+	out := make([]par2.Match, 0, len(cache))
+	for _, m := range cache {
+		pi, ok := nameToIdx[m.PostedName]
+		if !ok || seen[pi] {
+			return nil, false
+		}
+		if _, ok := idx.Files[m.FileID]; !ok {
+			return nil, false
+		}
+		seen[pi] = true
+		out = append(out, par2.Match{PostedIndex: pi, FileID: m.FileID, NameMismatch: m.NameMismatch})
+	}
+	for _, s := range seen {
+		if !s {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// par2MatchToCache builds the persistable cache from a MatchFiles result,
+// but ONLY when that result fully resolved the release: no skips, and one
+// distinct match per posted file. A partial result returns nil (not cached)
+// so a later cache hit can never mask a file MatchFiles couldn't pair.
+func par2MatchToCache(par2Source []storage.PostedFileRef, matches []par2.Match, skipped []par2.MatchSkip) []storage.Par2MatchRef {
+	if len(skipped) != 0 || len(matches) != len(par2Source) {
+		return nil
+	}
+	seen := make([]bool, len(par2Source))
+	out := make([]storage.Par2MatchRef, 0, len(matches))
+	for _, m := range matches {
+		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) || seen[m.PostedIndex] {
+			return nil
+		}
+		seen[m.PostedIndex] = true
+		out = append(out, storage.Par2MatchRef{
+			PostedName:   par2Source[m.PostedIndex].Name,
+			FileID:       m.FileID,
+			NameMismatch: m.NameMismatch,
+		})
+	}
+	return out
+}
+
 // earlyDamagedSliceCheck computes a lower bound on the number of damaged PAR2
 // slices using only the PAR2 index and persisted segment geometry - no
 // network. It matches pending (damaged) files against idx.Files by unique
-// FileDesc.Length only, exactly replicating MatchFiles' free-match path (one
-// FileDesc AND one posted file of that length); files whose length ties on
-// either side would need an MD5-16k fetch to disambiguate and are skipped.
-// The result is a lower bound: skipped files (ties, or names absent from
-// par2Source) can only ADD more damaged slices, never remove them. Returns 0
-// with no error if no pending file could be cheaply matched.
+// FileDesc.Length (exactly replicating MatchFiles' free-match path: one
+// FileDesc AND one posted file of that length), OR, when a fully-resolved
+// Par2Match cache is present, by that cache's exact name->FileID pairing -
+// which also covers length-tied files the network-free heuristic must skip.
+// The result is a lower bound: skipped files (ties with no cache, or names
+// absent from par2Source) can only ADD more damaged slices, never remove
+// them. Returns 0 if no pending file could be matched.
 func earlyDamagedSliceCheck(
 	idx *par2.Index,
 	pending map[string][]overlay.DeadSegment, // filename -> dead segments
 	par2Source []storage.PostedFileRef, // the NZB's Par2Source
+	matchCache []storage.Par2MatchRef, // the NZB's Par2Match (may be empty)
 	logger zerolog.Logger,
 ) int {
 	if idx == nil || len(pending) == 0 {
 		return 0
+	}
+
+	// A fully-resolved match cache gives an exact, network-free name->FileID
+	// for every posted file, with none of the length-tie ambiguity the
+	// heuristic below has to bail on. Use it in preference when present.
+	var cachedFID map[string][16]byte
+	if cached, ok := par2MatchFromCache(idx, par2Source, matchCache); ok {
+		cachedFID = make(map[string][16]byte, len(cached))
+		for _, m := range cached {
+			cachedFID[par2Source[m.PostedIndex].Name] = m.FileID
+		}
 	}
 
 	// length -> FileID, retaining only lengths carried by exactly one
@@ -1253,12 +1344,20 @@ func earlyDamagedSliceCheck(
 		if !ok {
 			continue // not in Par2Source -> can't cheaply match; lower bound stays safe
 		}
-		fileID, ok := lengthToFile[src.Size]
-		if !ok {
-			continue // no unique-length FileDesc for this size (tie or absent)
-		}
-		if postedLenCount[src.Size] != 1 {
-			continue // >1 posted file of this length -> MatchFiles needs MD5-16k
+		var fileID [16]byte
+		if cachedFID != nil {
+			fileID, ok = cachedFID[fname]
+			if !ok {
+				continue // pending file has no posted-file identity in the cache
+			}
+		} else {
+			fileID, ok = lengthToFile[src.Size]
+			if !ok {
+				continue // no unique-length FileDesc for this size (tie or absent)
+			}
+			if postedLenCount[src.Size] != 1 {
+				continue // >1 posted file of this length -> MatchFiles needs MD5-16k
+			}
 		}
 		fd := idx.Files[fileID]
 		if fd == nil {
@@ -1391,7 +1490,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// 430s for a large release) and declare terminal now. The authoritative
 	// exact gate in the solve loop below is unchanged.
 	if earlyIdx, perr := par2.ParseIndex(sources); perr == nil {
-		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, p.logger); earlyK > 0 {
+		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, nzb.Par2Match, p.logger); earlyK > 0 {
 			if earlyK > par2.MaxRepairSlices || uint32(earlyK) > available {
 				p.logger.Info().
 					Int("early_k", earlyK).
@@ -1457,9 +1556,26 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			},
 		}
 	}
-	matches, skipped, err := par2.MatchFiles(idx, posted)
-	if err != nil {
-		return fmt.Errorf("match posted files: %w", err)
+	var matches []par2.Match
+	var skipped []par2.MatchSkip
+	if cached, ok := par2MatchFromCache(idx, nzb.Par2Source, nzb.Par2Match); ok {
+		matches = cached
+		p.logger.Debug().Str("entry", entryName).Int("files", len(cached)).
+			Msg("par2 repair: reusing cached posted-file match set (skipping MD5-16k tie-break fetches)")
+	} else {
+		matches, skipped, err = par2.MatchFiles(idx, posted)
+		if err != nil {
+			return fmt.Errorf("match posted files: %w", err)
+		}
+		if ref := par2MatchToCache(nzb.Par2Source, matches, skipped); ref != nil {
+			if serr := u.SaveNZBPar2Match(nzbID, ref); serr != nil {
+				p.logger.Warn().Err(serr).Str("entry", entryName).
+					Msg("par2 repair: failed to persist posted-file match cache")
+			} else {
+				p.logger.Debug().Str("entry", entryName).Int("files", len(ref)).
+					Msg("par2 repair: cached posted-file match set for future attempts")
+			}
+		}
 	}
 	if len(matches) == 0 {
 		return fmt.Errorf("no posted file matched the PAR2 recovery set")

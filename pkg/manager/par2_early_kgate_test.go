@@ -99,7 +99,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 		src := postedFile("a.rar", 100, 50, 2)
 		pending := map[string][]overlay.DeadSegment{"a.rar": deadAt("a.rar", 0, 1, 2)}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src, postedFile("b.rar", 100, 0, 4)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src, postedFile("b.rar", 100, 0, 4)}, nil, zerolog.Nop())
 		if got != 3 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 3", got)
 		}
@@ -110,7 +110,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 		src := postedFile("a.rar", 100, 50, 2)
 		pending := map[string][]overlay.DeadSegment{"a.rar": deadAt("a.rar", 0, 2)}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src}, nil, zerolog.Nop())
 		if got != 2 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 2 (slices 0 and 2)", got)
 		}
@@ -124,7 +124,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 		src := postedFile("a.rar", 100, 50, 2)
 		pending := map[string][]overlay.DeadSegment{"a.rar": deadAt("a.rar", 0, 1, 2)}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src, postedFile("b.rar", 100, 50, 2)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{src, postedFile("b.rar", 100, 50, 2)}, nil, zerolog.Nop())
 		if got != 0 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 0 (length tie is skipped)", got)
 		}
@@ -134,7 +134,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 		idx, _ := buildTestIndexN(t, 100, []earlyFileSpec{{"a.rar", 250}, {"b.rar", 400}})
 		pending := map[string][]overlay.DeadSegment{"ghost.rar": deadAt("ghost.rar", 0)}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{postedFile("a.rar", 100, 50, 2)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{postedFile("a.rar", 100, 50, 2)}, nil, zerolog.Nop())
 		if got != 0 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 0 (not in Par2Source)", got)
 		}
@@ -147,7 +147,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 		srcC := postedFile("c.rar", 100, 50, 2)
 		pending := map[string][]overlay.DeadSegment{"a.rar": deadAt("a.rar", 0, 1, 2)}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{srcA, srcC, postedFile("b.rar", 100, 0, 4)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{srcA, srcC, postedFile("b.rar", 100, 0, 4)}, nil, zerolog.Nop())
 		if got != 0 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 0 (posted-side length tie needs MD5-16k)", got)
 		}
@@ -166,7 +166,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 			"b.rar": deadAt("b.rar", 0, 1, 2, 3),
 		}
 
-		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{srcA, srcB, postedFile("c.rar", 100, 0, 4)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, pending, []storage.PostedFileRef{srcA, srcB, postedFile("c.rar", 100, 0, 4)}, nil, zerolog.Nop())
 		if got != 3 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 3 (a.rar only; b.rar tied)", got)
 		}
@@ -174,7 +174,7 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 
 	t.Run("empty pending -> 0", func(t *testing.T) {
 		idx, _ := buildTestIndexN(t, 100, []earlyFileSpec{{"a.rar", 250}})
-		got := earlyDamagedSliceCheck(idx, nil, []storage.PostedFileRef{postedFile("a.rar", 100, 50, 2)}, zerolog.Nop())
+		got := earlyDamagedSliceCheck(idx, nil, []storage.PostedFileRef{postedFile("a.rar", 100, 50, 2)}, nil, zerolog.Nop())
 		if got != 0 {
 			t.Fatalf("earlyDamagedSliceCheck = %d, want 0", got)
 		}

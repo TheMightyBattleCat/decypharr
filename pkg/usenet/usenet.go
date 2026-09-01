@@ -1945,6 +1945,30 @@ func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 	return nil
 }
 
+// SaveNZBPar2Match persists the posted-file -> PAR2 FileDesc match cache for
+// nzoID (see storage.Par2MatchRef / NZB.Par2Match). Write-once: it is a
+// no-op if refs is empty or a non-empty cache is already stored, so a later
+// repair attempt never rewrites it. Concurrency matches BackfillPar2Refs -
+// GetNZB/modify/AddNZB, safe here because at most one repair pass runs per
+// nzbID at a time (see Par2Repair.running).
+func (u *Usenet) SaveNZBPar2Match(nzoID string, refs []storage.Par2MatchRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return fmt.Errorf("failed to load NZB: %w", err)
+	}
+	if len(nzb.Par2Match) > 0 {
+		return nil
+	}
+	nzb.Par2Match = refs
+	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+		return fmt.Errorf("failed to save par2 match cache: %w", err)
+	}
+	return nil
+}
+
 func (u *Usenet) Delete(nzoID string) error {
 	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
 	if err != nil {
