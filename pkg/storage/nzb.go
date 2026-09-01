@@ -64,6 +64,27 @@ type NZB struct {
 	// article's cumulative segment bytes give its byte range within the
 	// posted file PAR2 actually covers.
 	Par2Source []PostedFileRef `json:"par2_source,omitempty" msgpack:"par2_source,omitempty"`
+
+	// Par2Match caches the posted-file -> PAR2 FileDesc pairing a past
+	// par2.MatchFiles run resolved for this release (see Par2MatchRef).
+	// MatchFiles breaks a posted-file length tie by fetching that file's
+	// first article over NNTP and hashing its leading 16KB - on a release of
+	// near-uniform-size volumes that is one fetch per volume, run
+	// sequentially, and it dominates a repair pass's startup. The pairing
+	// never changes (Par2Source and every FileDesc.Length are write-once), so
+	// it is persisted here once and reused by every later attempt. Only
+	// written when MatchFiles fully resolved every posted file; left empty
+	// otherwise so a cache hit can never hide an unmatched file.
+	Par2Match []Par2MatchRef `json:"par2_match,omitempty" msgpack:"par2_match,omitempty"`
+}
+
+// Par2MatchRef is one cached posted-file -> PAR2 FileDesc pairing - see
+// NZB.Par2Match. Keyed by the posted file's Name rather than its index in
+// Par2Source so the cache survives Par2Source being re-derived (backfill).
+type Par2MatchRef struct {
+	PostedName   string   `json:"posted_name" msgpack:"posted_name"`
+	FileID       [16]byte `json:"file_id" msgpack:"file_id"`
+	NameMismatch bool     `json:"name_mismatch,omitempty" msgpack:"name_mismatch,omitempty"`
 }
 
 // Par2SegmentRef is one posted article's message ID and raw decoded byte

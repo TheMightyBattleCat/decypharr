@@ -263,7 +263,56 @@ func encodeHeader(nzb *storage.NZB) []byte {
 	// segments, each file's segments in slice order.
 	writeRealBitset(w, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...)
 
+	// Posted-file match cache, appended after the Real bitset exactly as that
+	// was appended after the PAR2 refs: a blob written before this change
+	// ends above and decodes with Par2Match nil. Always written (uvarint 0
+	// when empty) so the decode-side append-only guard stays a simple
+	// "is there more?" check.
+	writePar2MatchRefs(w, nzb.Par2Match)
+
 	return w.buf
+}
+
+// writePar2MatchRefs writes uvarint(count) then, per entry: the posted-file
+// name (length-prefixed), the 16-byte FileID, and the NameMismatch bool.
+func writePar2MatchRefs(w *byteWriter, refs []storage.Par2MatchRef) {
+	w.uvarint(uint64(len(refs)))
+	for _, m := range refs {
+		w.str(m.PostedName)
+		w.buf = append(w.buf, m.FileID[:]...)
+		w.boolean(m.NameMismatch)
+	}
+}
+
+// readPar2MatchRefs reads the cache written by writePar2MatchRefs. A count of
+// zero (the common case - most records have never had a repair pass) yields
+// a nil slice, identical to a blob that predates this trailer.
+func readPar2MatchRefs(r *byteReader) ([]storage.Par2MatchRef, error) {
+	n, err := r.uvarint()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	if n > uint64(len(r.buf)) {
+		return nil, fmt.Errorf("nzbcodec: par2 match count %d implausible", n)
+	}
+	out := make([]storage.Par2MatchRef, n)
+	for i := range out {
+		if out[i].PostedName, err = r.strCopy(); err != nil {
+			return nil, err
+		}
+		if r.pos+16 > len(r.buf) {
+			return nil, fmt.Errorf("nzbcodec: par2 match file id out of range")
+		}
+		copy(out[i].FileID[:], r.buf[r.pos:r.pos+16])
+		r.pos += 16
+		if out[i].NameMismatch, err = r.boolean(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // par2RealTargets returns each retained PAR2 file's segment slice in the
@@ -685,6 +734,13 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 		if r.pos < len(buf) {
 			if err = readRealBitset(r, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...); err != nil {
 				return nil, nil, err
+			}
+			// Posted-file match cache, appended after the Real bitset. A blob
+			// written before this field ends above, leaving Par2Match nil.
+			if r.pos < len(buf) {
+				if nzb.Par2Match, err = readPar2MatchRefs(r); err != nil {
+					return nil, nil, err
+				}
 			}
 		}
 	}

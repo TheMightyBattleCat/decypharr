@@ -323,4 +323,141 @@ func TestNZBCodecV2DecodesPar2BlobWithoutRealBitset(t *testing.T) {
 			}
 		}
 	}
+	if got.Par2Match != nil {
+		t.Errorf("Par2Match = %v, want nil (no trailer present)", got.Par2Match)
+	}
+}
+
+// TestNZBCodecV2RoundTripsPar2Match checks the posted-file match cache
+// trailer round-trips through a full encode/decode and a header-only decode.
+func TestNZBCodecV2RoundTripsPar2Match(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Match = []storage.Par2MatchRef{
+		{PostedName: "Some.Release.2024.rar", FileID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, NameMismatch: false},
+		{PostedName: "Some.Release.2024.r00", FileID: [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}, NameMismatch: true},
+	}
+
+	data, err := encodeNZBV2(nzb)
+	if err != nil {
+		t.Fatalf("encodeNZBV2: %v", err)
+	}
+	got, err := decodeNZBV2(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2: %v", err)
+	}
+	if len(got.Par2Match) != len(nzb.Par2Match) {
+		t.Fatalf("Par2Match len = %d, want %d", len(got.Par2Match), len(nzb.Par2Match))
+	}
+	for i, want := range nzb.Par2Match {
+		if got.Par2Match[i] != want {
+			t.Errorf("Par2Match[%d] = %+v, want %+v", i, got.Par2Match[i], want)
+		}
+	}
+
+	headerOnly, err := decodeNZBV2Header(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2Header: %v", err)
+	}
+	if len(headerOnly.Par2Match) != len(nzb.Par2Match) {
+		t.Fatalf("header-only Par2Match len = %d, want %d", len(headerOnly.Par2Match), len(nzb.Par2Match))
+	}
+	for i, want := range nzb.Par2Match {
+		if headerOnly.Par2Match[i] != want {
+			t.Errorf("header-only Par2Match[%d] = %+v, want %+v", i, headerOnly.Par2Match[i], want)
+		}
+	}
+}
+
+// TestNZBCodecV2RoundTripsWithoutPar2Match confirms the common case - PAR2
+// refs and Real bitset present, no match cache yet - encodes and decodes
+// cleanly with Par2Match nil.
+func TestNZBCodecV2RoundTripsWithoutPar2Match(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Files[0].Segments[0].Real = true
+
+	data, err := encodeNZBV2(nzb)
+	if err != nil {
+		t.Fatalf("encodeNZBV2: %v", err)
+	}
+	got, err := decodeNZBV2(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2: %v", err)
+	}
+	if got.Par2Match != nil {
+		t.Fatalf("Par2Match = %v, want nil", got.Par2Match)
+	}
+	if !got.Par2Files[0].Segments[0].Real {
+		t.Errorf("Real bitset did not round-trip alongside an empty match cache")
+	}
+}
+
+// TestNZBCodecV2DecodesPar2BlobWithoutMatchTrailer reproduces a blob written
+// AFTER the Real bitset landed but BEFORE the match-cache trailer: refs and
+// bitset present, nothing after. decodeHeader must accept it, Par2Match nil.
+func TestNZBCodecV2DecodesPar2BlobWithoutMatchTrailer(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Source[0].Segments[1].Real = true
+
+	w := &byteWriter{}
+	w.str(nzb.ID)
+	w.str(nzb.Name)
+	w.str(nzb.Title)
+	w.str(nzb.Path)
+	w.varint(nzb.TotalSize)
+	w.varint(nzb.DatePosted.Unix())
+	w.str(nzb.Category)
+	w.uvarint(uint64(len(nzb.Groups)))
+	for _, g := range nzb.Groups {
+		w.str(g)
+	}
+	w.boolean(nzb.Downloaded)
+	w.varint(nzb.AddedOn.Unix())
+	w.varint(nzb.LastActivity.Unix())
+	w.str(nzb.Status)
+	w.f64(nzb.Progress)
+	w.f64(nzb.Percentage)
+	w.varint(nzb.SizeDownloaded)
+	w.varint(nzb.ETA)
+	w.varint(nzb.Speed)
+	w.varint(nzb.CompletedOn.Unix())
+	w.boolean(nzb.IsBad)
+	w.str(nzb.Storage)
+	w.str(nzb.FailMessage)
+	w.str(nzb.Password)
+	w.uvarint(uint64(len(nzb.Files)))
+	for i := range nzb.Files {
+		f := &nzb.Files[i]
+		w.str(f.Name)
+		w.str(f.InternalPath)
+		w.varint(f.Size)
+		w.varint(f.StartOffset)
+		w.uvarint(uint64(len(f.Groups)))
+		for _, g := range f.Groups {
+			w.str(g)
+		}
+		w.str(string(f.FileType))
+		w.str(f.Password)
+		w.boolean(f.IsDeleted)
+		w.boolean(f.IsStored)
+		w.varint(f.SegmentSize)
+		w.raw(f.EncryptionKey)
+		w.raw(f.EncryptionIV)
+		w.boolean(f.IsEncrypted)
+		w.uvarint(uint64(len(f.Segments)))
+	}
+	// PAR2 refs + Real bitset, but deliberately NO match-cache trailer.
+	writePar2FileRefs(w, nzb.Par2Files)
+	writePar2FileRefs(w, nzb.Par2Source)
+	writeRealBitset(w, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...)
+
+	got, _, err := decodeHeader(w.buf)
+	if err != nil {
+		t.Fatalf("decodeHeader on a par2-without-match-trailer blob: %v", err)
+	}
+	if got.Par2Match != nil {
+		t.Fatalf("Par2Match = %v, want nil (no trailer present)", got.Par2Match)
+	}
+	if !got.Par2Source[0].Segments[1].Real {
+		t.Errorf("Real bitset did not round-trip without a match trailer")
+	}
 }
