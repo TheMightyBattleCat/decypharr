@@ -378,6 +378,17 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	currentFP := storage.EntryItemRepairFingerprint(c.item)
 	decodeVerified := !h.DecodeVerifiedAt.IsZero() && h.DecodeVerifiedFingerprint == currentFP
+	if decodeVerified && time.Since(h.DecodeVerifiedAt) >= r.decodeVerifyTTL() {
+		// The fingerprint still matches (file set unchanged) but it's been
+		// long enough since the last deep decode pass that mid-file rot -
+		// expired articles, dropped retention - could have gone undetected:
+		// the container header and STAT sample stay intact even when the
+		// compressed payload has rotted. Re-verify instead of trusting a
+		// stale pass indefinitely. A pass below refreshes DecodeVerifiedAt to
+		// now, re-arming the TTL.
+		decodeVerified = false
+		r.logger.Debug().Str("entry", c.item.Name).Dur("since_verified", time.Since(h.DecodeVerifiedAt)).Msg("Repair: decode verification stale (TTL expired), re-running decode windows")
+	}
 	if opts.ForceDecodeVerification && decodeVerified {
 		// Operator asked for a full re-verify of this entry despite the
 		// fingerprint match. Re-run the decode windows; a pass below refreshes

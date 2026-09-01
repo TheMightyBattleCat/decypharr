@@ -71,7 +71,11 @@ const (
 	repairStopSchedulerTag = "repair-sweep-stop"
 	repairDefaultWorkers   = 5
 	repairDefaultRecheck   = 7 * 24 * time.Hour
-	repairHistoryRetained  = 100
+	// repairDefaultDecodeVerifyTTL bounds how long a passed decode
+	// verification is trusted before probeEntry re-runs the decode windows
+	// despite a matching content fingerprint - see EntryHealth.DecodeVerifiedAt.
+	repairDefaultDecodeVerifyTTL = 30 * 24 * time.Hour
+	repairHistoryRetained        = 100
 	// At most this many files probed concurrently within a single entry. The
 	// outer worker count comes from cfg.Repair.Workers.
 	repairFilesPerEntry    = 2
@@ -211,6 +215,21 @@ func (r *Repair) recheckInterval() time.Duration {
 	d, err := utils.ParseDuration(raw)
 	if err != nil || d <= 0 {
 		return repairDefaultRecheck
+	}
+	return d
+}
+
+// decodeVerifyTTL bounds how long EntryHealth.DecodeVerifiedAt is trusted -
+// see probeEntry's decodeStale check and RepairConfig.DecodeVerifyTTL's doc
+// comment for why this exists.
+func (r *Repair) decodeVerifyTTL() time.Duration {
+	raw := r.cfg().DecodeVerifyTTL
+	if raw == "" {
+		return repairDefaultDecodeVerifyTTL
+	}
+	d, err := utils.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return repairDefaultDecodeVerifyTTL
 	}
 	return d
 }

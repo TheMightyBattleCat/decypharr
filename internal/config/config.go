@@ -304,6 +304,17 @@ type RepairConfig struct {
 	// unaffected by this setting. Defaults to true when not explicitly set.
 	FFProbeDecodeCheck *bool `json:"ffprobe_decode_check,omitempty"`
 
+	// DecodeVerifyTTL bounds how long a passed decode verification
+	// (EntryHealth.DecodeVerifiedAt) is trusted before probeEntry re-runs the
+	// decode windows even though the entry's content fingerprint hasn't
+	// changed. Without this, an entry that verified clean once never gets a
+	// deep decode re-check again as long as its file set is unchanged - so
+	// mid-file rot from expired articles or dropped retention, which leaves
+	// the container header and STAT sample intact, goes undetected forever
+	// after the first pass. Duration string (e.g. "720h"); empty defaults to
+	// 30 days.
+	DecodeVerifyTTL string `json:"decode_verify_ttl,omitempty"`
+
 	// ImportAvailabilityCheck, when true, samples a newly-downloaded NZB file's segments
 	// (via the same BatchStat primitive the repair sweep uses) BEFORE it is reported
 	// complete to Sonarr/Radarr, and now reads back UNPADDED (see
@@ -911,6 +922,9 @@ func (c *Config) applyRepairDefaults() {
 	}
 	if c.Repair.RecheckInterval == "" {
 		c.Repair.RecheckInterval = "168h"
+	}
+	if c.Repair.DecodeVerifyTTL == "" {
+		c.Repair.DecodeVerifyTTL = "720h"
 	}
 
 	if c.Repair.NNTPConnectionPercent == 0 {
