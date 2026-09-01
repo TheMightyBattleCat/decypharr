@@ -3,9 +3,11 @@ package manager
 import (
 	"context"
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
 
@@ -146,6 +148,63 @@ func TestStatRecoveryVolumes(t *testing.T) {
 	t.Run("empty vols -> empty", func(t *testing.T) {
 		if got := statRecoveryVolumes(ctx, parallelFetchNopLogger, mockStat(nil, nil), nil, "e"); len(got) != 0 {
 			t.Fatalf("got %d vols, want 0", len(got))
+		}
+	})
+}
+
+func TestStatPostedFileDamage(t *testing.T) {
+	ctx := context.Background()
+	src := []storage.PostedFileRef{
+		{Name: "a.rar", Segments: []storage.Par2SegmentRef{{MessageID: "a0"}, {MessageID: "a1"}, {MessageID: "a2"}}},
+		{Name: "b.rar", Segments: []storage.Par2SegmentRef{{MessageID: "b0"}, {MessageID: "b1"}}},
+		{Name: "c.rar", Segments: []storage.Par2SegmentRef{{MessageID: "c0"}}},
+	}
+	// Only a.rar and b.rar are matched.
+	matches := []par2.Match{{PostedIndex: 0}, {PostedIndex: 1}}
+
+	t.Run("reports confirmed-missing across matched files only", func(t *testing.T) {
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger,
+			mockStat(map[string]bool{"a1": true, "b0": true, "c0": true}, nil), matches, src, "e")
+		if !ok {
+			t.Fatalf("completed = false, want true")
+		}
+		sort.Strings(got)
+		want := []string{"a1", "b0"} // c0 not probed (c.rar unmatched)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("missing = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ambiguous per-segment error is not reported missing", func(t *testing.T) {
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger,
+			mockStat(nil, map[string]bool{"a1": true}), matches, src, "e")
+		if !ok || len(got) != 0 {
+			t.Fatalf("got ok=%v missing=%v, want ok=true missing=[]", ok, got)
+		}
+	})
+
+	t.Run("whole-batch error -> completed false, nil", func(t *testing.T) {
+		failing := func(context.Context, []string) ([]nntp.StatResult, error) {
+			return nil, fmt.Errorf("nntp client is closed")
+		}
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, failing, matches, src, "e")
+		if ok || got != nil {
+			t.Fatalf("got ok=%v missing=%v, want ok=false missing=nil", ok, got)
+		}
+	})
+
+	t.Run("no matched files -> completed true, nil", func(t *testing.T) {
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(nil, nil), nil, src, "e")
+		if !ok || got != nil {
+			t.Fatalf("got ok=%v missing=%v, want ok=true missing=nil", ok, got)
+		}
+	})
+
+	t.Run("out-of-range PostedIndex is skipped", func(t *testing.T) {
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(map[string]bool{"a0": true}, nil),
+			[]par2.Match{{PostedIndex: 0}, {PostedIndex: 99}, {PostedIndex: -1}}, src, "e")
+		if !ok || len(got) != 1 || got[0] != "a0" {
+			t.Fatalf("got ok=%v missing=%v, want ok=true missing=[a0]", ok, got)
 		}
 	})
 }

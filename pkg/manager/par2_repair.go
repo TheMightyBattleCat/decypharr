@@ -121,6 +121,13 @@ const (
 	// - the pre-census is header-only and probes at most ~MaxRepairSlices
 	// volumes, so a healthy run finishes in a few seconds.
 	par2RecoveryStatTimeout = 90 * time.Second
+
+	// par2PostedStatTimeout bounds the posted-file STAT damage sweep (see
+	// statPostedFileDamage). Larger than par2RecoveryStatTimeout because it
+	// probes every article of every matched posted file, not just a handful
+	// of recovery volumes; the sweep runs in Par2PhaseProbing, which the idle
+	// watchdog ignores, so this ceiling is the only bound that applies.
+	par2PostedStatTimeout = 5 * time.Minute
 )
 
 // repairLane distinguishes the two Par2Repair worker lanes - see the package
@@ -1661,6 +1668,20 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return fmt.Sprintf("no retained posted file for FileDesc %q (len %d)", fd.Name, fd.Length), true
 	}
 
+	// STAT every article of every matched posted file up front, so the full
+	// damaged-slice set is known before the first solve. Without this the
+	// round loop below discovers dead intact articles one at a time, and
+	// each discovery re-streams every intact slice in the recovery set
+	// (gigabytes) to find the next few. Runs in Par2PhaseProbing so the idle
+	// watchdog ignores it; best-effort, a failed sweep just falls back to
+	// per-round discovery.
+	progress.SetPhase(Par2PhaseProbing)
+	statCtx2, statCancel2 := context.WithTimeout(ctx, par2PostedStatTimeout)
+	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, entryName)
+	statCancel2()
+	progress.SetPhase(Par2PhaseFetchingRecovery)
+	progress.Touch()
+
 	// Map every dead segment (by message ID - NOT by the logical/extracted
 	// filename padding recorded it under, which may be an extracted-archive
 	// member with no posted-file identity of its own) to its damaged slice
@@ -1690,6 +1711,32 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			}
 			deadRefs = append(deadRefs, deadRef{file: file, seg: seg, rng: rng})
 		}
+	}
+
+	// Fold in the STAT sweep's confirmed-missing articles - intact slices
+	// that are actually gone too. No deadRef for these: they are being
+	// reconstructed only to run the solve, not patched for playback (same as
+	// the round loop's own newlyDamaged handling).
+	overlayDamaged := len(damagedSet)
+	for _, mid := range statMissing {
+		rng, ok := msgIDRange[mid]
+		if !ok {
+			continue
+		}
+		slices, derr := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
+		if derr != nil {
+			continue
+		}
+		for _, s := range slices {
+			damagedSet[s] = struct{}{}
+		}
+	}
+	if extra := len(damagedSet) - overlayDamaged; extra > 0 {
+		if deadDiscovered != nil {
+			*deadDiscovered += extra
+		}
+		p.logger.Info().Str("entry", entryName).Int("slices", extra).
+			Msg("par2 repair: STAT damage sweep found dead slices beyond the overlay's record")
 	}
 
 	damaged := make([]int64, 0, len(damagedSet))
@@ -1827,6 +1874,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Str("entry", entryName).
 			Int("newly_damaged", len(newlyDamaged)).
 			Int("round", round+1).
+			Bool("stat_sweep_ran", statSwept).
 			Msg("par2 repair: intact slice(s) confirmed missing across every provider; expanding damaged set and retrying")
 		damaged = append(damaged, newlyDamaged...)
 		sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
@@ -2047,6 +2095,62 @@ func statRecoveryVolumes(
 		Dur("duration", time.Since(start)).
 		Msg("par2: recovery-volume STAT pre-census dropped expired volumes")
 	return alive
+}
+
+// statPostedFileDamage STATs every article of every matched posted file and
+// returns the message IDs confirmed missing (a definitive article-not-found
+// across every provider). It lets runRepair seed the full damaged-slice set
+// before the first solve, instead of discovering dead articles one round at
+// a time - and every discovery round re-streams every intact slice in the
+// recovery set (gigabytes) just to find the next handful. A dead article can
+// belong to ANY posted file, not only one with overlay-recorded damage, so
+// the sweep covers the whole matched set.
+//
+// The bool return is whether the sweep actually completed: false means a
+// whole-batch STAT error (the caller falls back to per-round discovery,
+// exactly as before this sweep existed). An individual ambiguous per-article
+// error is simply not reported as missing - that segment is left for the
+// round loop, same as any transient miss.
+func statPostedFileDamage(
+	ctx context.Context,
+	logger zerolog.Logger,
+	stat func(context.Context, []string) ([]nntp.StatResult, error),
+	matches []par2.Match,
+	par2Source []storage.PostedFileRef,
+	entryName string,
+) (missing []string, completed bool) {
+	var msgIDs []string
+	for _, m := range matches {
+		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) {
+			continue
+		}
+		for _, seg := range par2Source[m.PostedIndex].Segments {
+			msgIDs = append(msgIDs, seg.MessageID)
+		}
+	}
+	if len(msgIDs) == 0 {
+		return nil, true
+	}
+
+	start := time.Now()
+	results, err := stat(ctx, msgIDs)
+	if err != nil {
+		logger.Warn().Err(err).Str("entry", entryName).
+			Msg("par2: posted-file STAT damage sweep failed; damage will be found per-round instead")
+		return nil, false
+	}
+	for _, r := range results {
+		if !r.Available && nntp.IsArticleNotFoundError(r.Error) {
+			missing = append(missing, r.MessageID)
+		}
+	}
+	logger.Info().
+		Str("entry", entryName).
+		Int("segments_probed", len(msgIDs)).
+		Int("segments_missing", len(missing)).
+		Dur("duration", time.Since(start)).
+		Msg("par2: posted-file STAT damage sweep complete")
+	return missing, true
 }
 
 // volumeFetchResult holds one parallel recovery-volume fetch outcome.

@@ -14,6 +14,7 @@ type Par2JobPhase string
 
 const (
 	Par2PhaseQueued           Par2JobPhase = "queued"
+	Par2PhaseProbing          Par2JobPhase = "probing"
 	Par2PhaseFetchingRecovery Par2JobPhase = "fetching_recovery"
 	Par2PhaseStreamingIntact  Par2JobPhase = "streaming_intact"
 	Par2PhaseSolving          Par2JobPhase = "solving"
