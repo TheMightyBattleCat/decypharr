@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
+	"sync"
 )
 
 // ErrChecksumMismatch wraps every error Repair returns because a slice - an
@@ -133,6 +135,17 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 		accum[j] = buf
 	}
 
+	// The per-slice fan-out below cancels each intact slice's contribution
+	// out of all k accumulators in parallel - they are independent (disjoint
+	// accum[j], shared read-only data). Accumulation is 85-90% of Repair's
+	// CPU and scales with total-recovery-set-bytes x k, so on a large release
+	// this is the difference between minutes and tens of minutes. Workers are
+	// capped at k (no point spawning more) and at GOMAXPROCS.
+	workers := runtime.GOMAXPROCS(0)
+	if workers > k {
+		workers = k
+	}
+
 	mismatches := 0
 	for s := int64(0); s < idx.numSlices; s++ {
 		if _, isDamaged := damagedPos[s]; isDamaged {
@@ -157,11 +170,7 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 			}
 		}
 
-		ci := inputConstant(s)
-		for j, rs := range recovery {
-			factor := gfPow(ci, rs.Exponent)
-			regionMulXOR(accum[j], data, factor)
-		}
+		accumulateSlice(accum, data, inputConstant(s), recovery, workers)
 	}
 
 	// Build and invert M[j][d] = C_{damaged[d]}^{E_j}.
@@ -215,4 +224,49 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 		}
 	}
 	return out, nil
+}
+
+// accumParallelMinK is the smallest k for which accumulateSlice fans the
+// per-slice work out across goroutines. Below it the goroutine hand-off costs
+// more than the k serial regionMulXOR calls save.
+const accumParallelMinK = 4
+
+// accumulateSlice folds one intact slice's contribution into every
+// accumulator: accum[j] ^= gfMul(data, C^Exp_j) for each recovery slice j.
+// The k calls are independent - disjoint accum[j], shared read-only data -
+// so for a large enough k they run on `workers` goroutines, each taking a
+// contiguous block of the j range (the calls are uniform cost, so a static
+// split balances). Falls back to the plain serial loop for small k or a
+// single worker.
+func accumulateSlice(accum [][]byte, data []byte, ci uint16, recovery []RecoverySlice, workers int) {
+	k := len(recovery)
+	if workers <= 1 || k < accumParallelMinK {
+		for j, rs := range recovery {
+			regionMulXOR(accum[j], data, gfPow(ci, rs.Exponent))
+		}
+		return
+	}
+	if workers > k {
+		workers = k
+	}
+	per := (k + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * per
+		if lo >= k {
+			break
+		}
+		hi := lo + per
+		if hi > k {
+			hi = k
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for j := lo; j < hi; j++ {
+				regionMulXOR(accum[j], data, gfPow(ci, recovery[j].Exponent))
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
 }

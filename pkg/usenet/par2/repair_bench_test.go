@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -133,36 +134,37 @@ func BenchmarkRepair(b *testing.B) {
 	}
 }
 
-// BenchmarkGFAccumulate isolates the streaming-accumulation phase: for each
+// BenchmarkGFAccumulate isolates the streaming-accumulation phase - for each
 // of k recovery slices, XOR-accumulate every input slice scaled by its
-// GF(2^16) factor. This is the part whose cost grows with total-recovery-set
-// bytes AND with k, and the candidate for parallelisation. SetBytes is the
-// input data streamed once (the k factor is the multiplier on top).
+// GF(2^16) factor - comparing the serial loop against accumulateSlice's
+// per-slice fan-out. This is the part whose cost grows with
+// total-recovery-set bytes AND with k. SetBytes is the input data streamed
+// once (k is the multiplier on top).
 func BenchmarkGFAccumulate(b *testing.B) {
 	for _, k := range []int{32, 64} {
-		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
-			f := getBenchFixture(b, benchSliceSize, benchNumSlices, k)
-			exps := make([]uint32, k)
-			for j := range exps {
-				exps[j] = uint32(j)
-			}
-			accum := make([][]byte, k)
-			for j := range accum {
-				accum[j] = make([]byte, benchSliceSize)
-			}
+		f := getBenchFixture(b, benchSliceSize, benchNumSlices, k)
+		accum := make([][]byte, k)
+		for j := range accum {
+			accum[j] = make([]byte, benchSliceSize)
+		}
+
+		b.Run(fmt.Sprintf("serial/k=%d", k), func(b *testing.B) {
 			b.SetBytes(int64(benchNumSlices) * benchSliceSize)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				for j := 0; j < k; j++ {
-					for offset := range accum[j] {
-						accum[j][offset] = 0
-					}
-				}
 				for s := 0; s < benchNumSlices; s++ {
-					ci := inputConstant(int64(s))
-					for j := 0; j < k; j++ {
-						regionMulXOR(accum[j], f.data[s], gfPow(ci, exps[j]))
-					}
+					accumulateSlice(accum, f.data[s], inputConstant(int64(s)), f.recovery, 1)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("parallel/k=%d", k), func(b *testing.B) {
+			workers := runtime.GOMAXPROCS(0)
+			b.SetBytes(int64(benchNumSlices) * benchSliceSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for s := 0; s < benchNumSlices; s++ {
+					accumulateSlice(accum, f.data[s], inputConstant(int64(s)), f.recovery, workers)
 				}
 			}
 		})
