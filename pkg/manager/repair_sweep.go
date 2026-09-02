@@ -397,7 +397,6 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		decodeVerified = false
 		r.logger.Info().Str("entry", c.item.Name).Msg("Repair: force-decode recheck - re-running decode verification despite fingerprint match")
 	}
-	decodeSkipped := decodeVerified
 	if decodeVerified {
 		// Debug on a sweep (thousands of entries, this fires constantly);
 		// Info on a targeted recheck so the operator sees it against the few
@@ -409,7 +408,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		evt.Str("entry", c.item.Name).Msg("Repair: decode already verified for this fingerprint, skipping decode windows")
 	}
 
-	results := r.probeFiles(ctx, c, names, opts, decodeVerified)
+	results, decodeRan := r.probeFiles(ctx, c, names, opts, decodeVerified)
 	if autoRepair {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -435,7 +434,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	case storage.HealthHealthy:
 		h.LastOKAt = h.LastCheckedAt
 		h.FailureReason = ""
-		if !decodeVerified {
+		if decodeRan {
 			h.DecodeVerifiedAt = h.LastCheckedAt
 			h.DecodeVerifiedFingerprint = currentFP
 		}
@@ -449,12 +448,12 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 
 	r.saveHealth(h)
-	return h, decodeSkipped
+	return h, !decodeRan
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
-func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) []fileResult {
+func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) ([]fileResult, bool) {
 	// If decode verification is disabled in config, force skip for sweeps -
 	// unless this is an explicit operator force-decode recheck, which is a
 	// deliberate "deep-check this one thing right now" and overrides the
@@ -463,6 +462,13 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	if !skipDecode && !opts.ForceDecodeVerification && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
 		skipDecode = true
 	}
+	// decodeRan reports whether a real frame-decode pass could actually occur
+	// this call, after the config override above has been applied - not just
+	// the caller's original skipDecode intent. probeEntry's DecodeVerifiedAt
+	// stamp must gate on this, not on the pre-call fingerprint-match flag, or
+	// it falsely marks an entry "decode verified" when decode never ran (e.g.
+	// FFProbeCheck/FFProbeDecodeCheck disabled in config).
+	decodeRan := !skipDecode
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
@@ -477,7 +483,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 		})
 	}
 	_ = g.Wait()
-	return results
+	return results, decodeRan
 }
 
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
