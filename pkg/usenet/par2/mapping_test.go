@@ -275,11 +275,120 @@ func TestMatchFilesResidualNoMatchOnMD5Mismatch(t *testing.T) {
 	}
 }
 
-// A single posted file's MD5-16k fetch erroring out during tie-break must
-// skip only that file - the other tied file still matches, the call still
-// succeeds, and the skip is reported so the caller can treat the miss as
-// transient.
-func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
+// Three same-length files: two are matched by MD5-16k, and the third has a
+// dead tie-break article. The last-one-standing pass pairs the sole
+// remaining posted file with the sole remaining FileDesc.
+func TestMatchFilesLastOneStandingResolvesDeadTieBreak(t *testing.T) {
+	fA, fB, fC := fid(1), fid(2), fid(3)
+	md5A, md5B, md5C := [16]byte{0xAA}, [16]byte{0xBB}, [16]byte{0xCC}
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 5000, MD5_16k: md5A, Name: "a.rar"},
+		fB: {FileID: fB, Length: 5000, MD5_16k: md5B, Name: "b.rar"},
+		fC: {FileID: fC, Length: 5000, MD5_16k: md5C, Name: "c.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB, fC})
+
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5A, nil }},
+		{Name: "b.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5B, nil }},
+		{Name: "c.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, errors.New("nntp: 430 no such article") }},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want 0", skipped)
+	}
+	got := map[int][16]byte{}
+	for _, m := range matches {
+		got[m.PostedIndex] = m.FileID
+	}
+	if got[0] != fA || got[1] != fB || got[2] != fC {
+		t.Fatalf("matches = %v, want {0:fA, 1:fB, 2:fC}", got)
+	}
+}
+
+// Two unmatched FileDescs and two unmatched posted files at the same length:
+// the pairing is genuinely ambiguous, so the deduction must not fire.
+func TestMatchFilesLastOneStandingStaysAmbiguous(t *testing.T) {
+	fA, fB := fid(1), fid(2)
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 5000, MD5_16k: [16]byte{0xAA}, Name: "a.rar"},
+		fB: {FileID: fB, Length: 5000, MD5_16k: [16]byte{0xBB}, Name: "b.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB})
+
+	// nil MD5_16k on both: no tie-break, no residual, both stay unmatched.
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 5000},
+		{Name: "b.rar", Length: 5000},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want 0", skipped)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("matches = %+v, want 0 - 2x2 length group is ambiguous", matches)
+	}
+}
+
+// A length group with one unmatched FileDesc and no posted files at all
+// must not panic or mismatch.
+func TestMatchFilesLastOneStandingNoPostedAtLength(t *testing.T) {
+	fA, fB := fid(1), fid(2)
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 1000, MD5_16k: [16]byte{0xAA}, Name: "a.rar"},
+		fB: {FileID: fB, Length: 9999, MD5_16k: [16]byte{0xBB}, Name: "b.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB})
+
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 1000, MD5_16k: func() ([16]byte, error) { return [16]byte{0xAA}, nil }},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want 0", skipped)
+	}
+	if len(matches) != 1 || matches[0].PostedIndex != 0 || matches[0].FileID != fA {
+		t.Fatalf("matches = %+v, want {0 -> fA}", matches)
+	}
+}
+
+// When every file is resolved by exact length, the deduction pass changes
+// nothing.
+func TestMatchFilesLastOneStandingNoOpWhenAllMatched(t *testing.T) {
+	fA, fB := fid(1), fid(2)
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 1000, Name: "a.rar"},
+		fB: {FileID: fB, Length: 2000, Name: "b.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB})
+
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 1000},
+		{Name: "b.rar", Length: 2000},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(skipped) != 0 || len(matches) != 2 {
+		t.Fatalf("matches = %+v, skipped = %+v, want 2 matches / 0 skipped", matches, skipped)
+	}
+}
+
+// A single posted file's MD5-16k fetch erroring out during tie-break, when
+// two same-length files remain: fA matches by MD5, and the last-one-standing
+// deduction then pairs the only unmatched posted file with the only
+// unmatched FileDesc at that length - no fetch needed, no skip recorded.
+func TestMatchFilesTieBreakFetchErrorResolvedByDeduction(t *testing.T) {
 	fA, fB := fid(1), fid(2)
 	md5A := [16]byte{0xAA}
 	md5B := [16]byte{0xBB}
@@ -298,14 +407,53 @@ func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
 	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want 0 - deduction should resolve the tie", skipped)
+	}
+	got := map[int][16]byte{}
+	for _, m := range matches {
+		got[m.PostedIndex] = m.FileID
+	}
+	if got[0] != fA || got[1] != fB {
+		t.Fatalf("matches = %v, want {0:fA, 1:fB}", got)
+	}
+}
+
+// With three same-length files and the tie-break fetch failing for two of
+// them, the deduction stays ambiguous (2 unmatched FileDescs, 2 unmatched
+// posted files) and both misses are reported as transient skips.
+func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
+	fA, fB, fC := fid(1), fid(2), fid(3)
+	md5A := [16]byte{0xAA}
+	files := map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 5000, MD5_16k: md5A, Name: "a.rar"},
+		fB: {FileID: fB, Length: 5000, MD5_16k: [16]byte{0xBB}, Name: "b.rar"},
+		fC: {FileID: fC, Length: 5000, MD5_16k: [16]byte{0xCC}, Name: "c.rar"},
+	}
+	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB, fC})
+
+	wantErr := errors.New("nntp: connection reset")
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5A, nil }},
+		{Name: "b.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+		{Name: "c.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+	}
+	matches, skipped, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
+	}
 	if len(matches) != 1 || matches[0].PostedIndex != 0 || matches[0].FileID != fA {
 		t.Fatalf("matches = %+v, want exactly {posted 0 -> fA}", matches)
 	}
-	if len(skipped) != 1 || skipped[0].PostedIndex != 1 {
-		t.Fatalf("skipped = %+v, want exactly one entry for posted index 1", skipped)
+	skippedIdx := map[int]bool{}
+	for _, s := range skipped {
+		skippedIdx[s.PostedIndex] = true
+		if !errors.Is(s.Err, wantErr) {
+			t.Errorf("skipped entry for %d: Err = %v, want it to wrap %v", s.PostedIndex, s.Err, wantErr)
+		}
 	}
-	if !errors.Is(skipped[0].Err, wantErr) {
-		t.Errorf("skipped[0].Err = %v, want it to wrap %v", skipped[0].Err, wantErr)
+	if len(skipped) != 2 || !skippedIdx[1] || !skippedIdx[2] {
+		t.Fatalf("skipped = %+v, want entries for posted indexes 1 and 2", skipped)
 	}
 }
 

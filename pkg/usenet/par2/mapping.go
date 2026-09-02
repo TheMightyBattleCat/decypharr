@@ -60,6 +60,11 @@ type Match struct {
 // rename - but it is checked afterward as a sanity signal; see
 // Match.NameMismatch.
 //
+// A final last-one-standing pass pairs any length group that has come down
+// to exactly one unmatched FileDesc and one unmatched posted file: with
+// every other same-length candidate already claimed, the two can only be
+// each other, so no fetch is needed to confirm it.
+//
 // Matching is best-effort with respect to fetch failures: if breaking a
 // length tie (or the residual MD5-16k pass) needs a posted file's real
 // bytes and that fetch/hash errors out, that ONE file is skipped and
@@ -177,9 +182,49 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 		}
 	}
 
+	// Last-one-standing deduction. After the length and MD5-16k passes have
+	// claimed every file they can prove, a length group that comes down to
+	// exactly one still-unmatched FileDesc and exactly one still-unmatched
+	// posted file can only be paired one way: MatchFiles has already
+	// confirmed the two lengths are equal and eliminated every other
+	// same-length candidate on each side by MD5, so no ambiguity is left.
+	// The pairing needs no fetch. This resolves the common multi-part RAR
+	// case where one dead tie-break article would otherwise leave a file
+	// "retained but unmatched" and starve the repair of fetcher coverage
+	// for slices it could have read intact.
+	unmatchedFDByLength := make(map[int64][][16]byte)
+	for _, fid := range idx.FileOrder {
+		if matchedFID[fid] {
+			continue
+		}
+		fd := idx.Files[fid]
+		if fd == nil {
+			continue
+		}
+		unmatchedFDByLength[fd.Length] = append(unmatchedFDByLength[fd.Length], fid)
+	}
+	unmatchedPostedByLength := make(map[int64][]int)
+	for pi := range posted {
+		if matchedPosted[pi] {
+			continue
+		}
+		unmatchedPostedByLength[posted[pi].Length] = append(unmatchedPostedByLength[posted[pi].Length], pi)
+	}
+	for length, fids := range unmatchedFDByLength {
+		pis := unmatchedPostedByLength[length]
+		if len(fids) != 1 || len(pis) != 1 {
+			continue
+		}
+		pi, fid := pis[0], fids[0]
+		matches = append(matches, newMatch(idx, posted, pi, fid))
+		matchedFID[fid] = true
+		matchedPosted[pi] = true
+	}
+
 	// A posted file skipped in the tie-break pass is retried in the
-	// residual pass; drop skip records for anything that ultimately
-	// matched, and collapse duplicates to one record per posted file.
+	// residual pass, and may be resolved by the deduction above; drop skip
+	// records for anything that ultimately matched, and collapse duplicates
+	// to one record per posted file.
 	if len(skipped) > 0 {
 		deduped := skipped[:0]
 		seen := make(map[int]bool, len(skipped))
