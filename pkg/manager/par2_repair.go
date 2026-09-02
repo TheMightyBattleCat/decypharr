@@ -1745,6 +1745,22 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
 
+	// Pre-solve fetcher-coverage check. par2.Repair's streaming pass reads
+	// every non-damaged slice through jobSliceSource; a slice whose FileID
+	// has no fetcher only errors out when that pass reaches it - after
+	// potentially gigabytes of intact-slice reads. Verify coverage now, at
+	// zero bytes, and abort with the exact same classified error
+	// jobSliceSource.ReadSlice would have produced. Combined with
+	// MatchFiles' last-one-standing deduction, only a truly unresolvable
+	// tie reaches this abort. Mirrors par2_warm_sweep.go's coverage gate.
+	if uncoveredFileID, uncoveredFiles, uncovered, cerr := firstUncoveredIntactSlice(idx, damagedSet, fetchers); cerr != nil {
+		return fmt.Errorf("pre-solve coverage check: %w", cerr)
+	} else if uncovered {
+		p.logger.Warn().Str("entry", entryName).Int("files", uncoveredFiles).
+			Msg("par2 repair: intact slices have no posted-file fetcher - aborting before solve (0 bytes read)")
+		return missingFetcherErr(uncoveredFileID, classifyMiss)
+	}
+
 	// Each round attempts the solve with the current damaged set; a hard,
 	// confirmed-across-every-provider 430 on what was assumed to be an
 	// intact slice means that slice's data is genuinely gone too - not a
@@ -2581,6 +2597,55 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 	return out, nil
 }
 
+// missingFetcherErr formats the error par2 repair returns when an intact
+// slice maps to a FileID that has no posted-file fetcher. classifyMiss (see
+// the closure of that name in runRepair) decides whether the miss is
+// structural/terminal or transient/retryable; the "(transient: ...)" tag
+// and the "no posted-file fetcher for file" prefix are both load-bearing
+// for classifyPar2Failure downstream, so keep this the single place that
+// builds the string.
+func missingFetcherErr(fileID [16]byte, classifyMiss func(fileID [16]byte) (reason string, terminal bool)) error {
+	reason, terminal := "", true
+	if classifyMiss != nil {
+		reason, terminal = classifyMiss(fileID)
+	}
+	if terminal {
+		if reason != "" {
+			return fmt.Errorf("no posted-file fetcher for file %x (%s)", fileID, reason)
+		}
+		return fmt.Errorf("no posted-file fetcher for file %x", fileID)
+	}
+	return fmt.Errorf("no posted-file fetcher for file %x (transient: %s)", fileID, reason)
+}
+
+// firstUncoveredIntactSlice scans every slice par2.Repair's streaming pass
+// would read as intact - all of idx's slices except those in damagedSet -
+// and returns the FileID of the first one whose posted file has no fetcher,
+// plus the number of distinct uncovered files. ok is false when every
+// intact slice is covered. Damaged slices are excluded on purpose: the
+// solve reconstructs them, it never calls ReadSlice for them, so a file
+// with slices only in the damaged set needs no fetcher.
+func firstUncoveredIntactSlice(idx *par2.Index, damagedSet map[int64]struct{}, fetchers map[[16]byte]*postedFileFetcher) (fileID [16]byte, uncoveredFiles int, ok bool, err error) {
+	seen := make(map[[16]byte]struct{})
+	for s := int64(0); s < idx.NumSlices(); s++ {
+		if _, isDamaged := damagedSet[s]; isDamaged {
+			continue
+		}
+		fid, _, lerr := idx.SliceLocation(s)
+		if lerr != nil {
+			return [16]byte{}, 0, false, fmt.Errorf("slice %d: %w", s, lerr)
+		}
+		if _, has := fetchers[fid]; has {
+			continue
+		}
+		if !ok {
+			fileID, ok = fid, true
+		}
+		seen[fid] = struct{}{}
+	}
+	return fileID, len(seen), ok, nil
+}
+
 // jobSliceSource adapts per-posted-file fetchers into the single
 // par2.SliceSource the streaming repair pass reads intact slices from.
 type jobSliceSource struct {
@@ -2600,17 +2665,7 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 	}
 	f, ok := s.fetchers[fileID]
 	if !ok {
-		reason, terminal := "", true
-		if s.classifyMiss != nil {
-			reason, terminal = s.classifyMiss(fileID)
-		}
-		if terminal {
-			if reason != "" {
-				return nil, fmt.Errorf("no posted-file fetcher for file %x (%s)", fileID, reason)
-			}
-			return nil, fmt.Errorf("no posted-file fetcher for file %x", fileID)
-		}
-		return nil, fmt.Errorf("no posted-file fetcher for file %x (transient: %s)", fileID, reason)
+		return nil, missingFetcherErr(fileID, s.classifyMiss)
 	}
 	return f.ReadRange(local*s.idx.SliceSize, s.idx.SliceSize)
 }

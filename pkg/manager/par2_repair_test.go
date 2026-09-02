@@ -500,6 +500,68 @@ func TestExtractPostedRangeOnSecondFileUsesCorrectBase(t *testing.T) {
 	}
 }
 
+func TestFirstUncoveredIntactSliceAllCovered(t *testing.T) {
+	// fileA: 250B -> slices 0,1,2. fileB: 150B -> slices 3,4.
+	idx, fileA, fileB := buildTestIndex(t, 100, 250, 150)
+	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil, fileB: nil}
+
+	_, _, uncovered, err := firstUncoveredIntactSlice(idx, nil, fetchers)
+	if err != nil {
+		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+	}
+	if uncovered {
+		t.Fatalf("uncovered = true, want false - every file has a fetcher")
+	}
+}
+
+func TestFirstUncoveredIntactSliceReportsMissingFile(t *testing.T) {
+	idx, fileA, fileB := buildTestIndex(t, 100, 250, 150)
+	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil} // fileB missing
+
+	gotFileID, nFiles, uncovered, err := firstUncoveredIntactSlice(idx, nil, fetchers)
+	if err != nil {
+		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+	}
+	if !uncovered || gotFileID != fileB {
+		t.Fatalf("got (%x, uncovered=%v), want (fileB %x, true)", gotFileID, uncovered, fileB)
+	}
+	if nFiles != 1 {
+		t.Errorf("uncoveredFiles = %d, want 1", nFiles)
+	}
+}
+
+func TestFirstUncoveredIntactSliceIgnoresDamagedOnlyFile(t *testing.T) {
+	idx, fileA, _ := buildTestIndex(t, 100, 250, 150)
+	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil} // fileB missing
+
+	// fileB's slices (global 3, 4) are all damaged -> reconstructed, never
+	// read -> no fetcher needed.
+	damagedSet := map[int64]struct{}{3: {}, 4: {}}
+	_, _, uncovered, err := firstUncoveredIntactSlice(idx, damagedSet, fetchers)
+	if err != nil {
+		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+	}
+	if uncovered {
+		t.Fatalf("uncovered = true, want false - fileB is fully in the damaged set")
+	}
+}
+
+func TestMissingFetcherErrClassification(t *testing.T) {
+	fid := [16]byte{0x0a, 0x1b}
+	structural := missingFetcherErr(fid, func([16]byte) (string, bool) {
+		return `no retained posted file for FileDesc "o5.7z.010" (len 51200000)`, true
+	})
+	if !classifyPar2Failure(structural).terminal {
+		t.Errorf("structural miss not classified terminal: %v", structural)
+	}
+	transient := missingFetcherErr(fid, func([16]byte) (string, bool) {
+		return `posted file "vol.007" failed to fetch/hash during matching`, false
+	})
+	if classifyPar2Failure(transient).terminal {
+		t.Errorf("transient miss classified terminal, want retryable: %v", transient)
+	}
+}
+
 func TestJobSliceSourceReadSlice(t *testing.T) {
 	idx, fileA, fileB := buildTestIndex(t, 100, 250, 150)
 
