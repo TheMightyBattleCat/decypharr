@@ -1832,6 +1832,10 @@ class RepairManager {
     // confirm; this adds a hard window.confirm() (the blocklist + re-search
     // is irreversible) plus a second one if any clean-verdict files are in
     // the set, since those have no detected damage.
+    // skip_repair:true tells the server to discard this copy outright - skip
+    // the warm PAR2 pass and the per-entry cooldown - so the sequential loop
+    // spends ~seconds, not ~minutes, per file and same-entry selections
+    // action every file.
     async runOverlayBulkDeleteResearch(items) {
         if (!window.confirm(
             `This will permanently delete overlay state, blocklist the current releases, ` +
@@ -1855,7 +1859,7 @@ class RepairManager {
                 const res = await fetch(`${this.api}/overlay/research`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
+                    body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id, skip_repair: true}),
                 });
                 if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
                 ok++;

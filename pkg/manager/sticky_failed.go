@@ -218,7 +218,7 @@ func (r *Repair) clearStickyFailed(entry *storage.Entry, name, nzbID string) {
 func (r *Repair) regrabStickyFailed(ctx context.Context, c *candidate, entry *storage.Entry, name string, res fileResult) fileResult {
 	res.healthy = false
 	res.reason = "sticky_failed_sample_broken"
-	acted, guardReason, err := r.repairPlaybackFileNow(ctx, c.name, name, true)
+	acted, guardReason, err := r.repairPlaybackFileNow(ctx, c.name, name, true, false)
 	switch {
 	case err != nil:
 		r.logger.Warn().Err(err).Str("entry", entry.Name).Str("file", name).

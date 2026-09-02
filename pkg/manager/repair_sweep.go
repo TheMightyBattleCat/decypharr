@@ -858,9 +858,9 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 			return true
 		}
 		if automatic {
-			r.healBrokenEntryGuarded(ctx, run, &statsMu, name, h)
+			r.healBrokenEntryGuarded(ctx, run, &statsMu, name, h, false)
 		} else {
-			r.healBrokenEntry(ctx, run, &statsMu, name, h)
+			r.healBrokenEntry(ctx, run, &statsMu, name, h, false)
 		}
 		return true
 	})
@@ -882,7 +882,7 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 // rather than issuing a blocklist the guard has already decided against.
 // Manual callers (FixBroken, RecheckEntry fix=true) must keep calling
 // healBrokenEntry directly - never this.
-func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) {
+func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, bulkOverride bool) {
 	if h == nil {
 		return
 	}
@@ -901,7 +901,7 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 			return
 		}
 	}
-	r.healBrokenEntry(ctx, run, statsMu, name, h)
+	r.healBrokenEntry(ctx, run, statsMu, name, h, bulkOverride)
 }
 
 // healBrokenEntry runs the Arr delete + blocklist + re-search for one broken
@@ -910,7 +910,7 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 // queue a download in the Arr — the replacement lands minutes-to-hours later,
 // so the next scheduled sweep is where verification happens. statsMu guards
 // run.Stats across concurrent entries.
-func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) {
+func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, bulkOverride bool) {
 	if h == nil || h.Status != storage.HealthBroken {
 		return
 	}
@@ -921,8 +921,17 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	// are dropped from h right here, exactly as if the probe had never
 	// flagged them broken - the remainder falls through to the unchanged
 	// delete + blocklist + re-search heal below.
+	//
+	// bulkOverride skips it: it flags a deliberate user "Delete & re-search
+	// selected" bulk action (overlay GUI) where the user has already chosen
+	// to discard this copy, so a multi-minute warm PAR2 solve per file is
+	// just a stall for a repair they don't want.
 	parRepaired := false
-	if fixed := r.warmSweepRepair(ctx, h.BrokenFiles); len(fixed) > 0 {
+	var fixed map[string]struct{}
+	if !bulkOverride {
+		fixed = r.warmSweepRepair(ctx, h.BrokenFiles)
+	}
+	if len(fixed) > 0 {
 		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
 		for _, bf := range h.BrokenFiles {
 			if _, ok := fixed[bf.InfoHash]; !ok {
@@ -1036,7 +1045,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 // routeAutoRepair.
 func (r *Repair) finalizeBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, autoRepair bool) {
 	if autoRepair {
-		r.healBrokenEntryGuarded(ctx, run, statsMu, name, h)
+		r.healBrokenEntryGuarded(ctx, run, statsMu, name, h, false)
 	}
 	r.releaseRegrabClaims(h)
 }
@@ -1789,7 +1798,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 		// fall back to the pre-coordination default. Still the automatic
 		// path (see repairPlaybackFileNow's auto flag) - the regrab guard
 		// still applies if Arr context can be resolved further in.
-		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
+		return r.repairPlaybackFileNow(ctx, entryName, fileName, true, false)
 	}
 	nzbID := entry.InfoHash
 
@@ -1807,7 +1816,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 			return false, "entry already being handled by another repair mechanism", nil
 		}
 		defer r.handlers.Release(nzbID)
-		return r.repairPlaybackFileNow(ctx, entryName, fileName, true)
+		return r.repairPlaybackFileNow(ctx, entryName, fileName, true, false)
 	case autoActionQueuePar2:
 		if r.manager.par2Repair != nil {
 			// proximity=0: a live playback read just hit this damage right
@@ -1856,7 +1865,19 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 // go through HandlePlaybackFailure, which calls the gated, auto=true form
 // of repairPlaybackFileNow instead.
 func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName string) error {
-	_, _, err := r.repairPlaybackFileNow(ctx, entryName, fileName, false)
+	_, _, err := r.repairPlaybackFileNow(ctx, entryName, fileName, false, false)
+	return err
+}
+
+// RepairPlaybackFileNowForBulkResearch is RepairPlaybackFileNow for the
+// overlay GUI's "Delete & re-search selected" bulk action. The user has
+// explicitly chosen to discard this copy across a whole selection, so it
+// skips the cache-only warm PAR2 pass (a multi-minute per-file stall for a
+// repair they don't want) and bypasses the per-entry playbackRepairCooldown
+// (a selection spanning several files of one season-pack entry must action
+// every one, not collapse to the first under the 2-minute anti-churn timer).
+func (r *Repair) RepairPlaybackFileNowForBulkResearch(ctx context.Context, entryName, fileName string) error {
+	_, _, err := r.repairPlaybackFileNow(ctx, entryName, fileName, false, true)
 	return err
 }
 
@@ -1876,9 +1897,16 @@ func (r *Repair) RepairPlaybackFileNow(ctx context.Context, entryName, fileName 
 // regrab_guard.go) - a manual retry always overrides and resets the guard's
 // count for this file instead of being blocked by it.
 //
+// bulkOverride flags the overlay GUI's "Delete & re-search selected" bulk
+// action, where the user has already chosen to discard this copy. It skips
+// the cache-only warm PAR2 pass (healBrokenEntry) and bypasses the per-entry
+// playbackRepairCooldown - a bulk selection spanning several files of one
+// season-pack entry must action every one, not collapse to the first under
+// the anti-churn timer. Only ever set via RepairPlaybackFileNowForBulkResearch.
+//
 // acted/reason mirror HandlePlaybackFailure's return values - see its doc
 // comment.
-func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName string, auto bool) (acted bool, reason string, err error) {
+func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName string, auto, bulkOverride bool) (acted bool, reason string, err error) {
 	if entryName == "" {
 		return false, "", errors.New("entry name is empty")
 	}
@@ -1900,7 +1928,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 	if r.lastPlaybackRepair == nil {
 		r.lastPlaybackRepair = make(map[string]time.Time)
 	}
-	if last, ok := r.lastPlaybackRepair[cooldownKey]; ok && time.Since(last) < playbackRepairCooldown {
+	if last, ok := r.lastPlaybackRepair[cooldownKey]; ok && !bulkOverride && time.Since(last) < playbackRepairCooldown {
 		r.playbackRepairMu.Unlock()
 		remaining := (playbackRepairCooldown - time.Since(last)).Round(time.Second)
 		r.logger.Debug().
@@ -2021,7 +2049,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 
 	pseudo := &storage.RepairRun{ID: "playback-" + entryName, Stats: storage.RepairRunStats{}}
 	var statsMu sync.Mutex
-	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h)
+	r.healBrokenEntry(runCtx, pseudo, &statsMu, entryName, h, bulkOverride)
 	return true, "", nil
 }
 
@@ -2275,7 +2303,7 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		}
 		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
 		var statsMu sync.Mutex
-		r.healBrokenEntry(ctx, pseudo, &statsMu, entryName, final)
+		r.healBrokenEntry(ctx, pseudo, &statsMu, entryName, final, false)
 	})
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The

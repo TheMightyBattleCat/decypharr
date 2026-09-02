@@ -510,6 +510,12 @@ type overlayFileRequest struct {
 	Entry string `json:"entry"`
 	File  string `json:"file"`
 	NzbID string `json:"nzb_id"`
+	// SkipRepair is set only by the overlay GUI's "Delete & re-search
+	// selected" bulk action (handleOverlayResearch): the user has chosen to
+	// discard this copy across a whole selection, so the re-search must skip
+	// the warm PAR2 pass and the per-entry cooldown. Empty/false for every
+	// other caller and action - the field is ignored where it isn't read.
+	SkipRepair bool `json:"skip_repair"`
 }
 
 func decodeOverlayFileRequest(r *http.Request) (overlayFileRequest, error) {
@@ -867,7 +873,14 @@ func (s *Server) handleOverlayResearch(w http.ResponseWriter, r *http.Request) {
 	// Repair.HandlePlaybackFailure for the automatic policy this bypasses.
 	svc.ClaimManualAutoRepairOverride(entry.InfoHash)
 	defer svc.ReleaseManualAutoRepairOverride(entry.InfoHash)
-	if err := svc.RepairPlaybackFileNow(s.manager.Context(), entry.Name, req.File); err != nil {
+	research := svc.RepairPlaybackFileNow
+	if req.SkipRepair {
+		// Bulk "Delete & re-search selected": discard this copy outright -
+		// skip the warm PAR2 pass and the per-entry cooldown so every file
+		// in a multi-file selection is actioned.
+		research = svc.RepairPlaybackFileNowForBulkResearch
+	}
+	if err := research(s.manager.Context(), entry.Name, req.File); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

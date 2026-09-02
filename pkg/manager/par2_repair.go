@@ -1221,7 +1221,7 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 	// this path - its own TryAcquire(handlerRegrab) could never win against
 	// the running PAR2 job, so it logged "already being handled" and did
 	// nothing.
-	if _, reason, rerr := p.repair.repairPlaybackFileNow(p.ctx, entryName, fileName, true); rerr != nil {
+	if _, reason, rerr := p.repair.repairPlaybackFileNow(p.ctx, entryName, fileName, true, false); rerr != nil {
 		p.logger.Debug().Err(rerr).Str("entry", entryName).Msg("par2 repair: immediate regrab did not proceed")
 	} else if reason != "" {
 		p.logger.Debug().Str("entry", entryName).Str("reason", reason).Msg("par2 repair: immediate regrab skipped")
