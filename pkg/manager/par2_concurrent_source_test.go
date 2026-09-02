@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -160,6 +161,86 @@ func TestConcurrentSliceSourceTracksShortSegmentAsNotFound(t *testing.T) {
 	got := src.NotFoundIndices()
 	if len(got) != 1 || got[0] != 1 {
 		t.Fatalf("NotFoundIndices() = %v, want [1] - a truncated backing article is unrecoverable data, like a 430", got)
+	}
+}
+
+// TestConcurrentSliceSourceWrapsContextErrorWhenCancelled covers the real
+// cause of the "worker pool closed early" report: run()'s workers take the
+// <-ctx.Done() branch on their result send when the job's context is
+// cancelled (idle-timeout / deadline / preemption / shutdown), so their
+// results never reach resultCh, run() closes the channel, and ReadSlice
+// drains it without a match. That must surface as a wrapped context error so
+// errors.Is(err, context.Canceled/DeadlineExceeded) works for the retry
+// loop and the backoff classifier downstream - not a bare synthetic string
+// that erases the cause.
+func TestConcurrentSliceSourceWrapsContextErrorWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Struct built directly so the "workers dropped their results, run()
+	// closed the channel" state is deterministic - racing a real cancel
+	// against the send select is inherently flaky.
+	s := &concurrentSliceSource{
+		ctx:      ctx,
+		resultCh: make(chan sliceFetchResult),
+		pending:  make(map[int64]sliceFetchResult),
+		notFound: make(map[int64]struct{}),
+	}
+	close(s.resultCh)
+
+	_, err := s.ReadSlice(7)
+	if err == nil {
+		t.Fatal("ReadSlice(7) returned nil error, want a wrapped context error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadSlice(7) error = %v, want errors.Is(..., context.Canceled)", err)
+	}
+	if !strings.Contains(err.Error(), "7") {
+		t.Errorf("ReadSlice(7) error = %q, want it to name slice 7", err)
+	}
+}
+
+// TestConcurrentSliceSourceReportsPoolClosedWhenNotCancelled is the
+// theoretical fallthrough: the channel drained without the requested index
+// but the context is still live (a genuine internal invariant break, e.g. a
+// caller requesting an index that was never in order). That must keep the
+// original diagnostic string and must NOT masquerade as a context error.
+func TestConcurrentSliceSourceReportsPoolClosedWhenNotCancelled(t *testing.T) {
+	s := &concurrentSliceSource{
+		ctx:      context.Background(),
+		resultCh: make(chan sliceFetchResult),
+		pending:  make(map[int64]sliceFetchResult),
+		notFound: make(map[int64]struct{}),
+	}
+	close(s.resultCh)
+
+	_, err := s.ReadSlice(2)
+	if err == nil {
+		t.Fatal("ReadSlice(2) returned nil error, want the pool-closed diagnostic")
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadSlice(2) error = %v, must not be a context error when ctx is live", err)
+	}
+	if !strings.Contains(err.Error(), "worker pool closed early") {
+		t.Errorf("ReadSlice(2) error = %q, want the original 'worker pool closed early' diagnostic", err)
+	}
+}
+
+// TestConcurrentSliceSourceContextErrorIsClassifiedTransient walks the wrapped
+// chain end to end - concurrentSliceSource.ReadSlice wrap, then par2.Repair's
+// own "read intact slice %d: %w" wrap (pkg/usenet/par2/repair.go) - and
+// confirms the backoff classifier still sees it as transient. This is the
+// misclassification the fix targets: a cut-off intact-slice fetch must back
+// off and retry, never mark the entry permanently unrepairable.
+func TestConcurrentSliceSourceContextErrorIsClassifiedTransient(t *testing.T) {
+	readErr := fmt.Errorf("par2: fetch for slice %d interrupted: %w", int64(7), context.DeadlineExceeded)
+	repairErr := fmt.Errorf("par2: read intact slice %d: %w", int64(7), readErr)
+
+	if !errors.Is(repairErr, context.DeadlineExceeded) {
+		t.Fatalf("wrapped repair error lost the context cause: %v", repairErr)
+	}
+	if class := classifyPar2Failure(repairErr); class.terminal {
+		t.Fatalf("classifyPar2Failure(interrupted repair).terminal = true (reason %q), want transient", class.reason)
 	}
 }
 

@@ -1867,6 +1867,25 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			break
 		}
 
+		// A cancelled context (idle-timeout, job-deadline, preemption,
+		// shutdown) surfaces here via concurrentSliceSource.ReadSlice, which
+		// now wraps ctx.Err(). This is a transient interruption, not a
+		// structural repair failure: the intact-slice fetch was cut off
+		// mid-stream, so NotFoundIndices() is meaningless (the dropped
+		// slices weren't 430s) and expanding the damaged set / retrying
+		// would burn a round reconstructing slices that aren't actually
+		// dead. Bail out with the raw error so the backoff classifier sees
+		// context.Canceled/DeadlineExceeded (absent from par2TerminalSubstrings)
+		// and reschedules instead of marking the entry unrepairable.
+		if errors.Is(repairErr, context.Canceled) || errors.Is(repairErr, context.DeadlineExceeded) {
+			p.logger.Warn().
+				Str("entry", entryName).
+				Int("round", round+1).
+				Err(repairErr).
+				Msg("par2 repair: intact-slice fetch interrupted by context cancellation; treating as transient")
+			return repairErr
+		}
+
 		notFound := sliceSource.NotFoundIndices()
 		newlyDamaged := make([]int64, 0, len(notFound))
 		for _, ni := range notFound {

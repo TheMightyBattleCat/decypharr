@@ -37,6 +37,7 @@ type sliceFetchResult struct {
 // exactly 1 to a small, fixed multiple of the connection limit, matching
 // the concurrency the normal download path already uses.
 type concurrentSliceSource struct {
+	ctx      context.Context // the pool's context; ReadSlice consults ctx.Err() so a cancelled/timed-out job surfaces as a wrapped context error, not a bare "pool closed early"
 	resultCh chan sliceFetchResult
 	pending  map[int64]sliceFetchResult // out-of-order results not yet consumed - read/written only from ReadSlice's single caller goroutine
 
@@ -59,6 +60,7 @@ func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency
 		maxConcurrency = 1
 	}
 	s := &concurrentSliceSource{
+		ctx:      ctx,
 		resultCh: make(chan sliceFetchResult, maxConcurrency*2),
 		pending:  make(map[int64]sliceFetchResult),
 		notFound: make(map[int64]struct{}),
@@ -133,6 +135,17 @@ func (s *concurrentSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 			return r.data, r.err
 		}
 		s.pending[r.idx] = r
+	}
+	// The channel drained without ever yielding globalIdx. The common cause
+	// is context cancellation: run()'s workers take the <-ctx.Done() branch
+	// on their result send, so an idle-timeout / job-deadline / preemption /
+	// shutdown drops in-flight results on the floor, run() closes resultCh,
+	// and we land here. Surface that as a wrapped context error so
+	// runRepair's retry loop (and the backoff classifier downstream) can see
+	// errors.Is(err, context.Canceled/DeadlineExceeded) and treat the repair
+	// as transiently interrupted rather than terminally failed.
+	if err := s.ctx.Err(); err != nil {
+		return nil, fmt.Errorf("par2: fetch for slice %d interrupted: %w", globalIdx, err)
 	}
 	return nil, fmt.Errorf("par2: no fetch result for slice %d (worker pool closed early)", globalIdx)
 }
