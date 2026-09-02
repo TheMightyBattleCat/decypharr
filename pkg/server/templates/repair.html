@@ -513,6 +513,11 @@
                 <div class="flex flex-wrap items-center justify-between gap-3">
                     <span class="text-sm font-medium"><span id="overlaySelectedCount">0</span> selected</span>
                     <div class="flex flex-wrap gap-2">
+                        <button id="overlayBulkDeleteResearchBtn" class="btn btn-sm btn-error"
+                                title="Delete overlay state, blocklist, and re-search every selected file regardless of verdict"
+                                disabled>
+                            <i class="bi bi-arrow-repeat mr-1"></i>Delete &amp; re-search selected (0)
+                        </button>
                         <button id="overlayBulkResearchBtn" class="btn btn-sm btn-error btn-outline"
                                 title="Delete overlay state, blocklist, and re-search every selected failed file">
                             <i class="bi bi-arrow-repeat mr-1"></i>Re-search all failed

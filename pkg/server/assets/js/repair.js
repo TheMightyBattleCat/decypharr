@@ -124,6 +124,12 @@ class RepairManager {
         $('precachePauseBtn')?.addEventListener('click', () => this.handleTogglePrecachePaused());
         $('precachePurgeIncompleteBtn')?.addEventListener('click', () => this.handlePurgeIncompletePrecache());
         this.bindOverlayConfirmButton(
+            $('overlayBulkDeleteResearchBtn'),
+            () => this.overlaySelectedFiles(),
+            'delete & re-search',
+            (items) => this.runOverlayBulkDeleteResearch(items),
+        );
+        this.bindOverlayConfirmButton(
             $('overlayBulkResearchBtn'),
             () => this.overlaySelectedFiles().filter((f) => f.verdict === 'failed'),
             'research',
@@ -1771,6 +1777,13 @@ class RepairManager {
         const failedSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'failed');
         const cleanSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'clean');
 
+        const allCount = this.overlaySelected.size;
+        const deleteResearchBtn = document.getElementById('overlayBulkDeleteResearchBtn');
+        if (deleteResearchBtn && deleteResearchBtn.dataset.confirming !== 'true') {
+            deleteResearchBtn.disabled = allCount === 0;
+            deleteResearchBtn.innerHTML = `<i class="bi bi-arrow-repeat mr-1"></i>Delete &amp; re-search selected (${allCount})`;
+        }
+
         const researchBtn = document.getElementById('overlayBulkResearchBtn');
         if (researchBtn && researchBtn.dataset.confirming !== 'true') {
             researchBtn.disabled = failedSelected.length === 0;
@@ -1811,6 +1824,50 @@ class RepairManager {
                 }
             }, 4000);
         });
+    }
+
+    // runOverlayBulkDeleteResearch applies POST /overlay/research to every
+    // selected file regardless of verdict - the "nuke everything selected"
+    // action. bindOverlayConfirmButton already gave the inline two-click
+    // confirm; this adds a hard window.confirm() (the blocklist + re-search
+    // is irreversible) plus a second one if any clean-verdict files are in
+    // the set, since those have no detected damage.
+    async runOverlayBulkDeleteResearch(items) {
+        if (!window.confirm(
+            `This will permanently delete overlay state, blocklist the current releases, ` +
+            `and trigger Arr re-searches for ${items.length} file(s).\n\n` +
+            `This cannot be undone. Continue?`
+        )) return;
+
+        const cleanItems = items.filter((f) => f.verdict === 'clean');
+        if (cleanItems.length > 0) {
+            if (!window.confirm(
+                `⚠️ ${cleanItems.length} of the ${items.length} selected file(s) have a clean verdict ` +
+                `with no detected damage. These will also be deleted and re-searched.\n\n` +
+                `Continue anyway?`
+            )) return;
+        }
+
+        window.createToast(`Deleting & re-searching ${items.length} file(s)…`, 'info');
+        let ok = 0, fail = 0;
+        for (const f of items) {
+            try {
+                const res = await fetch(`${this.api}/overlay/research`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
+                });
+                if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+                ok++;
+                this.overlaySelected.delete(this.overlayKey(f));
+            } catch (e) {
+                fail++;
+                console.error('Bulk delete & re-search failed for', f.file, e);
+            }
+        }
+        window.createToast(`Delete & re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
+        this.clearOverlaySelection();
+        await this.loadOverlayFiles();
     }
 
     async runOverlayBulkResearch(items) {
