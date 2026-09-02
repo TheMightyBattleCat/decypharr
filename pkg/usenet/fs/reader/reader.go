@@ -192,10 +192,19 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	sr.cache.PinRange(startSeg, endSeg)
 	defer sr.cache.UnpinRange(startSeg, endSeg)
 
-	// Queue prefetch for read-ahead (non-blocking)
-	prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
-	if prefetchEnd > endSeg {
-		sr.fetcher.QueuePrefetchRange(endSeg+1, prefetchEnd)
+	// Queue prefetch for read-ahead (non-blocking). Skipped for verification
+	// reads (ffprobe sweep/import checks, reconcileStickyFailed): the no-pad
+	// marker rides only on this ctx, but prefetchOne runs on the fetcher's
+	// lifetime context, so a dead article in the read-ahead window would be
+	// padded and AutoEnqueue'd to the urgent PAR2 lane despite the caller
+	// explicitly opting out of that. A seeky verification caller (ffprobe
+	// jumps across decode windows) gets nothing useful from a sequential
+	// read-ahead prediction anyway.
+	if !paddingDisabled(ctx) {
+		prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
+		if prefetchEnd > endSeg {
+			sr.fetcher.QueuePrefetchRange(endSeg+1, prefetchEnd)
+		}
 	}
 
 	// Ensure all required segments are available (may block for downloads)
