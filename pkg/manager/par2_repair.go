@@ -1843,7 +1843,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the whole job's deadline even with no single connection ever
 		// "stuck" forever - concurrency divides that cumulative latency by
 		// the connection limit instead.
-		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers, classifyMiss: classifyMiss}
+		jobSource := &jobSliceSource{idx: idx, fetchers: fetchers, classifyMiss: classifyMiss, logger: p.logger}
 		progress.SetIntactTotal(len(intactOrder))
 		if len(intactOrder) == 0 {
 			progress.SetPhase(Par2PhaseSolving)
@@ -2537,9 +2537,21 @@ func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
 var ErrSegmentShort = errors.New("segment data shorter than its recorded size")
 
 // ReadRange returns exactly length bytes starting at start, zero-padded past
-// the file's real length (the PAR2 final-slice padding convention).
+// the file's real length (the PAR2 final-slice padding convention). Bytes
+// are served from the local DFS cache where possible (see readCached),
+// otherwise fetched from Usenet.
 func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
-	out := make([]byte, length)
+	out, _, err := f.readRange(start, length, true)
+	return out, err
+}
+
+// readRange backs ReadRange, with two extra controls the repair job's
+// IFSC-verified cache path needs (see jobSliceSource.ReadSlice):
+// allowCache=false forces every byte to come from a fresh Usenet fetch, and
+// usedCache reports whether any returned byte was served from the DFS cache
+// (so the caller knows whether an IFSC re-check is worth doing).
+func (f *postedFileFetcher) readRange(start, length int64, allowCache bool) (out []byte, usedCache bool, err error) {
+	out = make([]byte, length)
 	pos := start
 	written := int64(0)
 	for written < length {
@@ -2548,7 +2560,7 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 		}
 		segIdx, err := f.segmentFor(pos)
 		if err != nil {
-			return nil, err
+			return nil, usedCache, err
 		}
 		withinSeg := pos - f.base[segIdx]
 		// Never copy past the file's real length, even mid-segment: a
@@ -2562,22 +2574,23 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 		// fetched length, exactly as before this cache-sourcing existed.
 		declaredAvail := f.segSizes[segIdx] - withinSeg
 		if declaredAvail <= 0 {
-			return nil, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
+			return nil, usedCache, fmt.Errorf("segment %d shorter than its recorded size", segIdx)
 		}
 		n := min(declaredAvail, length-written, f.length-pos)
 
-		if f.cacheSource != nil {
+		if allowCache && f.cacheSource != nil {
 			if cached, ok := f.cacheSource.readCached(f.segs[segIdx].MessageID, withinSeg, n); ok {
 				copy(out[written:written+n], cached)
 				written += n
 				pos += n
+				usedCache = true
 				continue
 			}
 		}
 
 		data, err := f.segmentData(segIdx)
 		if err != nil {
-			return nil, fmt.Errorf("fetch segment %d: %w", segIdx, err)
+			return nil, usedCache, fmt.Errorf("fetch segment %d: %w", segIdx, err)
 		}
 		avail := int64(len(data)) - withinSeg
 		if avail <= 0 {
@@ -2587,14 +2600,14 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 			// loop can fold into the damaged set for recovery-slice
 			// reconstruction, instead of a plain string that aborts the whole
 			// pass non-terminally forever (see concurrentSliceSource.run).
-			return nil, fmt.Errorf("segment %d: %w", segIdx, ErrSegmentShort)
+			return nil, usedCache, fmt.Errorf("segment %d: %w", segIdx, ErrSegmentShort)
 		}
 		n = min(avail, length-written, f.length-pos)
 		copy(out[written:written+n], data[withinSeg:withinSeg+n])
 		written += n
 		pos += n
 	}
-	return out, nil
+	return out, usedCache, nil
 }
 
 // missingFetcherErr formats the error par2 repair returns when an intact
@@ -2656,6 +2669,9 @@ type jobSliceSource struct {
 	// (retryable) - see the closure of the same name in runRepair. Nil is
 	// treated as structural/terminal, preserving the prior behavior.
 	classifyMiss func(fileID [16]byte) (reason string, terminal bool)
+	// logger is used only for the cache-slice IFSC-mismatch warning; the
+	// zero value (a disabled logger) is fine.
+	logger zerolog.Logger
 }
 
 func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
@@ -2667,7 +2683,38 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 	if !ok {
 		return nil, missingFetcherErr(fileID, s.classifyMiss)
 	}
-	return f.ReadRange(local*s.idx.SliceSize, s.idx.SliceSize)
+	start := local * s.idx.SliceSize
+	data, usedCache, err := f.readRange(start, s.idx.SliceSize, true)
+	if err != nil {
+		return nil, err
+	}
+	if !usedCache {
+		return data, nil
+	}
+
+	// This slice was served (at least partly) from the local DFS cache. A
+	// byte range that an earlier playback or read-ahead prefetch zero-filled
+	// as padding, then persisted in the cache, reads back here as plausible
+	// "intact" data: readCached's own guard (buildDeadOutputRanges) only
+	// masks the CURRENT repair pass's pending segments, so a
+	// historically-padded range is invisible to it. Verify the cached bytes
+	// against the PAR2 IFSC before trusting them. On a clean mismatch, drop
+	// them and take a fresh Usenet fetch, rather than let a stale slice burn
+	// one of par2.Repair's two canary-abort slots (>=3 aborts the whole
+	// repair) or silently corrupt the GF accumulators (1-2). A verify error
+	// (no IFSC for this file) is left for Repair's own streaming pass to
+	// surface exactly as before.
+	verified, verr := s.idx.VerifySliceChecksum(globalIdx, data)
+	if verr == nil && !verified {
+		s.logger.Warn().Int64("slice", globalIdx).Str("file", fmt.Sprintf("%x", fileID)).
+			Msg("par2 repair: cached intact slice failed IFSC verification (stale zero-fill) - refetching from NNTP")
+		fresh, _, ferr := f.readRange(start, s.idx.SliceSize, false)
+		if ferr != nil {
+			return nil, ferr
+		}
+		return fresh, nil
+	}
+	return data, nil
 }
 
 // extractPostedRange cuts [start, end) of posted file fileID out of the

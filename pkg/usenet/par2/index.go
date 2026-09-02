@@ -295,6 +295,19 @@ func (idx *Index) DamagedSlices(fileID [16]byte, byteStart, byteEnd int64) ([]in
 	return out, nil
 }
 
+// VerifySliceChecksum reports whether data (exactly SliceSize bytes, with
+// the PAR2 zero-padding convention applied to a final slice) matches the
+// IFSC MD5+CRC32 recorded for global slice globalIdx. A non-nil error means
+// the slice cannot be verified at all - no IFSC packet was retained for its
+// file, or the index is out of range - which is distinct from a clean
+// false (the bytes are simply wrong). Exported for the repair job's cache
+// path, which verifies a slice sourced from the local DFS cache before
+// trusting it as intact (see jobSliceSource.ReadSlice); Repair's own
+// streaming pass uses the unexported form.
+func (idx *Index) VerifySliceChecksum(globalIdx int64, data []byte) (bool, error) {
+	return idx.verifySliceChecksum(globalIdx, data)
+}
+
 // verifySliceChecksum reports whether data (exactly SliceSize bytes) matches
 // the recorded IFSC MD5 and CRC32 for global slice index globalIdx.
 func (idx *Index) verifySliceChecksum(globalIdx int64, data []byte) (bool, error) {
