@@ -168,6 +168,17 @@ func New() *Manager {
 		internalToken:          generateInternalToken(),
 	}
 
+	if instance.internalToken == "" {
+		// Defense-in-depth: generateInternalToken only returns "" on a
+		// crypto/rand failure, which should never happen. If it does, the
+		// sweep's ffprobe reads carry no bearer, webdav.Handler.isInternalBearer
+		// never matches, and ContextForVerificationRead is never activated -
+		// so dead segments get papered over by padding/PAR2 during the very
+		// read meant to catch them. Fire loudly at startup rather than
+		// degrade sweep accuracy silently.
+		instance.logger.Warn().Msg("internal bearer token is empty; sweep ffprobe verification reads will not be identified as internal")
+	}
+
 	instance.init()
 
 	// Create migrator

@@ -540,6 +540,15 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				res.reason = reason
 			}
 		}
+	} else if res.broken {
+		if checker := ffprobeCheckerFromContext(ctx); checker != nil {
+			// The STAT/provider probe already classified this file broken
+			// (dead segments recorded, PAR2 terminal, or routed to re-grab).
+			// An ffprobe container read would only spend the sweep's time
+			// pulling known-dead articles to reach the same verdict - skip it
+			// and let the existing broken classification stand.
+			r.logger.Info().Str("entry", c.name).Str("file", name).Msg("Repair: skipping ffprobe — STAT confirmed dead segments")
+		}
 	}
 	return res
 }

@@ -483,10 +483,22 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // cold-seek can fail one read and pass the next, and since a broken verdict
 // can lead to an automatic delete + re-search, a single bad read is never
 // enough. Only a second consecutive broken verdict is returned as broken.
+//
+// The one exception is an "ffprobe_unreadable" failure: the container could
+// not be opened at all (dead header segments, permanently broken assembly).
+// That is structural and permanent within the same NZB - the retry 2s later
+// reads the exact same dead bytes - so it is returned immediately without
+// waiting out ffprobeRetryDelay. Decode-error and timeout/inconclusive
+// failures still get the retry (a single decode window can glitch
+// transiently).
 func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string) {
 	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	if ok {
 		return true, ""
+	}
+	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
+		return false, reason
 	}
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("Repair: ffprobe check failed; retrying once before declaring broken")
 
