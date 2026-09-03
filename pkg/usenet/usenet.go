@@ -1987,6 +1987,48 @@ func (u *Usenet) StatSegments(ctx context.Context, messageIDs []string) ([]nntp.
 	return res.Results, nil
 }
 
+// StatFileHealth STATs every segment of nzoID/filename (header-only, no body
+// download) and reports how many are confirmed dead - a genuine
+// article-not-found across every configured provider, per
+// nntp.IsArticleNotFoundError. Connection/protocol errors are not counted:
+// they mean the segment couldn't be checked, not that it's gone.
+//
+// Unlike the overlay's padded-segment record - which only ever sees the
+// fraction of a file actually fetched during the streaming import window -
+// this checks the whole file deterministically. Used by the import STAT
+// census gate (see Downloader.statImportGate).
+//
+// total is len(segments) whenever the segment list could be loaded, so a
+// caller can still log a ratio when StatSegments itself errors (in which
+// case that transport error is returned as-is with dead=0). A missing or
+// segment-less NZB/file is a descriptive error with total=0.
+func (u *Usenet) StatFileHealth(ctx context.Context, nzoID string, filename string) (dead int, total int, err error) {
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat file health: failed to load NZB %s: %w", nzoID, err)
+	}
+	file := nzb.GetFileByName(filename)
+	if file == nil || len(file.Segments) == 0 {
+		return 0, 0, fmt.Errorf("stat file health: file %q has no segments in NZB %s", filename, nzoID)
+	}
+
+	msgIDs := make([]string, len(file.Segments))
+	for i, seg := range file.Segments {
+		msgIDs[i] = seg.MessageID
+	}
+
+	results, err := u.StatSegments(ctx, msgIDs)
+	if err != nil {
+		return 0, len(msgIDs), err
+	}
+	for _, r := range results {
+		if !r.Available && nntp.IsArticleNotFoundError(r.Error) {
+			dead++
+		}
+	}
+	return dead, len(msgIDs), nil
+}
+
 func (u *Usenet) Delete(nzoID string) error {
 	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
 	if err != nil {

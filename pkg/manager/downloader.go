@@ -164,6 +164,12 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // than surfaced here - so cleaning up here is always cleaning up a release
 // that's been given up on, never one that just couldn't be checked.
 //
+// statImportGate runs next: a header-only STAT census over every segment of
+// each qualifying video file, catching a confirmed-dead segment anywhere in
+// the file - not just the fraction paddingImportGate's overlay record
+// actually saw fetched during the streaming import. Inconclusive checks fail
+// open; only a positive dead-segment finding rejects (and re-grabs).
+//
 // paddingImportGate runs last, independently of whether ffprobe passed,
 // failed to run, or timed out: padding can land outside the windows ffprobe
 // actually reads, so it's a separate, unconditional check on the overlay
@@ -177,6 +183,13 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 		// rejection path this error feeds into (processAction ->
 		// entry.MarkAsError) only ever flips the entry's error state, so
 		// without this both would be left behind as permanent orphans.
+		d.cleanupRejectedImport(entry)
+		return err
+	}
+	if err := d.statImportGate(entry); err != nil {
+		// Same cleanup rationale as the gates around it: the symlink tree /
+		// DFS cache / overlay dir are already on disk by now, and the
+		// rejection path only flips the entry's error state.
 		d.cleanupRejectedImport(entry)
 		return err
 	}
