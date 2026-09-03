@@ -69,6 +69,14 @@ type Precache struct {
 	// Never consulted by gating logic - purely to rate-limit the deny log.
 	denyLogged map[string]struct{}
 
+	// progressSkipLogged records, per Plex session path, the last reason
+	// checkSessionProgress skipped it - so the 15s poll logs a standing skip
+	// once instead of ~240 times per episode, while a changed reason (e.g.
+	// "outside window" giving way to "already-triggered" as the playhead
+	// crosses the threshold) still logs afresh. Cleared for a path once its
+	// trigger fires. Guarded by mu; never consulted by the trigger path.
+	progressSkipLogged map[string]string
+
 	// precachedBytes is a running total of bytes this feature has
 	// deliberately pulled ahead of need (Sonarr next-episode bursts only -
 	// see PrecacheMaxBytes), checked/reserved before starting a new burst so
@@ -130,15 +138,16 @@ type Precache struct {
 // NewPrecache builds the precache service.
 func NewPrecache(m *Manager) *Precache {
 	return &Precache{
-		manager:     m,
-		logger:      logger.New("precache"),
-		triggered:   make(map[string]time.Time),
-		pausedKeys:  make(map[string]struct{}),
-		denyLogged:  make(map[string]struct{}),
-		precached:   make(map[string]int64),
-		readiness:   make(map[string]EpisodeReadiness),
-		inflight:    make(map[string]int),
-		plexChecker: newPlexSessionChecker(m),
+		manager:            m,
+		logger:             logger.New("precache"),
+		triggered:          make(map[string]time.Time),
+		pausedKeys:         make(map[string]struct{}),
+		denyLogged:         make(map[string]struct{}),
+		progressSkipLogged: make(map[string]string),
+		precached:          make(map[string]int64),
+		readiness:          make(map[string]EpisodeReadiness),
+		inflight:           make(map[string]int),
+		plexChecker:        newPlexSessionChecker(m),
 	}
 }
 
@@ -195,6 +204,10 @@ func (p *Precache) progressTriggerLoop() {
 // fires and the next episode never warms. Polling playback progress decouples
 // the trigger from the miss, so "current episode already warm" still advances
 // the next one.
+//
+// Every per-session skip below is logged once (via progressSkip, rate-limited
+// per session path + reason) - a title that silently never cascades almost
+// always shows up here as "unresolved" or "already-triggered".
 func (p *Precache) checkSessionProgress() {
 	cfg := config.Get()
 	if !cfg.Plex.Enabled() {
@@ -215,28 +228,64 @@ func (p *Precache) checkSessionProgress() {
 	p.plexChecker.refresh(cfg.Plex)
 	for path, prog := range p.plexChecker.sessionProgress() {
 		if prog.duration <= 0 {
+			p.progressSkip(path, "zero-duration").Msg("progress trigger skipped: zero duration")
 			continue
 		}
 		pct := prog.viewOffset * 100 / prog.duration
 		if pct < threshold || pct > 98 {
+			p.progressSkip(path, "outside-window").
+				Int64("pct", pct).Int64("threshold", threshold).
+				Msg("progress trigger skipped: outside threshold-98 window")
 			continue
 		}
 		entry, filename, ok := p.resolvedPathToEntry(path)
 		if !ok {
+			p.progressSkip(path, "unresolved").Msg("progress trigger skipped: path not resolved to an entry")
 			continue
 		}
 		f, ok := entry.Files[filename]
 		if !ok || f.Size <= 0 {
+			p.progressSkip(path, "file-not-in-entry").
+				Str("entry", entry.Name).Str("file", filename).
+				Msg("progress trigger skipped: file not in entry")
 			continue
 		}
 		key := entry.InfoHash + ":" + filename
 		if !p.tryMarkTriggered(key) {
+			p.progressSkip(path, "already-triggered").
+				Str("entry", entry.Name).Str("file", filename).
+				Msg("progress trigger skipped: already triggered")
 			continue
 		}
+		p.mu.Lock()
+		delete(p.progressSkipLogged, path)
+		p.mu.Unlock()
 		// viewOffset/duration are milliseconds; readAhead wants a byte offset.
 		from := f.Size * prog.viewOffset / prog.duration
 		go p.readAhead(entry, filename, from, f.Size)
 	}
+}
+
+// progressSkip returns a debug event for a checkSessionProgress per-session
+// skip, or nil if this exact (session path, reason) pair was already logged -
+// the 15s poll would otherwise repeat the same line ~240 times over one
+// episode. A changed reason logs afresh (so "outside-window" giving way to
+// "already-triggered" as the playhead advances stays visible), and a path's
+// record is cleared once its trigger fires. Caller completes the event with
+// .Msg(); a nil *zerolog.Event is a safe no-op. Behaviour-free: the trigger
+// path never reads progressSkipLogged.
+func (p *Precache) progressSkip(path, reason string) *zerolog.Event {
+	p.mu.Lock()
+	last, seen := p.progressSkipLogged[path]
+	dup := seen && last == reason
+	if !dup {
+		p.progressSkipLogged[path] = reason
+	}
+	p.mu.Unlock()
+	if dup {
+		return nil
+	}
+	return p.logger.Debug().Str("sessionPath", path).Str("reason", reason)
 }
 
 // resolvedPathToEntry reverses GetTorrentMountPath - a flat

@@ -220,8 +220,9 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// its repair exactly as a live read would - see ContextForBurstDownload.
 	burstCtx := usenet.ContextForBurstDownload(ctx)
 
-	if err := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency); err != nil {
-		p.logger.Debug().Err(err).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
+	burstErr := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency)
+	if burstErr != nil {
+		p.logger.Debug().Err(burstErr).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
 	}
 
 	// Durably persist whatever came back CLEAN into the DFS cache now, before
@@ -235,6 +236,20 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 		p.markPrecached(nextEntry.InfoHash, filename, next.Size)
 	} else {
 		p.releaseBudget(next.Size)
+	}
+
+	// Cascade forward. A completed burst is itself the trigger point for the
+	// episode after this one, and checkSessionProgress can't provide it: this
+	// burst just marked `key` in p.triggered, so when this file is eventually
+	// played tryMarkTriggered short-circuits and readAhead ->
+	// maybePrecacheNextEpisodes never runs for it. Only on a clean burst - a
+	// failed or cancelled download has no reliable context to resolve the next
+	// episode from. The forward walk stays bounded by tryMarkTriggered,
+	// reserveBudget, and season boundaries. Detached so it doesn't run under
+	// this pass's 45-minute deadline (ctx). Mirrors readAhead, where
+	// maybePrecacheNextEpisodes is likewise the final step.
+	if burstErr == nil && burstCtx.Err() == nil {
+		go p.maybePrecacheNextEpisodes(nextEntry, filename)
 	}
 }
 
