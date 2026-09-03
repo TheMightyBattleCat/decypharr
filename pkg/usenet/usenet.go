@@ -824,6 +824,19 @@ func (u *Usenet) OverlayDeleteEntry(nzoID string) error {
 	return u.overlay.DeleteEntry(nzoID)
 }
 
+// OverlayMarkRejected marks nzoID as import-rejected so subsequent
+// RecordDead/Decide calls for it silently no-op - see
+// overlay.Store.MarkRejected. Call it right before OverlayDeleteEntry when
+// tearing down a rejected import, so a straggling fetcher goroutine can't
+// re-create the manifest the delete just removed. No-op if the overlay store
+// is unavailable.
+func (u *Usenet) OverlayMarkRejected(nzoID string) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.MarkRejected(nzoID)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.

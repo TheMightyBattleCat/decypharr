@@ -95,6 +95,14 @@ type Store struct {
 	// (entry, segment) per process, across every reader session that hits it.
 	loggedPads sync.Map // map[string]struct{}
 
+	// rejected holds nzbIDs whose import was rejected and torn down
+	// (cleanupRejectedImport). Once marked, RecordDead/Decide silently no-op
+	// for that nzbID so a straggling fetcher goroutine - still serving reads
+	// from an already-open DFS file handle - can't re-create the overlay
+	// manifest that cleanup just removed. In-memory only; cleared on restart,
+	// which is correct because restart also closes every such handle.
+	rejected sync.Map // map[string]struct{}
+
 	// repairEnqueue is set by the manager-level PAR2 worker (commit 4); nil
 	// until then, in which case EnqueueRepair is a no-op. Receives the
 	// entry's current total (non-patched) dead-segment count alongside
@@ -202,6 +210,25 @@ func (s *Store) Policy() Policy {
 		return *p
 	}
 	return DefaultPolicy()
+}
+
+// MarkRejected records that nzbID's import was rejected and its overlay
+// state torn down, so any subsequent RecordDead/Decide for it silently
+// no-ops (see the rejected field). Idempotent; nil-Store safe.
+func (s *Store) MarkRejected(nzbID string) {
+	if s == nil || nzbID == "" {
+		return
+	}
+	s.rejected.Store(nzbID, struct{}{})
+}
+
+// isRejected reports whether MarkRejected was called for nzbID.
+func (s *Store) isRejected(nzbID string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.rejected.Load(nzbID)
+	return ok
 }
 
 // Handle binds a Store to one nzbID, for the common case of a reader/sweep
@@ -408,6 +435,11 @@ func sortDeadSegments(fe *FileEntry) {
 // RecordDead records segIndex as a confirmed-dead article for file. Idempotent:
 // a segment already present (in any status) is left untouched.
 func (s *Store) RecordDead(nzbID, file string, segIndex int, msgID string, bytes int64) error {
+	if s.isRejected(nzbID) {
+		// Import was rejected and torn down; a straggling fetcher must not
+		// re-create the manifest. Do this before any lock or file I/O.
+		return nil
+	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()

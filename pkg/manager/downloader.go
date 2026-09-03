@@ -243,6 +243,12 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	}
 
 	if d.manager.usenet != nil {
+		// Mark the nzbID rejected before removing the overlay dir: a fetcher
+		// goroutine still draining reads from an already-open DFS handle for
+		// this entry would otherwise re-create the manifest via
+		// RecordDead/Decide right after the RemoveAll below.
+		d.manager.usenet.OverlayMarkRejected(entry.InfoHash)
+
 		// OverlayDeleteEntry is an unconditional RemoveAll with no removed
 		// signal of its own, so probe the manifest first to only log when
 		// there was actually an overlay dir to reap (mirrors ReapOverlay).

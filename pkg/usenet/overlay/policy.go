@@ -88,6 +88,13 @@ func recomputeVerdictLocked(fe *FileEntry) {
 // verdict. Only ever called after a segment's article fetch has permanently
 // failed across every provider.
 func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
+	if s.isRejected(nzbID) {
+		// Import was rejected and torn down; a straggling fetcher must not
+		// re-create the manifest. Fail the read (same as the fail-safe path
+		// below) without recording or persisting anything. Do this before
+		// any lock or file I/O.
+		return DecisionFail, VerdictFailed
+	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()

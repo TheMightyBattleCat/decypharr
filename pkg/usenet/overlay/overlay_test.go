@@ -61,6 +61,39 @@ func TestDecidePadsWithinCapsAndPersists(t *testing.T) {
 	}
 }
 
+func TestMarkRejectedNoOpsRecordDeadAndDecide(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-rejected", "movie.mkv"
+	const fileSize = int64(1_000_000_000)
+
+	s.MarkRejected(nzbID)
+	if !s.isRejected(nzbID) {
+		t.Fatal("isRejected = false after MarkRejected")
+	}
+
+	if err := s.RecordDead(nzbID, file, 1, "<msg1>", 500_000); err != nil {
+		t.Fatalf("RecordDead on rejected nzbID = %v, want nil", err)
+	}
+	decision, verdict := s.Decide(nzbID, file, 2, "<msg2>", 500_000, fileSize, 0)
+	if decision != DecisionFail || verdict != VerdictFailed {
+		t.Fatalf("Decide on rejected nzbID = (%v, %v), want (DecisionFail, VerdictFailed)", decision, verdict)
+	}
+
+	// Neither call may have recorded anything for the rejected entry.
+	m, err := s.GetManifest(nzbID)
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if len(m.Files) != 0 {
+		t.Fatalf("rejected nzbID has %d file record(s); manifest was re-created", len(m.Files))
+	}
+
+	// A different, non-rejected nzbID is unaffected.
+	if _, dv := s.Decide("nzb-live", file, 0, "<m0>", 500_000, fileSize, 0); dv != VerdictDegraded {
+		t.Fatalf("Decide on live nzbID = %v, want VerdictDegraded", dv)
+	}
+}
+
 func TestDecideFailsNonVideoContainer(t *testing.T) {
 	s := newTestStore(t)
 	decision, verdict := s.Decide("nzb-1", "release.nfo", 0, "<msg0>", 1000, 1_000_000, 0)
