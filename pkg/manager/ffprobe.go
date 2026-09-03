@@ -99,14 +99,23 @@ type ffprobeChecker struct {
 	// token (see webdav.Handler.isInternalBearer), sent via ffprobe's
 	// -headers flag. It replaces the user's WebDAV password, which is only
 	// ever stored as a bcrypt hash and so cannot be recovered and handed to
-	// an external process. "" when WebDAV auth is off.
+	// an external process.
+	//
+	// Always set (the token is generated unconditionally at Manager init).
+	// When WebDAV auth is on it authenticates the read; when auth is off it
+	// carries no access it wouldn't already have, and its only effect is to
+	// make webdav.Handler.isInternalBearer recognise the request so that
+	// handleDownload switches into ContextForVerificationRead - which is
+	// exactly what a sweep/import probe wants, so a confirmed-dead segment
+	// surfaces as a real NNTP error instead of being papered over by padding
+	// or a PAR2 patch.
 	//
 	// Security note: this token appears in the ffprobe process's argument
 	// list, visible to anything that can read /proc or run `ps` on this
-	// host for the life of that (sub-second to low-second) process. That's
-	// an acceptable trade-off on a typical single-user box, and the
-	// ephemeral, restart-scoped nature of the token bounds the blast radius
-	// of a leak to "until the next restart" rather than forever.
+	// host for the life of that (sub-second to low-second) process. It is a
+	// process-local value, regenerated every restart and never persisted, so
+	// even with auth on the blast radius of a leak is bounded to "until the
+	// next restart" rather than forever.
 	authToken string
 
 	logger zerolog.Logger
@@ -173,10 +182,12 @@ func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger) *ff
 		}
 	}
 
-	var authToken string
-	if cfg.UseAuth && cfg.EnableWebdavAuth {
-		authToken = m.InternalToken()
-	}
+	// Always send the internal bearer token, regardless of the auth toggles.
+	// It authenticates the probe when WebDAV auth is on, and when auth is off
+	// its only effect is to trip webdav.Handler.isInternalBearer so the probe
+	// read runs under ContextForVerificationRead (no padding, no PAR2 patch).
+	// The token is process-local, regenerated every restart, never persisted.
+	authToken := m.InternalToken()
 
 	return &ffprobeChecker{
 		binPath:   resolved,
@@ -193,9 +204,11 @@ func (f *ffprobeChecker) probeTarget(entryFolder, fileName string) string {
 	return f.baseURL + EntryAllFolder + "/" + url.PathEscape(entryFolder) + "/" + url.PathEscape(fileName)
 }
 
-// probeArgs appends the shared -headers auth flag (if any) and the target
-// URL to args, so check and tailIntact only need to supply their own
-// probe-specific flags.
+// probeArgs appends the shared -headers auth flag and the target URL to
+// args, so check and tailIntact only need to supply their own
+// probe-specific flags. authToken is normally set (see the struct field);
+// the guard only covers the theoretical case of an empty token from a
+// failed generation at init.
 func (f *ffprobeChecker) probeArgs(entryFolder, fileName string, args []string) []string {
 	if f.authToken != "" {
 		args = append(args, "-headers", "Authorization: Bearer "+f.authToken+"\r\n")
