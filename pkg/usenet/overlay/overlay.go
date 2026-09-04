@@ -120,6 +120,15 @@ type Store struct {
 	// in which case Policy() falls back to DefaultPolicy() - the original,
 	// pre-configurable behavior.
 	policy atomic.Pointer[Policy]
+
+	// sweepEntries holds nzbIDs currently under an ffprobe sweep probe. While
+	// an entry is in this set the fetcher refuses to pad its dead segments -
+	// the real 430 propagates up so ffprobe sees the corruption and the sweep
+	// re-grabs - and PAR2 auto-enqueue is deferred for it to keep NNTP
+	// bandwidth for the probe. Scoped per-entry so playback of every other
+	// entry keeps full padding + PAR2 protection. In-memory only; cleared on
+	// restart, which is correct because a restart also ends any sweep.
+	sweepEntries sync.Map // map[string]struct{}, keyed by nzbID
 }
 
 // NewStore creates (if needed) the overlay root directory and returns a Store
@@ -231,6 +240,35 @@ func (s *Store) isRejected(nzbID string) bool {
 	return ok
 }
 
+// MarkSweepEntry records that nzbID is under an ffprobe sweep probe. While
+// marked, the fetcher refuses to pad this entry's dead segments and PAR2
+// auto-enqueue is deferred for it. Idempotent; nil-Store safe.
+func (s *Store) MarkSweepEntry(nzbID string) {
+	if s == nil || nzbID == "" {
+		return
+	}
+	s.sweepEntries.Store(nzbID, struct{}{})
+}
+
+// ClearSweepEntry removes nzbID from the sweep set once its probe finishes.
+// Idempotent; nil-Store safe.
+func (s *Store) ClearSweepEntry(nzbID string) {
+	if s == nil || nzbID == "" {
+		return
+	}
+	s.sweepEntries.Delete(nzbID)
+}
+
+// IsEntrySweepActive reports whether nzbID is currently under a sweep probe.
+// nil-Store safe (returns false).
+func (s *Store) IsEntrySweepActive(nzbID string) bool {
+	if s == nil || nzbID == "" {
+		return false
+	}
+	_, ok := s.sweepEntries.Load(nzbID)
+	return ok
+}
+
 // Handle binds a Store to one nzbID, for the common case of a reader/sweep
 // working against a single NZB. Every method is nil-receiver safe so a
 // caller can hold a possibly-nil *Handle (overlay disabled) without an extra
@@ -254,6 +292,15 @@ func (h *Handle) NzbID() string {
 		return ""
 	}
 	return h.nzbID
+}
+
+// IsSweepActive reports whether this entry is currently under a sweep probe.
+// nil-Handle safe (returns false).
+func (h *Handle) IsSweepActive() bool {
+	if h == nil {
+		return false
+	}
+	return h.store.IsEntrySweepActive(h.nzbID)
 }
 
 func (h *Handle) PatchBytes(file string, segIndex int) ([]byte, bool) {

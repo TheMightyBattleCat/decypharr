@@ -88,13 +88,12 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 
-	// Suppress the padding path's automatic urgent-lane PAR2 enqueues for the
-	// duration of the sweep - they'd only contend with the sweep's own
-	// NNTP probing for provider bandwidth. defer covers every exit path
-	// (completion, StopSchedule truncation, cancellation, panic). The sweep's
-	// own escalation still queues PAR2 passes explicitly (EnqueueUrgent).
-	r.manager.par2Repair.SetSweepActive(true)
-	defer r.manager.par2Repair.SetSweepActive(false)
+	// Padding suppression and PAR2 auto-enqueue deferral are now scoped
+	// per-entry: probeEntry marks each entry in the overlay's sweep set around
+	// its own ffprobe probe and clears it after, so playback of every entry
+	// not currently being probed keeps full padding + PAR2 protection while
+	// the sweep runs. The sweep's own escalation still queues PAR2 passes
+	// explicitly (EnqueueUrgent), which bypasses the per-entry gate.
 
 	ctx = r.attachFFProbeChecker(ctx, log)
 	ctx = contextWithSampleBudget(ctx, newSweepSampleBudget(stickyFailedSampleBudget))
@@ -357,6 +356,33 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 			return nil, false
 		}
 		c.item = item
+	}
+
+	// Mark every nzbID backing this entry as under a sweep probe for the
+	// duration of probeEntry. While marked, the fetcher refuses to pad the
+	// entry's dead segments (the real 430 propagates so this run's ffprobe
+	// sees the corruption and the sweep re-grabs it) and PAR2 auto-enqueue is
+	// deferred for it. Scoped to just this entry: playback of every other
+	// entry keeps full padding + PAR2 protection while the sweep runs. A
+	// season pack whose files were individually re-grabbed can span more than
+	// one InfoHash, so mark each distinct one.
+	if u := r.manager.usenet; u != nil {
+		seen := make(map[string]struct{}, len(c.item.Files))
+		for _, f := range c.item.Files {
+			if f == nil || f.InfoHash == "" {
+				continue
+			}
+			if _, ok := seen[f.InfoHash]; ok {
+				continue
+			}
+			seen[f.InfoHash] = struct{}{}
+			u.OverlayMarkSweepEntry(f.InfoHash)
+		}
+		defer func() {
+			for h := range seen {
+				u.OverlayClearSweepEntry(h)
+			}
+		}()
 	}
 
 	h, _ := s.GetEntryHealth(c.name)

@@ -258,27 +258,9 @@ type Par2Repair struct {
 	runningMu sync.Mutex
 	running   map[string]*runningJob
 
-	// sweepActive is set while a repair sweep is running (see
-	// Repair.executeSweep). While set, AutoEnqueue - the automatic
-	// padding-path trigger - defers rather than spending urgent-lane NNTP
-	// bandwidth that would contend with the sweep's own probing. Explicit
-	// actions (RunNow, batch Enqueue, the sweep's own EnqueueUrgent) are
-	// unaffected.
-	sweepActive atomic.Bool
-
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-}
-
-// SetSweepActive records whether a repair sweep is currently running. Called
-// by Repair.executeSweep at sweep start (true) and, via defer, at every exit
-// path (false). Nil-safe.
-func (p *Par2Repair) SetSweepActive(active bool) {
-	if p == nil {
-		return
-	}
-	p.sweepActive.Store(active)
 }
 
 // Progress returns nzbID's live (or most recently finished) PAR2 repair job
@@ -403,14 +385,15 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 			return
 		}
 	}
-	// A repair sweep is bandwidth-heavy background work already probing the
-	// whole entry set over NNTP. An urgent PAR2 pass kicked off by the
-	// padding path right now would just contend with it for provider
+	// This entry is currently under an ffprobe sweep probe, which is already
+	// pulling its articles over NNTP. An urgent PAR2 pass kicked off by the
+	// padding path right now would just contend with that probe for provider
 	// connections, so defer - the sweep's own escalation path (or a later
-	// playback read) will re-trigger this once the sweep is done. Explicit
-	// user actions (RunNow, batch Enqueue) bypass this: they don't route
-	// through AutoEnqueue.
-	if p.sweepActive.Load() {
+	// playback read) will re-trigger this once the probe clears the entry.
+	// Scoped per-entry: an entry not under probe still auto-enqueues normally
+	// even mid-sweep. Explicit user actions (RunNow, batch Enqueue) bypass
+	// this: they don't route through AutoEnqueue.
+	if p.manager.usenet != nil && p.manager.usenet.OverlayIsEntrySweepActive(nzbID) {
 		p.logger.Debug().Str("entry", nzbID).Msg("par2 auto-enqueue deferred: sweep active")
 		return
 	}

@@ -837,6 +837,33 @@ func (u *Usenet) OverlayMarkRejected(nzoID string) {
 	u.overlay.MarkRejected(nzoID)
 }
 
+// OverlayMarkSweepEntry / OverlayClearSweepEntry / OverlayIsEntrySweepActive
+// expose the overlay store's per-entry sweep set. While an entry is marked,
+// the fetcher refuses to pad its dead segments (the real 430 propagates so
+// ffprobe sees the corruption) and PAR2 auto-enqueue is deferred for it. The
+// repair sweep marks each entry around its ffprobe probe and clears it after.
+// No-ops / false if the overlay store is unavailable.
+func (u *Usenet) OverlayMarkSweepEntry(nzoID string) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.MarkSweepEntry(nzoID)
+}
+
+func (u *Usenet) OverlayClearSweepEntry(nzoID string) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.ClearSweepEntry(nzoID)
+}
+
+func (u *Usenet) OverlayIsEntrySweepActive(nzoID string) bool {
+	if u.overlay == nil {
+		return false
+	}
+	return u.overlay.IsEntrySweepActive(nzoID)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.

@@ -3,9 +3,13 @@ package manager
 import (
 	"testing"
 
+	"github.com/rs/zerolog"
+
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
 // newTestPar2Repair builds a minimal, storage-backed Par2Repair + Repair
@@ -146,27 +150,44 @@ func TestPar2RepairAutoEnqueueUsesTheUrgentLane(t *testing.T) {
 	}
 }
 
-// TestPar2RepairAutoEnqueueDeferredWhileSweepActive proves the sweep gate:
-// while SetSweepActive(true) is in effect, AutoEnqueue (the automatic
-// padding-path trigger) neither queues nor claims the registry, so an
+// TestPar2RepairAutoEnqueueDeferredWhileSweepActive proves the per-entry
+// sweep gate: while nzb1 is marked in the overlay's sweep set (probeEntry
+// does this around its ffprobe probe), AutoEnqueue (the automatic
+// padding-path trigger) neither queues nor claims the registry for it, so an
 // urgent PAR2 pass doesn't contend with the sweep's own NNTP probing.
-// Clearing the flag restores normal behaviour, and explicit EnqueueUrgent
-// calls (the sweep's own escalation path) are never gated.
+// Clearing the entry restores normal behaviour, an entry NOT under probe is
+// unaffected even while another entry is, and explicit EnqueueUrgent calls
+// (the sweep's own escalation path) are never gated.
 func TestPar2RepairAutoEnqueueDeferredWhileSweepActive(t *testing.T) {
 	p, repair := newTestPar2Repair(t)
+
+	// This test needs the overlay-backed sweep set that AutoEnqueue's
+	// per-entry gate consults; the bare helper leaves usenet nil.
+	overlayStore, err := overlay.NewStore(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("overlay.NewStore: %v", err)
+	}
+	p.manager.usenet = usenet.NewWithOverlayForTest(overlayStore)
 
 	cfg := config.Get()
 	enabled := true
 	cfg.Repair.Par2Repair = &enabled
 	cfg.Repair.Par2RepairMode = config.Par2RepairModeAutoAll
 
-	p.SetSweepActive(true)
+	p.manager.usenet.OverlayMarkSweepEntry("nzb1")
 	p.AutoEnqueue("nzb1", 5)
 	if p.handledByUrgent("nzb1") {
-		t.Fatalf("AutoEnqueue must defer while a sweep is active, not claim the urgent lane")
+		t.Fatalf("AutoEnqueue must defer while nzb1 is under a sweep probe, not claim the urgent lane")
 	}
 	if _, _, exists := repair.handlers.State("nzb1"); exists {
-		t.Fatalf("AutoEnqueue claimed the handler registry while a sweep is active - the gate must be a clean no-op")
+		t.Fatalf("AutoEnqueue claimed the handler registry while nzb1 is under a sweep probe - the gate must be a clean no-op")
+	}
+
+	// An entry not currently under a sweep probe still auto-enqueues normally,
+	// even while nzb1 is.
+	p.AutoEnqueue("nzb3", 5)
+	if !p.handledByUrgent("nzb3") {
+		t.Fatalf("AutoEnqueue must still route nzb3 to the urgent lane - it is not under a sweep probe")
 	}
 
 	// An explicit EnqueueUrgent (the sweep's own escalation) is never gated.
@@ -175,11 +196,12 @@ func TestPar2RepairAutoEnqueueDeferredWhileSweepActive(t *testing.T) {
 		t.Fatalf("EnqueueUrgent must bypass the sweep gate - it's an explicit action")
 	}
 
-	// Once the sweep ends, AutoEnqueue resumes routing to the urgent lane.
-	p.SetSweepActive(false)
+	// Once the probe clears the entry, AutoEnqueue resumes routing to the
+	// urgent lane.
+	p.manager.usenet.OverlayClearSweepEntry("nzb1")
 	p.AutoEnqueue("nzb1", 5)
 	if !p.handledByUrgent("nzb1") {
-		t.Fatalf("AutoEnqueue must route to the urgent lane again once the sweep is done")
+		t.Fatalf("AutoEnqueue must route to the urgent lane again once the sweep probe clears nzb1")
 	}
 }
 

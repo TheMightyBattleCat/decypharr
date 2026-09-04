@@ -314,7 +314,18 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// can never look healthy by way of the padding that makes it
 		// playable.
 		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) && !paddingDisabled(ctx) {
-			if sf.handleConfirmedMissing(ctx, segIdx, messageID) {
+			// An entry under a sweep probe is treated exactly like a
+			// verification read: no padding, so the real 430 propagates up,
+			// ffprobe sees the corruption and the sweep re-grabs. Scoped to
+			// this one entry - every other entry keeps full padding here.
+			if sf.config.Overlay.IsSweepActive() {
+				sf.logger.Debug().
+					Str("component", "fetcher").
+					Str("entry", sf.config.Overlay.NzbID()).
+					Str("file", sf.config.OverlayFile).
+					Int("segment", segIdx).
+					Msg("segment not padded: entry under sweep probe")
+			} else if sf.handleConfirmedMissing(ctx, segIdx, messageID) {
 				sf.stats.Downloads.Add(1)
 				return nil
 			}
