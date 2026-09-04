@@ -135,7 +135,11 @@ func newFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger) *ffpr
 	if !cfg.Repair.FFProbeCheck {
 		return nil
 	}
-	return buildFFProbeChecker(cfg, m, log)
+	// The sweep reads over Usenet under whatever I/O contention the rest of
+	// the repair run and live playback are creating, so it gets double the
+	// import gate's default budget before a slow cold read is treated as
+	// merely inconclusive.
+	return buildFFProbeChecker(cfg, m, log, 2*ffprobeDefaultTimeout)
 }
 
 // newImportFFProbeChecker builds a checker for the import-time gate
@@ -150,7 +154,7 @@ func newImportFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger)
 	if !cfg.Repair.FFProbeOnImport {
 		return nil
 	}
-	return buildFFProbeChecker(cfg, m, log)
+	return buildFFProbeChecker(cfg, m, log, ffprobeDefaultTimeout)
 }
 
 // buildFFProbeChecker does the binary/WebDAV/auth/timeout resolution shared
@@ -158,7 +162,13 @@ func newImportFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger)
 // exactly one WARN) when ffprobe can't actually be used: binary missing, or
 // WebDAV disabled. Callers must treat nil as "proceed without validation"
 // rather than failing whatever they're doing.
-func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger) *ffprobeChecker {
+//
+// defaultTimeout is the per-caller floor used when repair.ffprobe_timeout
+// isn't set - the sweep and import gate pass different values (see their
+// call sites) so the sweep can tolerate slower cold reads under repair/
+// playback I/O contention without also loosening the import gate. An
+// explicit repair.ffprobe_timeout in config always overrides either default.
+func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger, defaultTimeout time.Duration) *ffprobeChecker {
 	binPath := strings.TrimSpace(cfg.Repair.FFProbePath)
 	if binPath == "" {
 		binPath = "ffprobe"
@@ -173,7 +183,7 @@ func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger) *ff
 		return nil
 	}
 
-	timeout := ffprobeDefaultTimeout
+	timeout := defaultTimeout
 	if raw := strings.TrimSpace(cfg.Repair.FFProbeTimeout); raw != "" {
 		if d, err := utils.ParseDuration(raw); err == nil && d > 0 {
 			timeout = d
