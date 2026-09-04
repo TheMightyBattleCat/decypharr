@@ -320,6 +320,15 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 		}
 
+		// The above branch was skipped because this is a verification read
+		// observing a genuine confirmed-dead segment - the case that was
+		// previously invisible in logs (see the "verification read" comment
+		// above). DEBUG, not INFO: the sweep's own ffprobe-failure log
+		// already captures the downstream effect at INFO.
+		if paddingDisabled(ctx) && nntp.IsArticleNotFoundError(err) {
+			sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Msg("segment dead during verification read")
+		}
+
 		sf.cache.MarkFailed(segIdx, err)
 		return err
 	}
