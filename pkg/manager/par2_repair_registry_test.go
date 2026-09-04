@@ -146,6 +146,43 @@ func TestPar2RepairAutoEnqueueUsesTheUrgentLane(t *testing.T) {
 	}
 }
 
+// TestPar2RepairAutoEnqueueDeferredWhileSweepActive proves the sweep gate:
+// while SetSweepActive(true) is in effect, AutoEnqueue (the automatic
+// padding-path trigger) neither queues nor claims the registry, so an
+// urgent PAR2 pass doesn't contend with the sweep's own NNTP probing.
+// Clearing the flag restores normal behaviour, and explicit EnqueueUrgent
+// calls (the sweep's own escalation path) are never gated.
+func TestPar2RepairAutoEnqueueDeferredWhileSweepActive(t *testing.T) {
+	p, repair := newTestPar2Repair(t)
+
+	cfg := config.Get()
+	enabled := true
+	cfg.Repair.Par2Repair = &enabled
+	cfg.Repair.Par2RepairMode = config.Par2RepairModeAutoAll
+
+	p.SetSweepActive(true)
+	p.AutoEnqueue("nzb1", 5)
+	if p.handledByUrgent("nzb1") {
+		t.Fatalf("AutoEnqueue must defer while a sweep is active, not claim the urgent lane")
+	}
+	if _, _, exists := repair.handlers.State("nzb1"); exists {
+		t.Fatalf("AutoEnqueue claimed the handler registry while a sweep is active - the gate must be a clean no-op")
+	}
+
+	// An explicit EnqueueUrgent (the sweep's own escalation) is never gated.
+	p.EnqueueUrgent("nzb2", 0)
+	if !p.handledByUrgent("nzb2") {
+		t.Fatalf("EnqueueUrgent must bypass the sweep gate - it's an explicit action")
+	}
+
+	// Once the sweep ends, AutoEnqueue resumes routing to the urgent lane.
+	p.SetSweepActive(false)
+	p.AutoEnqueue("nzb1", 5)
+	if !p.handledByUrgent("nzb1") {
+		t.Fatalf("AutoEnqueue must route to the urgent lane again once the sweep is done")
+	}
+}
+
 // TestPar2RepairEnqueueSkippedWhenPersistedTerminal proves Enqueue never
 // queues (and never claims the registry) for an entry storage already
 // records as terminal - par2ShouldAutoEnqueue's existing durable gate, which

@@ -87,6 +87,15 @@ type fileResult struct {
 func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts RepairRunOptions, stopState *repairStopState) {
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
+
+	// Suppress the padding path's automatic urgent-lane PAR2 enqueues for the
+	// duration of the sweep - they'd only contend with the sweep's own
+	// NNTP probing for provider bandwidth. defer covers every exit path
+	// (completion, StopSchedule truncation, cancellation, panic). The sweep's
+	// own escalation still queues PAR2 passes explicitly (EnqueueUrgent).
+	r.manager.par2Repair.SetSweepActive(true)
+	defer r.manager.par2Repair.SetSweepActive(false)
+
 	ctx = r.attachFFProbeChecker(ctx, log)
 	ctx = contextWithSampleBudget(ctx, newSweepSampleBudget(stickyFailedSampleBudget))
 
