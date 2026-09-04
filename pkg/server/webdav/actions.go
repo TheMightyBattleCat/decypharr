@@ -75,7 +75,15 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 		// ffprobe/verification read: never let a confirmed-dead segment be
 		// papered over by padding or a PAR2 patch - the real NNTP failure
 		// must surface so a broken grab can't pass validation.
-		r = r.WithContext(manager.ContextForVerificationRead(r.Context()))
+		ctx := manager.ContextForVerificationRead(r.Context())
+		// Bridge the probe caller's dead-segment latch (registered by
+		// repair_sweep.probeFile / downloader.ffprobeImportGate) onto the
+		// context the fetcher sees, so a 430 that lands outside ffprobe's
+		// sampling windows still forces a broken verdict.
+		if sig := manager.DeadSignalForVerificationRead(info.InfoHash(), info.Name()); sig != nil {
+			ctx = manager.ContextWithDeadSignal(ctx, sig)
+		}
+		r = r.WithContext(ctx)
 	}
 	etag := fmt.Sprintf("\"%x-%x\"", info.ModTime().Unix(), info.Size())
 	w.Header().Set("ETag", etag)

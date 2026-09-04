@@ -319,6 +319,12 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			// ffprobe sees the corruption and the sweep re-grabs. Scoped to
 			// this one entry - every other entry keeps full padding here.
 			if sf.config.Overlay.IsSweepActive() {
+				// Mechanism A: latch the entry's sweep deadSeen flag so this
+				// run's probeFile can short-circuit to a broken verdict
+				// without waiting on (or being fooled by) ffprobe. This branch
+				// is the playback-read path - a viewer hitting the same dead
+				// article while the sweep probes the entry.
+				sf.config.Overlay.MarkSweepDead()
 				sf.logger.Debug().
 					Str("component", "fetcher").
 					Str("entry", sf.config.Overlay.NzbID()).
@@ -338,6 +344,16 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// already captures the downstream effect at INFO.
 		if paddingDisabled(ctx) && nntp.IsArticleNotFoundError(err) {
 			sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Msg("segment dead during verification read")
+			// Mechanism B: trip the dead-segment signal the ffprobe checker
+			// attached to this read's context (via the WebDAV handler), so it
+			// can override an otherwise-healthy ffprobe verdict to broken.
+			if sig := DeadSignalFromContext(ctx); sig != nil {
+				sig.Trip()
+			}
+			// Mechanism A belt-and-suspenders: if this verification read is
+			// itself the sweep probe, latch the entry's deadSeen flag too -
+			// covers the case where ffprobe's own read hit the dead range.
+			sf.config.Overlay.MarkSweepDead()
 		}
 
 		sf.cache.MarkFailed(segIdx, err)

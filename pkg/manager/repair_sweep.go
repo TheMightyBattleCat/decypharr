@@ -569,10 +569,39 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 
 	if res.healthy {
 		if checker := ffprobeCheckerFromContext(ctx); checker != nil {
-			if ok, reason := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode); !ok {
+			u := r.manager.usenet
+			// Mechanism A (pre-ffprobe): a 430 already surfaced for this entry
+			// during the sweep window - a concurrent playback read hit a dead
+			// article. The file is broken; don't spend the sweep's NNTP
+			// bandwidth pulling known-dead articles through ffprobe just to
+			// reach the same verdict.
+			if u != nil && u.OverlayIsSweepDead(res.infoHash) {
+				r.logger.Warn().Str("entry", c.name).Str("file", name).
+					Msg("Repair: dead segments detected during sweep probe; skipping ffprobe")
+				res.healthy = false
+				res.broken = true
+				res.reason = "sweep_dead_segment"
+				return res
+			}
+
+			sig := NewDeadSegmentSignal()
+			registerDeadSignal(res.infoHash, name, sig)
+			ok, reason := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode, sig)
+			unregisterDeadSignal(res.infoHash, name, sig)
+
+			if !ok {
 				res.healthy = false
 				res.broken = true
 				res.reason = reason
+			} else if u != nil && u.OverlayIsSweepDead(res.infoHash) {
+				// Mechanism A (post-ffprobe): ffprobe's sampling windows
+				// missed the damage, but a 430 was confirmed for this entry
+				// while the probe ran. Override the healthy verdict.
+				r.logger.Warn().Str("entry", c.name).Str("file", name).
+					Msg("Repair: ffprobe passed but dead segments confirmed during probe; overriding to broken")
+				res.healthy = false
+				res.broken = true
+				res.reason = "sweep_dead_segment_ffprobe_override"
 			}
 		}
 	} else if res.broken {

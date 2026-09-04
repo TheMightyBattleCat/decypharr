@@ -353,6 +353,52 @@ func burstNoFill(ctx context.Context) bool {
 	return v
 }
 
+// DeadSegmentSignal is a one-way latch a verification read carries on its
+// context. When SegmentFetcher.doFetch observes a confirmed-dead (NNTP 430)
+// segment on a padding-disabled read it trips the signal, so the ffprobe
+// checker that spawned the read (over the in-process WebDAV endpoint) can tell
+// after the fact that the assembly is genuinely damaged - even when ffprobe's
+// own sampling windows happened to miss the dead byte range and reported the
+// file healthy. Goroutine-safe; safe to call every method on a nil receiver.
+type DeadSegmentSignal struct {
+	detected atomic.Bool
+}
+
+// NewDeadSegmentSignal returns a fresh, untripped signal.
+func NewDeadSegmentSignal() *DeadSegmentSignal { return &DeadSegmentSignal{} }
+
+// Trip latches the signal. No-op on a nil receiver.
+func (s *DeadSegmentSignal) Trip() {
+	if s != nil {
+		s.detected.Store(true)
+	}
+}
+
+// Detected reports whether Trip was ever called. False on a nil receiver.
+func (s *DeadSegmentSignal) Detected() bool {
+	return s != nil && s.detected.Load()
+}
+
+// deadSignalCtxKey marks a context as carrying a *DeadSegmentSignal.
+type deadSignalCtxKey struct{}
+
+// ContextWithDeadSignal attaches sig to ctx so SegmentFetcher.doFetch can trip
+// it when a confirmed-dead segment surfaces on this (verification) read.
+// Returns ctx unchanged when sig is nil.
+func ContextWithDeadSignal(ctx context.Context, sig *DeadSegmentSignal) context.Context {
+	if sig == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, deadSignalCtxKey{}, sig)
+}
+
+// DeadSignalFromContext returns the signal attached by ContextWithDeadSignal,
+// or nil if none is present.
+func DeadSignalFromContext(ctx context.Context) *DeadSegmentSignal {
+	sig, _ := ctx.Value(deadSignalCtxKey{}).(*DeadSegmentSignal)
+	return sig
+}
+
 // PrefetchableReaderAt extends io.ReaderAt with prefetch capability.
 // This allows callers to trigger segment downloads before starting reads.
 type PrefetchableReaderAt interface {

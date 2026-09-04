@@ -128,7 +128,21 @@ type Store struct {
 	// bandwidth for the probe. Scoped per-entry so playback of every other
 	// entry keeps full padding + PAR2 protection. In-memory only; cleared on
 	// restart, which is correct because a restart also ends any sweep.
-	sweepEntries sync.Map // map[string]struct{}, keyed by nzbID
+	//
+	// The value is a *sweepEntry carrying a deadSeen latch: any 430 observed
+	// for the entry while it's under the probe (a concurrent playback read, or
+	// the probe's own verification read) sets it, so the repair sweep's
+	// probeFile can short-circuit straight to a broken verdict instead of
+	// waiting for ffprobe - whose sampling windows can miss the damaged range
+	// entirely.
+	sweepEntries sync.Map // map[string]*sweepEntry, keyed by nzbID
+}
+
+// sweepEntry is the per-nzbID value in Store.sweepEntries. deadSeen is a
+// one-way latch (never cleared while the entry stays in the set); the entry is
+// removed wholesale by ClearSweepEntry when the probe finishes.
+type sweepEntry struct {
+	deadSeen atomic.Bool
 }
 
 // NewStore creates (if needed) the overlay root directory and returns a Store
@@ -247,7 +261,9 @@ func (s *Store) MarkSweepEntry(nzbID string) {
 	if s == nil || nzbID == "" {
 		return
 	}
-	s.sweepEntries.Store(nzbID, struct{}{})
+	// LoadOrStore so a repeat mark for an already-tracked entry keeps the
+	// existing *sweepEntry (and any deadSeen latch already set on it).
+	s.sweepEntries.LoadOrStore(nzbID, &sweepEntry{})
 }
 
 // ClearSweepEntry removes nzbID from the sweep set once its probe finishes.
@@ -267,6 +283,30 @@ func (s *Store) IsEntrySweepActive(nzbID string) bool {
 	}
 	_, ok := s.sweepEntries.Load(nzbID)
 	return ok
+}
+
+// MarkSweepDead latches the deadSeen flag for nzbID's sweep entry, recording
+// that a confirmed-dead (NNTP 430) segment was observed for it while it's
+// under a probe. No-op if nzbID isn't currently sweep-active. nil-Store safe.
+func (s *Store) MarkSweepDead(nzbID string) {
+	if s == nil || nzbID == "" {
+		return
+	}
+	if v, ok := s.sweepEntries.Load(nzbID); ok {
+		v.(*sweepEntry).deadSeen.Store(true)
+	}
+}
+
+// IsEntrySweepDead reports whether MarkSweepDead has been called for nzbID's
+// current sweep entry. False if nzbID isn't sweep-active. nil-Store safe.
+func (s *Store) IsEntrySweepDead(nzbID string) bool {
+	if s == nil || nzbID == "" {
+		return false
+	}
+	if v, ok := s.sweepEntries.Load(nzbID); ok {
+		return v.(*sweepEntry).deadSeen.Load()
+	}
+	return false
 }
 
 // Handle binds a Store to one nzbID, for the common case of a reader/sweep
@@ -301,6 +341,25 @@ func (h *Handle) IsSweepActive() bool {
 		return false
 	}
 	return h.store.IsEntrySweepActive(h.nzbID)
+}
+
+// MarkSweepDead records that a confirmed-dead segment was observed for this
+// entry while it's under a sweep probe. No-op if the entry isn't sweep-active.
+// nil-Handle safe.
+func (h *Handle) MarkSweepDead() {
+	if h == nil {
+		return
+	}
+	h.store.MarkSweepDead(h.nzbID)
+}
+
+// IsSweepDead reports whether MarkSweepDead has been called for this entry's
+// current sweep probe. nil-Handle safe (returns false).
+func (h *Handle) IsSweepDead() bool {
+	if h == nil {
+		return false
+	}
+	return h.store.IsEntrySweepDead(h.nzbID)
 }
 
 func (h *Handle) PatchBytes(file string, segIndex int) ([]byte, bool) {

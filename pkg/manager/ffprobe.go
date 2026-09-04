@@ -501,8 +501,21 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // waiting out ffprobeRetryDelay. Decode-error and timeout/inconclusive
 // failures still get the retry (a single decode window can glitch
 // transiently).
-func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string) {
+//
+// deadSignal, when non-nil, is the caller's dead-segment latch for this read
+// (see deadSignalRegistry): if the fetcher observed a confirmed-dead (NNTP
+// 430) segment while serving the probe - even one ffprobe's own sampling
+// windows missed - the verdict is forced to broken with no retry. A retry
+// would only pull the same dead article again.
+func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal) (ok bool, reason string) {
+	const deadSegmentReason = "dead_segment_detected: NNTP 430 during verification read"
+
 	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
+	if deadSignal.Detected() {
+		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
+			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification read; forcing broken verdict")
+		return false, deadSegmentReason
+	}
 	if ok {
 		return true, ""
 	}
@@ -520,6 +533,11 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 
 	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Bool("ok", ok).Str("reason", reason).Msg("Repair: ffprobe retry result")
+	if deadSignal.Detected() {
+		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
+			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification retry; forcing broken verdict")
+		return false, deadSegmentReason
+	}
 	if ok {
 		return true, ""
 	}

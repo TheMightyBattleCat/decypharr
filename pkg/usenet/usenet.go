@@ -864,6 +864,26 @@ func (u *Usenet) OverlayIsEntrySweepActive(nzoID string) bool {
 	return u.overlay.IsEntrySweepActive(nzoID)
 }
 
+// OverlayMarkSweepDead / OverlayIsSweepDead expose the per-entry deadSeen latch
+// on the overlay's sweep set. The fetcher latches it when any confirmed-dead
+// (430) segment surfaces for an entry that's currently under a probe; the
+// repair sweep's probeFile reads it to short-circuit straight to a broken
+// verdict rather than waiting on ffprobe. No-op / false if the overlay store
+// is unavailable or the entry isn't sweep-active.
+func (u *Usenet) OverlayMarkSweepDead(nzoID string) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.MarkSweepDead(nzoID)
+}
+
+func (u *Usenet) OverlayIsSweepDead(nzoID string) bool {
+	if u.overlay == nil {
+		return false
+	}
+	return u.overlay.IsEntrySweepDead(nzoID)
+}
+
 // SetOverlayRepairEnqueuer installs the callback invoked whenever the reader
 // pads a segment, so the manager-level PAR2 repair worker (pkg/manager) can
 // be notified without the overlay/reader packages needing to know it exists.
@@ -1417,6 +1437,21 @@ func (u *Usenet) ClearFailedEntry(nzoID string) {
 // it playable during real playback.
 func ContextForVerificationRead(ctx context.Context) context.Context {
 	return reader.ContextWithoutPadding(ctx)
+}
+
+// DeadSegmentSignal is a one-way latch a verification read carries so the
+// ffprobe checker that spawned it can tell, after the fact, whether the
+// fetcher ever observed a confirmed-dead (430) segment - see
+// reader.DeadSegmentSignal.
+type DeadSegmentSignal = reader.DeadSegmentSignal
+
+// NewDeadSegmentSignal returns a fresh, untripped signal.
+func NewDeadSegmentSignal() *DeadSegmentSignal { return reader.NewDeadSegmentSignal() }
+
+// ContextWithDeadSignal attaches sig to ctx so the segment fetcher trips it on
+// a confirmed-dead segment during this read - see reader.ContextWithDeadSignal.
+func ContextWithDeadSignal(ctx context.Context, sig *DeadSegmentSignal) context.Context {
+	return reader.ContextWithDeadSignal(ctx, sig)
 }
 
 // IsVerificationRead reports whether ctx was marked by ContextForVerificationRead.
