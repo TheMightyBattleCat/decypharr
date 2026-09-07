@@ -1622,14 +1622,17 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 
 	// Posted files MatchFiles couldn't attempt this pass because breaking
 	// their length tie (or the residual MD5-16k pass) needed real bytes it
-	// failed to fetch/hash. Their absence from `matches` is TRANSIENT, not
-	// structural - a "no PAR2 coverage for this file" failure below that is
-	// traceable to one of these must not be classified terminal. Keyed by
-	// posted-file name (what downstream errors can name).
-	transientUnmatch := make(map[string]bool, len(skipped))
+	// failed to fetch/hash. Their absence from `matches` is usually
+	// TRANSIENT, not structural - a "no PAR2 coverage for this file" failure
+	// below traceable to one of these must not be classified terminal.
+	// Keyed by posted-file name (what downstream errors can name); the
+	// stored value is the fetch error, so classifyMiss can tell a genuinely
+	// permanent miss (a hard 430 confirmed across every provider) from a
+	// retryable one (a timeout or short read).
+	transientUnmatch := make(map[string]error, len(skipped))
 	for _, s := range skipped {
 		name := nzb.Par2Source[s.PostedIndex].Name
-		transientUnmatch[name] = true
+		transientUnmatch[name] = s.Err
 		p.logger.Warn().Err(s.Err).Str("entry", entryName).Str("file", name).
 			Msg("par2 repair: posted-file match skipped this pass (transient fetch/hash failure) - file has no PAR2 coverage until retry")
 	}
@@ -1673,7 +1676,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			if ps.Size != fd.Length && ps.Name != fd.Name {
 				continue
 			}
-			if transientUnmatch[ps.Name] {
+			if skipErr, ok := transientUnmatch[ps.Name]; ok {
+				if nntp.IsArticleNotFoundError(skipErr) {
+					return fmt.Sprintf("posted file %q: backing article confirmed missing across all providers", ps.Name), true
+				}
 				return fmt.Sprintf("posted file %q failed to fetch/hash during matching", ps.Name), false
 			}
 			return fmt.Sprintf("posted file %q retained but unmatched (length/tie)", ps.Name), false
@@ -1710,7 +1716,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		for _, seg := range segs {
 			rng, ok := msgIDRange[seg.MessageID]
 			if !ok {
-				if pn, isPosted := msgIDToPosted[seg.MessageID]; isPosted && transientUnmatch[pn] {
+				pn, isPosted := msgIDToPosted[seg.MessageID]
+				if _, transient := transientUnmatch[pn]; isPosted && transient {
 					return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file (transient: posted file %q failed to fetch/hash during matching)", seg.MessageID, file, pn)
 				}
 				return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file)
