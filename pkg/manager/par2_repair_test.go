@@ -500,49 +500,46 @@ func TestExtractPostedRangeOnSecondFileUsesCorrectBase(t *testing.T) {
 	}
 }
 
-func TestFirstUncoveredIntactSliceAllCovered(t *testing.T) {
+func TestUncoveredIntactFilesAllCovered(t *testing.T) {
 	// fileA: 250B -> slices 0,1,2. fileB: 150B -> slices 3,4.
 	idx, fileA, fileB := buildTestIndex(t, 100, 250, 150)
 	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil, fileB: nil}
 
-	_, _, uncovered, err := firstUncoveredIntactSlice(idx, nil, fetchers)
+	uncov, err := uncoveredIntactFiles(idx, nil, fetchers)
 	if err != nil {
-		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+		t.Fatalf("uncoveredIntactFiles: %v", err)
 	}
-	if uncovered {
-		t.Fatalf("uncovered = true, want false - every file has a fetcher")
+	if len(uncov) != 0 {
+		t.Fatalf("uncovered = %d files, want 0 - every file has a fetcher", len(uncov))
 	}
 }
 
-func TestFirstUncoveredIntactSliceReportsMissingFile(t *testing.T) {
+func TestUncoveredIntactFilesReportsMissingFile(t *testing.T) {
 	idx, fileA, fileB := buildTestIndex(t, 100, 250, 150)
 	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil} // fileB missing
 
-	gotFileID, nFiles, uncovered, err := firstUncoveredIntactSlice(idx, nil, fetchers)
+	uncov, err := uncoveredIntactFiles(idx, nil, fetchers)
 	if err != nil {
-		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+		t.Fatalf("uncoveredIntactFiles: %v", err)
 	}
-	if !uncovered || gotFileID != fileB {
-		t.Fatalf("got (%x, uncovered=%v), want (fileB %x, true)", gotFileID, uncovered, fileB)
-	}
-	if nFiles != 1 {
-		t.Errorf("uncoveredFiles = %d, want 1", nFiles)
+	if len(uncov) != 1 || uncov[0] != fileB {
+		t.Fatalf("got %x, want [fileB %x]", uncov, fileB)
 	}
 }
 
-func TestFirstUncoveredIntactSliceIgnoresDamagedOnlyFile(t *testing.T) {
+func TestUncoveredIntactFilesIgnoresDamagedOnlyFile(t *testing.T) {
 	idx, fileA, _ := buildTestIndex(t, 100, 250, 150)
 	fetchers := map[[16]byte]*postedFileFetcher{fileA: nil} // fileB missing
 
 	// fileB's slices (global 3, 4) are all damaged -> reconstructed, never
 	// read -> no fetcher needed.
 	damagedSet := map[int64]struct{}{3: {}, 4: {}}
-	_, _, uncovered, err := firstUncoveredIntactSlice(idx, damagedSet, fetchers)
+	uncov, err := uncoveredIntactFiles(idx, damagedSet, fetchers)
 	if err != nil {
-		t.Fatalf("firstUncoveredIntactSlice: %v", err)
+		t.Fatalf("uncoveredIntactFiles: %v", err)
 	}
-	if uncovered {
-		t.Fatalf("uncovered = true, want false - fileB is fully in the damaged set")
+	if len(uncov) != 0 {
+		t.Fatalf("uncovered = %d files, want 0 - fileB is fully in the damaged set", len(uncov))
 	}
 }
 

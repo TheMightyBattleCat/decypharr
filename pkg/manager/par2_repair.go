@@ -1761,17 +1761,60 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// Pre-solve fetcher-coverage check. par2.Repair's streaming pass reads
 	// every non-damaged slice through jobSliceSource; a slice whose FileID
 	// has no fetcher only errors out when that pass reaches it - after
-	// potentially gigabytes of intact-slice reads. Verify coverage now, at
-	// zero bytes, and abort with the exact same classified error
-	// jobSliceSource.ReadSlice would have produced. Combined with
-	// MatchFiles' last-one-standing deduction, only a truly unresolvable
-	// tie reaches this abort. Mirrors par2_warm_sweep.go's coverage gate.
-	if uncoveredFileID, uncoveredFiles, uncovered, cerr := firstUncoveredIntactSlice(idx, damagedSet, fetchers); cerr != nil {
+	// potentially gigabytes of intact-slice reads. Resolve coverage now, at
+	// zero bytes. A file missing a fetcher for a STRUCTURAL reason (nothing
+	// retained could be it) aborts here with the same classified error
+	// jobSliceSource.ReadSlice would have produced. A file missing a fetcher
+	// only TRANSIENTLY (its match needed bytes that failed to fetch/hash, or
+	// an unresolved length tie) is folded into the damaged set instead: the
+	// PAR2 recovery set fully describes it, so the solver rebuilds it from
+	// parity like any other damage. Mirrors par2_warm_sweep.go's coverage
+	// gate.
+	uncov, cerr := uncoveredIntactFiles(idx, damagedSet, fetchers)
+	if cerr != nil {
 		return fmt.Errorf("pre-solve coverage check: %w", cerr)
-	} else if uncovered {
-		p.logger.Warn().Str("entry", entryName).Int("files", uncoveredFiles).
-			Msg("par2 repair: intact slices have no posted-file fetcher - aborting before solve (0 bytes read)")
-		return missingFetcherErr(uncoveredFileID, classifyMiss)
+	}
+	var folded int
+	for _, fid := range uncov {
+		reason, terminal := classifyMiss(fid)
+		if terminal {
+			p.logger.Warn().Str("entry", entryName).Int("files", len(uncov)).
+				Msg("par2 repair: intact slices have no posted-file fetcher - aborting before solve (0 bytes read)")
+			return missingFetcherErr(fid, classifyMiss)
+		}
+		// Transient miss: fold this file's slices into the damaged set so
+		// the solver reconstructs them from parity instead of aborting.
+		// Cost: one recovery slice per file slice - almost always tiny
+		// (.nfo, one dead .rar part). The round-loop recovery-cap check
+		// escalates to a genuine terminal verdict if the enlarged damage
+		// exceeds the recovery budget.
+		fd := idx.Files[fid]
+		if fd == nil {
+			return missingFetcherErr(fid, classifyMiss)
+		}
+		fs, ferr := idx.DamagedSlices(fid, 0, fd.Length)
+		if ferr != nil {
+			return fmt.Errorf("fold uncovered file %x: %w", fid, ferr)
+		}
+		for _, s := range fs {
+			if _, ok := damagedSet[s]; !ok {
+				damagedSet[s] = struct{}{}
+				folded++
+			}
+		}
+		p.logger.Info().Str("entry", entryName).Str("file", fd.Name).
+			Str("reason", reason).Int("slices", len(fs)).
+			Msg("par2 repair: folding transiently-uncovered posted file into damaged set for reconstruction")
+	}
+	if folded > 0 {
+		damaged = damaged[:0]
+		for s := range damagedSet {
+			damaged = append(damaged, s)
+		}
+		sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
+		if deadDiscovered != nil {
+			*deadDiscovered += folded
+		}
 	}
 
 	// Each round attempts the solve with the current damaged set; a hard,
@@ -2663,32 +2706,34 @@ func missingFetcherErr(fileID [16]byte, classifyMiss func(fileID [16]byte) (reas
 	return fmt.Errorf("no posted-file fetcher for file %x (transient: %s)", fileID, reason)
 }
 
-// firstUncoveredIntactSlice scans every slice par2.Repair's streaming pass
-// would read as intact - all of idx's slices except those in damagedSet -
-// and returns the FileID of the first one whose posted file has no fetcher,
-// plus the number of distinct uncovered files. ok is false when every
-// intact slice is covered. Damaged slices are excluded on purpose: the
-// solve reconstructs them, it never calls ReadSlice for them, so a file
-// with slices only in the damaged set needs no fetcher.
-func firstUncoveredIntactSlice(idx *par2.Index, damagedSet map[int64]struct{}, fetchers map[[16]byte]*postedFileFetcher) (fileID [16]byte, uncoveredFiles int, ok bool, err error) {
+// uncoveredIntactFiles scans every slice par2.Repair's streaming pass would
+// read as intact - all of idx's slices except those in damagedSet - and
+// returns the FileIDs, in first-seen order, whose posted file has no
+// fetcher. An empty result means every intact slice is covered. Damaged
+// slices are excluded on purpose: the solve reconstructs them, it never
+// calls ReadSlice for them, so a file with slices only in the damaged set
+// needs no fetcher.
+func uncoveredIntactFiles(idx *par2.Index, damagedSet map[int64]struct{}, fetchers map[[16]byte]*postedFileFetcher) ([][16]byte, error) {
 	seen := make(map[[16]byte]struct{})
+	var out [][16]byte
 	for s := int64(0); s < idx.NumSlices(); s++ {
 		if _, isDamaged := damagedSet[s]; isDamaged {
 			continue
 		}
 		fid, _, lerr := idx.SliceLocation(s)
 		if lerr != nil {
-			return [16]byte{}, 0, false, fmt.Errorf("slice %d: %w", s, lerr)
+			return nil, fmt.Errorf("slice %d: %w", s, lerr)
 		}
 		if _, has := fetchers[fid]; has {
 			continue
 		}
-		if !ok {
-			fileID, ok = fid, true
+		if _, dup := seen[fid]; dup {
+			continue
 		}
 		seen[fid] = struct{}{}
+		out = append(out, fid)
 	}
-	return fileID, len(seen), ok, nil
+	return out, nil
 }
 
 // jobSliceSource adapts per-posted-file fetchers into the single
