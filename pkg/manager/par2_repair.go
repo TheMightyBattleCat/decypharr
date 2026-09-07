@@ -1543,6 +1543,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	needed := estimateNeededSlices(pending)
+	// fetchedSlices is the name-advertised slice count of the volumes fetched
+	// so far. It's only good enough to size and report this first fetch; from
+	// here on the code measures recovery coverage by len(idx.Recovery) (the
+	// parsed reality), since a fetched-but-mis-served volume inflates this
+	// count without contributing any usable slice - see topUpParsedRecovery.
 	var fetchedSlices uint32
 	var nextVolIdx int
 	nextVolIdx, fetchedSlices, sources, _, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, needed, fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
@@ -1561,15 +1566,21 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	logSkippedPar2Packets(p.logger, entryName, idx)
 
-	// Zero recovery slices fetched - every volume 430'd (see fetchMoreVolumes'
-	// consecutive-not-found abort). The verdict is already predetermined: no
-	// recovery data means no repair. Running MatchFiles + the dead-segment
-	// mapping first would MD5-16k every posted file (~30s each while they're
-	// 430'ing too - ~9min for a 269-volume release) only to arrive at this
-	// exact terminal error. Skip straight to it. The message matches the
-	// par2TerminalSubstrings entry the solve loop's own "N damaged but only 0
-	// recovery" return uses, so par2_backoff.go classifies it terminal.
-	if fetchedSlices == 0 {
+	// No usable recovery slices - either every volume 430'd (fetchMoreVolumes'
+	// consecutive-not-found abort) or every fetched volume was unparseable
+	// (mis-served articles whose bad-MD5 packets ParseIndex now skips). Gate
+	// on the PARSED count, not the name-advertised fetchedSlices accumulator:
+	// a volume that fetched but yielded no recovery packets still bumps
+	// fetchedSlices, so `fetchedSlices == 0` would miss that case and fall
+	// through to a full MatchFiles pass before arriving at the same verdict.
+	// The verdict is already predetermined: no recovery data means no repair.
+	// Running MatchFiles + the dead-segment mapping first would MD5-16k every
+	// posted file (~30s each while they're 430'ing too - ~9min for a
+	// 269-volume release) only to arrive at this exact terminal error. Skip
+	// straight to it. The message matches the par2TerminalSubstrings entry the
+	// solve loop's own "N damaged but only 0 recovery" return uses, so
+	// par2_backoff.go classifies it terminal.
+	if len(idx.Recovery) == 0 {
 		deadCount := 0
 		for _, segs := range pending {
 			deadCount += len(segs)
@@ -1845,26 +1856,16 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", k, par2.MaxRepairSlices, available)
 		}
 
-		// Top up recovery slice DATA for the current k if needed - discovering
-		// more damage mid-pass can push k past the original name-only
-		// estimate (needed) that sized the first fetch. Picks up exactly
-		// where the last fetch left off; re-parses only when new sources
-		// were actually added.
-		if uint32(k) > fetchedSlices {
-			var added int
-			nextVolIdx, fetchedSlices, sources, added, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, uint32(k), fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
-			if err != nil {
-				return fmt.Errorf("fetch recovery volumes: %w", err)
-			}
-			progress.SetRecoveryVolsFetched(nextVolIdx)
-			progress.SetRecoverySlices(int(fetchedSlices), k)
-			if added > 0 {
-				idx, err = par2.ParseIndex(sources)
-				if err != nil {
-					return fmt.Errorf("parse PAR2 index: %w", err)
-				}
-				logSkippedPar2Packets(p.logger, entryName, idx)
-			}
+		// Top up recovery slice DATA until we hold at least k PARSED recovery
+		// slices - discovering more damage mid-pass can push k past the
+		// original name-only estimate that sized the first fetch, and a volume
+		// that fetched but was mis-served yields nothing once ParseIndex skips
+		// its bad-MD5 packets. See topUpParsedRecovery.
+		idx, nextVolIdx, sources, err = topUpParsedRecovery(
+			ctx, p.logger, fetch, vols, nextVolIdx, k, idx, sources,
+			entryName, u.ProcessingMaxConnections(), progress)
+		if err != nil {
+			return err
 		}
 		if k > len(idx.Recovery) {
 			return fmt.Errorf("%d damaged slices but only %d recovery slices fetched/available", k, len(idx.Recovery))
@@ -2259,6 +2260,65 @@ type volumeFetchResult struct {
 	count    uint32 // slice count from the par2Volume
 	err      error
 	notFound bool // true when err is article-not-found
+}
+
+// topUpParsedRecovery fetches more recovery volumes until at least `want`
+// PARSED recovery slices (len(idx.Recovery)) are held, re-parsing the index
+// after each batch that added a source.
+//
+// The measure is deliberately the parsed count, never the name-advertised
+// slice count fetchMoreVolumes accumulates: a volume can fetch successfully
+// yet contribute zero usable recovery slices once ParseIndex skips its
+// bad-MD5 packets (a mis-served article - the divergence Fix D introduced by
+// making the parser resilient instead of aborting). Gating on the advertised
+// count lets that inflated number satisfy the gate while the real recovery
+// set is still short, so the caller's "N damaged but only M recovery" wall
+// fires with fetchable volumes still on the list.
+//
+// Each call to fetchMoreVolumes resumes at nextVolIdx, so no source is
+// re-fetched. The loop stops when a pass adds no new source - the volume list
+// is exhausted, or fetchMoreVolumes' own consecutive-not-found abort tripped.
+// nextVolIdx advances by at least one whenever a source is added, so the loop
+// is bounded by len(vols). A still-short recovery set on return is not an
+// error here; the caller turns it into the terminal verdict.
+func topUpParsedRecovery(
+	ctx context.Context,
+	logger zerolog.Logger,
+	fetch articleFetchFunc,
+	vols []par2Volume,
+	nextVolIdx int,
+	want int,
+	idx *par2.Index,
+	sources []par2.Source,
+	entryName string,
+	maxConc int,
+	progress *par2JobProgressState,
+) (*par2.Index, int, []par2.Source, error) {
+	for want > len(idx.Recovery) {
+		var added int
+		var err error
+		nextVolIdx, _, sources, added, err = fetchMoreVolumes(
+			ctx, logger, fetch, vols, nextVolIdx,
+			uint32(want), uint32(len(idx.Recovery)), sources, entryName, maxConc)
+		if err != nil {
+			return idx, nextVolIdx, sources, fmt.Errorf("fetch recovery volumes: %w", err)
+		}
+		if progress != nil {
+			progress.SetRecoveryVolsFetched(nextVolIdx)
+		}
+		if added == 0 {
+			break
+		}
+		idx, err = par2.ParseIndex(sources)
+		if err != nil {
+			return idx, nextVolIdx, sources, fmt.Errorf("parse PAR2 index: %w", err)
+		}
+		logSkippedPar2Packets(logger, entryName, idx)
+		if progress != nil {
+			progress.SetRecoverySlices(len(idx.Recovery), want)
+		}
+	}
+	return idx, nextVolIdx, sources, nil
 }
 
 // computeRecoveryBatch selects the smallest prefix of vols whose cumulative
