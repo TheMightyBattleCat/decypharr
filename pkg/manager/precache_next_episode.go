@@ -89,6 +89,22 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 		return
 	}
 
+	// Season warm-up summary: one INFO line when the forward walk ends
+	// (whatever the reason - depth reached, season boundary, Arr error, or the
+	// 45-minute deadline), so the log shows how far ahead the season actually
+	// got warmed rather than just a scatter of per-episode lines.
+	var burstsRun, searchesRequested, skipped int
+	walkStart := time.Now()
+	defer func() {
+		p.logger.Info().Str("series", entry.Name).Int("season", seasonNumber).
+			Int("depthRequested", n).
+			Int("burstsRun", burstsRun).
+			Int("searchesRequested", searchesRequested).
+			Int("skipped", skipped).
+			Dur("elapsed", time.Since(walkStart)).
+			Msg("next-episode precache: forward walk complete")
+	}()
+
 	for range n {
 		if ctx.Err() != nil {
 			return
@@ -99,7 +115,8 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 			return
 		}
 		if !found {
-			p.logger.Debug().Str("series", entry.Name).Msg("next-episode precache: no next episode (season boundary)")
+			p.logger.Info().Str("series", entry.Name).Int("season", seasonNumber).Int("afterEpisode", episodeNumber).
+				Msg("next-episode precache: reached season boundary, no further episode to warm")
 			return
 		}
 		episodeNumber = next.EpisodeNumber
@@ -113,12 +130,17 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 			if err := a.SearchEpisode(ctx, next.EpisodeId); err != nil {
 				p.logger.Debug().Err(err).Str("series", entry.Name).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next-episode search failed")
 			} else {
+				searchesRequested++
 				p.logger.Info().Str("series", entry.Name).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next episode not yet grabbed; requested search")
 			}
 			return
 		}
 
-		p.precacheEpisodeFile(ctx, next)
+		if p.precacheEpisodeFile(ctx, next) {
+			burstsRun++
+		} else {
+			skipped++
+		}
 	}
 }
 
@@ -167,24 +189,27 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 // damage - cheap now, since intact slices come from the bytes just cached.
 // Records the outcome for Commit D (notifications/GUI). Best-effort: any
 // failure just means this episode isn't pre-cached, not a hard error.
-func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) {
+// Returns true only when a burst-download was actually started for this
+// file - the caller's forward-walk summary uses this to count episodes
+// genuinely warmed apart from ones skipped for pause/budget/already-done.
+func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) bool {
 	target := readSymlinkTarget(next.Path)
 	if target == "" {
 		p.logger.Debug().Str("file", next.Path).Msg("next-episode precache: next episode is not a local symlink")
-		return // not a decypharr-managed symlink (e.g. imported directly)
+		return false // not a decypharr-managed symlink (e.g. imported directly)
 	}
 	dir, filename := filepath.Split(target)
 	entryName := filepath.Clean(filepath.Base(filepath.Clean(dir)))
 
 	nextEntry, err := p.manager.GetEntryByName(entryName, filename)
 	if err != nil || nextEntry == nil || nextEntry.Protocol != config.ProtocolNZB {
-		return // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
+		return false // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
 	}
 
 	if p.keyPaused(nextEntry.InfoHash, filename) {
 		p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
 			Msg("next-episode precache skipped: paused")
-		return
+		return false
 	}
 
 	key := nextEntry.InfoHash + ":" + filename
@@ -197,17 +222,41 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	p.mu.Unlock()
 	if already {
 		p.logger.Debug().Str("key", key).Msg("next-episode precache: already triggered for this file")
-		return
+		return false
 	}
 
 	if !p.reserveBudget(next.Size) {
 		p.logger.Debug().Str("entry", nextEntry.Name).Int64("size", next.Size).Msg("next-episode pre-cache skipped: PrecacheMaxBytes budget exhausted")
-		return
+		return false
 	}
 	if !p.manager.usenet.HasBandwidthHeadroom() {
 		p.logger.Debug().Str("entry", nextEntry.Name).Msg("next-episode pre-cache deferred: no bandwidth headroom outside reserve")
 		p.releaseBudget(next.Size)
-		return
+		return false
+	}
+
+	// What does the DFS cache already hold for this file? Logged before the
+	// burst so an operator can tell a genuine cold fetch apart from a re-warm
+	// of an already-cached (or partially-evicted) file - the burst itself
+	// skips anything already cached, so "fully cached" here means the burst
+	// will be cheap re-verification, not a download.
+	if reader := p.cacheCoverageReader(); reader != nil {
+		if cached, total, _, ok := reader.CacheCoverage(nextEntry.Name, filename); ok && total > 0 {
+			switch {
+			case cached >= total:
+				p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
+					Int64("cachedBytes", cached).Int64("totalBytes", total).
+					Msg("next-episode precache: already fully cached; burst will re-verify only")
+			case cached > 0:
+				p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
+					Int64("cachedBytes", cached).Int64("totalBytes", total).
+					Float64("coverage", float64(cached)/float64(total)).
+					Msg("next-episode precache: partially cached; burst will fill the gaps")
+			default:
+				p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
+					Msg("next-episode precache: nothing cached yet; cold burst")
+			}
+		}
 	}
 
 	concurrency := p.cfg().ReadAheadConcurrency()
@@ -251,6 +300,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	if burstErr == nil && burstCtx.Err() == nil {
 		go p.maybePrecacheNextEpisodes(nextEntry, filename)
 	}
+	return true
 }
 
 // recordReadiness checks for damage the burst-download surfaced, routes it

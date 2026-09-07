@@ -2,8 +2,10 @@ package manager
 
 import (
 	"context"
+	"errors"
 
 	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
@@ -100,7 +102,18 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		}
 	}
 
-	var bytesWritten, segmentsWritten, writeFailures, readFailures, segmentsSeen int64
+	// Read failures are split three ways so the summary line distinguishes a
+	// benign "not all fetched yet" from a real dead article:
+	//   shortReads  - ReadCachedAt returned no error but fewer bytes than the
+	//                 segment's recorded size (partial fetch / near-EOF). The
+	//                 range simply isn't fully warm yet; a later pass gets it.
+	//   deadReads   - the backing article is confirmed missing (430) or
+	//                 shorter than posted. This segment raced ahead of the
+	//                 overlay's pending-repair map; it's real damage, not a
+	//                 timing artefact, and escalates the summary to WARN.
+	//   readErrors  - any other read error (I/O, cancellation surfacing here).
+	var bytesWritten, segmentsWritten, writeFailures, segmentsSeen int64
+	var shortReads, deadReads, readErrors int64
 	firstByteZero := false
 	aborted := false
 
@@ -129,9 +142,17 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		buf = buf[:size]
 		n, err := src.ReadCachedAt(ctx, infoHash, filename, buf, start)
 		if err != nil || int64(n) != size {
-			readFailures++
-			log.Debug().Err(err).Str("entry", entryName).Str("file", filename).Int("segment", idx).Int64("offset", start).
-				Msg("next-episode pre-cache: durable read failed")
+			switch {
+			case err == nil:
+				shortReads++
+			case nntp.IsArticleNotFoundError(err) || errors.Is(err, ErrSegmentShort):
+				deadReads++
+			default:
+				readErrors++
+			}
+			log.Debug().Err(err).Str("entry", entryName).Str("file", filename).Int("segment", idx).
+				Int64("offset", start).Int("got", n).Int64("want", size).
+				Msg("next-episode pre-cache: durable read incomplete")
 			continue // not actually available right now - a later pass picks it up
 		}
 		if err := writer.WriteCachedRange(entryName, filename, fileSize, buf, start); err != nil {
@@ -150,14 +171,18 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		}
 	}
 
+	// A benign short read (shortReads) is an expected "not warm yet" state and
+	// stays at INFO; only genuine damage (deadReads), write failures, or the
+	// zero-fill canary escalate to WARN.
 	evt := log.Info()
-	if firstByteZero || writeFailures > 0 || readFailures > 0 {
+	if firstByteZero || writeFailures > 0 || deadReads > 0 || readErrors > 0 {
 		evt = log.Warn()
 	}
 	evt.Str("entry", entryName).Str("file", filename).
 		Int64("bytes", bytesWritten).Int64("segments", segmentsWritten).
 		Int64("segmentsSeen", segmentsSeen).Int("segmentsTotal", len(file.Segments)).
-		Int64("writeFailures", writeFailures).Int64("readFailures", readFailures).
+		Int64("writeFailures", writeFailures).
+		Int64("shortReads", shortReads).Int64("deadReads", deadReads).Int64("readErrors", readErrors).
 		Bool("firstByteZero", firstByteZero).Bool("aborted", aborted).
 		Msg("durable persist complete")
 }
