@@ -61,12 +61,35 @@ type EpisodeReadiness struct {
 	CacheCoverage float64 `json:"cache_coverage"` // 0.0-1.0
 }
 
+// cascadeIdentity is the Sonarr coordinate a forward walk needs: which Arr to
+// ask, which series, and the season/episode to step forward FROM. It is
+// captured up front, before a burst starts, precisely so the cascade that
+// follows that burst never has to resolve a decypharr entry again - by the
+// time a damaged burst finishes, its entry may have been deleted out from
+// under it (see precacheEpisodeFile's cascade comment).
+type cascadeIdentity struct {
+	arr *arr.Arr
+
+	// seriesName is the decypharr entry name the walk originally started
+	// from, carried for log context only - never used to resolve anything,
+	// so it staying valid does not matter.
+	seriesName string
+
+	seriesId      int
+	seasonNumber  int
+	episodeNumber int
+}
+
 // maybePrecacheNextEpisodes resolves the Sonarr series/episode context for a
 // just-triggered (entry, filename) and, if found, walks forward up to
 // config.Precache.NextEpisodes episodes: burst-downloading (and repairing)
 // each one that's already grabbed, or triggering a targeted Sonarr search
 // for one that isn't. No-op for movies (no Sonarr context resolves), when
 // NextEpisodes is 0, or when arrs are unreachable.
+//
+// This is the entry-based entry point, used from readAhead where the playing
+// entry is by definition still alive. The burst-completion cascade uses
+// cascadeForward instead, which skips the entry resolution entirely.
 func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename string) {
 	// Next-episode precache only applies to series. Resolve the Arr this entry
 	// came from and bail unless it's a Sonarr instance - a movie (Radarr) has no
@@ -89,6 +112,53 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 		return
 	}
 
+	p.precacheForwardWalk(ctx, cascadeIdentity{
+		arr:           a,
+		seriesName:    entry.Name,
+		seriesId:      seriesId,
+		seasonNumber:  seasonNumber,
+		episodeNumber: episodeNumber,
+	}, n)
+}
+
+// cascadeForward continues the forward walk from an identity captured before
+// a burst started. This is the detached burst-completion cascade: it builds
+// its own precacheNextEpisodeTimeout context rather than inheriting the
+// finishing burst's (which is about to be cancelled), exactly as the previous
+// `go p.maybePrecacheNextEpisodes(entry, filename)` cascade did.
+//
+// The point of taking an identity rather than an entry is that the episode
+// whose burst just completed may no longer exist: a burst that surfaced
+// damage runs recordReadiness -> HandlePlaybackFailure, which on a re-grab
+// verdict deletes the broken entry outright. The old cascade then handed that
+// dead entry to resolveSonarrEpisode, which correctly found nothing and
+// logged "no matching Sonarr episode resolved" - silently ending the chain at
+// every damaged episode. Confirmed live on The Conjurors S03E12 (see
+// docs/handovers/handover-precache-readahead-logging-analysis-2026-09-07.md).
+func (p *Precache) cascadeForward(ident cascadeIdentity) {
+	if ident.arr == nil || p.manager.usenet == nil {
+		return
+	}
+	n := p.cfg().NextEpisodes()
+	if n <= 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), precacheNextEpisodeTimeout)
+	defer cancel()
+
+	p.precacheForwardWalk(ctx, ident, n)
+}
+
+// precacheForwardWalk steps forward up to n episodes from ident, burst-caching
+// each already-grabbed episode and asking Sonarr to search for the first one
+// that isn't. Pure Sonarr-coordinate walk: it never touches the decypharr
+// entry the walk began at, so a caller whose entry has since been deleted is
+// still able to drive it.
+func (p *Precache) precacheForwardWalk(ctx context.Context, ident cascadeIdentity, n int) {
+	a, seriesId, seasonNumber := ident.arr, ident.seriesId, ident.seasonNumber
+	episodeNumber := ident.episodeNumber
+
 	// Season warm-up summary: one INFO line when the forward walk ends
 	// (whatever the reason - depth reached, season boundary, Arr error, or the
 	// 45-minute deadline), so the log shows how far ahead the season actually
@@ -96,7 +166,8 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 	var burstsRun, searchesRequested, skipped int
 	walkStart := time.Now()
 	defer func() {
-		p.logger.Info().Str("series", entry.Name).Int("season", seasonNumber).
+		p.logger.Info().Str("series", ident.seriesName).Int("season", seasonNumber).
+			Int("fromEpisode", ident.episodeNumber).
 			Int("depthRequested", n).
 			Int("burstsRun", burstsRun).
 			Int("searchesRequested", searchesRequested).
@@ -111,11 +182,11 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 		}
 		next, found, err := a.NextEpisode(ctx, seriesId, seasonNumber, episodeNumber)
 		if err != nil {
-			p.logger.Debug().Err(err).Str("series", entry.Name).Msg("next-episode precache: NextEpisode lookup failed (Arr unreachable?)")
+			p.logger.Debug().Err(err).Str("series", ident.seriesName).Msg("next-episode precache: NextEpisode lookup failed (Arr unreachable?)")
 			return
 		}
 		if !found {
-			p.logger.Info().Str("series", entry.Name).Int("season", seasonNumber).Int("afterEpisode", episodeNumber).
+			p.logger.Info().Str("series", ident.seriesName).Int("season", seasonNumber).Int("afterEpisode", episodeNumber).
 				Msg("next-episode precache: reached season boundary, no further episode to warm")
 			return
 		}
@@ -128,15 +199,23 @@ func (p *Precache) maybePrecacheNextEpisodes(entry *storage.Entry, filename stri
 			// nothing to burst-cache until then, and no further episode can
 			// be resolved without this one's season/episode context anyway.
 			if err := a.SearchEpisode(ctx, next.EpisodeId); err != nil {
-				p.logger.Debug().Err(err).Str("series", entry.Name).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next-episode search failed")
+				p.logger.Debug().Err(err).Str("series", ident.seriesName).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next-episode search failed")
 			} else {
 				searchesRequested++
-				p.logger.Info().Str("series", entry.Name).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next episode not yet grabbed; requested search")
+				p.logger.Info().Str("series", ident.seriesName).Int("season", next.SeasonNumber).Int("episode", next.EpisodeNumber).Msg("next episode not yet grabbed; requested search")
 			}
 			return
 		}
 
-		if p.precacheEpisodeFile(ctx, next) {
+		// Capture this episode's own coordinate before its burst starts, so
+		// the burst can cascade from it without needing its entry afterwards.
+		if p.precacheEpisodeFile(ctx, next, cascadeIdentity{
+			arr:           a,
+			seriesName:    ident.seriesName,
+			seriesId:      seriesId,
+			seasonNumber:  next.SeasonNumber,
+			episodeNumber: next.EpisodeNumber,
+		}) {
 			burstsRun++
 		} else {
 			skipped++
@@ -192,7 +271,12 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 // Returns true only when a burst-download was actually started for this
 // file - the caller's forward-walk summary uses this to count episodes
 // genuinely warmed apart from ones skipped for pause/budget/already-done.
-func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) bool {
+//
+// ident is this episode's own Sonarr coordinate, captured by the caller
+// before the burst begins; it is what the burst-completion cascade walks
+// forward from, so the cascade survives this episode's entry being deleted by
+// its own repair pass.
+func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo, ident cascadeIdentity) bool {
 	target := readSymlinkTarget(next.Path)
 	if target == "" {
 		p.logger.Debug().Str("file", next.Path).Msg("next-episode precache: next episode is not a local symlink")
@@ -291,14 +375,30 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// episode after this one, and checkSessionProgress can't provide it: this
 	// burst just marked `key` in p.triggered, so when this file is eventually
 	// played tryMarkTriggered short-circuits and readAhead ->
-	// maybePrecacheNextEpisodes never runs for it. Only on a clean burst - a
-	// failed or cancelled download has no reliable context to resolve the next
-	// episode from. The forward walk stays bounded by tryMarkTriggered,
-	// reserveBudget, and season boundaries. Detached so it doesn't run under
-	// this pass's 45-minute deadline (ctx). Mirrors readAhead, where
-	// maybePrecacheNextEpisodes is likewise the final step.
-	if burstErr == nil && burstCtx.Err() == nil {
-		go p.maybePrecacheNextEpisodes(nextEntry, filename)
+	// maybePrecacheNextEpisodes never runs for it. Detached so it doesn't run
+	// under this pass's 45-minute deadline (ctx). Mirrors readAhead, where the
+	// forward walk is likewise the final step.
+	//
+	// Cascades from the captured `ident` rather than from nextEntry: this
+	// episode's own repair may already have deleted that entry. recordReadiness
+	// above routes damage through HandlePlaybackFailure, which on a re-grab
+	// verdict deletes the broken entry - so by here nextEntry can be a dangling
+	// handle that resolveSonarrEpisode would fail to match, silently ending the
+	// chain at exactly the damaged episodes that most need the next one warmed.
+	//
+	// Gated only on cancellation, not on burstErr. A dead article does not
+	// surface as burstErr at all (ReadAhead -> FetchRange only reports
+	// ctx errors; a permanent article failure is recorded in the overlay and
+	// the walk continues), so this gate was never actually the thing blocking
+	// damaged episodes. What burstErr does catch is a setup failure - no
+	// volumes, reader creation - which says nothing about whether the NEXT
+	// episode is worth warming. burstCtx.Err() still stops a cascade whose
+	// parent pass was cancelled or timed out. The walk stays bounded by
+	// tryMarkTriggered (each file bursts at most once, and only a burst that
+	// actually ran reaches this line, so fan-out is one cascade per episode),
+	// reserveBudget, and season boundaries.
+	if burstCtx.Err() == nil {
+		go p.cascadeForward(ident)
 	}
 	return true
 }
