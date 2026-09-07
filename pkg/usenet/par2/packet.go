@@ -83,10 +83,21 @@ func verifyPacketMD5(h packetHeader, packet []byte) bool {
 // walkPackets calls fn once for every well-formed, MD5-verified packet found
 // in data, back-to-back starting at offset 0 (the layout PAR2 files use - no
 // padding between packets). It stops (without error) at the first byte range
-// that isn't a valid, complete, MD5-correct packet header - typically the
-// natural end of file, but also a defensible way to stop cleanly on trailing
-// garbage rather than hard-failing the whole file over it.
-func walkPackets(data []byte, fn func(h packetHeader, packet []byte, offset int64) error) error {
+// that isn't a valid, complete packet header - typically the natural end of
+// file, but also a defensible way to stop cleanly on trailing garbage rather
+// than hard-failing the whole file over it.
+//
+// A packet whose header parses and whose declared length fits the buffer but
+// whose packet MD5 does not verify is handled per onChecksumError. When that
+// callback is nil, walkPackets stops with an error (the strict default). When
+// it is non-nil, walkPackets invokes it, advances past the packet's declared
+// length, and continues. The length field sits ahead of the region the packet
+// MD5 covers and is structurally validated by parsePacketHeader, so advancing
+// by it is a sound resync point - the next iteration lands on a valid header
+// or stops cleanly on garbage. Skipping lets a caller salvage an index from a
+// source set where one volume carries a mis-served or mis-decoded article,
+// relying on PAR2's duplication of the structural packets across every volume.
+func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64), fn func(h packetHeader, packet []byte, offset int64) error) error {
 	pos := int64(0)
 	for pos+packetHeaderSize <= int64(len(data)) {
 		h, err := parsePacketHeader(data[pos:])
@@ -98,7 +109,12 @@ func walkPackets(data []byte, fn func(h packetHeader, packet []byte, offset int6
 		}
 		packet := data[pos : pos+h.Length]
 		if !verifyPacketMD5(h, packet) {
-			return fmt.Errorf("par2: packet MD5 mismatch at offset %d (type %q)", pos, packetTypeName(h.Type))
+			if onChecksumError == nil {
+				return fmt.Errorf("par2: packet MD5 mismatch at offset %d (type %q)", pos, packetTypeName(h.Type))
+			}
+			onChecksumError(h, pos)
+			pos += h.Length
+			continue
 		}
 		if err := fn(h, packet, pos); err != nil {
 			return err

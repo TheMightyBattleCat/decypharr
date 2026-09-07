@@ -1559,6 +1559,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if err != nil {
 		return fmt.Errorf("parse PAR2 index: %w", err)
 	}
+	logSkippedPar2Packets(p.logger, entryName, idx)
 
 	// Zero recovery slices fetched - every volume 430'd (see fetchMoreVolumes'
 	// consecutive-not-found abort). The verdict is already predetermined: no
@@ -1862,6 +1863,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				if err != nil {
 					return fmt.Errorf("parse PAR2 index: %w", err)
 				}
+				logSkippedPar2Packets(p.logger, entryName, idx)
 			}
 		}
 		if k > len(idx.Recovery) {
@@ -2690,6 +2692,27 @@ func (f *postedFileFetcher) readRange(start, length int64, allowCache bool) (out
 		pos += n
 	}
 	return out, usedCache, nil
+}
+
+// logSkippedPar2Packets warns when par2.ParseIndex had to skip packets whose
+// packet MD5 did not verify (a mis-served / mis-decoded article in one of the
+// sources - see par2.walkPackets). The index was still built from the
+// remaining packets; this line is here to correlate a later "not enough
+// recovery slices" verdict, or a re-parse that suddenly succeeded, with a
+// transient bad article rather than genuine recovery-set corruption.
+func logSkippedPar2Packets(logger zerolog.Logger, entryName string, idx *par2.Index) {
+	if idx == nil || len(idx.SkippedPackets) == 0 {
+		return
+	}
+	ev := logger.Warn().Str("entry", entryName).Int("count", len(idx.SkippedPackets))
+	byType := make(map[string]int, 4)
+	for _, s := range idx.SkippedPackets {
+		byType[s.Type]++
+	}
+	for t, n := range byType {
+		ev = ev.Int("skipped_"+t, n)
+	}
+	ev.Msg("par2 repair: skipped bad-checksum PAR2 packet(s) during index parse (mis-served article?) - index built from the rest")
 }
 
 // missingFetcherErr formats the error par2 repair returns when an intact

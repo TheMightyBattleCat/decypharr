@@ -34,6 +34,15 @@ type RecoverySliceRef struct {
 	Length   int64 // length of the recovery data (== Index.SliceSize for a well-formed packet)
 }
 
+// SkippedPacket records one packet ParseIndex could not trust because its
+// packet MD5 did not verify - a mis-served or mis-decoded article during the
+// fetch, not necessarily genuine corruption.
+type SkippedPacket struct {
+	Source int    // index into the []Source passed to ParseIndex
+	Offset int64  // byte offset of the packet within that source
+	Type   string // "Main", "FileDesc", "IFSC", "RecvSlic", or a hex type
+}
+
 // Index is the fully-parsed, deduplicated PAR2 metadata for one recovery
 // set, aggregated across every source scanned by ParseIndex.
 type Index struct {
@@ -49,6 +58,16 @@ type Index struct {
 	Slices map[[16]byte][]SliceChecksum // by FileID; one entry per slice of that file, in slice order
 
 	Recovery []RecoverySliceRef
+
+	// SkippedPackets lists packets walkPackets skipped during the parse
+	// because their packet MD5 did not verify. PAR2 duplicates the structural
+	// packets (Main/FileDesc/IFSC) into every volume, so a skip here is
+	// frequently covered by a clean copy in another source; when it is not,
+	// the shortfall surfaces downstream - a missing FileDesc fails finalize,
+	// and missing RecvSlic packets leave len(Recovery) short of the
+	// damaged-slice count. Non-empty means the index was assembled from a
+	// partially-unreadable source set.
+	SkippedPackets []SkippedPacket
 
 	// fileBase[i] is the global slice index at which FileOrder[i]'s slices
 	// begin. Same length and order as FileOrder; built once by finalize.
@@ -79,7 +98,14 @@ func ParseIndex(sources []Source) (*Index, error) {
 	haveSetID := false
 
 	for srcIdx, src := range sources {
-		err := walkPackets(src.Data, func(h packetHeader, packet []byte, offset int64) error {
+		onBad := func(h packetHeader, offset int64) {
+			idx.SkippedPackets = append(idx.SkippedPackets, SkippedPacket{
+				Source: srcIdx,
+				Offset: offset,
+				Type:   packetTypeName(h.Type),
+			})
+		}
+		err := walkPackets(src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
 			if !haveSetID {
 				idx.SetID = h.RecoverySetID
 				haveSetID = true

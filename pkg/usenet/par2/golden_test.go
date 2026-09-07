@@ -71,6 +71,53 @@ func TestParseIndexAgainstFixtures(t *testing.T) {
 	}
 }
 
+// TestParseIndexSkipsBadPacketButStillBuilds corrupts one packet's body in a
+// single source so its packet MD5 fails, and asserts ParseIndex skips it,
+// records it in SkippedPackets, and still assembles a structurally complete
+// index from the duplicate Main/FileDesc/IFSC packets in the other sources.
+func TestParseIndexSkipsBadPacketButStillBuilds(t *testing.T) {
+	sources := loadFixtureSources(t)
+	clean, err := ParseIndex(sources)
+	if err != nil {
+		t.Fatalf("baseline ParseIndex: %v", err)
+	}
+
+	// Locate the first packet of the first source and flip a body byte.
+	var badOffset int64 = -1
+	_ = walkPackets(sources[0].Data, nil, func(h packetHeader, packet []byte, offset int64) error {
+		if badOffset < 0 {
+			badOffset = offset
+		}
+		return nil
+	})
+	if badOffset < 0 {
+		t.Fatal("fixture source 0 has no parseable packet")
+	}
+	mutated := append([]byte(nil), sources[0].Data...)
+	mutated[badOffset+int64(packetHeaderSize)+4] ^= 0xFF // a body byte, past the header
+	sources[0].Data = mutated
+
+	idx, err := ParseIndex(sources)
+	if err != nil {
+		t.Fatalf("ParseIndex with one bad packet: %v", err)
+	}
+	if len(idx.SkippedPackets) == 0 {
+		t.Fatal("SkippedPackets is empty; the bad packet was not recorded")
+	}
+	if idx.SkippedPackets[0].Source != 0 || idx.SkippedPackets[0].Offset != badOffset {
+		t.Errorf("SkippedPackets[0] = %+v, want Source 0, Offset %d", idx.SkippedPackets[0], badOffset)
+	}
+	if idx.SliceSize != clean.SliceSize || idx.NumSlices() != clean.NumSlices() || len(idx.FileOrder) != len(clean.FileOrder) {
+		t.Errorf("index from a partial source set differs from clean: SliceSize %d/%d, NumSlices %d/%d, files %d/%d",
+			idx.SliceSize, clean.SliceSize, idx.NumSlices(), clean.NumSlices(), len(idx.FileOrder), len(clean.FileOrder))
+	}
+	for _, id := range idx.FileOrder {
+		if _, ok := idx.Files[id]; !ok {
+			t.Errorf("FileOrder references %x with no FileDesc after skip", id)
+		}
+	}
+}
+
 // fixtureSliceSource resolves global slice indices to bytes from the
 // original (undamaged) fixture files, for feeding to Repair as the "intact"
 // source. It panics if asked for a slice index the test marked damaged -

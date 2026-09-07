@@ -46,7 +46,7 @@ func TestWalkPacketsVerifiesMD5(t *testing.T) {
 	pkt := buildPacket(t, setID, typeMain, body)
 
 	var seen int
-	err := walkPackets(pkt, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(pkt, nil, func(h packetHeader, packet []byte, offset int64) error {
 		seen++
 		if h.Type != typeMain {
 			t.Errorf("packet type = %q, want Main", packetTypeName(h.Type))
@@ -63,14 +63,43 @@ func TestWalkPacketsVerifiesMD5(t *testing.T) {
 		t.Fatalf("walkPackets visited %d packets, want 1", seen)
 	}
 
-	// Corrupt one byte of the body - MD5 verification must catch it.
+	// Corrupt one byte of the body - MD5 verification must catch it. With a
+	// nil onChecksumError callback walkPackets fails strict.
 	corrupt := append([]byte(nil), pkt...)
 	corrupt[70] ^= 0xFF
-	err = walkPackets(corrupt, func(h packetHeader, packet []byte, offset int64) error {
+	err = walkPackets(corrupt, nil, func(h packetHeader, packet []byte, offset int64) error {
 		return nil
 	})
 	if err == nil {
 		t.Fatalf("expected a packet MD5 mismatch error on corrupted data, got none")
+	}
+}
+
+func TestWalkPacketsSkipsBadPacketWithRecorder(t *testing.T) {
+	var setID [16]byte
+	setID[0] = 0x02
+
+	p1 := buildPacket(t, setID, typeMain, make([]byte, 12))
+	p2 := buildPacket(t, setID, typeFileDesc, make([]byte, 56))
+	data := append(append([]byte{}, p1...), p2...)
+	data[70] ^= 0xFF // corrupt p1's body; p2 stays intact
+
+	var skippedOffsets []int64
+	var visited []string
+	err := walkPackets(data, func(h packetHeader, offset int64) {
+		skippedOffsets = append(skippedOffsets, offset)
+	}, func(h packetHeader, packet []byte, offset int64) error {
+		visited = append(visited, packetTypeName(h.Type))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkPackets with a recorder should not error on a bad packet: %v", err)
+	}
+	if len(skippedOffsets) != 1 || skippedOffsets[0] != 0 {
+		t.Fatalf("skipped offsets = %v, want [0]", skippedOffsets)
+	}
+	if len(visited) != 1 || visited[0] != "FileDesc" {
+		t.Fatalf("visited packet types = %v, want [FileDesc]", visited)
 	}
 }
 
@@ -83,7 +112,7 @@ func TestWalkPacketsMultiplePackets(t *testing.T) {
 	data := append(append([]byte{}, p1...), p2...)
 
 	var types []string
-	err := walkPackets(data, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(data, nil, func(h packetHeader, packet []byte, offset int64) error {
 		types = append(types, packetTypeName(h.Type))
 		return nil
 	})
@@ -101,7 +130,7 @@ func TestWalkPacketsStopsOnTrailingGarbage(t *testing.T) {
 	data := append(append([]byte{}, p1...), []byte{1, 2, 3}...) // not a valid packet header
 
 	var seen int
-	err := walkPackets(data, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(data, nil, func(h packetHeader, packet []byte, offset int64) error {
 		seen++
 		return nil
 	})
