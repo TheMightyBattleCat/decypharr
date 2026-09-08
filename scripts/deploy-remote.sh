@@ -318,9 +318,19 @@ fi
 # Does not assert read_ahead_enabled=False anymore: read-ahead may
 # legitimately be on now. The bound is enforced by verify_precache_bounded
 # (step 8), not here - this check just needs the endpoint to answer sanely.
-body=\$(curl -s --max-time 5 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/precache/status" 2>/dev/null || true)
-enabled=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('read_ahead_enabled', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
-max_bytes=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('max_bytes', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
+# This endpoint takes ~6s to respond even on a warm service, so --max-time 5
+# single-shot false-fails it - same generous timeout + retry as
+# overlay_disk_usage above.
+enabled=PARSE_ERROR
+max_bytes=PARSE_ERROR
+body=""
+for i in \$(seq 1 3); do
+    body=\$(curl -s --max-time 20 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/precache/status" 2>/dev/null || true)
+    enabled=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('read_ahead_enabled', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
+    max_bytes=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('max_bytes', 'MISSING'))" 2>/dev/null || echo "PARSE_ERROR")
+    [ "\$enabled" != "PARSE_ERROR" ] && [ "\$enabled" != "MISSING" ] && break
+    sleep 5
+done
 if [ "\$enabled" != "PARSE_ERROR" ] && [ "\$enabled" != "MISSING" ]; then
     echo "PASS precache_status: read_ahead_enabled=\$enabled max_bytes=\$max_bytes"
 else
