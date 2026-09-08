@@ -1864,6 +1864,36 @@ func (u *Usenet) ForEachNZB(fn func(*storage.NZB) error) error {
 	return u.nzbStorage.ForEachNZB(fn)
 }
 
+// MarkPostingDeadByNZBID records the raw-content identity of nzoID's source
+// NZB (its ContentHash - see hashNZBContent) in the dead-posting negative
+// cache, so an identical re-list (same posted articles, fresh grab ID) is
+// rejected at ParseWithID for deadPostingTTL instead of re-parsing,
+// re-STATting and re-ffprobing its way to the same verdict.
+//
+// Intended for a caller that has *confirmed the posted articles are gone* -
+// e.g. the import gate on a dead-segment (NNTP 430) ffprobe verdict - not for
+// a transient or an ambiguous unreadable/decode failure, since a same-name
+// repost with fresh message-IDs hashes differently and must not be
+// suppressed.
+//
+// marked is false (a no-op) when the record can't be resolved or has no
+// persisted ContentHash (NZBs parsed before ContentHash serialization); err
+// is only the header-lookup error. The caller decides how loudly to log.
+func (u *Usenet) MarkPostingDeadByNZBID(nzoID string) (marked bool, err error) {
+	if u == nil || nzoID == "" {
+		return false, nil
+	}
+	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
+	if err != nil {
+		return false, err
+	}
+	if nzb == nil || nzb.ContentHash == "" {
+		return false, nil
+	}
+	u.deadPostings.Mark(nzb.ContentHash)
+	return true, nil
+}
+
 // HasPar2Data reports whether nzoID's stored record already has retained
 // PAR2 file references (Par2Files/Par2Source - see storage.NZB), via the
 // cheap header-only decode. Does not attempt a backfill for a record that

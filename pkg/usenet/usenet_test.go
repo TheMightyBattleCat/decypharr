@@ -184,6 +184,45 @@ func TestParseWithIDRejectsKnownDeadPosting(t *testing.T) {
 	}
 }
 
+// TestMarkPostingDeadByNZBID proves the import-gate entry point into the
+// dead-posting cache: given a stored NZB record with a persisted ContentHash,
+// MarkPostingDeadByNZBID marks that hash so a re-list of the identical
+// content is rejected at parse; a record with no ContentHash (predates
+// persistence) is a no-op, and a missing record returns an error.
+func TestMarkPostingDeadByNZBID(t *testing.T) {
+	store := &NZBStorage{metaDir: t.TempDir(), logger: zerolog.Nop()}
+	u := &Usenet{
+		logger:       zerolog.Nop(),
+		deadPostings: newDeadPostingCache(),
+		nzbStorage:   store,
+	}
+
+	content := []byte("<nzb><file>genuinely dead at source</file></nzb>")
+	hash := hashNZBContent(content)
+	if err := store.AddNZB(&storage.NZB{ID: "nzb-dead", Name: "Dead.Release", ContentHash: hash}); err != nil {
+		t.Fatalf("AddNZB: %v", err)
+	}
+	if err := store.AddNZB(&storage.NZB{ID: "nzb-legacy", Name: "Legacy.Release"}); err != nil {
+		t.Fatalf("AddNZB (legacy): %v", err)
+	}
+
+	marked, err := u.MarkPostingDeadByNZBID("nzb-dead")
+	if err != nil || !marked {
+		t.Fatalf("MarkPostingDeadByNZBID(nzb-dead) = (%v, %v), want (true, nil)", marked, err)
+	}
+	if !u.deadPostings.Check(hash) {
+		t.Error("content hash was not marked dead")
+	}
+
+	if marked, err := u.MarkPostingDeadByNZBID("nzb-legacy"); marked || err != nil {
+		t.Errorf("MarkPostingDeadByNZBID(nzb-legacy) = (%v, %v), want (false, nil) - no persisted ContentHash", marked, err)
+	}
+
+	if marked, err := u.MarkPostingDeadByNZBID("nzb-missing"); marked || err == nil {
+		t.Errorf("MarkPostingDeadByNZBID(nzb-missing) = (%v, %v), want (false, non-nil error)", marked, err)
+	}
+}
+
 // TestParseWithIDAllowsUnmarkedContent proves the negative cache doesn't
 // over-reject: content that was never marked dead reaches the real parser
 // (which then fails for an unrelated reason - no NNTP client configured in

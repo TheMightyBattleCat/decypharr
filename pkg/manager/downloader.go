@@ -389,6 +389,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
+			d.markDeadPostingOnDeadSegment(entry, reason)
 			if rerr := d.manager.Repair().RegrabImportGrab(ctx, entry, file.Name, reason); rerr != nil {
 				d.logger.Warn().Err(rerr).Str("entry", entry.Name).Str("file", file.Name).
 					Msg("Import: failed to blocklist + re-search via Arr")
@@ -452,6 +453,35 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 			return true, false, ""
 		case <-time.After(backoff):
 		}
+	}
+}
+
+// markDeadPostingOnDeadSegment records an NZB entry's posted-articles identity
+// in the usenet dead-posting negative cache when, and only when, the import
+// gate's broken verdict was a confirmed dead segment (NNTP 430). An identical
+// re-list - the same NZB content back under a fresh grab ID, which the Arr's
+// own re-search can produce even after RegrabImportGrab blocklists the release
+// - then rejects at parse for deadPostingTTL instead of re-parsing,
+// re-STATting and re-ffprobing to the same verdict.
+//
+// Scoped deliberately tight: only ffprobeReasonDeadSegment (the fetcher
+// actually saw a 430), never an unreadable/decode/timeout verdict, because a
+// same-name repost with fresh message-IDs could be perfectly good and hashes
+// differently anyway. NZB protocol only.
+func (d *Downloader) markDeadPostingOnDeadSegment(entry *storage.Entry, reason string) {
+	if reason != ffprobeReasonDeadSegment || entry.Protocol != config.ProtocolNZB || d.manager.usenet == nil {
+		return
+	}
+	switch marked, err := d.manager.usenet.MarkPostingDeadByNZBID(entry.InfoHash); {
+	case err != nil:
+		d.logger.Debug().Err(err).Str("entry", entry.Name).
+			Msg("Import: dead-segment verdict but the NZB header lookup failed; identical re-lists will not be short-circuited")
+	case !marked:
+		d.logger.Debug().Str("entry", entry.Name).
+			Msg("Import: dead-segment verdict but the NZB record has no persisted ContentHash (predates hash persistence); identical re-lists will not be short-circuited")
+	default:
+		d.logger.Info().Str("entry", entry.Name).
+			Msg("Import: dead segment confirmed; marked the NZB posting as dead so an identical re-grab rejects at parse")
 	}
 }
 
