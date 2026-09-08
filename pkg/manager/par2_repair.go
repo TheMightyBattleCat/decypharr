@@ -2894,6 +2894,20 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 		if ferr != nil {
 			return nil, ferr
 		}
+		// Verify the REFETCHED bytes too. A stale zero-fill in the cache is
+		// only one of two explanations for the mismatch above; the other is
+		// that our posted-file byte->slice offset mapping is drifted for this
+		// file, in which case bytes straight off Usenet fail exactly the same
+		// way. Without this check the two are indistinguishable: the warning
+		// above positively asserts "stale zero-fill", a cause nothing
+		// confirmed, and a fresh-but-wrong slice then silently burns one of
+		// par2.Repair's two tolerated canary slots before the whole repair
+		// aborts blaming "a drifted offset mapping". Saying which one it is
+		// costs one hash of bytes we already hold.
+		if freshOK, fverr := s.idx.VerifySliceChecksum(globalIdx, fresh); fverr == nil && !freshOK {
+			s.logger.Warn().Int64("slice", globalIdx).Str("file", fmt.Sprintf("%x", fileID)).
+				Msg("par2 repair: freshly-fetched intact slice ALSO failed IFSC - offset mapping is drifted for this file, not a stale cache")
+		}
 		return fresh, nil
 	}
 	return data, nil
