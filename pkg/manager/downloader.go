@@ -347,7 +347,10 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		}
 		sig := NewDeadSegmentSignal()
 		registerDeadSignal(infoHash, file.Name, sig)
-		ok, reason := checker.checkConfirmed(ctx, entryFolder, file.Name, expected, false, sig)
+		// The import gate never touches DecodeVerifiedAt, so the conclusive
+		// flag is not consulted here - a genuine broken verdict rejects, an
+		// inconclusive (timeout) ok=true admits, same as before.
+		ok, reason, _ := checker.checkConfirmed(ctx, entryFolder, file.Name, expected, false, sig)
 		unregisterDeadSignal(infoHash, file.Name, sig)
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).

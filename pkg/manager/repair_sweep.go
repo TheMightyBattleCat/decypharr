@@ -81,6 +81,14 @@ type fileResult struct {
 	healthy  bool
 	broken   bool
 	reason   string // populated only when broken or unknown
+
+	// decodeConclusive is true when this file's ffprobe frame-decode pass
+	// actually ran to a verdict this probe (clean, or a concrete decode
+	// error) rather than being cut short by a timeout or context
+	// cancellation. probeFiles rolls this up into decodeRan, which gates
+	// probeEntry's DecodeVerifiedAt stamp. Zero-value false when no decode
+	// pass was attempted (skipDecode, or no ffprobe checker attached).
+	decodeConclusive bool
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -497,13 +505,6 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	if !skipDecode && !opts.ForceDecodeVerification && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
 		skipDecode = true
 	}
-	// decodeRan reports whether a real frame-decode pass could actually occur
-	// this call, after the config override above has been applied - not just
-	// the caller's original skipDecode intent. probeEntry's DecodeVerifiedAt
-	// stamp must gate on this, not on the pre-call fingerprint-match flag, or
-	// it falsely marks an entry "decode verified" when decode never ran (e.g.
-	// FFProbeCheck/FFProbeDecodeCheck disabled in config).
-	decodeRan := !skipDecode
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
@@ -518,6 +519,38 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 		})
 	}
 	_ = g.Wait()
+
+	// decodeRan gates probeEntry's DecodeVerifiedAt stamp. It's true only
+	// when a frame-decode pass was attempted for this entry (skipDecode
+	// false, after the config override above) AND every file that
+	// contributes to a healthy rollup completed its decode windows
+	// conclusively - i.e. not cut short by an ffprobe timeout or a context
+	// cancellation, which return inconclusively (see ffprobeChecker.check).
+	// One healthy file with an inconclusive decode blocks the stamp for the
+	// whole entry, so a slow cold REMUX read that times out mid-sweep no
+	// longer arms the 30-day skip as though it had verified clean. This also
+	// covers the case where no ffprobe checker was attached (FFProbeCheck
+	// off): the STAT-healthy files carry decodeConclusive=false and block
+	// the stamp.
+	//
+	// Non-healthy files don't gate this: a broken rollup clears the stamp
+	// anyway, and a file that errored out before reaching ffprobe
+	// (usenet_probe_error, protocol_skipped, ...) is already outside the
+	// healthy verdict rollupStatus computes. A transiently-errored file in
+	// an otherwise-healthy entry can therefore still leave the entry stamped
+	// without that file's decode having run; it self-heals at the TTL and
+	// never suppresses that file's own STAT probe, so the residual window is
+	// narrow and bounded.
+	decodeRan := false
+	if !skipDecode {
+		decodeRan = true
+		for _, fr := range results {
+			if fr.healthy && !fr.decodeConclusive {
+				decodeRan = false
+				break
+			}
+		}
+	}
 	return results, decodeRan
 }
 
@@ -586,8 +619,9 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
-			ok, reason := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode, sig)
+			ok, reason, conclusive := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode, sig)
 			unregisterDeadSignal(res.infoHash, name, sig)
+			res.decodeConclusive = conclusive
 
 			if !ok {
 				res.healthy = false

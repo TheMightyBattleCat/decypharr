@@ -239,7 +239,15 @@ type ffprobeOutput struct {
 // the file looks healthy. A context timeout or cancellation is treated as
 // inconclusive (ok=true) rather than broken - a slow cold read over Usenet
 // must never cause an auto-delete.
-func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string) {
+//
+// conclusive reports whether the verdict is a real signal about the file's
+// integrity worth caching for DecodeVerifyTTL: false means the probe (or its
+// decode pass) was cut short by a timeout or context cancellation and proved
+// nothing, so callers must not treat an ok=true here as a passed decode
+// verification. A definite verdict - clean, or broken for a concrete reason -
+// is conclusive=true; a skipDecode call that never ran the decode windows is
+// conclusive=false.
+func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string, conclusive bool) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
 	cctx, cancel := context.WithTimeout(ctx, f.timeout)
@@ -255,15 +263,15 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
 			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Msg("Repair: ffprobe timed out; treating as inconclusive")
 		}
-		return true, ""
+		return true, "", false
 	}
 	if runErr != nil {
-		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String())
+		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true
 	}
 
 	var probe ffprobeOutput
 	if err := json.Unmarshal(stdout.Bytes(), &probe); err != nil {
-		return false, ffprobeReasonUnreadable + ": " + firstLine(err.Error())
+		return false, ffprobeReasonUnreadable + ": " + firstLine(err.Error()), true
 	}
 
 	hasVideo, hasAudio := false, false
@@ -276,15 +284,15 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		}
 	}
 	if !hasVideo && !hasAudio {
-		return false, ffprobeReasonNoStreams
+		return false, ffprobeReasonNoStreams, true
 	}
 	if !hasVideo {
-		return false, ffprobeReasonNoVideoStream
+		return false, ffprobeReasonNoVideoStream, true
 	}
 
 	durationSec, err := strconv.ParseFloat(strings.TrimSpace(probe.Format.Duration), 64)
 	if err != nil || durationSec <= 0 {
-		return false, ffprobeReasonNoDuration
+		return false, ffprobeReasonNoDuration, true
 	}
 	duration := time.Duration(durationSec * float64(time.Second))
 
@@ -294,12 +302,14 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			ceiling = ffprobeCeilingSonarr
 		}
 		if duration > ceiling {
-			return false, ffprobeReasonAbsurdDuration
+			return false, ffprobeReasonAbsurdDuration, true
 		}
 		if !skipDecode {
 			return f.decodeWindows(ctx, entryFolder, fileName, duration)
 		}
-		return true, ""
+		// Decode verification was skipped for this call, so nothing was
+		// deep-verified - not conclusive.
+		return true, "", false
 	}
 
 	expectedDur := time.Duration(expected.Seconds) * time.Second
@@ -310,7 +320,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		tooLongRatio = ffprobeTooLongRatioUnconfirmed
 	}
 	if ratio >= tooLongRatio && duration-expectedDur >= ffprobeTooLongMinOverage {
-		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx)", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio)
+		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx)", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true
 	}
 	if ratio <= ffprobeTooShortRatio && expectedDur-duration >= ffprobeTooShortMinUnder {
 		tailFn := f.tailIntactFn
@@ -327,9 +337,9 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			if !skipDecode {
 				return f.decodeWindows(ctx, entryFolder, fileName, duration)
 			}
-			return true, ""
+			return true, "", false
 		}
-		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio)
+		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true
 	}
 
 	// Grey zone: meaningfully different from expected but inside the safety
@@ -341,7 +351,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	if !skipDecode {
 		return f.decodeWindows(ctx, entryFolder, fileName, duration)
 	}
-	return true, ""
+	return true, "", false
 }
 
 type ffprobeTailOutput struct {
@@ -428,10 +438,13 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 //
 // Like every other probe in this file, timeout and cancellation are
 // inconclusive (ok=true, fail-open): a slow WebDAV read must never
-// auto-delete a file that might be fine.
-func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration) (ok bool, reason string) {
+// auto-delete a file that might be fine. conclusive distinguishes a real
+// decode verdict (clean, or a concrete decode error) from a timed-out or
+// cancelled pass that proved nothing - the caller uses it to decide
+// whether an ok=true here counts as a passed decode verification.
+func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration) (ok bool, reason string, conclusive bool) {
 	if duration <= 0 {
-		return true, ""
+		return true, "", true
 	}
 
 	n := ffprobeDecodeWindowCount
@@ -440,7 +453,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		n = durSec
 	}
 	if n <= 0 {
-		return true, ""
+		return true, "", true
 	}
 
 	intervals := make([]string, n)
@@ -471,7 +484,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
-		return true, ""
+		return true, "", false
 	}
 
 	// Decode errors surface on stderr even when the exit code is 0 (ffprobe
@@ -479,14 +492,14 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// continue demuxing). Check stderr first.
 	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
-		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr)
+		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
 
 	if runErr != nil {
-		return false, ffprobeReasonDecodeError
+		return false, ffprobeReasonDecodeError, true
 	}
 
-	return true, ""
+	return true, "", true
 }
 
 // checkConfirmed retries once before declaring a file broken: a transient
@@ -507,41 +520,48 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // 430) segment while serving the probe - even one ffprobe's own sampling
 // windows missed - the verdict is forced to broken with no retry. A retry
 // would only pull the same dead article again.
-func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal) (ok bool, reason string) {
+//
+// conclusive is threaded straight through from check: an ok=true result
+// whose underlying decode pass timed out or was cancelled comes back
+// conclusive=false so the sweep does not stamp it as decode-verified. A
+// forced-broken dead-segment verdict is conclusive=true (a confirmed 430
+// is a definite signal). A retry abandoned because ctx was cancelled
+// mid-wait is conclusive=false.
+func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal) (ok bool, reason string, conclusive bool) {
 	const deadSegmentReason = "dead_segment_detected: NNTP 430 during verification read"
 
-	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
+	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification read; forcing broken verdict")
-		return false, deadSegmentReason
+		return false, deadSegmentReason, true
 	}
 	if ok {
-		return true, ""
+		return true, "", conclusive
 	}
 	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
 		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
-		return false, reason
+		return false, reason, conclusive
 	}
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("Repair: ffprobe check failed; retrying once before declaring broken")
 
 	select {
 	case <-ctx.Done():
-		return true, ""
+		return true, "", false
 	case <-time.After(ffprobeRetryDelay):
 	}
 
-	ok, reason = f.check(ctx, entryFolder, fileName, expected, skipDecode)
+	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Bool("ok", ok).Str("reason", reason).Msg("Repair: ffprobe retry result")
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification retry; forcing broken verdict")
-		return false, deadSegmentReason
+		return false, deadSegmentReason, true
 	}
 	if ok {
-		return true, ""
+		return true, "", conclusive
 	}
-	return false, reason
+	return false, reason, conclusive
 }
 
 func firstLine(s string) string {
