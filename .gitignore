@@ -23,3 +23,5 @@ node_modules/
 .stignore
 .stfolder/**
 docs/handovers/
+review-logs/
+*-logs.txt

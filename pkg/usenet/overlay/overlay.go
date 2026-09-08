@@ -61,10 +61,23 @@ const (
 
 // DeadSegment is one confirmed-missing article recorded against a logical file.
 type DeadSegment struct {
-	Index     int           `json:"index"`
-	MessageID string        `json:"message_id"`
-	Bytes     int64         `json:"bytes"`
-	Status    SegmentStatus `json:"status"`
+	Index     int    `json:"index"`
+	MessageID string `json:"message_id"`
+	// Bytes is the segment's length in READER space - what
+	// SegmentCache.SegmentDataSize said the slot holds when the damage was
+	// recorded. It stays put when the segment is later patched: the pad-cap
+	// accounting (policy.go) and the GUI damage totals both skip patched
+	// records, so nothing reads it for those, and keeping it is what lets
+	// WritePatch check a repaired patch against the length the reader will
+	// actually give it.
+	Bytes  int64         `json:"bytes"`
+	Status SegmentStatus `json:"status"`
+	// PatchBytes is the length of the PAR2-reconstructed blob, in the
+	// repair's own segment geometry. Recorded separately from Bytes because
+	// the two are computed from different sources and a divergence between
+	// them is a bug worth being able to see after the fact. Zero unless
+	// Status is StatusPatched. Absent from older manifests.
+	PatchBytes int64 `json:"patch_bytes,omitempty"`
 }
 
 // FileEntry is the per-logical-filename record inside an NZB's manifest.
@@ -609,28 +622,52 @@ func (s *Store) WritePatch(nzbID, file string, segIndex int, data []byte) error 
 	mu.Lock()
 	defer mu.Unlock()
 
-	path := s.patchPath(nzbID, file, segIndex)
-	if err := writeFileAtomic(s.entryDir(nzbID), path, data); err != nil {
-		return err
-	}
-
+	// Validate BEFORE writing anything. The patch's length comes from the
+	// repair's segment geometry (Par2SegmentRef.Bytes, anchored on
+	// FileDesc.Length); the reader will lay it into a slot sized by its own
+	// geometry (NZBSegment.Bytes). Those are independent computations, and
+	// when the yEnc source-size probe has succeeded they genuinely differ -
+	// measured at +3-7KB on a 768000-byte article. A patch of the wrong
+	// length is not merely useless (SegmentCache.Put now refuses it): if it
+	// were persisted, the record would flip to StatusPatched and the file
+	// would report itself repaired while playback still failed.
+	//
+	// Bytes on the existing StatusDead record is exactly the number to check
+	// against - RecordDead stored the reader's own SegmentDataSize there.
+	// Only check when we have one; a patch for a segment with no prior record
+	// (or no recorded length) can't be validated, and refusing it would be a
+	// regression rather than a safeguard.
 	m, err := s.loadManifestLocked(nzbID)
 	if err != nil {
 		return err
 	}
 	fe := fileEntryLocked(m, file)
-	found := false
+	idx := -1
 	for i := range fe.DeadSegments {
 		if fe.DeadSegments[i].Index == segIndex {
-			fe.DeadSegments[i].Status = StatusPatched
-			fe.DeadSegments[i].Bytes = int64(len(data))
-			found = true
+			idx = i
 			break
 		}
 	}
-	if !found {
+	if idx >= 0 {
+		if want := fe.DeadSegments[idx].Bytes; want > 0 && int64(len(data)) != want {
+			return fmt.Errorf("patch for segment %d is %d bytes but the reader's slot is %d (repair and reader segment geometry disagree by %+d; refusing to record a patch that cannot be served)",
+				segIndex, len(data), want, int64(len(data))-want)
+		}
+	}
+
+	path := s.patchPath(nzbID, file, segIndex)
+	if err := writeFileAtomic(s.entryDir(nzbID), path, data); err != nil {
+		return err
+	}
+
+	if idx >= 0 {
+		fe.DeadSegments[idx].Status = StatusPatched
+		fe.DeadSegments[idx].PatchBytes = int64(len(data))
+	} else {
 		fe.DeadSegments = append(fe.DeadSegments, DeadSegment{
 			Index: segIndex, Bytes: int64(len(data)), Status: StatusPatched,
+			PatchBytes: int64(len(data)),
 		})
 		sortDeadSegments(fe)
 	}

@@ -369,7 +369,31 @@ func (sc *SegmentCache) Put(segIdx int, data []byte) error {
 		sc.drainOverBudget()
 	}
 
+	// A segment's bytes must stay inside its own slot. The streaming fetch
+	// path enforces this itself (StreamWriter caps writes at the segment's
+	// max); Put did not, and its two callers are exactly the paths that can
+	// supply foreign-sized data:
+	//
+	//   - the zero-fill pad, sized from SegmentDataSize - always in range, and
+	//   - the PAR2 overlay patch, whose length comes from the REPAIR's segment
+	//     geometry (storage.Par2SegmentRef.Bytes, a real probed yEnc size when
+	//     the source-size probe succeeded) while this slot is sized from the
+	//     READER's geometry (storage.NZBSegment.Bytes = 0.97 x the NZB's
+	//     declared wire bytes). Those are different numbers - measured at
+	//     +3-7KB apart on a 768000-byte article - so a patch could silently
+	//     overrun into segment segIdx+1's byte range and leave the virtual
+	//     file overlapping at the seam.
+	//
+	// Refusing is the safe half of that fix: the caller treats a failed Put as
+	// "overlay declined" and lets the original article-not-found propagate,
+	// which fails the read instead of serving bytes laid down over a
+	// neighbour. The real repair is to size the patch in reader space; this is
+	// the backstop that makes getting it wrong loud instead of silent.
 	off := sc.segOffsets[segIdx]
+	if slot := sc.segOffsets[segIdx+1] - off; int64(len(data)) > slot {
+		return fmt.Errorf("segment %d: %d bytes exceeds its %d-byte slot (refusing to overrun segment %d)",
+			segIdx, len(data), slot, segIdx+1)
+	}
 	if _, err := sc.buf.WriteAt(data, off); err != nil {
 		return fmt.Errorf("write segment %d: %w", segIdx, err)
 	}

@@ -185,7 +185,7 @@ func TestWritePatchClearsDegradedVerdictButNotFailed(t *testing.T) {
 	if _, verdict := s.Decide(nzbID, file, 0, "<msg>", 1000, 1_000_000_000, 0); verdict != VerdictDegraded {
 		t.Fatalf("setup: verdict = %v, want VerdictDegraded", verdict)
 	}
-	if err := s.WritePatch(nzbID, file, 0, []byte("fixed")); err != nil {
+	if err := s.WritePatch(nzbID, file, 0, make([]byte, 1000)); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
 	if got := s.Verdict(nzbID, file); got != VerdictClean {
@@ -196,7 +196,7 @@ func TestWritePatchClearsDegradedVerdictButNotFailed(t *testing.T) {
 	// to degraded/clean - the legacy repair path may already be in flight.
 	s2 := newTestStore(t)
 	s2.Decide(nzbID, "release.nfo", 0, "<msg>", 1000, 1_000_000, 0) // non-video -> immediate fail
-	if err := s2.WritePatch(nzbID, "release.nfo", 0, []byte("fixed")); err != nil {
+	if err := s2.WritePatch(nzbID, "release.nfo", 0, make([]byte, 1000)); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
 	if got := s2.Verdict(nzbID, "release.nfo"); got != VerdictFailed {
@@ -457,5 +457,64 @@ func TestDecideHeaderDamageSelfHealsPreviouslyPadded(t *testing.T) {
 	}
 	if verdict != VerdictFailed {
 		t.Fatalf("verdict = %v, want VerdictFailed", verdict)
+	}
+}
+
+// A patch whose length disagrees with the reader-space length recorded when
+// the segment was marked dead cannot be served (SegmentCache.Put refuses to
+// overrun the slot), and recording it anyway would flip the segment to
+// StatusPatched - making the file report itself repaired while playback still
+// failed. WritePatch must refuse it, and must not leave a blob behind.
+func TestWritePatchRejectsGeometryMismatch(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	s.Decide(nzbID, file, 0, "<msg>", 1000, 1_000_000_000, 0)
+
+	// +5040 is the divergence measured between a real 750000-byte probed
+	// posting size and the 744960-byte 0.97 estimate for the same article.
+	err := s.WritePatch(nzbID, file, 0, make([]byte, 1000+5040))
+	if err == nil {
+		t.Fatal("WritePatch accepted a patch 5040 bytes longer than the reader's slot")
+	}
+	t.Logf("refused as expected: %v", err)
+
+	if _, ok := s.PatchBytes(nzbID, file, 0); ok {
+		t.Error("a rejected patch left a blob on disk")
+	}
+	m, _ := s.GetManifest(nzbID)
+	if fe := m.Files[file]; fe == nil || len(fe.DeadSegments) != 1 || fe.DeadSegments[0].Status == StatusPatched {
+		t.Error("a rejected patch marked the segment patched anyway")
+	}
+
+	// The correctly-sized patch is accepted, keeps Bytes as the reader-space
+	// length, and records its own length separately.
+	if err := s.WritePatch(nzbID, file, 0, make([]byte, 1000)); err != nil {
+		t.Fatalf("WritePatch with a correctly-sized patch: %v", err)
+	}
+	m, _ = s.GetManifest(nzbID)
+	ds := m.Files[file].DeadSegments[0]
+	if ds.Status != StatusPatched {
+		t.Errorf("Status = %v, want StatusPatched", ds.Status)
+	}
+	if ds.Bytes != 1000 {
+		t.Errorf("Bytes = %d, want 1000 preserved as the reader-space length", ds.Bytes)
+	}
+	if ds.PatchBytes != 1000 {
+		t.Errorf("PatchBytes = %d, want 1000", ds.PatchBytes)
+	}
+}
+
+// A patch for a segment with no recorded reader-space length can't be checked
+// against anything; refusing it would be a regression, not a safeguard.
+func TestWritePatchAllowsUnvalidatableSegment(t *testing.T) {
+	s := newTestStore(t)
+	const nzbID, file = "nzb-1", "movie.mkv"
+
+	if err := s.WritePatch(nzbID, file, 7, []byte("no prior dead record")); err != nil {
+		t.Fatalf("WritePatch for an unrecorded segment: %v", err)
+	}
+	if _, ok := s.PatchBytes(nzbID, file, 7); !ok {
+		t.Error("patch blob was not written")
 	}
 }

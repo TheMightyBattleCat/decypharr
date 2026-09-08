@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -83,6 +84,15 @@ func TestDecideStickyFailedActionNeverClearsOnInconclusiveOrBroken(t *testing.T)
 	}
 }
 
+// sizedPatch builds a patch blob of exactly n bytes whose leading bytes are
+// marker, so a test can still recognise the content while satisfying
+// WritePatch's rule that a patch is exactly the segment's reader-space length.
+func sizedPatch(marker string, n int) []byte {
+	buf := make([]byte, n)
+	copy(buf, marker)
+	return buf
+}
+
 // TestOverlayClearFileDamagePreservesPatches verifies that ClearFileDamage
 // removes dead/padded records while preserving patched segments.
 func TestOverlayClearFileDamagePreservesPatches(t *testing.T) {
@@ -98,8 +108,10 @@ func TestOverlayClearFileDamagePreservesPatches(t *testing.T) {
 	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
 	s.Decide(nzbID, file, 1, "<msg-1>", 1000, 1_000_000, 0)
 
-	// Write a patch for segment 0 (simulating PAR2 repair).
-	if err := s.WritePatch(nzbID, file, 0, []byte("recovered-data")); err != nil {
+	// Write a patch for segment 0 (simulating PAR2 repair). A real patch is
+	// exactly the segment's reader-space length - WritePatch now enforces
+	// that, since a wrongly-sized patch cannot be served into the cache slot.
+	if err := s.WritePatch(nzbID, file, 0, sizedPatch("recovered-data", 1000)); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
 
@@ -140,8 +152,8 @@ func TestOverlayClearFileDamagePreservesPatches(t *testing.T) {
 		t.Errorf("expected VerdictClean after clear, got %s", fe.Verdict)
 	}
 
-	// Verify the patch blob still exists on disk.
-	if data, ok := s.PatchBytes(nzbID, file, 0); !ok || string(data) != "recovered-data" {
+	// Verify the patch blob still exists on disk, with its content intact.
+	if data, ok := s.PatchBytes(nzbID, file, 0); !ok || !bytes.HasPrefix(data, []byte("recovered-data")) || len(data) != 1000 {
 		t.Error("patch blob for segment 0 was destroyed by ClearFileDamage")
 	}
 }
@@ -265,7 +277,7 @@ func TestOverlayDeleteFileRemovesPatches(t *testing.T) {
 	file := "movie.mkv"
 
 	s.Decide(nzbID, file, 0, "<msg-0>", 1000, 1_000_000, 0)
-	if err := s.WritePatch(nzbID, file, 0, []byte("recovered")); err != nil {
+	if err := s.WritePatch(nzbID, file, 0, sizedPatch("recovered", 1000)); err != nil {
 		t.Fatalf("WritePatch: %v", err)
 	}
 
