@@ -224,31 +224,59 @@ TOKEN=\$(python3 -c "import json; print(json.load(open('\${DEPLOY_DIR}/auth.json
 AUTH_HEADER=()
 [ -n "\$TOKEN" ] && AUTH_HEADER=(-H "Authorization: Bearer \$TOKEN")
 
-# Give the HTTP listener a few seconds to actually bind after start.
-for i in \$(seq 1 10); do
-    code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:\${PORT}/" 2>/dev/null || echo 000)
+# The http_code %{http_code} placeholder already prints 000 on a refused or
+# failed connection, but the old "curl ... or echo 000" appended a SECOND
+# 000, giving "000000" - which both misread as healthy: "000000" != "000"
+# broke the warmup loop on its first iteration, and "000000" -lt 500 passed
+# every HTTP check with the listener down. That is what rolled back an
+# otherwise-fine deploy. Capture the code cleanly and treat 000 as down.
+http_code() {
+    local c
+    c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "\$@" 2>/dev/null) || true
+    [ -n "\$c" ] || c=000
+    printf '%s' "\$c"
+}
+http_ok() {
+    # reachable and not 5xx; 000 means the listener is down
+    [ -n "\${1:-}" ] || return 1
+    [ "\$1" = 000 ] && return 1
+    [ "\$1" -ge 200 ] 2>/dev/null && [ "\$1" -lt 500 ] 2>/dev/null
+}
+
+# Wait for the HTTP listener to actually bind - on a busy restart it can lag
+# the process start by 10s+. Retry on 000, never treat it as up.
+for i in \$(seq 1 20); do
+    code=\$(http_code "http://127.0.0.1:\${PORT}/")
     [ "\$code" != "000" ] && break
     sleep 1
 done
 
-# mount
-if mountpoint -q "\$MOUNT"; then
+# mount - retry briefly; the FUSE mount can lag the "DFS started" log by a beat
+mnt=fail
+for i in \$(seq 1 5); do
+    if mountpoint -q "\$MOUNT"; then
+        mnt=ok
+        break
+    fi
+    sleep 2
+done
+if [ "\$mnt" = ok ]; then
     echo "PASS mount: \$MOUNT is mounted"
 else
     echo "FAIL mount: \$MOUNT is NOT a mountpoint"
 fi
 
 # HTTP root
-code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:\${PORT}/" 2>/dev/null || echo 000)
-if [ "\$code" != "000" ] && [ "\$code" -lt 500 ]; then
+code=\$(http_code "http://127.0.0.1:\${PORT}/")
+if http_ok "\$code"; then
     echo "PASS http_root: HTTP \$code"
 else
     echo "FAIL http_root: HTTP \$code"
 fi
 
 # /repair
-code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:\${PORT}/repair" 2>/dev/null || echo 000)
-if [ "\$code" != "000" ] && [ "\$code" -lt 500 ]; then
+code=\$(http_code "http://127.0.0.1:\${PORT}/repair")
+if http_ok "\$code"; then
     echo "PASS repair_page: HTTP \$code"
 else
     echo "FAIL repair_page: HTTP \$code"
@@ -274,9 +302,9 @@ else
     echo "FAIL overlay_disk_usage: total_overlay_disk_bytes=\$bytes (expected 0 <= x < 1e9; response: \$body)"
 fi
 
-# /api/overlay/repair-progress - just needs to respond (200 or a real JSON/text body, not connection failure/5xx)
-code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/overlay/repair-progress?entry=healthcheck&file=healthcheck" 2>/dev/null || echo 000)
-if [ "\$code" != "000" ] && [ "\$code" -lt 500 ]; then
+# /api/overlay/repair-progress - just needs to respond (not connection failure/5xx)
+code=\$(http_code "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/overlay/repair-progress?entry=healthcheck&file=healthcheck")
+if http_ok "\$code"; then
     echo "PASS overlay_repair_progress: HTTP \$code"
 else
     echo "FAIL overlay_repair_progress: HTTP \$code"
