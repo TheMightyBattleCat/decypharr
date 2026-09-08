@@ -52,7 +52,32 @@ const (
 	// this at import time, so junk sample clips bundled in an otherwise good
 	// release can't fail the whole grab.
 	ffprobeImportMinSize = 100 * 1024 * 1024 // 100 MiB
+
+	// ffprobeImportInconclusiveRetries bounds how many extra ffprobe passes a
+	// single file gets while it keeps coming back ok-but-inconclusive (a
+	// cold-read timeout, not a verdict). A small file that times out fast
+	// clears or exhausts this quickly; for a large REMUX the entry budget
+	// below is the real limiter and this rarely bites. 2 => up to 3 passes.
+	ffprobeImportInconclusiveRetries = 2
+
+	// ffprobeImportEntryBudget caps the total wall-clock the import gate
+	// spends on ffprobe verification for one entry - across every qualifying
+	// file, every pass, and every back-off wait combined. The gate runs on
+	// the shared download-completion path, so this is a hard ceiling: once
+	// it's exhausted the remaining files are admitted (entry flagged dirty
+	// for the next sweep), never rejected. A season pack of REMUXes on a slow
+	// backing store shares this one budget rather than multiplying it per
+	// file. One inconclusive pass on a ~40 GB REMUX is roughly 4-11 min
+	// (size-scaled metadata + size-scaled decode), so this fits ~2 passes of
+	// the largest realistic file, or one shot each at several smaller ones.
+	ffprobeImportEntryBudget = 20 * time.Minute
 )
+
+// ffprobeImportRetryBackoffs is the wait before each successive inconclusive
+// ffprobe verification retry for one file (index 0 = wait after the first
+// pass). It has ffprobeImportInconclusiveRetries entries; the last value
+// repeats if that count is ever raised past the slice length.
+var ffprobeImportRetryBackoffs = []time.Duration{30 * time.Second, 60 * time.Second}
 
 type downloadLogMeta struct {
 	requestHost     string
@@ -291,11 +316,14 @@ func (d *Downloader) importFFProbeChecker() *ffprobeChecker {
 //
 // Deliberately conservative, because wrongly rejecting a good release here is
 // worse than letting a bad file through to the repair sweep, which will still catch
-// it: a timeout or a cancelled context is inconclusive and lets the import
-// proceed, a missing ffprobe binary or disabled WebDAV lets it proceed (after
-// one WARN, see importFFProbeChecker), and any unexpected error from the gate
-// itself is swallowed and logged rather than failing the import - this gate
-// must never be the reason a good download breaks.
+// it: an inconclusive pass (cold-read timeout, cancelled context) is retried a
+// few times within a per-entry wall-clock budget (ffprobeImportEntryBudget,
+// shared across the entry's files) and, if it never resolves, the import
+// proceeds anyway with the entry flagged dirty so the next sweep re-probes it;
+// a missing ffprobe binary or disabled WebDAV lets it proceed (after one WARN,
+// see importFFProbeChecker); and any unexpected error from the gate itself is
+// swallowed and logged rather than failing the import - this gate must never
+// be the reason a good download breaks.
 //
 // Only checks structural health - container parses, a video stream exists, a
 // sane duration - plus a category-based ceiling (6h for a Sonarr grab, 12h
@@ -333,6 +361,13 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 	expected := expectedRuntime{ArrKind: kind}
 	entryFolder := entry.GetFolder()
 
+	// One wall-clock budget for the whole entry: every file's verification
+	// passes and back-off waits draw from it, so a slow backing store can
+	// delay a season pack's import by at most ffprobeImportEntryBudget, not
+	// that per file. Files reached after it's spent are admitted dirty.
+	budgetCtx, cancelBudget := context.WithTimeout(ctx, ffprobeImportEntryBudget)
+	defer cancelBudget()
+
 	for _, file := range entry.GetActiveFiles() {
 		if ctx.Err() != nil {
 			// Cancellation (shutdown) is inconclusive, never a rejection.
@@ -345,16 +380,12 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		if infoHash == "" {
 			infoHash = entry.InfoHash
 		}
-		sig := NewDeadSegmentSignal()
-		registerDeadSignal(infoHash, file.Name, sig)
-		// The import gate never touches DecodeVerifiedAt, so the conclusive
-		// flag is not consulted here - a genuine broken verdict rejects, an
-		// inconclusive (timeout) ok=true admits, same as before. Bytes is
-		// set per file so the decode timeout scales for a large import.
+		// Bytes is set per file so both the metadata and decode probe
+		// timeouts scale for a large import.
 		exp := expected
 		exp.Bytes = file.Size
-		ok, reason, _ := checker.checkConfirmed(ctx, entryFolder, file.Name, exp, false, sig)
-		unregisterDeadSignal(infoHash, file.Name, sig)
+
+		ok, conclusive, reason := d.verifyImportFile(budgetCtx, checker, entry, entryFolder, file.Name, infoHash, exp)
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
@@ -364,8 +395,64 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 			}
 			return fmt.Errorf("ffprobe import check: %s", reason)
 		}
+		if !conclusive {
+			// Every pass timed out or was cut short - the file is neither
+			// confirmed good nor confirmed broken. Admit it (a good download
+			// must never be held back by a slow backing store) but flag the
+			// entry so the next repair sweep actually re-probes it instead of
+			// inheriting a "passed import" it never earned.
+			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).
+				Dur("entry_budget", ffprobeImportEntryBudget).
+				Msg("Import: ffprobe verification stayed inconclusive after retries; admitting and flagging entry for re-probe")
+			if d.manager.storage != nil {
+				d.manager.storage.MarkEntryDirty(entry.Name, entry.Protocol, "import_ffprobe_inconclusive")
+			}
+		}
 	}
 	return nil
+}
+
+// verifyImportFile runs the import-gate ffprobe verification for one file,
+// retrying while the result comes back ok-but-inconclusive (a cold-read
+// timeout rather than a verdict). It stops at the first conclusive result, a
+// broken verdict, ffprobeImportInconclusiveRetries extra passes, or the
+// caller's ctx expiring (the shared per-entry ffprobeImportEntryBudget) -
+// whichever is first.
+//
+// A fresh dead-segment signal is registered per pass, so a confirmed 430 seen
+// on any attempt forces the broken verdict with no further retries.
+//
+// ok=false is a genuine broken verdict (caller rejects + re-grabs). ok=true
+// with conclusive=false means "admit but flag dirty": every pass ran out of
+// time and nothing was actually verified.
+func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, entryFolder, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return true, false, ""
+		}
+
+		sig := NewDeadSegmentSignal()
+		registerDeadSignal(infoHash, fileName, sig)
+		ok, reason, conclusive = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig)
+		unregisterDeadSignal(infoHash, fileName, sig)
+
+		if !ok {
+			return false, conclusive, reason
+		}
+		if conclusive || attempt >= ffprobeImportInconclusiveRetries {
+			return true, conclusive, reason
+		}
+
+		backoff := ffprobeImportRetryBackoffs[min(attempt, len(ffprobeImportRetryBackoffs)-1)]
+		d.logger.Debug().Str("entry", entry.Name).Str("file", fileName).
+			Int("attempt", attempt+1).Dur("backoff", backoff).
+			Msg("Import: ffprobe verification inconclusive (cold-read timeout); retrying before admitting")
+		select {
+		case <-ctx.Done():
+			return true, false, ""
+		case <-time.After(backoff):
+		}
+	}
 }
 
 func (d *Downloader) markAsCompleted(entry *storage.Entry) {

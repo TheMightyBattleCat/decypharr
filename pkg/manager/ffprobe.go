@@ -29,11 +29,26 @@ const (
 	ffprobeReasonRuntimeMismatch = "ffprobe_runtime_mismatch"
 	ffprobeReasonAbsurdDuration  = "ffprobe_absurd_duration"
 	ffprobeReasonDecodeError     = "ffprobe_decode_error"
+
+	// ffprobeReasonDeadSegment is the verdict checkConfirmed forces when the
+	// fetcher observed a confirmed-dead (NNTP 430) segment while serving the
+	// probe read. Callers match on this exact string to distinguish a
+	// genuinely-dead posting from any other broken verdict (see the import
+	// gate's dead-posting handling).
+	ffprobeReasonDeadSegment = "dead_segment_detected: NNTP 430 during verification read"
 )
 
 const (
 	ffprobeDefaultTimeout = 90 * time.Second
 	ffprobeRetryDelay     = 2 * time.Second
+
+	// ffprobeVerifyBaseTimeout is the per-probe floor for both the repair
+	// sweep and the import gate (an explicit repair.ffprobe_timeout in config
+	// still overrides it). Both read cold over Usenet/WebDAV under whatever I/O
+	// contention playback and the rest of the run are creating, and both now
+	// have large REMUXes in scope, so a single cold read gets 3 minutes before
+	// it's treated as merely inconclusive rather than the old flat 90s.
+	ffprobeVerifyBaseTimeout = 2 * ffprobeDefaultTimeout
 
 	// TOO LONG: broken when the file runs at least this many times its
 	// expected runtime AND is at least ffprobeTooLongMinOverage over. The
@@ -74,6 +89,15 @@ const (
 	// clamped to the cap. A 40 GB file lands around base+200s.
 	ffprobeDecodeTimeoutPerGB = 5 * time.Second
 	ffprobeDecodeTimeoutCap   = 10 * time.Minute
+
+	// The metadata probe (-show_format/-show_streams, no -read_intervals) only
+	// reads the container header plus a tail moov atom, so it doesn't scale
+	// with total bytes the way the decode windows do - but on a 20 GB+ REMUX
+	// even that is a real cold seek over WebDAV that has blown the flat 90s
+	// import budget (CiNEPHiLES 2026-09-08). Scale it gently, with a lower cap
+	// than the decode path.
+	ffprobeMetadataTimeoutPerGB = 2 * time.Second
+	ffprobeMetadataTimeoutCap   = 5 * time.Minute
 
 	// ffprobeDecodeWindowSpan is how long each decode window reads.
 	ffprobeDecodeWindowSpan = 2 * time.Second
@@ -154,11 +178,7 @@ func newFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger) *ffpr
 	if !cfg.Repair.FFProbeCheck {
 		return nil
 	}
-	// The sweep reads over Usenet under whatever I/O contention the rest of
-	// the repair run and live playback are creating, so it gets double the
-	// import gate's default budget before a slow cold read is treated as
-	// merely inconclusive.
-	return buildFFProbeChecker(cfg, m, log, 2*ffprobeDefaultTimeout)
+	return buildFFProbeChecker(cfg, m, log, ffprobeVerifyBaseTimeout)
 }
 
 // newImportFFProbeChecker builds a checker for the import-time gate
@@ -173,7 +193,7 @@ func newImportFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger)
 	if !cfg.Repair.FFProbeOnImport {
 		return nil
 	}
-	return buildFFProbeChecker(cfg, m, log, ffprobeDefaultTimeout)
+	return buildFFProbeChecker(cfg, m, log, ffprobeVerifyBaseTimeout)
 }
 
 // buildFFProbeChecker does the binary/WebDAV/auth/timeout resolution shared
@@ -182,11 +202,12 @@ func newImportFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger)
 // WebDAV disabled. Callers must treat nil as "proceed without validation"
 // rather than failing whatever they're doing.
 //
-// defaultTimeout is the per-caller floor used when repair.ffprobe_timeout
-// isn't set - the sweep and import gate pass different values (see their
-// call sites) so the sweep can tolerate slower cold reads under repair/
-// playback I/O contention without also loosening the import gate. An
-// explicit repair.ffprobe_timeout in config always overrides either default.
+// defaultTimeout is the per-probe floor used when repair.ffprobe_timeout
+// isn't set. Both callers currently pass ffprobeVerifyBaseTimeout (the sweep
+// for cold-read tolerance under I/O contention, the import gate because large
+// REMUXes are now in its scope), but the parameter stays so the two can
+// diverge again without touching this function. An explicit
+// repair.ffprobe_timeout in config always overrides the default.
 func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger, defaultTimeout time.Duration) *ffprobeChecker {
 	binPath := strings.TrimSpace(cfg.Repair.FFProbePath)
 	if binPath == "" {
@@ -207,7 +228,7 @@ func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger, def
 		if d, err := utils.ParseDuration(raw); err == nil && d > 0 {
 			timeout = d
 		} else {
-			log.Warn().Str("value", raw).Msg("Repair: invalid repair.ffprobe_timeout; using default of 90s")
+			log.Warn().Str("value", raw).Dur("default", defaultTimeout).Msg("Repair: invalid repair.ffprobe_timeout; using the built-in default")
 		}
 	}
 
@@ -245,6 +266,23 @@ func (f *ffprobeChecker) probeArgs(entryFolder, fileName string, args []string) 
 	return append(args, f.probeTarget(entryFolder, fileName))
 }
 
+// scaledTimeout returns f.timeout grown by perGB for every GB of fileBytes,
+// clamped to cap. fileBytes <= 0 (size unknown) falls back to the flat
+// f.timeout. The decode-windows probe and the metadata probe call this with
+// different perGB/cap pairs - a decode pass pulls bytes roughly proportional
+// to file size, a metadata probe only seeks the header and tail.
+func (f *ffprobeChecker) scaledTimeout(fileBytes int64, perGB, capAt time.Duration) time.Duration {
+	if fileBytes <= 0 {
+		return f.timeout
+	}
+	sizeGB := float64(fileBytes) / (1024 * 1024 * 1024)
+	scaled := f.timeout + time.Duration(sizeGB*float64(perGB))
+	if scaled > capAt {
+		scaled = capAt
+	}
+	return scaled
+}
+
 type ffprobeOutput struct {
 	Format struct {
 		Duration string `json:"duration"`
@@ -269,7 +307,7 @@ type ffprobeOutput struct {
 func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string, conclusive bool) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
-	cctx, cancel := context.WithTimeout(ctx, f.timeout)
+	cctx, cancel := context.WithTimeout(ctx, f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap))
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, f.binPath, args...)
@@ -501,15 +539,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// REMUX has far more compressed data to pull through the decode windows
 	// than a WEB episode, so a flat budget times out on the big ones and
 	// wastes time on the small ones.
-	timeout := f.timeout
-	if fileBytes > 0 {
-		sizeGB := float64(fileBytes) / (1024 * 1024 * 1024)
-		scaled := f.timeout + time.Duration(sizeGB*float64(ffprobeDecodeTimeoutPerGB))
-		if scaled > ffprobeDecodeTimeoutCap {
-			scaled = ffprobeDecodeTimeoutCap
-		}
-		timeout = scaled
-	}
+	timeout := f.scaledTimeout(fileBytes, ffprobeDecodeTimeoutPerGB, ffprobeDecodeTimeoutCap)
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -570,13 +600,11 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // is a definite signal). A retry abandoned because ctx was cancelled
 // mid-wait is conclusive=false.
 func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal) (ok bool, reason string, conclusive bool) {
-	const deadSegmentReason = "dead_segment_detected: NNTP 430 during verification read"
-
 	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode)
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification read; forcing broken verdict")
-		return false, deadSegmentReason, true
+		return false, ffprobeReasonDeadSegment, true
 	}
 	if ok {
 		return true, "", conclusive
@@ -598,7 +626,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification retry; forcing broken verdict")
-		return false, deadSegmentReason, true
+		return false, ffprobeReasonDeadSegment, true
 	}
 	if ok {
 		return true, "", conclusive
