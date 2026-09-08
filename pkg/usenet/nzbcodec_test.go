@@ -368,6 +368,108 @@ func TestNZBCodecV2RoundTripsPar2Match(t *testing.T) {
 	}
 }
 
+func TestNZBCodecV2RoundTripsContentHash(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.ContentHash = "2f3a1c9e8b7d6f5041a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081"
+
+	data, err := encodeNZBV2(nzb)
+	if err != nil {
+		t.Fatalf("encodeNZBV2: %v", err)
+	}
+	got, err := decodeNZBV2(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2: %v", err)
+	}
+	if got.ContentHash != nzb.ContentHash {
+		t.Errorf("ContentHash = %q, want %q", got.ContentHash, nzb.ContentHash)
+	}
+
+	// The import gate reads NZB records header-only, so the field must
+	// survive that path too - not just the full segment-map decode.
+	headerOnly, err := decodeNZBV2Header(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2Header: %v", err)
+	}
+	if headerOnly.ContentHash != nzb.ContentHash {
+		t.Errorf("header-only ContentHash = %q, want %q", headerOnly.ContentHash, nzb.ContentHash)
+	}
+}
+
+// TestNZBCodecV2DecodesPar2BlobWithoutContentHashTrailer confirms a header
+// blob written before the ContentHash trailer existed (PAR2 refs, Real
+// bitset, and a match cache present, then the buffer ends) still decodes,
+// leaving ContentHash empty rather than erroring.
+func TestNZBCodecV2DecodesPar2BlobWithoutContentHashTrailer(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	nzb.Par2Match = []storage.Par2MatchRef{
+		{PostedName: "Some.Release.2024.rar", FileID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}},
+	}
+
+	w := &byteWriter{}
+	w.str(nzb.ID)
+	w.str(nzb.Name)
+	w.str(nzb.Title)
+	w.str(nzb.Path)
+	w.varint(nzb.TotalSize)
+	w.varint(nzb.DatePosted.Unix())
+	w.str(nzb.Category)
+	w.uvarint(uint64(len(nzb.Groups)))
+	for _, g := range nzb.Groups {
+		w.str(g)
+	}
+	w.boolean(nzb.Downloaded)
+	w.varint(nzb.AddedOn.Unix())
+	w.varint(nzb.LastActivity.Unix())
+	w.str(nzb.Status)
+	w.f64(nzb.Progress)
+	w.f64(nzb.Percentage)
+	w.varint(nzb.SizeDownloaded)
+	w.varint(nzb.ETA)
+	w.varint(nzb.Speed)
+	w.varint(nzb.CompletedOn.Unix())
+	w.boolean(nzb.IsBad)
+	w.str(nzb.Storage)
+	w.str(nzb.FailMessage)
+	w.str(nzb.Password)
+	w.uvarint(uint64(len(nzb.Files)))
+	for i := range nzb.Files {
+		f := &nzb.Files[i]
+		w.str(f.Name)
+		w.str(f.InternalPath)
+		w.varint(f.Size)
+		w.varint(f.StartOffset)
+		w.uvarint(uint64(len(f.Groups)))
+		for _, g := range f.Groups {
+			w.str(g)
+		}
+		w.str(string(f.FileType))
+		w.str(f.Password)
+		w.boolean(f.IsDeleted)
+		w.boolean(f.IsStored)
+		w.varint(f.SegmentSize)
+		w.raw(f.EncryptionKey)
+		w.raw(f.EncryptionIV)
+		w.boolean(f.IsEncrypted)
+		w.uvarint(uint64(len(f.Segments)))
+	}
+	// PAR2 refs + Real bitset + match cache, but deliberately NO ContentHash trailer.
+	writePar2FileRefs(w, nzb.Par2Files)
+	writePar2FileRefs(w, nzb.Par2Source)
+	writeRealBitset(w, par2RealTargets(nzb.Par2Files, nzb.Par2Source)...)
+	writePar2MatchRefs(w, nzb.Par2Match)
+
+	got, _, err := decodeHeader(w.buf)
+	if err != nil {
+		t.Fatalf("decodeHeader on a blob without a ContentHash trailer: %v", err)
+	}
+	if got.ContentHash != "" {
+		t.Fatalf("ContentHash = %q, want empty (no trailer present)", got.ContentHash)
+	}
+	if len(got.Par2Match) != 1 {
+		t.Errorf("Par2Match len = %d, want 1 (match cache must still decode)", len(got.Par2Match))
+	}
+}
+
 // TestNZBCodecV2RoundTripsWithoutPar2Match confirms the common case - PAR2
 // refs and Real bitset present, no match cache yet - encodes and decodes
 // cleanly with Par2Match nil.

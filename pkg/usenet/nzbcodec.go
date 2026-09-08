@@ -270,6 +270,15 @@ func encodeHeader(nzb *storage.NZB) []byte {
 	// "is there more?" check.
 	writePar2MatchRefs(w, nzb.Par2Match)
 
+	// ContentHash of the raw source .nzb, appended after the Par2Match cache
+	// on the same append-only terms. It is set at parse time but was never
+	// persisted before this field, and the raw .nzb is deleted the moment the
+	// NZB completes - so without this the posted-articles identity a re-grab
+	// of a genuinely-dead release would hash to is lost as soon as the
+	// download finishes. Always written (empty string when unknown) so the
+	// decode-side guard stays a plain "is there more?" check.
+	w.str(nzb.ContentHash)
+
 	return w.buf
 }
 
@@ -740,6 +749,13 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 			if r.pos < len(buf) {
 				if nzb.Par2Match, err = readPar2MatchRefs(r); err != nil {
 					return nil, nil, err
+				}
+				// ContentHash, appended after the Par2Match cache. A blob
+				// written before this field ends above, leaving it empty.
+				if r.pos < len(buf) {
+					if nzb.ContentHash, err = r.strCopy(); err != nil {
+						return nil, nil, err
+					}
 				}
 			}
 		}
