@@ -2586,12 +2586,52 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerol
 	}
 	seedSeg := segs[0].Bytes
 	lastSeg := trueLen - int64(n-1)*seedSeg
-	if trueLen > 0 && seedSeg > 0 && lastSeg > 0 && segs[0].Real {
+	exact := trueLen > 0 && seedSeg > 0 && lastSeg > 0 && segs[0].Real
+
+	// A file's final article is never LARGER than a full one, so lastSeg >
+	// seedSeg is proof that the seed size and FileDesc.Length disagree -
+	// the uniform-interior assumption this branch rests on does not hold, and
+	// committing to it would put every interior boundary in the wrong place.
+	//
+	// This is reachable, not theoretical: realPar2SegmentRefs accepts the yEnc
+	// header's declared total whenever it is within +/-1.5 x segmentSize of
+	// n x segmentSize and then marks every ref Real, which permits a final
+	// segment up to 2.5x the seed. trueLen arrives from a different authority
+	// (FileDesc.Length) and nothing previously cross-checked the two.
+	//
+	// The cost of getting this wrong is not a clean failure: an overstated
+	// final segment makes readRange demand more bytes than the article holds,
+	// which surfaces as ErrSegmentShort and gets folded into the damaged set
+	// as if the posting were truncated - reconstructing intact data from
+	// parity, inflating k toward the 64-slice cap, and potentially reaching a
+	// terminal "unrepairable" verdict on a healthy release. Fall back to the
+	// scaled accumulate, which anchors on trueLen without assuming uniformity.
+	if exact && lastSeg > seedSeg {
+		logger.Warn().
+			Int64("seed_segment", seedSeg).
+			Int64("implied_last_segment", lastSeg).
+			Int64("trueLen", trueLen).
+			Int("segments", n).
+			Msg("exactSegGeometry: implied final segment exceeds the seed article size - persisted geometry and FileDesc.Length disagree; falling back to scaled accumulate")
+		exact = false
+	}
+
+	if exact {
 		for i := range segs {
 			bases[i] = int64(i) * seedSeg
 			sizes[i] = seedSeg
 		}
 		sizes[n-1] = lastSeg
+		// Logged for the same reason the scaled branch below is: this is the
+		// branch that hands the repair its byte offsets, and it was previously
+		// the silent one - the safe path was visible and the load-bearing one
+		// was not.
+		logger.Debug().
+			Int64("seed_segment", seedSeg).
+			Int64("last_segment", lastSeg).
+			Int64("trueLen", trueLen).
+			Int("segments", n).
+			Msg("exactSegGeometry: using exact uniform-interior geometry (real seed provenance)")
 	} else if trueLen > 0 {
 		// Scaled accumulate: anchor estimated sizes to trueLen (FileDesc.Length)
 		// to prevent cumulative drift from the 0.97 yEnc overhead estimate.

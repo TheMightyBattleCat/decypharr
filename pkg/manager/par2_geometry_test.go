@@ -126,3 +126,83 @@ func TestPar2SegmentRef_JSONRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// A yEnc file's final article is never larger than a full one, so an implied
+// final segment bigger than the seed proves the persisted seed size and
+// FileDesc.Length disagree. The exact branch must not commit to a uniform
+// interior on that evidence: an overstated tail makes readRange demand bytes
+// the article does not hold, which surfaces as ErrSegmentShort and gets folded
+// into the damaged set as if the posting were truncated.
+//
+// Reachable via realPar2SegmentRefs, which marks every ref Real while
+// tolerating a declared total within +/-1.5 x segmentSize - permitting a final
+// segment up to 2.5x the seed.
+func TestExactSegGeometry_RejectsFinalSegmentLargerThanSeed(t *testing.T) {
+	segs := []storage.Par2SegmentRef{
+		{MessageID: "a", Bytes: 700000, Real: true},
+		{MessageID: "b", Bytes: 700000, Real: true},
+		{MessageID: "c", Bytes: 300000, Real: true},
+	}
+	// 700000*2 + 1300000: the exact branch would claim a 1.3MB final segment
+	// from a 700KB article.
+	const trueLen = 2700000
+
+	bases, sizes := exactSegGeometry(segs, trueLen, zerolog.Nop())
+
+	if sizes[2] > segs[0].Bytes {
+		t.Errorf("final segment = %d bytes, which exceeds the %d-byte seed article - the exact branch accepted impossible geometry",
+			sizes[2], segs[0].Bytes)
+	}
+	// The scaled fallback still anchors the total on trueLen.
+	var total int64
+	for _, s := range sizes {
+		total += s
+	}
+	if total != trueLen {
+		t.Errorf("sizes sum to %d, want %d (the fallback must still anchor on FileDesc.Length)", total, trueLen)
+	}
+	if bases[0] != 0 {
+		t.Errorf("bases[0] = %d, want 0", bases[0])
+	}
+	for i := 1; i < len(bases); i++ {
+		if bases[i] != bases[i-1]+sizes[i-1] {
+			t.Errorf("bases[%d] = %d, want %d (contiguous)", i, bases[i], bases[i-1]+sizes[i-1])
+		}
+	}
+}
+
+// The guard must not disturb the case it was carved out of: a final segment
+// smaller than the seed is normal and still takes the exact path.
+func TestExactSegGeometry_AllowsNormalShorterFinalSegment(t *testing.T) {
+	segs := []storage.Par2SegmentRef{
+		{MessageID: "a", Bytes: 700000, Real: true},
+		{MessageID: "b", Bytes: 700000, Real: true},
+		{MessageID: "c", Bytes: 300000, Real: true},
+	}
+	const trueLen = 700000*2 + 250000
+
+	_, sizes := exactSegGeometry(segs, trueLen, zerolog.Nop())
+
+	if sizes[0] != 700000 || sizes[1] != 700000 {
+		t.Errorf("interior sizes = %v, want the exact seed size for both", sizes[:2])
+	}
+	if sizes[2] != 250000 {
+		t.Errorf("final size = %d, want 250000 (trueLen - 2*seed)", sizes[2])
+	}
+}
+
+// A single-segment file: lastSeg == trueLen, which can legitimately exceed the
+// seed estimate. Both paths must produce the same answer, so the guard is
+// harmless here.
+func TestExactSegGeometry_SingleSegment(t *testing.T) {
+	segs := []storage.Par2SegmentRef{{MessageID: "a", Bytes: 744960, Real: true}}
+	const trueLen = 750000
+
+	bases, sizes := exactSegGeometry(segs, trueLen, zerolog.Nop())
+	if len(sizes) != 1 || sizes[0] != trueLen {
+		t.Errorf("sizes = %v, want [%d] - a lone segment is exactly the file", sizes, int64(trueLen))
+	}
+	if bases[0] != 0 {
+		t.Errorf("bases = %v, want [0]", bases)
+	}
+}
