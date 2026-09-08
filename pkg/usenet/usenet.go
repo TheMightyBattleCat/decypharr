@@ -32,6 +32,13 @@ import (
 const (
 	bufferSize = 256 * 1024 // 256KB buffer for streaming
 
+	// verifyBufferSize is the streaming copy-buffer size for verification
+	// reads (ffprobe import/sweep checks, padding disabled). Larger than
+	// bufferSize so each safeCopyBuffer iteration spans several segments,
+	// giving EnsureSegmentsConcurrent a multi-segment window to parallelise.
+	// Real playback keeps the 256KB buffer.
+	verifyBufferSize = 4 * 1024 * 1024 // 4MB
+
 	// failedFileTTL bounds how long a permanent-failure record in
 	// failedFiles survives before preStreamChecks/FailedFileCause treat it
 	// as expired and let the next read re-verify from scratch. Without
@@ -64,6 +71,30 @@ func releaseStreamBuffer(buf []byte) {
 		return
 	}
 	streamBufferPool.Put(buf[:bufferSize])
+}
+
+var verifyBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, verifyBufferSize)
+	},
+}
+
+func acquireVerifyBuffer() []byte {
+	buf := verifyBufferPool.Get().([]byte)
+	if cap(buf) < verifyBufferSize {
+		buf = make([]byte, verifyBufferSize)
+	}
+	return buf[:verifyBufferSize]
+}
+
+func releaseVerifyBuffer(buf []byte) {
+	if buf == nil {
+		return
+	}
+	if cap(buf) < verifyBufferSize {
+		return
+	}
+	verifyBufferPool.Put(buf[:verifyBufferSize])
 }
 
 type fsEntry struct {
@@ -1535,8 +1566,17 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	readerAt.Prefetch(ctx, rangeStart, prefetchLen)
 
 	section := newContextSectionReader(ctx, readerAt, rangeStart, length)
-	buf := acquireStreamBuffer()
-	defer releaseStreamBuffer(buf)
+	var buf []byte
+	if reader.PaddingDisabled(ctx) {
+		// Verification read: bigger copy buffer so each safeCopyBuffer
+		// iteration hands readAtPlain a multi-segment span to fetch
+		// concurrently (prefetch is disabled on this path).
+		buf = acquireVerifyBuffer()
+		defer releaseVerifyBuffer(buf)
+	} else {
+		buf = acquireStreamBuffer()
+		defer releaseStreamBuffer(buf)
+	}
 
 	// Use a safe copy loop that checks context and validates read counts
 	_, err = safeCopyBuffer(ctx, writer, section, buf)

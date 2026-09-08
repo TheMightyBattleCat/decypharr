@@ -207,10 +207,19 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 		}
 	}
 
-	// Ensure all required segments are available (may block for downloads)
-	if err := sr.fetcher.EnsureSegments(ctx, startSeg, endSeg); err != nil {
+	// Ensure all required segments are available (may block for downloads).
+	// Verification reads (padding disabled) run with no prefetch, so a
+	// multi-segment span is fetched via a worker pool; single-segment spans
+	// and normal playback keep the serial path.
+	var ensureErr error
+	if paddingDisabled(ctx) && endSeg > startSeg {
+		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
+	} else {
+		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
+	}
+	if ensureErr != nil {
 		sr.stats.ReadErrors.Add(1)
-		return 0, err
+		return 0, ensureErr
 	}
 
 	// Read data from cache

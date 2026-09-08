@@ -530,6 +530,80 @@ func (sf *SegmentFetcher) EnsureSegments(ctx context.Context, startSeg, endSeg i
 	return nil
 }
 
+// EnsureSegmentsConcurrent fetches every missing segment in
+// [startSeg, endSeg] using a worker pool capped at MaxConnections,
+// returning once all are on disk or the first error is seen. It exists for
+// verification reads (padding disabled): readAtPlain queues no prefetch on
+// that path, so the serial EnsureSegments would pull one ~750KB article at
+// a time with the other connection slots idle.
+//
+// The per-fetcher semaphore in doFetch still bounds real NNTP connections,
+// so the worker count only limits how many fetchWithRetry calls are in
+// flight. Workers never cancel each other: a sibling failure must not
+// surface as a synthetic context.Canceled that masks a genuine dead-article
+// verdict (cf. the padding/PAR2 ctx-cancel-misclassification fixes). Each
+// worker honours the caller's ctx; the first non-nil error - a real fetch
+// error or the caller's ctx error - is returned, and the rest of the
+// window is still probed.
+func (sf *SegmentFetcher) EnsureSegmentsConcurrent(ctx context.Context, startSeg, endSeg int) error {
+	var needed []int
+	for i := startSeg; i <= endSeg; i++ {
+		if sf.cache.GetState(i) != StateOnDisk {
+			needed = append(needed, i)
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+
+	workers := sf.config.MaxConnections
+	if workers < 1 {
+		workers = 8
+	}
+	if workers > len(needed) {
+		workers = len(needed)
+	}
+
+	ch := make(chan int, len(needed))
+	for _, idx := range needed {
+		ch <- idx
+	}
+	close(ch)
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	record := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+	}
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range ch {
+				if err := ctx.Err(); err != nil {
+					record(err)
+					return
+				}
+				record(sf.fetchWithRetry(ctx, idx))
+			}
+		}()
+	}
+	wg.Wait()
+
+	return firstErr
+}
+
 // fetchWithRetry fetches a single segment, retrying transient failures so a
 // momentary provider hiccup or stall does not tear down the whole stream.
 // Permanent failures (article-not-found) and cancellations return immediately.
