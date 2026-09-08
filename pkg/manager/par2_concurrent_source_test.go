@@ -164,6 +164,44 @@ func TestConcurrentSliceSourceTracksShortSegmentAsNotFound(t *testing.T) {
 	}
 }
 
+// A short read and a hard 430 both land in the damaged set, but they mean
+// opposite things about where the fault lies - a 430 is provider damage, a
+// short read is a claim about our own persisted segment geometry. Reporting
+// both as "confirmed missing across every provider" made a geometry bug on
+// intact data indistinguishable from a dead posting, in the logs and in the
+// terminal classifier.
+func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
+	order := []int64{0, 1, 2, 3}
+	notFoundErr := &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
+	fetchOne := func(idx int64) ([]byte, error) {
+		switch idx {
+		case 1:
+			return nil, notFoundErr
+		case 2:
+			return nil, fmt.Errorf("segment %d: %w", 7, ErrSegmentShort)
+		case 3:
+			// A transient timeout is neither: it must not be counted at all.
+			return nil, context.DeadlineExceeded
+		}
+		return []byte{byte(idx)}, nil
+	}
+	src := newConcurrentSliceSource(context.Background(), order, 4, fetchOne)
+	for _, idx := range order {
+		_, _ = src.ReadSlice(idx)
+	}
+
+	confirmedMissing, shortRead := src.DeadCauseCounts()
+	if confirmedMissing != 1 {
+		t.Errorf("confirmedMissing = %d, want 1 (only the 430)", confirmedMissing)
+	}
+	if shortRead != 1 {
+		t.Errorf("shortRead = %d, want 1 (only the ErrSegmentShort)", shortRead)
+	}
+	if total := len(src.NotFoundIndices()); total != 2 {
+		t.Errorf("NotFoundIndices() has %d entries, want 2 - the timeout must not be folded in", total)
+	}
+}
+
 // TestConcurrentSliceSourceWrapsContextErrorWhenCancelled covers the real
 // cause of the "worker pool closed early" report: run()'s workers take the
 // <-ctx.Done() branch on their result send when the job's context is
@@ -184,7 +222,7 @@ func TestConcurrentSliceSourceWrapsContextErrorWhenCancelled(t *testing.T) {
 		ctx:      ctx,
 		resultCh: make(chan sliceFetchResult),
 		pending:  make(map[int64]sliceFetchResult),
-		notFound: make(map[int64]struct{}),
+		notFound: make(map[int64]deadCause),
 	}
 	close(s.resultCh)
 
@@ -210,7 +248,7 @@ func TestConcurrentSliceSourceReportsPoolClosedWhenNotCancelled(t *testing.T) {
 		ctx:      context.Background(),
 		resultCh: make(chan sliceFetchResult),
 		pending:  make(map[int64]sliceFetchResult),
-		notFound: make(map[int64]struct{}),
+		notFound: make(map[int64]deadCause),
 	}
 	close(s.resultCh)
 

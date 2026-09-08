@@ -99,6 +99,21 @@ var par2TerminalSubstrings = []string{
 	// runRepair. The typed nntp.IsArticleNotFoundError check above can't
 	// see this case because repairErr itself isn't an nntp.Error here.
 	"confirmed missing across every provider",
+	// The short-read half of the same round-cap return: every unreadable
+	// slice was a backing article that decoded to fewer bytes than its
+	// recorded size, with no confirmed 430 among them (see deadCause). Kept
+	// terminal to preserve the behaviour this wording was split out of - a
+	// genuinely truncated posting never heals, and these passes cost
+	// gigabytes each, so retrying one on a backoff is expensive.
+	//
+	// REVISIT if spurious short reads reappear: a short read is a claim about
+	// OUR arithmetic as much as the posting, so an over-estimated segment
+	// size can manufacture this verdict on wholly intact data. The
+	// lastSeg <= seedSeg guard in exactSegGeometry closes the known
+	// manufacturer; if the "decoded shorter" count stays nonzero on healthy
+	// releases after that, this entry is the thing to drop - it is the line
+	// between "unrepairable" and "try again later".
+	"decoded shorter than their recorded size",
 }
 
 // classifyPar2Failure decides whether err (a runRepair failure) should back

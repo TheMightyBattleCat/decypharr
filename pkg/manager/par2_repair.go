@@ -1965,18 +1965,33 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			// rounds is exactly the distinct-slice count - no set needed.
 			*deadDiscovered += len(newlyDamaged)
 		}
+		// Report WHY the slices were unreadable, not just how many. A hard 430
+		// and a short decode are folded into the damaged set identically but
+		// mean opposite things (see deadCause), and both used to be reported
+		// as "confirmed missing across every provider" - a false statement for
+		// the short-read case, and one that made a geometry bug on intact data
+		// indistinguishable from genuine provider damage.
+		confirmedMissing, shortRead := sliceSource.DeadCauseCounts()
 		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
-			if len(notFound) > 0 {
-				return fmt.Errorf("repair: %d intact slice(s) confirmed missing across every provider: %w", len(notFound), repairErr)
+			switch {
+			case confirmedMissing > 0 && shortRead > 0:
+				return fmt.Errorf("repair: %d intact slice(s) unreadable - %d confirmed missing across every provider, %d decoded shorter than their recorded size: %w",
+					len(notFound), confirmedMissing, shortRead, repairErr)
+			case confirmedMissing > 0:
+				return fmt.Errorf("repair: %d intact slice(s) confirmed missing across every provider: %w", confirmedMissing, repairErr)
+			case shortRead > 0:
+				return fmt.Errorf("repair: %d intact slice(s) decoded shorter than their recorded size: %w", shortRead, repairErr)
 			}
 			return fmt.Errorf("repair: %w", repairErr)
 		}
 		p.logger.Info().
 			Str("entry", entryName).
 			Int("newly_damaged", len(newlyDamaged)).
+			Int("confirmed_missing", confirmedMissing).
+			Int("short_read", shortRead).
 			Int("round", round+1).
 			Bool("stat_sweep_ran", statSwept).
-			Msg("par2 repair: intact slice(s) confirmed missing across every provider; expanding damaged set and retrying")
+			Msg("par2 repair: intact slice(s) unreadable; expanding damaged set and retrying")
 		damaged = append(damaged, newlyDamaged...)
 		sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
 	}

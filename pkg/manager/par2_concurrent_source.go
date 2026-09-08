@@ -19,6 +19,31 @@ type sliceFetchResult struct {
 	err  error
 }
 
+// deadCause records WHY a slice's backing bytes could not be read. Both
+// causes are unrecoverable at this position and both are folded into the
+// damaged set identically - the distinction is not about what to do, it is
+// about what is true, because the two have opposite root causes and the same
+// remedy would be wrong for one of them:
+//
+//   - causeConfirmedMissing: a hard 430 across every provider. The article is
+//     genuinely gone from usenet. Provider-side damage.
+//   - causeShortRead: the article EXISTS (it STATs fine) and simply decoded
+//     to fewer bytes than our persisted segment geometry claimed. That is a
+//     statement about our own arithmetic, not about the posting - an
+//     over-estimated segment size manufactures this on wholly intact data.
+//
+// Reporting both as "confirmed missing across every provider" is not merely
+// imprecise, it actively misleads: it makes a geometry bug indistinguishable
+// from provider damage in the logs, and lets an inflated damaged set push k
+// past the recovery budget into a terminal "unrepairable" verdict on a
+// release that is fine.
+type deadCause uint8
+
+const (
+	causeConfirmedMissing deadCause = iota
+	causeShortRead
+)
+
 // concurrentSliceSource wraps a per-slice fetch function with a bounded
 // pool of concurrent fetchers - mirroring pkg/usenet/download.go's model
 // (pool.New().WithContext(ctx).WithMaxGoroutines(N) plus a bounded result
@@ -45,7 +70,7 @@ type concurrentSliceSource struct {
 	// run(), read by NotFoundIndices after the pool has drained (or
 	// mid-flight, best-effort). See NotFoundIndices.
 	notFoundMu sync.Mutex
-	notFound   map[int64]struct{}
+	notFound   map[int64]deadCause
 }
 
 // newConcurrentSliceSource launches maxConcurrency worker goroutines that
@@ -63,7 +88,7 @@ func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency
 		ctx:      ctx,
 		resultCh: make(chan sliceFetchResult, maxConcurrency*2),
 		pending:  make(map[int64]sliceFetchResult),
-		notFound: make(map[int64]struct{}),
+		notFound: make(map[int64]deadCause),
 	}
 	go s.run(ctx, order, maxConcurrency, fetchOne)
 	return s
@@ -74,22 +99,38 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 	for _, idx := range order {
 		p.Go(func(ctx context.Context) error {
 			data, err := fetchOne(idx)
-			if err != nil && (nntp.IsArticleNotFoundError(err) || errors.Is(err, ErrSegmentShort)) {
-				// This slice's backing data is gone at this position: either a
-				// hard 430 confirmed across every provider (ExecuteWithFailover
-				// already exhausted them all before returning it), or a
-				// truncated backing article (ErrSegmentShort) that decoded too
-				// short to serve the bytes the slice needs. Either way it's not
-				// a transient hiccup - retrying the same fetch yields the same
-				// result. Recorded regardless of whether ReadSlice ever gets
+			if err != nil {
+				// This slice's backing data is unreadable at this position:
+				// either a hard 430 confirmed across every provider
+				// (ExecuteWithFailover already exhausted them all before
+				// returning it), or a backing article that decoded too short to
+				// serve the bytes the slice needs (ErrSegmentShort). Either way
+				// it's not a transient hiccup - retrying the same fetch yields
+				// the same result - so both are folded into the damaged set for
+				// recovery-slice reconstruction. The CAUSE is retained because
+				// the two mean opposite things about where the fault lies; see
+				// deadCause. Recorded regardless of whether ReadSlice ever gets
 				// asked for this exact index: par2.Repair aborts on the FIRST
 				// error it sees, so a later index's failure here would otherwise
 				// be silently lost - see runRepair's retry loop, which
 				// reclassifies every index collected here into the damaged set
-				// at once for recovery-slice reconstruction.
-				s.notFoundMu.Lock()
-				s.notFound[idx] = struct{}{}
-				s.notFoundMu.Unlock()
+				// at once.
+				//
+				// The 430 test comes first: readRange wraps a fetch failure as
+				// "fetch segment N: <err>" and a short decode as
+				// "segment N: ErrSegmentShort", so the two are disjoint in
+				// practice, but a genuinely-missing article is the stronger
+				// claim and should win any overlap.
+				switch {
+				case nntp.IsArticleNotFoundError(err):
+					s.notFoundMu.Lock()
+					s.notFound[idx] = causeConfirmedMissing
+					s.notFoundMu.Unlock()
+				case errors.Is(err, ErrSegmentShort):
+					s.notFoundMu.Lock()
+					s.notFound[idx] = causeShortRead
+					s.notFoundMu.Unlock()
+				}
 			}
 			select {
 			case s.resultCh <- sliceFetchResult{idx: idx, data: data, err: err}:
@@ -117,6 +158,29 @@ func (s *concurrentSliceSource) NotFoundIndices() []int64 {
 		out = append(out, idx)
 	}
 	return out
+}
+
+// DeadCauseCounts breaks the NotFoundIndices set down by why each slice was
+// unreadable: articles confirmed gone from every provider, versus articles
+// that exist but decoded shorter than our persisted segment geometry claimed.
+// Same locking and same best-effort snapshot semantics as NotFoundIndices.
+//
+// The split exists so a caller can say which it saw. A nonzero shortRead is a
+// signal about THIS code's arithmetic, not about the posting: it means a
+// segment size we persisted overstates what the article really decodes to (see
+// exactSegGeometry), and the slices counted here may be wholly intact data
+// being reconstructed from parity for no reason.
+func (s *concurrentSliceSource) DeadCauseCounts() (confirmedMissing, shortRead int) {
+	s.notFoundMu.Lock()
+	defer s.notFoundMu.Unlock()
+	for _, cause := range s.notFound {
+		if cause == causeShortRead {
+			shortRead++
+			continue
+		}
+		confirmedMissing++
+	}
+	return confirmedMissing, shortRead
 }
 
 // ReadSlice implements par2.SliceSource, satisfying the "read exactly once
