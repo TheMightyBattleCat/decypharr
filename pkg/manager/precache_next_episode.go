@@ -324,10 +324,12 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// of an already-cached (or partially-evicted) file - the burst itself
 	// skips anything already cached, so "fully cached" here means the burst
 	// will be cheap re-verification, not a download.
+	fullyCached := false
 	if reader := p.cacheCoverageReader(); reader != nil {
 		if cached, total, _, ok := reader.CacheCoverage(nextEntry.Name, filename); ok && total > 0 {
 			switch {
 			case cached >= total:
+				fullyCached = true
 				p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
 					Int64("cachedBytes", cached).Int64("totalBytes", total).
 					Msg("next-episode precache: already fully cached; burst will re-verify only")
@@ -344,7 +346,14 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	}
 
 	concurrency := p.cfg().ReadAheadConcurrency()
-	p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Msg("burst-downloading next episode ahead of playback")
+	burstMsg := "burst-downloading next episode ahead of playback"
+	if fullyCached {
+		// Fetch fast-paths a fully-cached file (StateOnDisk) and pulls 0
+		// bytes, so wording it as a download here is misleading right after
+		// the "already fully cached" line above.
+		burstMsg = "re-verifying already-cached next episode ahead of playback"
+	}
+	p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Bool("fullyCached", fullyCached).Msg(burstMsg)
 
 	// No viewer is waiting on this read, so a dead article must surface as a
 	// real fetch failure instead of being zero-filled - the fabricated bytes
