@@ -202,10 +202,14 @@ sudo systemctl stop $SERVICE
 mv "$REMOTE_BUILD_DIR/decypharr_new" "$REMOTE_BIN"
 chmod +x "$REMOTE_BIN"
 sudo systemctl start $SERVICE
-sleep 3
+# The process goes active in ~1s, but its /api/* JSON layer (precache,
+# overlay disk-usage) takes 20-30s more to warm up after a restart. The
+# health checks that follow hit those endpoints - give them time to settle
+# first, or a cold-but-fine deploy gets rolled back.
+sleep 30
 systemctl is-active $SERVICE
 REMOTE
-    log "Service restarted with new binary"
+    log "Service restarted with new binary (waited 30s for API warmup)"
 }
 
 # ---------------------------------------------------------------------------
