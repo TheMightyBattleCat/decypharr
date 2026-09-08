@@ -254,9 +254,20 @@ else
     echo "FAIL repair_page: HTTP \$code"
 fi
 
-# /api/overlay/disk-usage - must respond AND report a sane (not GB-scale) figure
-body=\$(curl -s --max-time 5 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/overlay/disk-usage" 2>/dev/null || true)
-bytes=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_overlay_disk_bytes',-1))" 2>/dev/null || echo -1)
+# /api/overlay/disk-usage - must respond AND report a sane (not GB-scale) figure.
+# This endpoint walks every overlay entry (~15k) and serializes a large JSON
+# body, so a freshly-restarted service needs well over 5s to answer it - a
+# flat --max-time 5 here false-fails every deploy and triggers a needless
+# rollback. Retry with a generous per-attempt timeout (same shape as the
+# http_root warmup loop above): up to 3 attempts, 5s apart.
+bytes=-1
+body=""
+for i in \$(seq 1 3); do
+    body=\$(curl -s --max-time 20 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/overlay/disk-usage" 2>/dev/null || true)
+    bytes=\$(echo "\$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_overlay_disk_bytes',-1))" 2>/dev/null || echo -1)
+    [ "\$bytes" -ge 0 ] 2>/dev/null && break
+    sleep 5
+done
 if [ "\$bytes" -ge 0 ] 2>/dev/null && [ "\$bytes" -lt 1000000000 ]; then
     echo "PASS overlay_disk_usage: total_overlay_disk_bytes=\$bytes (< 1GB)"
 else
