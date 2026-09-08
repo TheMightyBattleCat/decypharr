@@ -61,6 +61,20 @@ const (
 	// the decode check opens across the file's duration.
 	ffprobeDecodeWindowCount = 15
 
+	// Large files (REMUXes) get fewer decode windows to cut cold-seek I/O
+	// over WebDAV: each 2s window on a REMUX pulls ~15-25 MB, so 15 scattered
+	// seeks on a 40 GB file is ~300-450 MB of cold random reads that
+	// routinely blow the timeout budget. 6 windows still samples the full
+	// duration end-to-end.
+	ffprobeDecodeWindowCountLarge    = 6
+	ffprobeDecodeWindowLargeFileSize = 10 * 1024 * 1024 * 1024 // 10 GB
+
+	// The decode timeout scales with file size so a REMUX gets budget
+	// proportional to the bytes it has to pull: f.timeout + sizeGB*perGB,
+	// clamped to the cap. A 40 GB file lands around base+200s.
+	ffprobeDecodeTimeoutPerGB = 5 * time.Second
+	ffprobeDecodeTimeoutCap   = 10 * time.Minute
+
 	// ffprobeDecodeWindowSpan is how long each decode window reads.
 	ffprobeDecodeWindowSpan = 2 * time.Second
 
@@ -82,6 +96,11 @@ type expectedRuntime struct {
 	Seconds               int
 	EpisodeCountConfirmed bool
 	ArrKind               storage.ArrKind
+
+	// Bytes is the file's size, used to scale the decode timeout and pick
+	// the decode-window count. 0 when unknown - callers fall back to the
+	// flat base timeout and the full window count.
+	Bytes int64
 }
 
 // ffprobeChecker validates one file's assembled stream by running ffprobe
@@ -305,7 +324,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			return false, ffprobeReasonAbsurdDuration, true
 		}
 		if !skipDecode {
-			return f.decodeWindows(ctx, entryFolder, fileName, duration)
+			return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
 		}
 		// Decode verification was skipped for this call, so nothing was
 		// deep-verified - not conclusive.
@@ -335,7 +354,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Int("expected_minutes", int(expectedDur.Minutes())).
 				Msg("Repair: runtime shorter than Arr metadata but stream is complete to its own header duration; treating as metadata mismatch (split release or as-aired special), not marking broken")
 			if !skipDecode {
-				return f.decodeWindows(ctx, entryFolder, fileName, duration)
+				return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
 			}
 			return true, "", false
 		}
@@ -349,7 +368,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
 	}
 	if !skipDecode {
-		return f.decodeWindows(ctx, entryFolder, fileName, duration)
+		return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
 	}
 	return true, "", false
 }
@@ -442,12 +461,20 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 // decode verdict (clean, or a concrete decode error) from a timed-out or
 // cancelled pass that proved nothing - the caller uses it to decide
 // whether an ok=true here counts as a passed decode verification.
-func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration) (ok bool, reason string, conclusive bool) {
+func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration, fileBytes int64) (ok bool, reason string, conclusive bool) {
 	if duration <= 0 {
 		return true, "", true
 	}
 
-	n := ffprobeDecodeWindowCount
+	// Adaptive window count: a large file (REMUX) gets fewer windows so the
+	// probe pulls ~120-150 MB of cold random I/O over WebDAV instead of
+	// ~300-450 MB. Still spans the whole duration.
+	windowCount := ffprobeDecodeWindowCount
+	if fileBytes > ffprobeDecodeWindowLargeFileSize {
+		windowCount = ffprobeDecodeWindowCountLarge
+	}
+
+	n := windowCount
 	durSec := int(duration.Seconds())
 	if durSec < n {
 		n = durSec
@@ -470,7 +497,21 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		"-of", "csv=p=0",
 	})
 
-	cctx, cancel := context.WithTimeout(ctx, f.timeout)
+	// Scale the timeout with file size: base + sizeGB*perGB, clamped. A
+	// REMUX has far more compressed data to pull through the decode windows
+	// than a WEB episode, so a flat budget times out on the big ones and
+	// wastes time on the small ones.
+	timeout := f.timeout
+	if fileBytes > 0 {
+		sizeGB := float64(fileBytes) / (1024 * 1024 * 1024)
+		scaled := f.timeout + time.Duration(sizeGB*float64(ffprobeDecodeTimeoutPerGB))
+		if scaled > ffprobeDecodeTimeoutCap {
+			scaled = ffprobeDecodeTimeoutCap
+		}
+		timeout = scaled
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, f.binPath, args...)
@@ -482,6 +523,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
 			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).
 				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
 		return true, "", false
@@ -605,13 +647,26 @@ func (r *Repair) attachFFProbeChecker(ctx context.Context, log zerolog.Logger) c
 // expectedRuntimeFor resolves the expected playback duration for one file in
 // a candidate entry from its Arr content mapping, when available.
 func expectedRuntimeFor(c *candidate, name string) expectedRuntime {
+	// File size comes from the entry item (the actual assembled/declared
+	// size); fall back to the Arr's reported size when the item has no
+	// record for this file.
+	var bytes int64
+	if c.item != nil {
+		if f := c.item.Files[name]; f != nil {
+			bytes = f.Size
+		}
+	}
 	cf, ok := c.contentMap[name]
 	if !ok {
-		return expectedRuntime{ArrKind: c.arrKind}
+		return expectedRuntime{ArrKind: c.arrKind, Bytes: bytes}
+	}
+	if bytes == 0 {
+		bytes = cf.Size
 	}
 	return expectedRuntime{
 		Seconds:               cf.RuntimeSec,
 		EpisodeCountConfirmed: cf.EpisodeCountConfirmed,
 		ArrKind:               c.arrKind,
+		Bytes:                 bytes,
 	}
 }
