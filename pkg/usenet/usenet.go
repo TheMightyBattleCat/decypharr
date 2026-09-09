@@ -34,17 +34,22 @@ const (
 
 	// verifyBufferSize is the streaming copy-buffer size for verification
 	// reads (ffprobe import/sweep checks, padding disabled). Larger than
-	// bufferSize so each safeCopyBuffer iteration spans several segments,
-	// giving EnsureSegmentsConcurrent a multi-segment window to parallelise.
+	// bufferSize so each safeCopyBuffer iteration spans several segments.
 	// Real playback keeps the 256KB buffer.
 	//
-	// ~5 segments/iteration. It was tried at 24MB (~32 segments, filling the
-	// 15-worker pool); the instrumented probe on a production install 2026-09-09 showed
-	// no throughput gain - sustained ~24 MiB/s at 5 concurrent and at ~15. The
-	// ceiling is provider-side (per-connection speed test: eweka ~11 MiB/s cold
-	// then degrading under load, frugalusenet ~1.6, newshosting ~2.5, all
-	// backups ~1-2), not the fan-out width, so keep this minimal.
+	// Kept small: verificationPrefetch keeps the segments warm ahead of the
+	// read, so the foreground EnsureSegmentsConcurrent is usually a no-op and
+	// the copy buffer only sizes the memcpy-out-of-cache granularity. It was
+	// tried at 24MB with no gain when the fetch was still synchronous.
 	verifyBufferSize = 4 * 1024 * 1024 // 4MB
+
+	// verificationPrefetchAhead is how far ahead of a verification read's
+	// position Usenet.verificationPrefetch keeps segments fetched. Sized to
+	// sit comfortably inside bufferMemorySize (64MB) so the prefetched blocks
+	// stay RAM-resident until the foreground read consumes them.
+	verificationPrefetchAhead = 32 * 1024 * 1024
+	// verificationPrefetchChunk is one FetchRange burst inside that window.
+	verificationPrefetchChunk = 8 * 1024 * 1024
 
 	// failedFileTTL bounds how long a permanent-failure record in
 	// failedFiles survives before preStreamChecks/FailedFileCause treat it
@@ -281,6 +286,10 @@ type meteredReader struct {
 	reads    int
 	bytes    int64
 	readWait time.Duration
+	// consumed is bytes delivered so far, relative to the request's range
+	// start. Written by Read (single goroutine), read concurrently by
+	// Usenet.verificationPrefetch, so it must be atomic.
+	consumed atomic.Int64
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
@@ -289,6 +298,7 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 	m.readWait += time.Since(t)
 	m.reads++
 	m.bytes += int64(n)
+	m.consumed.Add(int64(n))
 	return n, err
 }
 
@@ -1591,30 +1601,51 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	if u.prefetchSize > 0 && prefetchLen > u.prefetchSize {
 		prefetchLen = u.prefetchSize
 	}
-	readerAt.Prefetch(ctx, rangeStart, prefetchLen)
+	verifyRead := reader.PaddingDisabled(ctx)
+	if !verifyRead {
+		// Normal read: hint the background prefetch workers. They fetch on
+		// the fetcher's lifetime ctx, which is fine here - padding is allowed.
+		// A verification read gets a no-pad rolling prefetch instead (below):
+		// the background workers would pad a dead read-ahead segment and
+		// AutoEnqueue it, defeating the point of the no-pad probe.
+		readerAt.Prefetch(ctx, rangeStart, prefetchLen)
+	}
 
 	section := newContextSectionReader(ctx, readerAt, rangeStart, length)
 	var buf []byte
-	verifyRead := reader.PaddingDisabled(ctx)
+	var meter *meteredReader
 	if verifyRead {
-		// Verification read: bigger copy buffer so each safeCopyBuffer
-		// iteration hands readAtPlain a multi-segment span to fetch
-		// concurrently (prefetch is disabled on this path).
 		buf = acquireVerifyBuffer()
 		defer releaseVerifyBuffer(buf)
+
+		// Meter the verification path so a decode probe's throughput is
+		// visible. ffprobe issues one HTTP range request per decode window,
+		// so each log line below is one window - bucket by file for the
+		// per-window breakdown.
+		meter = &meteredReader{inner: section}
+
+		// Rolling no-pad prefetch: keep segments fetched ahead of the read
+		// position so the fetch overlaps ffmpeg's consume instead of running
+		// synchronously per readAtPlain call (~3x slower). The deferred
+		// cancel+wait guarantees the goroutine is fully stopped before Stream
+		// returns and releaseFS drops this entry's reader refcount.
+		pfCtx, pfCancel := context.WithCancel(ctx)
+		pfDone := make(chan struct{})
+		defer func() {
+			pfCancel()
+			<-pfDone
+		}()
+		go func() {
+			defer close(pfDone)
+			u.verificationPrefetch(pfCtx, readerAt, rangeStart, length, meter)
+		}()
 	} else {
 		buf = acquireStreamBuffer()
 		defer releaseStreamBuffer(buf)
 	}
 
-	// Meter the verification path so a decode probe's throughput is visible.
-	// ffprobe issues one HTTP range request per decode window, so each of
-	// these log lines is one window - bucket by file to get the per-window
-	// breakdown. copySrc is the plain section reader on every other path.
 	var copySrc io.Reader = section
-	var meter *meteredReader
-	if verifyRead {
-		meter = &meteredReader{inner: section}
+	if meter != nil {
 		copySrc = meter
 	}
 	copyStart := time.Now()
@@ -1661,6 +1692,52 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	}
 
 	return err
+}
+
+// verificationPrefetch keeps a rolling window of segments fetched ahead of a
+// verification read's position so the NNTP fetch overlaps ffmpeg's decode
+// instead of running synchronously per readAtPlain call. Measured on a production install
+// 2026-09-09: the synchronous path sustained ~24 MiB/s on a REMUX while the
+// normal (prefetched) read path did ~73.
+//
+// It uses FetchRange on the caller's ctx, which carries the no-pad marker and
+// the dead-segment signal the WebDAV handler attached: a dead article in the
+// read-ahead trips the broken verdict exactly as the foreground read would,
+// rather than being padded. That is why the background prefetch workers (which
+// fetch on the fetcher's lifetime ctx and would pad) are bypassed for this
+// path. FetchRange swallows every non-ctx error - a failed segment stays
+// StateFailed for the foreground read to surface - and returns early only on
+// ctx cancellation.
+func (u *Usenet) verificationPrefetch(ctx context.Context, r fs.PrefetchableReaderAt, base, total int64, meter *meteredReader) {
+	if total <= 0 || meter == nil {
+		return
+	}
+	conc := u.maxConnections
+	if conc < 1 {
+		conc = 8
+	}
+	var fetchedTo int64
+	for fetchedTo < total {
+		if ctx.Err() != nil {
+			return
+		}
+		if fetchedTo-meter.consumed.Load() >= verificationPrefetchAhead {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+			continue
+		}
+		n := int64(verificationPrefetchChunk)
+		if fetchedTo+n > total {
+			n = total - fetchedTo
+		}
+		if err := r.FetchRange(ctx, base+fetchedTo, n, conc); err != nil {
+			return
+		}
+		fetchedTo += n
+	}
 }
 
 // shouldPoisonFailedFile decides whether an article-not-found from this read

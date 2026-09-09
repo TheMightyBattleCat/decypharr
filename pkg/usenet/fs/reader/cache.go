@@ -110,13 +110,15 @@ const (
 	segmentSweepBatch = 128
 
 	// bufferMemorySize is the per-stream RAM ceiling for the underlying buffer:
-	// forward prefetch + recent reads. 32 MB covers ~40 segments hot in RAM —
-	// enough headroom that a bursty download or a seek-back within the window
-	// doesn't stall playback or force a re-download. Aggregate RAM across many
-	// concurrent streams is bounded separately by the global buffer budget
-	// (buffer.SetGlobalMemoryBudget), so this can stay generous without the
-	// per-stream-size x concurrency blowup that a small ceiling was guarding.
-	bufferMemorySize = 32 << 20
+	// forward prefetch + recent reads. 64 MB covers ~85 segments hot in RAM,
+	// which is what a verification read's rolling no-pad prefetch window needs
+	// to stay resident (Usenet.verificationPrefetch keeps ~32 MB fetched ahead
+	// of the read position; the rest is the working set + a seek-back cushion).
+	// Aggregate RAM across concurrent streams is bounded separately by the
+	// global buffer budget (Usenet.buffer_memory): past ~budget/64MB resident
+	// streams, the rest fall back to the lock-free write-through path rather
+	// than growing RAM.
+	bufferMemorySize = 64 << 20
 )
 
 // NewSegmentCache creates a new segment cache backed by a freshly-created
