@@ -314,6 +314,9 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 	m.reads++
 	m.bytes += int64(n)
 	m.consumed.Add(int64(n))
+	// Only credited on a clean read: bytes handed back alongside io.EOF end
+	// the body anyway, so charging them could only turn the last read of a
+	// finished probe into a spurious "budget blown".
 	if err == nil && !m.budget.Add(int64(n)) {
 		// Hand back what we already read, then stop. The caller (Stream)
 		// recognises this sentinel and ends the response body cleanly - a

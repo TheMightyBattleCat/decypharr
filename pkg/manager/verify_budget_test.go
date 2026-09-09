@@ -2,8 +2,13 @@ package manager
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 func TestVerifyBudgetFor_Sizing(t *testing.T) {
@@ -94,6 +99,70 @@ func TestVerifyBudgetRegistry_RoundTripAndScoping(t *testing.T) {
 	unregisterVerifyBudget(hash, file, b)
 	if got := VerifyBudgetForVerificationRead(hash, file); got != nil {
 		t.Fatalf("registry should be empty after unregister, got %v", got)
+	}
+}
+
+// newFailingFFProbeBinary writes a stand-in ffprobe that fails the way a
+// truncated container does: something on stderr and a non-zero exit. This is
+// what the metadata probe sees when the budget was spent mid-body, and it is
+// the case that escapes the decode-path guard as ffprobe_unreadable.
+func newFailingFFProbeBinary(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ffprobe")
+	script := "#!/bin/sh\necho '[matroska,webm @ 0x0] File ended prematurely' >&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing failing fake ffprobe: %v", err)
+	}
+	return path
+}
+
+// A spent budget must stay inconclusive even when the *metadata* probe is the
+// thing that fails - that failure is our own truncation, not the file's.
+func TestCheckConfirmed_ExhaustedBudget_UnreadableStillInconclusive(t *testing.T) {
+	f := &ffprobeChecker{
+		binPath: newFailingFFProbeBinary(t),
+		timeout: 5 * time.Second,
+		baseURL: "http://127.0.0.1:1/",
+		logger:  zerolog.Nop(),
+	}
+
+	budget := NewVerifyBudget(100)
+	budget.Add(1000) // spent before the probe runs
+
+	ok, reason, conclusive := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+		Seconds: 3600,
+		Bytes:   4 * 1024 * 1024 * 1024,
+	}, false, nil, budget)
+
+	if !ok {
+		t.Fatalf("a spent budget must never produce a broken verdict, got ok=false reason=%q", reason)
+	}
+	if conclusive {
+		t.Fatal("a spent budget must yield conclusive=false")
+	}
+}
+
+// Sanity anchor for the test above: with no budget in play the very same
+// failing binary MUST still be reported broken, so the guard is suppressing
+// our truncation rather than suppressing real failures.
+func TestCheckConfirmed_NoBudget_UnreadableStillBroken(t *testing.T) {
+	f := &ffprobeChecker{
+		binPath: newFailingFFProbeBinary(t),
+		timeout: 5 * time.Second,
+		baseURL: "http://127.0.0.1:1/",
+		logger:  zerolog.Nop(),
+	}
+
+	ok, reason, _ := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+		Seconds: 3600,
+		Bytes:   4 * 1024 * 1024 * 1024,
+	}, false, nil, nil)
+
+	if ok {
+		t.Fatal("an unreadable file with no budget must still be broken")
+	}
+	if !strings.HasPrefix(reason, ffprobeReasonUnreadable) {
+		t.Fatalf("expected an %s reason, got %q", ffprobeReasonUnreadable, reason)
 	}
 }
 

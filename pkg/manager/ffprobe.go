@@ -338,6 +338,18 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes).
 			Msg("Repair: ffprobe metadata probe was slow")
 	}
+	// The metadata probe reads through the same budget as the decode pass, so
+	// it can be the read that spends it (or find it already spent by an
+	// earlier pass). Either way the body it saw was cut short by us, and both
+	// failure modes below - a non-zero exit and unparseable JSON - are what a
+	// truncated container looks like. Never let that become a broken verdict.
+	if budget.Exceeded() {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).Dur("elapsed", metaElapsed).
+			Msg("Repair: ffprobe metadata probe exceeded its read budget; treating as inconclusive")
+		return true, "", false
+	}
+
 	if runErr != nil {
 		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true
 	}
@@ -650,20 +662,23 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if ok {
 		return true, "", conclusive
 	}
-	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
-		return false, reason, conclusive
-	}
-	// The budget is shared across every pass, so once it is spent a retry
-	// would be cut off at the very first read and could only produce another
-	// truncation artefact. Stop here and report inconclusive rather than
-	// burning a second full pass to re-learn that (this is the multiplication
-	// that turned one 4.25 GB grab into 11.16 GB of reads).
+	// This must come BEFORE the unreadable short-circuit below. A spent
+	// budget means we truncated the body ourselves, and the single most
+	// likely thing a truncated container produces is exactly an
+	// "ffprobe_unreadable" failure - letting that jump the queue would
+	// blocklist a grab on the strength of our own cap. The budget is also
+	// shared across passes, so a retry could only re-truncate: stop here
+	// rather than burn a second full pass to re-learn that (this is the
+	// multiplication that turned one 4.25 GB grab into 11.16 GB of reads).
 	if budget.Exceeded() {
 		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
 			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
 			Msg("Repair: skipping ffprobe retry — verification read budget already spent")
 		return true, "", false
+	}
+	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
+		return false, reason, conclusive
 	}
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("Repair: ffprobe check failed; retrying once before declaring broken")
 
