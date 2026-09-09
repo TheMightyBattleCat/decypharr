@@ -135,3 +135,46 @@ func (p *Precache) overlayPendingCount(entry *storage.Entry, filename string) (i
 	}
 	return len(pending[filename]), true
 }
+
+// durableCacheComplete reports whether the durable DFS cache already holds
+// filename under entryName end to end, i.e. whether a next-episode burst has
+// anything left to fetch.
+//
+// This is the gate in front of ReadAhead + persistCleanRanges, and it is the
+// difference between "re-verify" and "re-download". The burst reads through
+// the usenet reader's SegmentCache, which is per-reader scratch under
+// Usenet.DiskBufferPath that is removed when the reader closes - it is not the
+// durable cache and does not consult it. So on a reader opened after a restart
+// every segment is StateEmpty and SegmentFetcher.doFetch pulls the article
+// down again over NNTP, even for a file the DFS cache already holds in full.
+//
+// Split out as a plain function of the coverage seam so the decision is
+// testable without a real DFS mount or usenet client, matching the gating
+// tests around reserveBudget.
+func (p *Precache) durableCacheComplete(reader dfsCacheCoverageReader, entryName, filename string) bool {
+	if reader == nil {
+		// No coverage seam (rclone mode, no mount, mount not ready). Nothing
+		// can be proven cached, so let the burst run as before.
+		return false
+	}
+	cached, total, _, ok := reader.CacheCoverage(entryName, filename)
+	if !ok || total <= 0 {
+		return false
+	}
+	switch {
+	case cached >= total:
+		p.logger.Info().Str("entry", entryName).Str("file", filename).
+			Int64("cachedBytes", cached).Int64("totalBytes", total).
+			Msg("next-episode precache: already fully cached; skipping burst")
+		return true
+	case cached > 0:
+		p.logger.Info().Str("entry", entryName).Str("file", filename).
+			Int64("cachedBytes", cached).Int64("totalBytes", total).
+			Float64("coverage", float64(cached)/float64(total)).
+			Msg("next-episode precache: partially cached; burst will fill the gaps")
+	default:
+		p.logger.Debug().Str("entry", entryName).Str("file", filename).
+			Msg("next-episode precache: nothing cached yet; cold burst")
+	}
+	return false
+}

@@ -492,21 +492,40 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	ctx, cancel := context.WithTimeout(context.Background(), precacheReadAheadTimeout)
 	defer cancel()
 
-	p.logger.Info().
-		Str("entry", entry.Name).
-		Str("file", filename).
-		Int64("from", from).
-		Int64("size", size).
-		Int("concurrency", concurrency).
-		Msg("starting read-ahead precache")
-
-	if err := p.manager.usenet.ReadAhead(ctx, entry.InfoHash, filename, from, concurrency); err != nil {
-		p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("read-ahead precache ended early")
-		p.logger.Warn().Str("entry", entry.Name).Str("file", filename).Int64("from", from).Err(err).
-			Msg("read-ahead incomplete")
+	// Same gate as the next-episode burst: the point of the read-ahead is to
+	// get bytes onto disk, so if the durable DFS cache already holds this file
+	// end to end there is nothing to fetch. Without this, the burst re-pulls
+	// [from, EOF) over NNTP for a file that is already fully cached, because
+	// it runs through the usenet reader's per-reader scratch SegmentCache
+	// rather than the durable cache - see durableCacheComplete.
+	//
+	// repairAhead and the forward cascade below still run either way: the
+	// first reads the overlay's pending-repair map (cheap, and a skipped burst
+	// surfaces no new damage anyway) and the second is what walks the season.
+	if p.durableCacheComplete(p.cacheCoverageReader(), entry.Name, filename) {
+		p.logger.Info().
+			Str("entry", entry.Name).
+			Str("file", filename).
+			Int64("from", from).
+			Int64("size", size).
+			Msg("read-ahead precache skipped: durable cache already complete")
 	} else {
-		p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
-			Msg("read-ahead complete")
+		p.logger.Info().
+			Str("entry", entry.Name).
+			Str("file", filename).
+			Int64("from", from).
+			Int64("size", size).
+			Int("concurrency", concurrency).
+			Msg("starting read-ahead precache")
+
+		if err := p.manager.usenet.ReadAhead(ctx, entry.InfoHash, filename, from, concurrency); err != nil {
+			p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("read-ahead precache ended early")
+			p.logger.Warn().Str("entry", entry.Name).Str("file", filename).Int64("from", from).Err(err).
+				Msg("read-ahead incomplete")
+		} else {
+			p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
+				Msg("read-ahead complete")
+		}
 	}
 
 	p.repairAhead(entry, filename, from)

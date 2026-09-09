@@ -319,41 +319,11 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 		return false
 	}
 
-	// What does the DFS cache already hold for this file? Logged before the
+	// What does the DFS cache already hold for this file? Checked before the
 	// burst so an operator can tell a genuine cold fetch apart from a re-warm
-	// of an already-cached (or partially-evicted) file - the burst itself
-	// skips anything already cached, so "fully cached" here means the burst
-	// will be cheap re-verification, not a download.
-	fullyCached := false
-	if reader := p.cacheCoverageReader(); reader != nil {
-		if cached, total, _, ok := reader.CacheCoverage(nextEntry.Name, filename); ok && total > 0 {
-			switch {
-			case cached >= total:
-				fullyCached = true
-				p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
-					Int64("cachedBytes", cached).Int64("totalBytes", total).
-					Msg("next-episode precache: already fully cached; burst will re-verify only")
-			case cached > 0:
-				p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
-					Int64("cachedBytes", cached).Int64("totalBytes", total).
-					Float64("coverage", float64(cached)/float64(total)).
-					Msg("next-episode precache: partially cached; burst will fill the gaps")
-			default:
-				p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
-					Msg("next-episode precache: nothing cached yet; cold burst")
-			}
-		}
-	}
-
-	concurrency := p.cfg().ReadAheadConcurrency()
-	burstMsg := "burst-downloading next episode ahead of playback"
-	if fullyCached {
-		// Fetch fast-paths a fully-cached file (StateOnDisk) and pulls 0
-		// bytes, so wording it as a download here is misleading right after
-		// the "already fully cached" line above.
-		burstMsg = "re-verifying already-cached next episode ahead of playback"
-	}
-	p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Bool("fullyCached", fullyCached).Msg(burstMsg)
+	// of an already-cached (or partially-evicted) file - and so a file the
+	// durable cache already holds in full can skip the burst entirely.
+	fullyCached := p.durableCacheComplete(p.cacheCoverageReader(), nextEntry.Name, filename)
 
 	// No viewer is waiting on this read, so a dead article must surface as a
 	// real fetch failure instead of being zero-filled - the fabricated bytes
@@ -362,15 +332,49 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// its repair exactly as a live read would - see ContextForBurstDownload.
 	burstCtx := usenet.ContextForBurstDownload(ctx)
 
-	burstErr := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency)
-	if burstErr != nil {
-		p.logger.Debug().Err(burstErr).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
-	}
+	// The whole point of the read-ahead is to get this file onto disk. If the
+	// durable DFS cache already holds it end to end, there is nothing left to
+	// do and both halves below are pure waste:
+	//
+	//   - ReadAhead goes through the usenet reader's SegmentCache, which is a
+	//     per-reader scratch buffer under Usenet.DiskBufferPath that is
+	//     RemoveAll'd when the reader closes. It is NOT the durable cache and
+	//     it does NOT consult it. So on any reader opened after a restart (or
+	//     after the reader idled out) every segment is StateEmpty, and
+	//     SegmentFetcher.doFetch acquires an NNTP connection and re-downloads
+	//     the article - the entire file, from usenet.
+	//   - persistCleanRanges then reads all of it back and hands each segment
+	//     to WriteCachedRange -> WriteAtNoOverwrite, which skips every byte
+	//     because the durable cache already has it.
+	//
+	// Net effect before this gate: walking a watched season re-downloaded each
+	// already-cached episode in full and discarded every byte. Measured on
+	// a production install 2026-09-09 at ~4 min / ~4.2 GB per episode, chaining E10 -> E13
+	// back to back. Skipping is also what the original code intended - its
+	// comment assumed the burst would "fast-path a fully-cached file and pull
+	// 0 bytes", which only holds while that scratch cache is still warm.
+	if fullyCached {
+		// Skip the burst and the persist walk only. Everything below - the
+		// readiness record, the budget accounting and the forward cascade to
+		// the episode after this one - still has to run, or a season of
+		// already-cached episodes would stop walking forward.
+		p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).
+			Int64("size", next.Size).
+			Msg("next-episode precache: durable cache already complete; nothing to fetch")
+	} else {
+		concurrency := p.cfg().ReadAheadConcurrency()
+		p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Msg("burst-downloading next episode ahead of playback")
 
-	// Durably persist whatever came back CLEAN into the DFS cache now, before
-	// waiting on repair - see persistCleanRanges for why damaged segments are
-	// deliberately excluded rather than persisted as padding.
-	p.persistCleanRanges(burstCtx, nextEntry, filename, next.Size)
+		burstErr := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency)
+		if burstErr != nil {
+			p.logger.Debug().Err(burstErr).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
+		}
+
+		// Durably persist whatever came back CLEAN into the DFS cache now, before
+		// waiting on repair - see persistCleanRanges for why damaged segments are
+		// deliberately excluded rather than persisted as padding.
+		p.persistCleanRanges(burstCtx, nextEntry, filename, next.Size)
+	}
 
 	p.recordReadiness(burstCtx, nextEntry, filename, next.Size)
 
