@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"io"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/nntp"
@@ -144,6 +145,14 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 		if err != nil || int64(n) != size {
 			switch {
 			case err == nil:
+				shortReads++
+			case errors.Is(err, io.ErrUnexpectedEOF):
+				// The reader stopped at a segment stored shorter than its
+				// slot and handed back the contiguous prefix (see
+				// StreamingReader.readFromCache). Same benign accounting as a
+				// nil-error short read - it is a hole, not a dead article -
+				// but it arrives as an explicit signal rather than as a count
+				// that silently disagrees with the buffer.
 				shortReads++
 			case nntp.IsArticleNotFoundError(err) || errors.Is(err, ErrSegmentShort):
 				deadReads++

@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -243,7 +244,12 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 
 	// Read data from cache
 	n, err := sr.readFromCache(ctx, p[:readLen], off, startSeg, endSeg)
-	if err != nil {
+	// A short read (readFromCache stopping at a segment stored shorter than
+	// its slot) is not a read ERROR: the bytes it did return are valid, and
+	// the caller is expected to re-issue from off+n. Fall through so those
+	// bytes still count towards BytesRead and MarkConsumed, and let the
+	// io.ErrUnexpectedEOF ride out with them.
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		sr.stats.ReadErrors.Add(1)
 		return n, err
 	}
@@ -315,6 +321,38 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 		}
 
 		totalRead += n
+
+		// ReadRangeInto clamps to the segment's RECORDED length and still
+		// reports ok - a segment stored shorter than its slot (a truncated
+		// body committed by bufferStreamWriter.Finalize, which commits on
+		// written > 0 without checking it filled maxBytes) hands back fewer
+		// bytes than this slice asked for.
+		//
+		// Everything after those bytes in p was never written by this
+		// iteration. Carrying on to the next segment would write ITS bytes at
+		// their own outOffset, leaving a stale gap in the middle of p while
+		// totalRead - a plain sum - implies a contiguous run. Every
+		// io.ReaderAt caller reads n as "the first n bytes are valid", so
+		// that combination hands back a buffer whose contents don't match its
+		// own length.
+		//
+		// Stop at the hole and return the contiguous prefix. Deliberately no
+		// re-fetch here: these segments are deterministically short (measured
+		// byte-identical across separate runs), so retrying them would only
+		// build a retry storm. io.ErrUnexpectedEOF is this codebase's existing
+		// short-read signal (see limitedReaderAt above, and skippableError in
+		// the hanwen backend, which already unwraps it to a partial-data
+		// success) and it lets persistDurableRanges tell a hole apart from a
+		// segment that is merely cold.
+		if int64(n) < copyLen {
+			sr.logger.Debug().
+				Int("segment", segIdx).
+				Int("got", n).
+				Int64("want", copyLen).
+				Int64("segment_stored_size", sr.cache.SegmentDataSize(segIdx)).
+				Msg("segment is short of its slot; returning contiguous prefix")
+			return totalRead, io.ErrUnexpectedEOF
+		}
 	}
 
 	return totalRead, nil
