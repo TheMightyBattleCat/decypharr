@@ -110,14 +110,16 @@ const (
 	segmentSweepBatch = 128
 
 	// bufferMemorySize is the per-stream RAM ceiling for the underlying buffer:
-	// forward prefetch + recent reads. 64 MB covers ~85 segments hot in RAM,
-	// which is what a verification read's rolling no-pad prefetch window needs
-	// to stay resident (Usenet.verificationPrefetch keeps ~32 MB fetched ahead
-	// of the read position; the rest is the working set + a seek-back cushion).
-	// Aggregate RAM across concurrent streams is bounded separately by the
-	// global buffer budget (Usenet.buffer_memory): past ~budget/64MB resident
-	// streams, the rest fall back to the lock-free write-through path rather
-	// than growing RAM.
+	// forward prefetch + recent reads. 64 MB gives a verification read's
+	// rolling no-pad prefetch window (Usenet.verificationPrefetch keeps ~32 MB
+	// fetched ahead) room to stay resident alongside the working set and a
+	// seek-back cushion, instead of spilling to the HDD-backed stream file.
+	// This is only a per-stream cap: the effective ceiling is the global
+	// buffer budget (Usenet.buffer_memory), and once that is exhausted new
+	// blocks fall back to the lock-free write-through path (to disk) regardless
+	// of this number. So the residency win holds while the pool has headroom;
+	// under a busy sweep + playback it degrades to "pipelined but disk-backed",
+	// which is still faster than the synchronous fetch it replaces.
 	bufferMemorySize = 64 << 20
 )
 

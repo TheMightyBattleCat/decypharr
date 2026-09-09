@@ -1633,7 +1633,14 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 		pfDone := make(chan struct{})
 		defer func() {
 			pfCancel()
-			<-pfDone
+			// Bounded: a FetchRange call blocked in a dial/read timeout would
+			// otherwise hold the WebDAV handler open for the full NNTP timeout.
+			// The goroutine holds no reader ref of its own, so a brief linger
+			// past this point is harmless (releaseFS has a grace period).
+			select {
+			case <-pfDone:
+			case <-time.After(2 * time.Second):
+			}
 		}()
 		go func() {
 			defer close(pfDone)
@@ -1721,7 +1728,16 @@ func (u *Usenet) verificationPrefetch(ctx context.Context, r fs.PrefetchableRead
 		if ctx.Err() != nil {
 			return
 		}
-		if fetchedTo-meter.consumed.Load() >= verificationPrefetchAhead {
+		consumed := meter.consumed.Load()
+
+		// ffmpeg's range GETs are open-ended, so `total` is the whole rest of
+		// the file even for a short seek or the metadata/moov probe. Don't
+		// prefetch until the read has proven it's a sustained forward scan by
+		// consuming a full chunk - a window read or metadata probe finishes
+		// first and pays nothing. The ahead window then tracks `consumed` up
+		// to the cap, so it never runs more than ~2x the read's own progress
+		// ahead.
+		if consumed < verificationPrefetchChunk {
 			select {
 			case <-ctx.Done():
 				return
@@ -1729,6 +1745,19 @@ func (u *Usenet) verificationPrefetch(ctx context.Context, r fs.PrefetchableRead
 			}
 			continue
 		}
+		ahead := consumed
+		if ahead > verificationPrefetchAhead {
+			ahead = verificationPrefetchAhead
+		}
+		if fetchedTo-consumed >= ahead {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+			continue
+		}
+
 		n := int64(verificationPrefetchChunk)
 		if fetchedTo+n > total {
 			n = total - fetchedTo
