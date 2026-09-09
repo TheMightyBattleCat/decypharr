@@ -13,6 +13,11 @@ import (
 	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
+// verificationFetchLogThreshold gates the "concurrent segment fetch blocked"
+// debug line - only log when the foreground fetch in a verification read
+// actually stalled (prefetch fell behind), not on every instant cache hit.
+const verificationFetchLogThreshold = 150 * time.Millisecond
+
 var decryptionBufPool = sync.Pool{}
 
 func acquireDecryptionBuffer(size int) []byte {
@@ -216,12 +221,18 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	if paddingDisabled(ctx) && endSeg > startSeg {
 		fetchStart := time.Now()
 		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
-		sr.logger.Debug().
-			Int("start_seg", startSeg).
-			Int("end_seg", endSeg).
-			Int("segments", endSeg-startSeg+1).
-			Dur("fetch_dur", time.Since(fetchStart)).
-			Msg("verification read: concurrent segment fetch")
+		// Only log the slow ones. With the verification prefetch pipelining
+		// ahead (Usenet.verificationPrefetch) the common case is an instant
+		// cache hit, one line per readAtPlain call - pure noise. A fetch that
+		// actually blocked here means the prefetch fell behind.
+		if d := time.Since(fetchStart); d >= verificationFetchLogThreshold {
+			sr.logger.Debug().
+				Int("start_seg", startSeg).
+				Int("end_seg", endSeg).
+				Int("segments", endSeg-startSeg+1).
+				Dur("fetch_dur", d).
+				Msg("verification read: concurrent segment fetch blocked")
+		}
 	} else {
 		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
 	}
