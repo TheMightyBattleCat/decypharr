@@ -38,14 +38,13 @@ const (
 	// giving EnsureSegmentsConcurrent a multi-segment window to parallelise.
 	// Real playback keeps the 256KB buffer.
 	//
-	// Sized at ~2 full waves of the reader connection pool: at
-	// usenet.max_connections=15 and ~750KB/segment, 24MB is ~32 segments, so
-	// EnsureSegmentsConcurrent actually fills the pool. At 4MB each iteration
-	// only offered ~5 segments and the fan-out sat at a third of budget - the
-	// bursty, under-saturated throughput seen on cold REMUX decode probes.
-	// Transient cost: sweepWorkers*repairFilesPerEntry (+ a few import probes)
-	// buffers from a sync.Pool, ~150-250MB peak at the default sweep width.
-	verifyBufferSize = 24 * 1024 * 1024 // 24MB
+	// ~5 segments/iteration. It was tried at 24MB (~32 segments, filling the
+	// 15-worker pool); the instrumented probe on a production install 2026-09-09 showed
+	// no throughput gain - sustained ~24 MiB/s at 5 concurrent and at ~15. The
+	// ceiling is provider-side (per-connection speed test: eweka ~11 MiB/s cold
+	// then degrading under load, frugalusenet ~1.6, newshosting ~2.5, all
+	// backups ~1-2), not the fan-out width, so keep this minimal.
+	verifyBufferSize = 4 * 1024 * 1024 // 4MB
 
 	// failedFileTTL bounds how long a permanent-failure record in
 	// failedFiles survives before preStreamChecks/FailedFileCause treat it
