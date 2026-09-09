@@ -377,25 +377,10 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// classified, never padded, never queued for repair, and the next read
 		// starts over. That is what let one article wedge a whole file for
 		// 55 minutes (Grant S04E10) while other offsets read in under 1.5s.
-		//
-		// The DEBUG line states the concrete error type rather than leaving it
-		// to inference: the first cut of this escalation matched only
-		// context.DeadlineExceeded and never fired once in production. It is
-		// cheap - a failed fetch only.
 		callerDone := ctx.Err() != nil
 		fetcherDone := sf.ctx.Err() != nil
 		isCtxDeadline := errors.Is(err, context.DeadlineExceeded)
 		isNNTPTimeout := nntp.IsTimeoutError(err)
-		sf.logger.Debug().
-			Int("segment", segIdx).
-			Str("err_type", fmt.Sprintf("%T", err)).
-			Str("err", err.Error()).
-			Bool("caller_done", callerDone).
-			Bool("fetcher_done", fetcherDone).
-			Bool("ctx_deadline", isCtxDeadline).
-			Bool("nntp_timeout", isNNTPTimeout).
-			Bool("article_not_found", nntp.IsArticleNotFoundError(err)).
-			Msg("segment fetch failed")
 
 		// "The fetch ran out of time" arrives in TWO shapes and the first cut
 		// only matched one of them:

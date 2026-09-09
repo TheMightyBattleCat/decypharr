@@ -5,7 +5,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -283,28 +282,6 @@ func (s *Server) handlePurgeMountCache(w http.ResponseWriter, r *http.Request) {
 		"status": "success",
 		"cache":  purgeStats,
 	}, http.StatusOK)
-}
-
-// handleGoroutineDump writes a full goroutine stack dump as plain text.
-//
-// It exists because a read can hang with no error and no log line at all - the
-// fetch never returns, so nothing is ever classified or recorded. Log
-// archaeology cannot locate a blocked frame; only a stack can. Narrower than
-// mounting net/http/pprof: this exposes the goroutine profile and nothing else
-// (no heap, no CPU profiling, no symbol table), and sits behind the same auth
-// as every other API route.
-func (s *Server) handleGoroutineDump(w http.ResponseWriter, r *http.Request) {
-	profile := pprof.Lookup("goroutine")
-	if profile == nil {
-		http.Error(w, "goroutine profile unavailable", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	// debug=2 renders human-readable stacks per goroutine, including the
-	// wait reason and how long it has been blocked - that is the whole point.
-	if err := profile.WriteTo(w, 2); err != nil {
-		s.logger.Debug().Err(err).Msg("goroutine dump write failed")
-	}
 }
 
 func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
