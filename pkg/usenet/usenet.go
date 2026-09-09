@@ -37,7 +37,15 @@ const (
 	// bufferSize so each safeCopyBuffer iteration spans several segments,
 	// giving EnsureSegmentsConcurrent a multi-segment window to parallelise.
 	// Real playback keeps the 256KB buffer.
-	verifyBufferSize = 4 * 1024 * 1024 // 4MB
+	//
+	// Sized at ~2 full waves of the reader connection pool: at
+	// usenet.max_connections=15 and ~750KB/segment, 24MB is ~32 segments, so
+	// EnsureSegmentsConcurrent actually fills the pool. At 4MB each iteration
+	// only offered ~5 segments and the fan-out sat at a third of budget - the
+	// bursty, under-saturated throughput seen on cold REMUX decode probes.
+	// Transient cost: sweepWorkers*repairFilesPerEntry (+ a few import probes)
+	// buffers from a sync.Pool, ~150-250MB peak at the default sweep width.
+	verifyBufferSize = 24 * 1024 * 1024 // 24MB
 
 	// failedFileTTL bounds how long a permanent-failure record in
 	// failedFiles survives before preStreamChecks/FailedFileCause treat it
@@ -261,6 +269,27 @@ func (r *contextSectionReader) Read(p []byte) (int, error) {
 	if err == nil && r.off >= r.limit {
 		return n, io.EOF
 	}
+	return n, err
+}
+
+// meteredReader wraps the verification-read source so Stream can report a
+// decode probe's effective throughput. read_wait is the cumulative time spent
+// blocked in the underlying ReadAt (i.e. waiting on EnsureSegmentsConcurrent),
+// which for a verification read is essentially the whole copy - if it is far
+// below dur the bottleneck is downstream (ffmpeg/CPU), not the fetch.
+type meteredReader struct {
+	inner    io.Reader
+	reads    int
+	bytes    int64
+	readWait time.Duration
+}
+
+func (m *meteredReader) Read(p []byte) (int, error) {
+	t := time.Now()
+	n, err := m.inner.Read(p)
+	m.readWait += time.Since(t)
+	m.reads++
+	m.bytes += int64(n)
 	return n, err
 }
 
@@ -1567,7 +1596,8 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	section := newContextSectionReader(ctx, readerAt, rangeStart, length)
 	var buf []byte
-	if reader.PaddingDisabled(ctx) {
+	verifyRead := reader.PaddingDisabled(ctx)
+	if verifyRead {
 		// Verification read: bigger copy buffer so each safeCopyBuffer
 		// iteration hands readAtPlain a multi-segment span to fetch
 		// concurrently (prefetch is disabled on this path).
@@ -1578,8 +1608,39 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 		defer releaseStreamBuffer(buf)
 	}
 
+	// Meter the verification path so a decode probe's throughput is visible.
+	// ffprobe issues one HTTP range request per decode window, so each of
+	// these log lines is one window - bucket by file to get the per-window
+	// breakdown. copySrc is the plain section reader on every other path.
+	var copySrc io.Reader = section
+	var meter *meteredReader
+	if verifyRead {
+		meter = &meteredReader{inner: section}
+		copySrc = meter
+	}
+	copyStart := time.Now()
+
 	// Use a safe copy loop that checks context and validates read counts
-	_, err = safeCopyBuffer(ctx, writer, section, buf)
+	_, err = safeCopyBuffer(ctx, writer, copySrc, buf)
+
+	if verifyRead && meter != nil && meter.bytes > 0 {
+		dur := time.Since(copyStart)
+		var mbps float64
+		if dur > 0 {
+			mbps = float64(meter.bytes) / (1024 * 1024) / dur.Seconds()
+		}
+		u.logger.Debug().
+			Str("nzb_id", nzoID).
+			Str("file", filename).
+			Int64("range_start", rangeStart).
+			Int64("range_len", length).
+			Int64("bytes", meter.bytes).
+			Dur("dur", dur).
+			Float64("throughput_mbps", mbps).
+			Int("reads", meter.reads).
+			Dur("read_wait", meter.readWait).
+			Msg("Repair: verification range served")
+	}
 
 	// Handle context cancellation explicitly
 	if err != nil && ctx.Err() != nil {

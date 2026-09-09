@@ -99,6 +99,11 @@ const (
 	ffprobeMetadataTimeoutPerGB = 2 * time.Second
 	ffprobeMetadataTimeoutCap   = 5 * time.Minute
 
+	// A healthy metadata probe returns in well under a second; anything past
+	// this is logged so the size-scaling above can be judged against real
+	// numbers (it runs on every file, so only the slow ones are worth a line).
+	ffprobeMetadataSlowThreshold = 5 * time.Second
+
 	// ffprobeDecodeWindowSpan is how long each decode window reads.
 	ffprobeDecodeWindowSpan = 2 * time.Second
 
@@ -307,20 +312,31 @@ type ffprobeOutput struct {
 func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string, conclusive bool) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
-	cctx, cancel := context.WithTimeout(ctx, f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap))
+	metaTimeout := f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap)
+	cctx, cancel := context.WithTimeout(ctx, metaTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, f.binPath, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	start := time.Now()
 	runErr := cmd.Run()
+	metaElapsed := time.Since(start)
 
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Msg("Repair: ffprobe timed out; treating as inconclusive")
+			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+				Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes).
+				Msg("Repair: ffprobe timed out; treating as inconclusive")
 		}
 		return true, "", false
+	}
+
+	if metaElapsed >= ffprobeMetadataSlowThreshold {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes).
+			Msg("Repair: ffprobe metadata probe was slow")
 	}
 	if runErr != nil {
 		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true
@@ -548,12 +564,14 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	start := time.Now()
 	runErr := cmd.Run()
+	elapsed := time.Since(start)
 
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
 			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).
+				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
 				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
 		return true, "", false
@@ -564,13 +582,22 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// continue demuxing). Check stderr first.
 	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+			Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
 
 	if runErr != nil {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Err(runErr).
+			Msg("Repair: ffprobe decode check exited non-zero")
 		return false, ffprobeReasonDecodeError, true
 	}
 
+	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+		Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+		Msg("Repair: ffprobe decode check passed")
 	return true, "", true
 }
 

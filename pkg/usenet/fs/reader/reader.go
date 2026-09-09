@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/crypto"
@@ -213,7 +214,14 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// and normal playback keep the serial path.
 	var ensureErr error
 	if paddingDisabled(ctx) && endSeg > startSeg {
+		fetchStart := time.Now()
 		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
+		sr.logger.Debug().
+			Int("start_seg", startSeg).
+			Int("end_seg", endSeg).
+			Int("segments", endSeg-startSeg+1).
+			Dur("fetch_dur", time.Since(fetchStart)).
+			Msg("verification read: concurrent segment fetch")
 	} else {
 		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
 	}
