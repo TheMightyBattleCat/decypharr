@@ -90,6 +90,31 @@ func TestFetchRangeWindowed_HorizonMeasuredFromBase(t *testing.T) {
 	}
 }
 
+// TestVerificationConnectionsAreAdditive proves the verification prefetch gets
+// its own connection slots on top of MaxConnections, so it cannot starve the
+// foreground EnsureSegmentsConcurrent out of the semaphore.
+func TestVerificationConnectionsAreAdditive(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	segments := []SegmentMeta{{MessageID: "<a@test>", Number: 1, Bytes: 1024}}
+
+	cfg := DefaultConfig()
+	cfg.MaxConnections = 15
+	cfg.VerificationConnections = 32
+	cfg.DiskPath = t.TempDir()
+
+	cache, err := NewSegmentCache(context.Background(), segments, cfg, &ReaderStats{}, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewSegmentCache: %v", err)
+	}
+	defer cache.Close()
+	sf := NewSegmentFetcher(context.Background(), &nntp.Client{}, cache, cfg, &ReaderStats{}, zerolog.Nop())
+	defer sf.Close()
+
+	if got, want := cap(sf.semaphore), 15+32; got != want {
+		t.Fatalf("fetcher semaphore cap = %d, want %d (MaxConnections + VerificationConnections)", got, want)
+	}
+}
+
 // TestFetchRangeWindowed_ReturnsOnCancel proves a stalled window does not pin
 // the caller: cancelling ctx returns promptly with a non-nil (ctx) error.
 func TestFetchRangeWindowed_ReturnsOnCancel(t *testing.T) {

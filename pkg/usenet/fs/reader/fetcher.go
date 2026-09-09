@@ -98,15 +98,17 @@ func NewSegmentFetcher(
 		maxConns = 8
 	}
 
-	// The semaphore is widened to VerificationConnections when that is larger:
-	// an ffprobe verification read's background prefetch (FetchRangeWindowed)
-	// runs at that width, while playback prefetch and foreground reads stay
-	// bounded by maxConns (numPrefetchWorkers and EnsureSegmentsConcurrent both
-	// read config.MaxConnections). A playback read of the same file can use the
-	// headroom too, but nothing drives it that wide on its own.
+	// An ffprobe verification read's background prefetch (FetchRangeWindowed)
+	// runs at VerificationConnections wide. Give it its OWN slots on top of
+	// maxConns rather than sharing: the prefetch keeps its workers busy
+	// continuously, so a shared semaphore would starve the foreground
+	// EnsureSegmentsConcurrent (which needs slots for the exact segments the
+	// read is blocked on right now) behind the prefetch's far-ahead fetches -
+	// observed live as multi-second foreground stalls. numPrefetchWorkers and
+	// EnsureSegmentsConcurrent still bound themselves by maxConns.
 	semCap := maxConns
-	if config.VerificationConnections > semCap {
-		semCap = config.VerificationConnections
+	if config.VerificationConnections > 0 {
+		semCap = maxConns + config.VerificationConnections
 	}
 
 	sf := &SegmentFetcher{

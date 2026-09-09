@@ -44,10 +44,13 @@ const (
 	verifyBufferSize = 4 * 1024 * 1024 // 4MB
 
 	// verificationPrefetchAhead is how far ahead of a verification read's
-	// position Usenet.verificationPrefetch keeps segments fetched. Sized to
-	// sit comfortably inside bufferMemorySize (64MB) so the prefetched blocks
-	// stay RAM-resident until the foreground read consumes them.
-	verificationPrefetchAhead = 32 * 1024 * 1024
+	// position Usenet.verificationPrefetch keeps segments fetched. Deep enough
+	// (~3-4s of lead at observed REMUX scan rates) that a multi-second
+	// provider/retry tail on one segment overlaps ffmpeg's consume of the
+	// segments already fetched, instead of stalling the sequential read. The
+	// overshoot past bufferMemorySize (64MB) spills to the disk-backed stream
+	// file, which on an HDD still outruns the fetch rate.
+	verificationPrefetchAhead = 128 * 1024 * 1024
 	// verificationPrefetchRamp is how much a verification read must consume
 	// before its prefetch starts: a seek or ffprobe's moov probe finishes
 	// inside this and pays nothing; a sustained forward scan crosses it and
@@ -403,12 +406,12 @@ func New() (*Usenet, error) {
 		processingMaxConns = maxConns
 	}
 
+	// Width of a verification read's background prefetch. It gets its own
+	// connection slots on top of maxConns (see NewSegmentFetcher), so this is
+	// additive headroom, not a ceiling.
 	verifyConns := cfg.Repair.VerificationConnections
 	if verifyConns <= 0 {
 		verifyConns = 32
-	}
-	if verifyConns < maxConns {
-		verifyConns = maxConns
 	}
 
 	prefetchSize, err := config.ParseSize(usenetConfig.ReadAhead)
