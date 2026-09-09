@@ -301,6 +301,10 @@ type meteredReader struct {
 	// start. Written by Read (single goroutine), read concurrently by
 	// Usenet.verificationPrefetch, so it must be atomic.
 	consumed atomic.Int64
+	// budget, when non-nil, caps the bytes this probe may pull across every
+	// range request it issues for the file (see reader.VerifyBudget). Once
+	// blown, Read stops feeding the probe.
+	budget *reader.VerifyBudget
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
@@ -310,6 +314,12 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 	m.reads++
 	m.bytes += int64(n)
 	m.consumed.Add(int64(n))
+	if err == nil && !m.budget.Add(int64(n)) {
+		// Hand back what we already read, then stop. The caller (Stream)
+		// recognises this sentinel and ends the response body cleanly - a
+		// blown budget is a statement about the probe, not the file.
+		return n, reader.ErrVerifyBudgetExhausted
+	}
 	return n, err
 }
 
@@ -1544,6 +1554,19 @@ func ContextWithDeadSignal(ctx context.Context, sig *DeadSegmentSignal) context.
 	return reader.ContextWithDeadSignal(ctx, sig)
 }
 
+// VerifyBudget caps the bytes one ffprobe verification may pull for a file -
+// see reader.VerifyBudget for why it exists.
+type VerifyBudget = reader.VerifyBudget
+
+// NewVerifyBudget returns a budget of limit bytes, or nil when limit <= 0.
+func NewVerifyBudget(limit int64) *VerifyBudget { return reader.NewVerifyBudget(limit) }
+
+// ContextWithVerifyBudget attaches b to ctx so the verification read path
+// meters against it - see reader.ContextWithVerifyBudget.
+func ContextWithVerifyBudget(ctx context.Context, b *VerifyBudget) context.Context {
+	return reader.ContextWithVerifyBudget(ctx, b)
+}
+
 // IsVerificationRead reports whether ctx was marked by ContextForVerificationRead.
 // Callers outside this package (pkg/manager) use this to skip triggering
 // behavior meant only for real client playback - e.g. read-ahead precache -
@@ -1643,7 +1666,10 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 		// visible. ffprobe issues one HTTP range request per decode window,
 		// so each log line below is one window - bucket by file for the
 		// per-window breakdown.
-		meter = &meteredReader{inner: section}
+		// The budget (if the probe caller registered one) is shared across
+		// every range request this probe issues, so a runaway read is capped
+		// for the file as a whole rather than per window.
+		meter = &meteredReader{inner: section, budget: reader.VerifyBudgetFromContext(ctx)}
 
 		// Rolling no-pad prefetch: keep segments fetched ahead of the read
 		// position so the fetch overlaps ffmpeg's consume instead of running
@@ -1680,6 +1706,20 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Use a safe copy loop that checks context and validates read counts
 	_, err = safeCopyBuffer(ctx, writer, copySrc, buf)
+
+	// A blown verification budget ends the body early on purpose. It is not a
+	// stream failure and must not reach the article-not-found / failedFiles
+	// handling below: the probe caller sees Exceeded() and downgrades its
+	// verdict to inconclusive.
+	if meter != nil && errors.Is(err, reader.ErrVerifyBudgetExhausted) {
+		err = nil
+		u.logger.Debug().
+			Str("nzb_id", nzoID).
+			Str("file", filename).
+			Int64("budget_bytes", meter.budget.Limit()).
+			Int64("used_bytes", meter.budget.Used()).
+			Msg("Repair: verification read hit its byte budget; ending body early (verdict will be inconclusive)")
+	}
 
 	if verifyRead && meter != nil && meter.bytes > 0 {
 		dur := time.Since(copyStart)

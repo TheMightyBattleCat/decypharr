@@ -309,7 +309,7 @@ type ffprobeOutput struct {
 // verification. A definite verdict - clean, or broken for a concrete reason -
 // is conclusive=true; a skipDecode call that never ran the decode windows is
 // conclusive=false.
-func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool) (ok bool, reason string, conclusive bool) {
+func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
 	metaTimeout := f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap)
@@ -378,7 +378,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			return false, ffprobeReasonAbsurdDuration, true
 		}
 		if !skipDecode {
-			return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
+			return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 		}
 		// Decode verification was skipped for this call, so nothing was
 		// deep-verified - not conclusive.
@@ -408,7 +408,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Int("expected_minutes", int(expectedDur.Minutes())).
 				Msg("Repair: runtime shorter than Arr metadata but stream is complete to its own header duration; treating as metadata mismatch (split release or as-aired special), not marking broken")
 			if !skipDecode {
-				return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
+				return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 			}
 			return true, "", false
 		}
@@ -422,7 +422,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
 	}
 	if !skipDecode {
-		return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes)
+		return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 	}
 	return true, "", false
 }
@@ -515,7 +515,7 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 // decode verdict (clean, or a concrete decode error) from a timed-out or
 // cancelled pass that proved nothing - the caller uses it to decide
 // whether an ok=true here counts as a passed decode verification.
-func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration, fileBytes int64) (ok bool, reason string, conclusive bool) {
+func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
 	if duration <= 0 {
 		return true, "", true
 	}
@@ -577,6 +577,20 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		return true, "", false
 	}
 
+	// A blown byte budget means *we* cut the stream short mid-probe, so
+	// whatever ffprobe reports from here on describes our truncation, not the
+	// file: a container error is exactly what a truncated read produces. This
+	// must be checked before stderr/exit-code interpretation, and can only
+	// ever be inconclusive - never a broken verdict, which would blocklist a
+	// grab on the strength of our own cap.
+	if budget.Exceeded() {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+			Msg("Repair: ffprobe decode check exceeded its read budget; treating as inconclusive")
+		return true, "", false
+	}
+
 	// Decode errors surface on stderr even when the exit code is 0 (ffprobe
 	// reports per-frame codec errors but still exits cleanly when it can
 	// continue demuxing). Check stderr first.
@@ -626,8 +640,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // forced-broken dead-segment verdict is conclusive=true (a confirmed 430
 // is a definite signal). A retry abandoned because ctx was cancelled
 // mid-wait is conclusive=false.
-func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal) (ok bool, reason string, conclusive bool) {
-	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode)
+func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
+	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification read; forcing broken verdict")
@@ -640,6 +654,17 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
 		return false, reason, conclusive
 	}
+	// The budget is shared across every pass, so once it is spent a retry
+	// would be cut off at the very first read and could only produce another
+	// truncation artefact. Stop here and report inconclusive rather than
+	// burning a second full pass to re-learn that (this is the multiplication
+	// that turned one 4.25 GB grab into 11.16 GB of reads).
+	if budget.Exceeded() {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
+			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+			Msg("Repair: skipping ffprobe retry — verification read budget already spent")
+		return true, "", false
+	}
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("Repair: ffprobe check failed; retrying once before declaring broken")
 
 	select {
@@ -648,8 +673,17 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	case <-time.After(ffprobeRetryDelay):
 	}
 
-	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode)
+	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Bool("ok", ok).Str("reason", reason).Msg("Repair: ffprobe retry result")
+	// A budget spent during the retry taints that pass the same way - the
+	// metadata probe can fail on a body we cut short - so it can only be
+	// inconclusive, never broken.
+	if budget.Exceeded() {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
+			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+			Msg("Repair: ffprobe retry exceeded its read budget; treating as inconclusive")
+		return true, "", false
+	}
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification retry; forcing broken verdict")

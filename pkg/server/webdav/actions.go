@@ -83,6 +83,12 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 		if sig := manager.DeadSignalForVerificationRead(info.InfoHash(), info.Name()); sig != nil {
 			ctx = manager.ContextWithDeadSignal(ctx, sig)
 		}
+		// Same bridge for the probe's byte budget: it is shared across every
+		// range request of one verification, so a runaway decode read is
+		// bounded for the file as a whole (see manager.VerifyBudget).
+		if b := manager.VerifyBudgetForVerificationRead(info.InfoHash(), info.Name()); b != nil {
+			ctx = manager.ContextWithVerifyBudget(ctx, b)
+		}
 		r = r.WithContext(ctx)
 	}
 	etag := fmt.Sprintf("\"%x-%x\"", info.ModTime().Unix(), info.Size())

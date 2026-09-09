@@ -51,7 +51,7 @@ func TestCheck_TooShort_TailIntact_NotBroken(t *testing.T) {
 	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
-	}, false)
+	}, false, nil)
 
 	if !ok {
 		t.Fatalf("expected ok=true (tail intact => metadata mismatch, not broken), got ok=false reason=%q", reason)
@@ -69,7 +69,7 @@ func TestCheck_TooShort_TailBroken_MarkedBroken(t *testing.T) {
 	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
-	}, false)
+	}, false, nil)
 
 	if ok {
 		t.Fatalf("expected ok=false (tail unreadable => broken), got ok=true")
@@ -92,7 +92,7 @@ func TestCheck_NormalRuntime_DoesNotCallTailIntact(t *testing.T) {
 	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
-	}, false)
+	}, false, nil)
 
 	if !ok || reason != "" {
 		t.Fatalf("expected ok=true, empty reason for a matching runtime; got ok=%v reason=%q", ok, reason)

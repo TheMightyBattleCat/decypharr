@@ -617,10 +617,18 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				return res
 			}
 
+			exp := expectedRuntimeFor(c, name)
+			// The sweep runs the same decode check as the import gate, so it
+			// gets the same byte cap - otherwise a file the gate admitted on
+			// a spent budget would simply re-spend it here (moving the cost
+			// to the nightly sweep rather than removing it).
+			budget := verifyBudgetFor(exp.Bytes)
+			registerVerifyBudget(res.infoHash, name, budget)
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
-			ok, reason, conclusive := checker.checkConfirmed(ctx, c.name, name, expectedRuntimeFor(c, name), skipDecode, sig)
+			ok, reason, conclusive := checker.checkConfirmed(ctx, c.name, name, exp, skipDecode, sig, budget)
 			unregisterDeadSignal(res.infoHash, name, sig)
+			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive
 
 			if !ok {

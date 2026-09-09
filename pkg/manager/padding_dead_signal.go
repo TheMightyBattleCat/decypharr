@@ -64,3 +64,9 @@ func DeadSignalForVerificationRead(infoHash, fileName string) *DeadSegmentSignal
 	sig, _ := v.(*DeadSegmentSignal)
 	return sig
 }
+
+// ContextWithVerifyBudget attaches b to ctx for the metered verification read
+// - see usenet.ContextWithVerifyBudget.
+func ContextWithVerifyBudget(ctx context.Context, b *VerifyBudget) context.Context {
+	return usenet.ContextWithVerifyBudget(ctx, b)
+}

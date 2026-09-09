@@ -427,6 +427,15 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 // with conclusive=false means "admit but flag dirty": every pass ran out of
 // time and nothing was actually verified.
 func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, entryFolder, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
+	// One budget for the whole file, deliberately shared across every pass:
+	// the point is to cap what this file can cost the gate in total, so a
+	// runaway read cannot simply be repeated ffprobeImportInconclusiveRetries
+	// times. Registered for the life of the verification so every range
+	// request the probe issues meters against it.
+	budget := verifyBudgetFor(exp.Bytes)
+	registerVerifyBudget(infoHash, fileName, budget)
+	defer unregisterVerifyBudget(infoHash, fileName, budget)
+
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return true, false, ""
@@ -434,7 +443,7 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 
 		sig := NewDeadSegmentSignal()
 		registerDeadSignal(infoHash, fileName, sig)
-		ok, reason, conclusive = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig)
+		ok, reason, conclusive = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig, budget)
 		unregisterDeadSignal(infoHash, fileName, sig)
 
 		if !ok {
@@ -442,6 +451,15 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 		}
 		if conclusive || attempt >= ffprobeImportInconclusiveRetries {
 			return true, conclusive, reason
+		}
+		// A spent budget is terminal for this file: retrying would be cut off
+		// at the first read, so admit-and-flag-dirty now instead of sleeping
+		// out the backoffs to reach the same answer.
+		if budget.Exceeded() {
+			d.logger.Debug().Str("entry", entry.Name).Str("file", fileName).
+				Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+				Msg("Import: ffprobe verification hit its read budget; admitting and flagging dirty")
+			return true, false, ""
 		}
 
 		backoff := ffprobeImportRetryBackoffs[min(attempt, len(ffprobeImportRetryBackoffs)-1)]
