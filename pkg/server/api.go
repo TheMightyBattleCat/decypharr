@@ -627,6 +627,10 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Invalid nntp_connection_percent (must be between 0 and 100)", http.StatusBadRequest)
 		return
 	}
+	if req.VerificationConnections < 0 || req.VerificationConnections > 500 {
+		http.Error(w, "Invalid verification_connections (must be between 0 and 500)", http.StatusBadRequest)
+		return
+	}
 	switch req.Par2RepairMode {
 	case "", config.Par2RepairModeAutoAll, config.Par2RepairModeAutoThreshold, config.Par2RepairModeManual:
 	default:

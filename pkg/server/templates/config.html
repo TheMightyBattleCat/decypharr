@@ -1412,6 +1412,16 @@
                             </div>
 
                             <div>
+                                <label class="label" for="repair.verification_connections">
+                                    <span class="font-medium">ffprobe verification connections</span>
+                                </label>
+                                <input type="number" min="1" max="200" class="input w-full"
+                                       name="repair.verification_connections" id="repair.verification_connections"
+                                       value="32">
+                                <span class="label-text-alt opacity-70">Concurrent NNTP fetches an ffprobe decode-verification read may drive ahead of itself. Higher saturates the pool faster on large REMUX probes; too high can trip provider connection-rate limits. Default 32.</span>
+                            </div>
+
+                            <div>
                                 <label class="label" for="repair.strategy">
                                     <span class="font-medium">Strategy</span>
                                 </label>

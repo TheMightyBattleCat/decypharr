@@ -48,8 +48,11 @@ const (
 	// sit comfortably inside bufferMemorySize (64MB) so the prefetched blocks
 	// stay RAM-resident until the foreground read consumes them.
 	verificationPrefetchAhead = 32 * 1024 * 1024
-	// verificationPrefetchChunk is one FetchRange burst inside that window.
-	verificationPrefetchChunk = 8 * 1024 * 1024
+	// verificationPrefetchRamp is how much a verification read must consume
+	// before its prefetch starts: a seek or ffprobe's moov probe finishes
+	// inside this and pays nothing; a sustained forward scan crosses it and
+	// then gets the full look-ahead window.
+	verificationPrefetchRamp = 8 * 1024 * 1024
 
 	// failedFileTTL bounds how long a permanent-failure record in
 	// failedFiles survives before preStreamChecks/FailedFileCause treat it
@@ -234,6 +237,11 @@ func (n *noPrefetchReader) FetchRange(ctx context.Context, off, length int64, co
 	return nil
 }
 
+func (n *noPrefetchReader) FetchRangeWindowed(ctx context.Context, base, total int64, concurrency int, horizon func() int64) error {
+	// No-op for multi-volume readers - no dedicated fetcher/cache to drive.
+	return nil
+}
+
 type contextSectionReader struct {
 	ctx   context.Context
 	r     fs.PrefetchableReaderAt
@@ -321,6 +329,7 @@ type Usenet struct {
 	metadataDir              string
 	nzbStorage               *NZBStorage // File-based NZB metadata storage
 	maxConnections           int         // Connections allocated per streaming file
+	verificationConnections  int         // Concurrent fetches an ffprobe verification read's prefetch may drive
 	processingMaxConnections int         // Connections allocated per file for parsing and NZB downloads
 	prefetchSize             int64       // Streaming prefetch size in bytes
 	failedFiles              *xsync.Map[string, failedFileRecord]
@@ -394,6 +403,14 @@ func New() (*Usenet, error) {
 		processingMaxConns = maxConns
 	}
 
+	verifyConns := cfg.Repair.VerificationConnections
+	if verifyConns <= 0 {
+		verifyConns = 32
+	}
+	if verifyConns < maxConns {
+		verifyConns = maxConns
+	}
+
 	prefetchSize, err := config.ParseSize(usenetConfig.ReadAhead)
 	if err != nil {
 		prefetchSize = 16 * 1024 * 1024 // Default to 16MB
@@ -418,6 +435,7 @@ func New() (*Usenet, error) {
 		logger:                   _logger,
 		metadataDir:              metadataDir,
 		maxConnections:           maxConns,
+		verificationConnections:  verifyConns,
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
@@ -1633,7 +1651,7 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 		pfDone := make(chan struct{})
 		defer func() {
 			pfCancel()
-			// Bounded: a FetchRange call blocked in a dial/read timeout would
+			// Bounded: a prefetch worker blocked in a dial/read timeout would
 			// otherwise hold the WebDAV handler open for the full NNTP timeout.
 			// The goroutine holds no reader ref of its own, so a brief linger
 			// past this point is harmless (releaseFS has a grace period).
@@ -1701,72 +1719,44 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	return err
 }
 
-// verificationPrefetch keeps a rolling window of segments fetched ahead of a
-// verification read's position so the NNTP fetch overlaps ffmpeg's decode
-// instead of running synchronously per readAtPlain call. Measured on a production install
-// 2026-09-09: the synchronous path sustained ~24 MiB/s on a REMUX while the
-// normal (prefetched) read path did ~73.
+// verificationPrefetch keeps segments fetched ahead of a verification read's
+// position so the NNTP fetch overlaps ffmpeg's decode instead of running
+// synchronously per readAtPlain call. Measured on a production install 2026-09-09: the
+// synchronous path sustained ~24 MiB/s on a REMUX while the normal (prefetched)
+// read path did ~73, and the earlier chunk-at-a-time FetchRange loop only
+// reached ~30 because each 8MB burst barriered on its slowest segment.
 //
-// It uses FetchRange on the caller's ctx, which carries the no-pad marker and
-// the dead-segment signal the WebDAV handler attached: a dead article in the
-// read-ahead trips the broken verdict exactly as the foreground read would,
-// rather than being padded. That is why the background prefetch workers (which
-// fetch on the fetcher's lifetime ctx and would pad) are bypassed for this
-// path. FetchRange swallows every non-ctx error - a failed segment stays
-// StateFailed for the foreground read to surface - and returns early only on
-// ctx cancellation.
+// It runs FetchRangeWindowed on the caller's ctx, which carries the no-pad
+// marker and the dead-segment signal the WebDAV handler attached: a dead
+// article in the read-ahead trips the broken verdict exactly as the foreground
+// read would, rather than being padded. That is why the background prefetch
+// workers (which fetch on the fetcher's lifetime ctx and would pad) are bypassed
+// for this path. Non-ctx errors are swallowed - a failed segment stays
+// StateFailed for the foreground read to surface.
+//
+// The horizon keeps the workers within verificationPrefetchAhead of the read
+// position and holds them off entirely until the read has consumed
+// verificationPrefetchRamp - a seek or moov probe finishes inside the ramp and
+// costs nothing.
 func (u *Usenet) verificationPrefetch(ctx context.Context, r fs.PrefetchableReaderAt, base, total int64, meter *meteredReader) {
 	if total <= 0 || meter == nil {
 		return
 	}
-	conc := u.maxConnections
+	conc := u.verificationConnections
+	if conc < 1 {
+		conc = u.maxConnections
+	}
 	if conc < 1 {
 		conc = 8
 	}
-	var fetchedTo int64
-	for fetchedTo < total {
-		if ctx.Err() != nil {
-			return
-		}
+	horizon := func() int64 {
 		consumed := meter.consumed.Load()
-
-		// ffmpeg's range GETs are open-ended, so `total` is the whole rest of
-		// the file even for a short seek or the metadata/moov probe. Don't
-		// prefetch until the read has proven it's a sustained forward scan by
-		// consuming a full chunk - a window read or metadata probe finishes
-		// first and pays nothing. The ahead window then tracks `consumed` up
-		// to the cap, so it never runs more than ~2x the read's own progress
-		// ahead.
-		if consumed < verificationPrefetchChunk {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(15 * time.Millisecond):
-			}
-			continue
+		if consumed < verificationPrefetchRamp {
+			return -1
 		}
-		ahead := consumed
-		if ahead > verificationPrefetchAhead {
-			ahead = verificationPrefetchAhead
-		}
-		if fetchedTo-consumed >= ahead {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(15 * time.Millisecond):
-			}
-			continue
-		}
-
-		n := int64(verificationPrefetchChunk)
-		if fetchedTo+n > total {
-			n = total - fetchedTo
-		}
-		if err := r.FetchRange(ctx, base+fetchedTo, n, conc); err != nil {
-			return
-		}
-		fetchedTo += n
+		return consumed + verificationPrefetchAhead
 	}
+	_ = r.FetchRangeWindowed(ctx, base, total, conc, horizon)
 }
 
 // shouldPoisonFailedFile decides whether an article-not-found from this read

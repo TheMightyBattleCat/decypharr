@@ -508,6 +508,99 @@ sendLoop:
 	return firstErr
 }
 
+// FetchRangeWindowed fetches every segment covering [base, base+total) into the
+// cache using `concurrency` persistent workers. Unlike FetchRange it has no
+// per-batch barrier: each worker claims the next segment the instant it finishes
+// one, so a single slow segment (retry ladder, slow provider) stalls only its
+// own worker while the rest keep the connections full - the behaviour the normal
+// prefetch workers have and the ffprobe verification read previously lacked.
+//
+// horizon() returns a byte offset measured from base; a worker will not fetch a
+// segment whose start is past that offset, and blocks (ctx-aware) until horizon
+// advances. A caller that consumes little - a seek, ffprobe's moov probe - keeps
+// horizon low and fetches little; a negative horizon fetches nothing at all (the
+// ramp before a scan proves itself a sustained forward read). Segment offsets
+// are absolute in the file; the horizon comparison converts to the base frame.
+//
+// Non-ctx fetch errors are swallowed - a confirmed-missing article stays
+// StateFailed for the foreground read to surface, exactly as FetchRange does.
+// Returns on ctx cancellation or once every segment in range has been attempted.
+func (sr *StreamingReader) FetchRangeWindowed(ctx context.Context, base, total int64, concurrency int, horizon func() int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sr.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	if horizon == nil {
+		return nil
+	}
+	if base < 0 {
+		base = 0
+	}
+	if base >= sr.totalSize || total <= 0 {
+		return nil
+	}
+	if base+total > sr.totalSize {
+		total = sr.totalSize - base
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	startSeg, endSeg := sr.cache.SegmentsForRange(base, total)
+
+	var (
+		nextSeg  atomic.Int64
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	nextSeg.Store(int64(startSeg))
+	recordCtxErr := func() {
+		if e := ctx.Err(); e != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = e
+			}
+			errMu.Unlock()
+		}
+	}
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if ctx.Err() != nil {
+					recordCtxErr()
+					return
+				}
+				seg := int(nextSeg.Add(1)) - 1
+				if seg > endSeg {
+					return
+				}
+				segStart := sr.cache.SegmentOffset(seg) - base
+				for segStart > horizon() {
+					select {
+					case <-ctx.Done():
+						recordCtxErr()
+						return
+					case <-time.After(15 * time.Millisecond):
+					}
+				}
+				if err := sr.fetcher.Fetch(ctx, seg); err != nil && ctx.Err() != nil {
+					recordCtxErr()
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
 // Prefetch triggers segment downloads for the given byte range without blocking.
 func (sr *StreamingReader) Prefetch(ctx context.Context, off, length int64) {
 	if sr.closed.Load() {

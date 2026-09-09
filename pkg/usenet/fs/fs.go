@@ -30,6 +30,10 @@ type PrefetchableReaderAt interface {
 	// read-ahead burst, distinct from Prefetch's normal steady-state window.
 	// See reader.StreamingReader.FetchRange.
 	FetchRange(ctx context.Context, off, length int64, concurrency int) error
+	// FetchRangeWindowed fetches [base, base+total) with `concurrency` workers
+	// that never barrier on each other, gated by horizon() (a byte offset from
+	// base). See reader.StreamingReader.FetchRangeWindowed.
+	FetchRangeWindowed(ctx context.Context, base, total int64, concurrency int, horizon func() int64) error
 }
 
 // FS implements fs.FS for RAR volumes backed by NNTP Segments
@@ -212,6 +216,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume, extraOpts ...reader.Opt
 	// Configure the new reader
 	readerConfig := reader.DefaultConfig()
 	readerConfig.MaxConnections = f.maxConcurrent
+	readerConfig.VerificationConnections = cfg.Repair.VerificationConnections
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(f.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
 
@@ -222,6 +227,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume, extraOpts ...reader.Opt
 	opts := []reader.Option{
 		reader.WithMaxDisk(readerConfig.MaxDisk),
 		reader.WithMaxConnections(readerConfig.MaxConnections),
+		reader.WithVerificationConnections(readerConfig.VerificationConnections),
 		reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 		reader.WithDiskPath(readerConfig.DiskPath),
 		reader.WithLogger(f.logger),

@@ -111,6 +111,12 @@ type Config struct {
 	// MaxConnections is the maximum concurrent NNTP downloads (default: 8).
 	MaxConnections int
 
+	// VerificationConnections widens the fetcher's connection semaphore to at
+	// least this value so an ffprobe verification read's background prefetch
+	// (FetchRangeWindowed) can run wider than the MaxConnections that bounds
+	// playback prefetch. 0 leaves the semaphore at MaxConnections.
+	VerificationConnections int
+
 	// PrefetchAhead is the number of segments to prefetch ahead of reads (default: 8).
 	PrefetchAhead int
 
@@ -204,6 +210,14 @@ func WithDiskPath(path string) Option {
 func WithMaxConnections(n int) Option {
 	return func(c *Config) {
 		c.MaxConnections = n
+	}
+}
+
+// WithVerificationConnections widens the fetcher connection semaphore so an
+// ffprobe verification read's background prefetch can run wider than playback.
+func WithVerificationConnections(n int) Option {
+	return func(c *Config) {
+		c.VerificationConnections = n
 	}
 }
 

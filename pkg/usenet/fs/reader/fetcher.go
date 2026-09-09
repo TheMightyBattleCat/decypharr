@@ -98,13 +98,24 @@ func NewSegmentFetcher(
 		maxConns = 8
 	}
 
+	// The semaphore is widened to VerificationConnections when that is larger:
+	// an ffprobe verification read's background prefetch (FetchRangeWindowed)
+	// runs at that width, while playback prefetch and foreground reads stay
+	// bounded by maxConns (numPrefetchWorkers and EnsureSegmentsConcurrent both
+	// read config.MaxConnections). A playback read of the same file can use the
+	// headroom too, but nothing drives it that wide on its own.
+	semCap := maxConns
+	if config.VerificationConnections > semCap {
+		semCap = config.VerificationConnections
+	}
+
 	sf := &SegmentFetcher{
 		client:     client,
 		cache:      cache,
 		config:     config,
 		logger:     logger.With().Str("component", "fetcher").Logger(),
 		stats:      stats,
-		semaphore:  make(chan struct{}, maxConns),
+		semaphore:  make(chan struct{}, semCap),
 		inFlight:   make(map[int]*fetchPromise),
 		prefetchCh: make(chan int, 256), // Buffer for prefetch hints
 		// A packed atomic bitmap keeps duplicate suppression cheap even for

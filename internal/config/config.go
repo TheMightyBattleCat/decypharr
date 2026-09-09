@@ -256,12 +256,20 @@ type RepairConfig struct {
 	// broken list) once no Sonarr/Radarr references any of its files anymore - i.e. the library
 	// has already replaced it with a working copy. Off by default: clearing the broken list is
 	// always done, but removing the underlying entry is opt-in.
-	CleanupSuperseded     bool     `json:"cleanup_superseded,omitempty"`
-	NNTPConnectionPercent int      `json:"nntp_connection_percent,omitempty"`
-	Strategy              string   `json:"strategy,omitempty"`
-	RecheckInterval       string   `json:"recheck_interval,omitempty"`
-	Arrs                  []string `json:"arrs,omitempty"`
-	AutoRepair            bool     `json:"auto_repair,omitempty"`
+	CleanupSuperseded     bool `json:"cleanup_superseded,omitempty"`
+	NNTPConnectionPercent int  `json:"nntp_connection_percent,omitempty"`
+	// VerificationConnections is the max concurrent NNTP fetches an ffprobe
+	// verification read (import gate / sweep decode check) may drive through
+	// its background prefetch. Verification reads disable padding, so they
+	// cannot use the shared background prefetch workers (which would pad a
+	// dead read-ahead article); this is their own connection budget instead.
+	// Default 32. The per-stream reader semaphore is widened to this value,
+	// so a normal playback read of the same file may also use the headroom.
+	VerificationConnections int      `json:"verification_connections,omitempty"`
+	Strategy                string   `json:"strategy,omitempty"`
+	RecheckInterval         string   `json:"recheck_interval,omitempty"`
+	Arrs                    []string `json:"arrs,omitempty"`
+	AutoRepair              bool     `json:"auto_repair,omitempty"`
 
 	// RepairOnPlaybackFailure, when true, escalates a streaming read that fails with a
 	// permanent NNTP article-not-found (430) into an immediate delete + re-search for the
@@ -390,7 +398,7 @@ type RepairConfig struct {
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
-		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
+		r.NNTPConnectionPercent == 0 && r.VerificationConnections == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" &&
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport && r.FFProbeDecodeCheck == nil &&
@@ -929,6 +937,10 @@ func (c *Config) applyRepairDefaults() {
 
 	if c.Repair.NNTPConnectionPercent == 0 {
 		c.Repair.NNTPConnectionPercent = 20
+	}
+
+	if c.Repair.VerificationConnections <= 0 {
+		c.Repair.VerificationConnections = 32
 	}
 
 	// Materialize the "default true when unset" pointers so config.json

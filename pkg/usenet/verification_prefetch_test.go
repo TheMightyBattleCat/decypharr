@@ -7,66 +7,86 @@ import (
 	"time"
 )
 
-// fakePrefetchReader records FetchRange calls for verificationPrefetch tests.
-type fakePrefetchReader struct {
-	mu    sync.Mutex
-	calls []fetchCall
-	block chan struct{} // if non-nil, FetchRange blocks on it before returning
-	err   error         // returned by FetchRange once calls have been recorded
+// fakeWindowedReader simulates reader.StreamingReader.FetchRangeWindowed at
+// segment granularity so verificationPrefetch's horizon function can be tested
+// without a real NNTP-backed reader.
+type fakeWindowedReader struct {
+	mu        sync.Mutex
+	fetchedTo int64 // highest segment-end offset (relative to base) fetched so far
+	calls     int
+	block     chan struct{} // if non-nil, each "segment fetch" waits on it
 }
 
-type fetchCall struct {
-	off, length int64
-}
+const fakeSegSize = 1 << 20 // 1 MiB
 
-func (f *fakePrefetchReader) ReadAt(p []byte, off int64) (int, error) { return len(p), nil }
-
-func (f *fakePrefetchReader) ReadAtContext(ctx context.Context, p []byte, off int64) (int, error) {
+func (f *fakeWindowedReader) ReadAt(p []byte, off int64) (int, error) { return len(p), nil }
+func (f *fakeWindowedReader) ReadAtContext(ctx context.Context, p []byte, off int64) (int, error) {
 	return len(p), nil
 }
+func (f *fakeWindowedReader) Prefetch(ctx context.Context, off, length int64) {}
+func (f *fakeWindowedReader) FetchRange(ctx context.Context, off, length int64, concurrency int) error {
+	return nil
+}
 
-func (f *fakePrefetchReader) Prefetch(ctx context.Context, off, length int64) {}
-
-func (f *fakePrefetchReader) FetchRange(ctx context.Context, off, length int64, concurrency int) error {
+func (f *fakeWindowedReader) FetchRangeWindowed(ctx context.Context, base, total int64, concurrency int, horizon func() int64) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, fetchCall{off, length})
+	f.calls++
 	block := f.block
 	f.mu.Unlock()
-	if block != nil {
-		select {
-		case <-block:
-		case <-ctx.Done():
+
+	var rel int64
+	for rel < total {
+		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-	}
-	return f.err
-}
-
-func (f *fakePrefetchReader) fetchedTo(base int64) int64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var max int64
-	for _, c := range f.calls {
-		if end := c.off - base + c.length; end > max {
-			max = end
+		for rel > horizon() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 		}
+		if block != nil {
+			select {
+			case <-block:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		next := rel + fakeSegSize
+		if next > total {
+			next = total
+		}
+		f.mu.Lock()
+		f.fetchedTo = next
+		f.mu.Unlock()
+		rel = next
 	}
-	return max
+	return nil
 }
 
-func (f *fakePrefetchReader) callCount() int {
+func (f *fakeWindowedReader) fetched() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.calls)
+	return f.fetchedTo
+}
+
+func (f *fakeWindowedReader) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 func TestVerificationPrefetch_StopsAtTotal(t *testing.T) {
-	u := &Usenet{maxConnections: 15}
-	r := &fakePrefetchReader{}
+	u := &Usenet{maxConnections: 15, verificationConnections: 32}
+	r := &fakeWindowedReader{}
 	const base, total = int64(1 << 20), int64(20 << 20)
 
 	m := &meteredReader{}
-	m.consumed.Store(total) // read already finished: prefetch should fill to total and stop
+	m.consumed.Store(total) // read already finished: fill to total and stop
 
 	done := make(chan struct{})
 	go func() { defer close(done); u.verificationPrefetch(context.Background(), r, base, total, m) }()
@@ -77,24 +97,17 @@ func TestVerificationPrefetch_StopsAtTotal(t *testing.T) {
 		t.Fatal("verificationPrefetch did not return")
 	}
 
-	if got := r.fetchedTo(base); got != total {
-		t.Fatalf("fetched to %d, want %d", got, total)
+	if got := r.fetched(); got != total {
+		t.Fatalf("fetched to %d, want %d (no overshoot, no shortfall)", got, total)
 	}
-	r.mu.Lock()
-	for _, c := range r.calls {
-		if c.off-base+c.length > total {
-			t.Fatalf("FetchRange %+v overshoots total %d (base %d)", c, total, base)
-		}
-	}
-	r.mu.Unlock()
 }
 
-func TestVerificationPrefetch_RampsWithConsumed(t *testing.T) {
-	u := &Usenet{maxConnections: 15}
-	r := &fakePrefetchReader{}
+func TestVerificationPrefetch_RampHoldsUntilConsumed(t *testing.T) {
+	u := &Usenet{maxConnections: 15, verificationConnections: 32}
+	r := &fakeWindowedReader{}
 	const base, total = int64(0), int64(1 << 30)
 
-	m := &meteredReader{} // consumed stays 0
+	m := &meteredReader{} // consumed stays 0 - below the ramp
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -104,39 +117,41 @@ func TestVerificationPrefetch_RampsWithConsumed(t *testing.T) {
 	cancel()
 	<-done
 
-	// consumed never crossed the ramp threshold, so nothing should have been
-	// fetched despite total being 1 GiB.
-	if n := r.callCount(); n != 0 {
-		t.Fatalf("prefetched %d chunks with consumed=0, want 0", n)
+	if got := r.fetched(); got != 0 {
+		t.Fatalf("prefetched %d bytes with consumed below the ramp, want 0", got)
+	}
+	if r.callCount() != 1 {
+		t.Fatalf("FetchRangeWindowed called %d times, want exactly 1", r.callCount())
 	}
 }
 
-func TestVerificationPrefetch_RespectsAheadWindow(t *testing.T) {
-	u := &Usenet{maxConnections: 15}
-	r := &fakePrefetchReader{}
+func TestVerificationPrefetch_StaysWithinAheadWindow(t *testing.T) {
+	u := &Usenet{maxConnections: 15, verificationConnections: 32}
+	r := &fakeWindowedReader{}
 	const base, total = int64(0), int64(1 << 30)
 
 	m := &meteredReader{}
-	m.consumed.Store(verificationPrefetchChunk) // just past the ramp gate
+	m.consumed.Store(verificationPrefetchRamp) // just past the ramp, and not advancing
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); u.verificationPrefetch(ctx, r, base, total, m) }()
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	cancel()
 	<-done
 
-	// ahead == consumed == 8 MiB, so fetchedTo should settle around
-	// consumed+ahead and not run away toward total.
-	if got := r.fetchedTo(base); got > 4*verificationPrefetchChunk {
-		t.Fatalf("fetched to %d, expected it to stay near the ahead window (~%d)", got, 2*verificationPrefetchChunk)
+	// horizon == consumed + ahead; with consumed frozen at the ramp the fetch
+	// must settle around that and never run away toward the 1 GiB total.
+	want := int64(verificationPrefetchRamp + verificationPrefetchAhead)
+	if got := r.fetched(); got > want+fakeSegSize {
+		t.Fatalf("fetched to %d, expected it to stop near the ahead window (~%d)", got, want)
 	}
 }
 
 func TestVerificationPrefetch_ExitsOnCancelWhileFetching(t *testing.T) {
-	u := &Usenet{maxConnections: 15}
-	r := &fakePrefetchReader{block: make(chan struct{})}
+	u := &Usenet{maxConnections: 15, verificationConnections: 32}
+	r := &fakeWindowedReader{block: make(chan struct{})}
 	const base, total = int64(0), int64(1 << 30)
 
 	m := &meteredReader{}
@@ -146,13 +161,12 @@ func TestVerificationPrefetch_ExitsOnCancelWhileFetching(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); u.verificationPrefetch(ctx, r, base, total, m) }()
 
-	// let it enter a blocked FetchRange
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // let it block inside a "segment fetch"
 	cancel()
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("verificationPrefetch did not exit after ctx cancel during FetchRange")
+		t.Fatal("verificationPrefetch did not exit after ctx cancel during a fetch")
 	}
 }
