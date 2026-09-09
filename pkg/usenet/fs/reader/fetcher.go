@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -45,6 +46,53 @@ func isForcedMissing(messageID string) bool {
 	return ok
 }
 
+// maxDownloadTimeoutStreak is how many consecutive DownloadTimeout expiries on
+// the SAME segment are tolerated before it is treated as unfetchable and handed
+// to the confirmed-missing path (pad + queue a repair), exactly as a 430 is.
+//
+// Why this exists: an article that times out instead of returning 430 was
+// previously retried forever. doFetch's cancel/deadline branch calls
+// ReleaseFetching, which resets the slot to Empty WITHOUT MarkFailed, so the
+// segment was never classified, never padded and never queued for repair - the
+// next read simply started over. Observed live on Grant S04E10 segment 139
+// (~100MB): reads spanning it blocked until DFS's 90s no-progress watchdog
+// killed them, and because a stall is transient by design the downloader's
+// error budget was wiped every 2 minutes. The file looped for 55 minutes and
+// could never reach repair, while every neighbouring offset read in under 1.5s.
+//
+// How fast this escalates, for the DFS playback path: within one DFS stream
+// attempt, fetchWithRetry's first try hits the 60s DownloadTimeout while the
+// caller is still alive (so it counts), and its second try is cut short by the
+// 90s no-progress watchdog (so it does not). That is exactly ONE increment per
+// DFS stream attempt, and DFS makes 3 of those per `download error` cycle - so
+// a wedged segment escalates inside the FIRST cycle, roughly 4.5 minutes in,
+// instead of looping for the better part of an hour.
+//
+// 3 is deliberately conservative: a merely slow segment gets three full
+// DownloadTimeout windows to land, and any success clears the streak.
+const maxDownloadTimeoutStreak = 3
+
+// noteDownloadTimeout records one DownloadTimeout expiry for segIdx and returns
+// the resulting consecutive count.
+func (sf *SegmentFetcher) noteDownloadTimeout(segIdx int) int {
+	sf.timeoutStreakMu.Lock()
+	defer sf.timeoutStreakMu.Unlock()
+	sf.timeoutStreak[segIdx]++
+	return sf.timeoutStreak[segIdx]
+}
+
+// clearDownloadTimeout forgets any timeout streak for segIdx. Called on every
+// successful download so a segment that is merely slow (or briefly unreachable)
+// never accumulates its way to a permanent verdict.
+func (sf *SegmentFetcher) clearDownloadTimeout(segIdx int) {
+	sf.timeoutStreakMu.Lock()
+	defer sf.timeoutStreakMu.Unlock()
+	if len(sf.timeoutStreak) == 0 {
+		return
+	}
+	delete(sf.timeoutStreak, segIdx)
+}
+
 // SegmentFetcher handles downloading segments from NNTP with deduplication and retry.
 //
 // Key features:
@@ -65,6 +113,13 @@ type SegmentFetcher struct {
 	// Request deduplication
 	inFlight   map[int]*fetchPromise
 	inFlightMu sync.Mutex
+
+	// Consecutive whole-download-timeout failures per segment. A segment that
+	// keeps exhausting DownloadTimeout without ever returning a 430 is
+	// unfetchable in practice but classified transient, so it would otherwise
+	// be retried forever - see noteDownloadTimeout.
+	timeoutStreak   map[int]int
+	timeoutStreakMu sync.Mutex
 
 	// Background prefetch
 	prefetchCh     chan int
@@ -117,9 +172,10 @@ func NewSegmentFetcher(
 		config:     config,
 		logger:     logger.With().Str("component", "fetcher").Logger(),
 		stats:      stats,
-		semaphore:  make(chan struct{}, semCap),
-		inFlight:   make(map[int]*fetchPromise),
-		prefetchCh: make(chan int, 256), // Buffer for prefetch hints
+		semaphore:     make(chan struct{}, semCap),
+		inFlight:      make(map[int]*fetchPromise),
+		timeoutStreak: make(map[int]int),
+		prefetchCh:    make(chan int, 256), // Buffer for prefetch hints
 		// A packed atomic bitmap keeps duplicate suppression cheap even for
 		// very large NZBs: 100k segments consume about 12 KiB, versus roughly
 		// 400 KiB for one atomic.Bool per segment.
@@ -306,6 +362,42 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 	if err != nil {
 		sf.stats.DownloadErrors.Add(1)
+
+		// A DownloadTimeout expiry says something about the article; a caller
+		// that walked away (DFS's 90s no-progress watchdog, a closed player)
+		// says nothing, so only the former is counted - hence the ctx.Err()
+		// guards. Once the same segment has burned maxDownloadTimeoutStreak
+		// consecutive download windows it is unfetchable in practice, even
+		// though no provider ever said 430. Convert it into the confirmed-
+		// missing error so the identical handling below pads it and queues a
+		// repair.
+		//
+		// Without this, the branch underneath calls ReleaseFetching, which
+		// resets the slot to Empty WITHOUT MarkFailed: the segment is never
+		// classified, never padded, never queued for repair, and the next read
+		// starts over. That is what let one article wedge a whole file for
+		// 55 minutes (Grant S04E10 segment 139) while every other offset in
+		// the same file read in under 1.5s.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && sf.ctx.Err() == nil {
+			if streak := sf.noteDownloadTimeout(segIdx); streak >= maxDownloadTimeoutStreak {
+				sf.logger.Warn().
+					Int("segment", segIdx).
+					Int("timeouts", streak).
+					Dur("download_timeout", timeout).
+					Msg("segment exhausted its download timeout repeatedly; treating as unfetchable")
+				err = &nntp.Error{
+					Type: nntp.ErrorTypeArticleNotFound,
+					Message: fmt.Sprintf(
+						"article unfetchable: download timeout expired on %d consecutive attempts", streak),
+				}
+				// The verdict is made and the slot ends up OnDisk (padded) or
+				// Failed either way, so stop tracking this segment rather than
+				// retaining an entry per timed-out segment for the life of the
+				// fetcher. A later re-fetch starts counting from scratch.
+				sf.clearDownloadTimeout(segIdx)
+			}
+		}
+
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			sf.cache.ReleaseFetching(segIdx)
 			return err
@@ -345,6 +437,9 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 					Int("segment", segIdx).
 					Msg("segment not padded: entry under sweep probe")
 			} else if sf.handleConfirmedMissing(ctx, segIdx, messageID) {
+				// The slot now holds patch/pad bytes and is OnDisk, so the
+				// streak that may have brought us here is spent.
+				sf.clearDownloadTimeout(segIdx)
 				sf.stats.Downloads.Add(1)
 				return nil
 			}
@@ -373,6 +468,9 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		return err
 	}
 
+	// A real download landed: the segment is not the wedged kind, so forget any
+	// timeout streak it built up. Only CONSECUTIVE timeouts escalate.
+	sf.clearDownloadTimeout(segIdx)
 	sf.stats.Downloads.Add(1)
 	return nil
 }
