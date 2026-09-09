@@ -1,8 +1,61 @@
 package reader
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
+
+// "The fetch ran out of time" reaches doFetch in two different shapes, and the
+// first cut of the escalation matched only one of them - which is why it never
+// fired once in production. Both must be recognised, and a caller that simply
+// walked away must NOT be.
+func TestFetchTimeoutClassification(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantCount bool
+	}{
+		{
+			name:      "DownloadTimeout expiry (article trickling under the idle deadline)",
+			err:       context.DeadlineExceeded,
+			wantCount: true,
+		},
+		{
+			name:      "StreamBodyTimeout expiry (connection fully idle)",
+			err:       &nntp.Error{Type: nntp.ErrorTypeTimeout, Message: "read timeout"},
+			wantCount: true,
+		},
+		{
+			name:      "wrapped nntp timeout still counts",
+			err:       fmt.Errorf("fetch segment: %w", &nntp.Error{Type: nntp.ErrorTypeTimeout}),
+			wantCount: true,
+		},
+		{
+			name:      "article-not-found is the 430 path, not a timeout",
+			err:       &nntp.Error{Type: nntp.ErrorTypeArticleNotFound},
+			wantCount: false,
+		},
+		{
+			name:      "caller cancellation says nothing about the article",
+			err:       context.Canceled,
+			wantCount: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Mirrors the guard in doFetch.
+			got := errors.Is(tc.err, context.DeadlineExceeded) || nntp.IsTimeoutError(tc.err)
+			if got != tc.wantCount {
+				t.Fatalf("counts-as-timeout = %v, want %v (err %T: %v)", got, tc.wantCount, tc.err, tc.err)
+			}
+		})
+	}
+}
 
 // The streak counter is what decides whether a segment that keeps exhausting
 // DownloadTimeout is escalated to the confirmed-missing path (pad + queue a

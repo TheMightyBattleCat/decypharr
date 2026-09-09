@@ -363,32 +363,63 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	if err != nil {
 		sf.stats.DownloadErrors.Add(1)
 
-		// A DownloadTimeout expiry says something about the article; a caller
-		// that walked away (DFS's 90s no-progress watchdog, a closed player)
-		// says nothing, so only the former is counted - hence the ctx.Err()
-		// guards. Once the same segment has burned maxDownloadTimeoutStreak
-		// consecutive download windows it is unfetchable in practice, even
-		// though no provider ever said 430. Convert it into the confirmed-
-		// missing error so the identical handling below pads it and queues a
-		// repair.
+		// A fetch that ran out of time says something about the article; a
+		// caller that walked away (DFS's 90s no-progress watchdog, a closed
+		// player) says nothing, so only the former is counted - hence the
+		// caller/fetcher guards below. Once the same segment has burned
+		// maxDownloadTimeoutStreak consecutive windows it is unfetchable in
+		// practice, even though no provider ever said 430, so convert it into
+		// the confirmed-missing error and let the identical handling below pad
+		// it and queue a repair.
 		//
 		// Without this, the branch underneath calls ReleaseFetching, which
 		// resets the slot to Empty WITHOUT MarkFailed: the segment is never
 		// classified, never padded, never queued for repair, and the next read
 		// starts over. That is what let one article wedge a whole file for
-		// 55 minutes (Grant S04E10 segment 139) while every other offset in
-		// the same file read in under 1.5s.
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && sf.ctx.Err() == nil {
+		// 55 minutes (Grant S04E10) while other offsets read in under 1.5s.
+		//
+		// The DEBUG line states the concrete error type rather than leaving it
+		// to inference: the first cut of this escalation matched only
+		// context.DeadlineExceeded and never fired once in production. It is
+		// cheap - a failed fetch only.
+		callerDone := ctx.Err() != nil
+		fetcherDone := sf.ctx.Err() != nil
+		isCtxDeadline := errors.Is(err, context.DeadlineExceeded)
+		isNNTPTimeout := nntp.IsTimeoutError(err)
+		sf.logger.Debug().
+			Int("segment", segIdx).
+			Str("err_type", fmt.Sprintf("%T", err)).
+			Str("err", err.Error()).
+			Bool("caller_done", callerDone).
+			Bool("fetcher_done", fetcherDone).
+			Bool("ctx_deadline", isCtxDeadline).
+			Bool("nntp_timeout", isNNTPTimeout).
+			Bool("article_not_found", nntp.IsArticleNotFoundError(err)).
+			Msg("segment fetch failed")
+
+		// "The fetch ran out of time" arrives in TWO shapes and the first cut
+		// only matched one of them:
+		//   - context.DeadlineExceeded, when DownloadTimeout expires on an
+		//     article that keeps trickling just under the NNTP idle deadline;
+		//   - *nntp.Error{ErrorTypeTimeout}, when the connection goes fully
+		//     idle and StreamBodyTimeout fires first.
+		// Both mean the same thing about the article, so both must count.
+		if (isCtxDeadline || isNNTPTimeout) && !callerDone && !fetcherDone {
 			if streak := sf.noteDownloadTimeout(segIdx); streak >= maxDownloadTimeoutStreak {
+				shape := "nntp_idle_timeout"
+				if isCtxDeadline {
+					shape = "download_timeout"
+				}
 				sf.logger.Warn().
 					Int("segment", segIdx).
 					Int("timeouts", streak).
 					Dur("download_timeout", timeout).
-					Msg("segment exhausted its download timeout repeatedly; treating as unfetchable")
+					Str("shape", shape).
+					Msg("segment repeatedly timed out; treating as unfetchable")
 				err = &nntp.Error{
 					Type: nntp.ErrorTypeArticleNotFound,
 					Message: fmt.Sprintf(
-						"article unfetchable: download timeout expired on %d consecutive attempts", streak),
+						"article unfetchable: fetch timed out on %d consecutive attempts (%s)", streak, shape),
 				}
 				// The verdict is made and the slot ends up OnDisk (padded) or
 				// Failed either way, so stop tracking this segment rather than

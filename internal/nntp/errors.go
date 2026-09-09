@@ -228,6 +228,21 @@ func IsAuthenticationError(err error) bool {
 	return false
 }
 
+// IsTimeoutError reports whether err is a read/stream timeout classified by
+// this package (StreamBodyTimeout expiring on a stalled or crawling article),
+// as opposed to a context deadline belonging to the caller. The two are
+// distinct and a caller that wants "the fetch ran out of time" must check
+// both: a fully idle connection trips the NNTP idle deadline and surfaces
+// here, while an article that keeps trickling just under that deadline
+// instead exhausts DownloadTimeout and surfaces as context.DeadlineExceeded.
+func IsTimeoutError(err error) bool {
+	var nntpErr *Error
+	if errors.As(err, &nntpErr) {
+		return nntpErr.Type == ErrorTypeTimeout
+	}
+	return false
+}
+
 func IsRetryableError(err error) bool {
 	var nntpErr *Error
 	if errors.As(err, &nntpErr) {
