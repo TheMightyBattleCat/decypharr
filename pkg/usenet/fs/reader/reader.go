@@ -215,24 +215,41 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	}
 
 	// Ensure all required segments are available (may block for downloads).
-	// Verification reads (padding disabled) run with no prefetch, so a
-	// multi-segment span is fetched via a worker pool; single-segment spans
-	// and normal playback keep the serial path.
+	//
+	// A multi-segment span is fetched via a worker pool on EVERY path, not just
+	// verification reads. readFromCache below cannot return a single byte until
+	// the whole span is on disk, so a serial fetch makes the read's latency the
+	// SUM of its segments. When a region is cold and its articles are slow (a
+	// provider serving one at ~20-30s rather than the usual sub-second), seven
+	// serial segments blow past DFS's 90s no-progress watchdog, which cancels
+	// the read having seen zero bytes - while no individual fetch ever reaches
+	// its own 60s DownloadTimeout, so nothing is classified as failed and
+	// nothing is retried at the segment level. Measured on a production install
+	// 2026-09-09: reads that hung 200s+ this way, on segments that were merely
+	// slow and completed fine once given the time. Fetching the span
+	// concurrently makes its latency the MAX of its segments instead, which
+	// keeps a cold slow region inside the watchdog.
+	//
+	// Playback prefetch (queued just above) already covers the warm case; this
+	// only changes the cold-span read that would otherwise serialize.
 	var ensureErr error
-	if paddingDisabled(ctx) && endSeg > startSeg {
+	if endSeg > startSeg {
 		fetchStart := time.Now()
 		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
-		// Only log the slow ones. With the verification prefetch pipelining
-		// ahead (Usenet.verificationPrefetch) the common case is an instant
-		// cache hit, one line per readAtPlain call - pure noise. A fetch that
-		// actually blocked here means the prefetch fell behind.
+		// Only log the slow ones. With prefetch pipelining ahead the common
+		// case is an instant cache hit, one line per readAtPlain call - pure
+		// noise. A fetch that actually blocked here means prefetch fell behind.
 		if d := time.Since(fetchStart); d >= verificationFetchLogThreshold {
-			sr.logger.Debug().
+			ev := sr.logger.Debug().
 				Int("start_seg", startSeg).
 				Int("end_seg", endSeg).
 				Int("segments", endSeg-startSeg+1).
-				Dur("fetch_dur", d).
-				Msg("verification read: concurrent segment fetch blocked")
+				Dur("fetch_dur", d)
+			if paddingDisabled(ctx) {
+				ev.Msg("verification read: concurrent segment fetch blocked")
+			} else {
+				ev.Msg("playback read: concurrent segment fetch blocked")
+			}
 		}
 	} else {
 		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
