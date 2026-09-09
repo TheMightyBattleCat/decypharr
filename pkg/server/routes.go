@@ -131,6 +131,10 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/mount/cache/purge", s.handlePurgeMountCache)
 			r.Post("/refresh-token", s.handleRefreshAPIToken)
 			r.Post("/update-auth", s.handleUpdateAuth)
+
+			// Diagnostics: full goroutine stack dump, for reads that hang
+			// without ever producing an error or a log line.
+			r.Get("/debug/goroutines", s.handleGoroutineDump)
 		})
 	})
 
