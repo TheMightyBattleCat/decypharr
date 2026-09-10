@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
+	"time"
 )
 
 // ErrVerifyBudgetExhausted is returned by a verification read once it has
@@ -42,6 +43,14 @@ type VerifyBudget struct {
 	limit    int64
 	used     atomic.Int64
 	exceeded atomic.Bool
+
+	// Accounting, so one line at the end of a verification can stand in for
+	// the per-range-request logging the read path used to emit (ffprobe
+	// issues dozens to hundreds of range GETs per probe). Written by Observe
+	// from the single metered-read goroutine, read once the probe finishes.
+	reads   atomic.Int64 // metered reads that delivered >0 bytes
+	waitNs  atomic.Int64 // cumulative time blocked in the underlying reader
+	firstAt atomic.Int64 // UnixNano of the first delivered byte, set once
 }
 
 // NewVerifyBudget returns a budget of limit bytes, or nil when limit <= 0
@@ -69,9 +78,63 @@ func (b *VerifyBudget) Add(n int64) bool {
 	return !b.exceeded.Load()
 }
 
+// Observe records that a metered read delivered n bytes after spending
+// waited blocked in the underlying reader. Pure accounting for the
+// end-of-verification summary line - the cap itself is enforced by Add.
+// Safe no-op on a nil receiver or a non-positive n.
+func (b *VerifyBudget) Observe(n int64, waited time.Duration) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.reads.Add(1)
+	b.waitNs.Add(int64(waited))
+	b.firstAt.CompareAndSwap(0, time.Now().UnixNano())
+}
+
 // Exceeded reports whether the budget was ever blown. False on nil.
 func (b *VerifyBudget) Exceeded() bool {
 	return b != nil && b.exceeded.Load()
+}
+
+// Reads returns the number of metered reads that delivered bytes. 0 on nil.
+func (b *VerifyBudget) Reads() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.reads.Load()
+}
+
+// Wait returns the cumulative time metered reads spent blocked on the
+// underlying fetch. 0 on nil. If this is close to a probe's wall time the
+// verification is fetch-bound; well below it, the bottleneck is ffmpeg/CPU.
+func (b *VerifyBudget) Wait() time.Duration {
+	if b == nil {
+		return 0
+	}
+	return time.Duration(b.waitNs.Load())
+}
+
+// Elapsed returns the wall time since the first byte was delivered, or 0 if
+// nothing has been read yet (or on nil).
+func (b *VerifyBudget) Elapsed() time.Duration {
+	if b == nil {
+		return 0
+	}
+	first := b.firstAt.Load()
+	if first == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, first))
+}
+
+// MiBPerSec is the effective delivered-bytes throughput over Elapsed, or 0
+// when nothing has been read yet.
+func (b *VerifyBudget) MiBPerSec() float64 {
+	e := b.Elapsed()
+	if b == nil || e <= 0 {
+		return 0
+	}
+	return float64(b.used.Load()) / (1024 * 1024) / e.Seconds()
 }
 
 // Used returns the bytes recorded so far. 0 on nil.

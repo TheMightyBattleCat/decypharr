@@ -456,8 +456,7 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 		// at the first read, so admit-and-flag-dirty now instead of sleeping
 		// out the backoffs to reach the same answer.
 		if budget.Exceeded() {
-			d.logger.Debug().Str("entry", entry.Name).Str("file", fileName).
-				Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+			budgetStats(d.logger.Debug().Str("entry", entry.Name).Str("file", fileName), budget).
 				Msg("Import: ffprobe verification hit its read budget; admitting and flagging dirty")
 			return true, false, ""
 		}

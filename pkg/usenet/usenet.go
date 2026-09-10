@@ -310,10 +310,14 @@ type meteredReader struct {
 func (m *meteredReader) Read(p []byte) (int, error) {
 	t := time.Now()
 	n, err := m.inner.Read(p)
-	m.readWait += time.Since(t)
+	waited := time.Since(t)
+	m.readWait += waited
 	m.reads++
 	m.bytes += int64(n)
 	m.consumed.Add(int64(n))
+	// Feed the budget's end-of-verification accounting (reads / wait /
+	// throughput), which stands in for the per-range-request log line.
+	m.budget.Observe(int64(n), waited)
 	// Only credited on a clean read: bytes handed back alongside io.EOF end
 	// the body anyway, so charging them could only turn the last read of a
 	// finished probe into a spurious "budget blown".
@@ -1726,18 +1730,25 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	if verifyRead && meter != nil && meter.bytes > 0 {
 		dur := time.Since(copyStart)
-		var mbps float64
+		var mibs float64
 		if dur > 0 {
-			mbps = float64(meter.bytes) / (1024 * 1024) / dur.Seconds()
+			mibs = float64(meter.bytes) / (1024 * 1024) / dur.Seconds()
 		}
-		u.logger.Debug().
+		// One line per HTTP range request. ffprobe issues dozens to hundreds
+		// of these per decode probe, so it is Trace, not Debug: the useful
+		// per-verification totals (bytes, throughput, read_wait, whether the
+		// budget was cut) are logged once by the ffprobe checker from the
+		// VerifyBudget accounting. Flip log_level to trace to get the
+		// per-range breakdown back (range_start progression = forward-scan vs
+		// seek signature).
+		u.logger.Trace().
 			Str("nzb_id", nzoID).
 			Str("file", filename).
 			Int64("range_start", rangeStart).
 			Int64("range_len", length).
 			Int64("bytes", meter.bytes).
 			Dur("dur", dur).
-			Float64("throughput_mbps", mbps).
+			Float64("throughput_mib_s", mibs).
 			Int("reads", meter.reads).
 			Dur("read_wait", meter.readWait).
 			Msg("Repair: verification range served")

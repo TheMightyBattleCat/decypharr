@@ -646,7 +646,10 @@ func (p *NZBParser) fetchYencHeaderFast(ctx context.Context, messageID string) (
 func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename string, segs nzbparser.NzbSegments, fetch yencHeaderFetchFunc) (refs []storage.Par2SegmentRef, total int64, notFound, real bool) {
 	yencData, err := fetch(ctx, segs[0].Id)
 	if err != nil || yencData == nil || yencData.Size <= 0 {
-		logger.Debug().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
+		// Trace, not Debug: one line per source file on every parse, and the
+		// aggregate is already reported by the "PAR2 source-size probing
+		// complete" WARN (files_probed / fell_back_to_estimate / not_found).
+		logger.Trace().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
 		refs, total = par2SegmentRefsFallback(segs)
 		return refs, total, err != nil && nntp.IsArticleNotFoundError(err), false
 	}

@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestVerifyBudget_NilIsUnbounded(t *testing.T) {
@@ -50,6 +51,44 @@ func TestVerifyBudget_AddLatchesOnceExceeded(t *testing.T) {
 	}
 	if b.Limit() != 100 {
 		t.Fatalf("Limit() = %d, want 100", b.Limit())
+	}
+}
+
+func TestVerifyBudget_ObserveAccounting(t *testing.T) {
+	b := NewVerifyBudget(1 << 30)
+
+	// Nothing observed yet: every accounting accessor is zero, and no divide
+	// by a zero Elapsed.
+	if b.Reads() != 0 || b.Wait() != 0 || b.Elapsed() != 0 || b.MiBPerSec() != 0 {
+		t.Fatalf("fresh budget accounting must be zero, got reads=%d wait=%v elapsed=%v mib=%f",
+			b.Reads(), b.Wait(), b.Elapsed(), b.MiBPerSec())
+	}
+
+	b.Observe(4<<20, 10*time.Millisecond)
+	time.Sleep(2 * time.Millisecond) // let wall time advance past firstAt
+	b.Observe(4<<20, 20*time.Millisecond)
+	b.Observe(0, 5*time.Millisecond) // zero-byte read: not counted
+	b.Add(8 << 20)                   // Observe does not move the cap; Add does
+
+	if b.Reads() != 2 {
+		t.Fatalf("Reads() = %d, want 2 (zero-byte read excluded)", b.Reads())
+	}
+	if b.Wait() != 30*time.Millisecond {
+		t.Fatalf("Wait() = %v, want 30ms", b.Wait())
+	}
+	if b.Elapsed() <= 0 {
+		t.Fatal("Elapsed() must be positive once a byte has been observed")
+	}
+	if b.MiBPerSec() <= 0 {
+		t.Fatal("MiBPerSec() must be positive once bytes have been observed")
+	}
+}
+
+func TestVerifyBudget_NilObserveIsSafe(t *testing.T) {
+	var b *VerifyBudget
+	b.Observe(1<<20, time.Second) // must not panic
+	if b.Reads() != 0 || b.Wait() != 0 || b.Elapsed() != 0 || b.MiBPerSec() != 0 {
+		t.Fatal("nil budget accounting accessors must all be zero")
 	}
 }
 

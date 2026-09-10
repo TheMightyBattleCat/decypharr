@@ -297,6 +297,30 @@ type ffprobeOutput struct {
 	} `json:"streams"`
 }
 
+// budgetStats annotates a verdict log event with the verification read's
+// byte accounting from its VerifyBudget: how much ffprobe actually pulled
+// (served_mb), against the cap (budget_mb / budget_cut), the effective
+// throughput (mib_s), and how much of the wall time was spent blocked on the
+// fetch (read_wait_ms). This replaces the former per-range-request
+// "verification range served" line, which fired dozens to hundreds of times
+// per probe. Returns ev unchanged when there is no budget (unknown file
+// size). Safe to chain: the returned event is still the same event.
+func budgetStats(ev *zerolog.Event, b *VerifyBudget) *zerolog.Event {
+	if b == nil {
+		return ev
+	}
+	ev = ev.Int64("served_mb", b.Used()>>20).
+		Int64("range_gets", b.Reads()).
+		Int64("read_wait_ms", b.Wait().Milliseconds())
+	if b.Limit() > 0 {
+		ev = ev.Int64("budget_mb", b.Limit()>>20).Bool("budget_cut", b.Exceeded())
+	}
+	if s := b.MiBPerSec(); s > 0 {
+		ev = ev.Float64("mib_s", s)
+	}
+	return ev
+}
+
 // check runs ffprobe once against entryFolder/fileName and returns whether
 // the file looks healthy. A context timeout or cancellation is treated as
 // inconclusive (ok=true) rather than broken - a slow cold read over Usenet
@@ -326,16 +350,16 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-				Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes).
+			budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+				Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes), budget).
 				Msg("Repair: ffprobe timed out; treating as inconclusive")
 		}
 		return true, "", false
 	}
 
 	if metaElapsed >= ffprobeMetadataSlowThreshold {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes), budget).
 			Msg("Repair: ffprobe metadata probe was slow")
 	}
 	// The metadata probe reads through the same budget as the decode pass, so
@@ -344,8 +368,8 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	// failure modes below - a non-zero exit and unparseable JSON - are what a
 	// truncated container looks like. Never let that become a broken verdict.
 	if budget.Exceeded() {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).Dur("elapsed", metaElapsed).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Dur("elapsed", metaElapsed), budget).
 			Msg("Repair: ffprobe metadata probe exceeded its read budget; treating as inconclusive")
 		return true, "", false
 	}
@@ -582,8 +606,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+			budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
 				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
 		return true, "", false
@@ -596,9 +620,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// ever be inconclusive - never a broken verdict, which would blocklist a
 	// grab on the strength of our own cap.
 	if budget.Exceeded() {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
-			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
 			Msg("Repair: ffprobe decode check exceeded its read budget; treating as inconclusive")
 		return true, "", false
 	}
@@ -608,21 +631,21 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// continue demuxing). Check stderr first.
 	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
 			Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
 
 	if runErr != nil {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Err(runErr).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Err(runErr), budget).
 			Msg("Repair: ffprobe decode check exited non-zero")
 		return false, ffprobeReasonDecodeError, true
 	}
 
-	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-		Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).
+	budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+		Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
 		Msg("Repair: ffprobe decode check passed")
 	return true, "", true
 }
@@ -671,8 +694,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	// rather than burn a second full pass to re-learn that (this is the
 	// multiplication that turned one 4.25 GB grab into 11.16 GB of reads).
 	if budget.Exceeded() {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
-			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: skipping ffprobe retry — verification read budget already spent")
 		return true, "", false
 	}
@@ -694,8 +716,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	// metadata probe can fail on a body we cut short - so it can only be
 	// inconclusive, never broken.
 	if budget.Exceeded() {
-		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
-			Int64("budget_bytes", budget.Limit()).Int64("used_bytes", budget.Used()).
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: ffprobe retry exceeded its read budget; treating as inconclusive")
 		return true, "", false
 	}

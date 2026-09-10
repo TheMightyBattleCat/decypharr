@@ -263,11 +263,14 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		// (plays with a bogus duration / won't start) while every segment
 		// decodes fine, the fault is here — wrong volume offsets, a
 		// packed-vs-unpacked size mismatch, or bad DataOffset header-skipping.
-		// Logged at debug; silent unless log_level=debug.
+		// Trace, not Debug: a multi-volume RAR emits one line per part (50+
+		// for a big release), which is pure parser-internals noise on the
+		// debug-level box unless you are actually chasing a geometry bug.
+		// Flip log_level to trace to get it back.
 		if len(fileSegments) > 0 {
 			first := fileSegments[0]
 			last := fileSegments[len(fileSegments)-1]
-			p.logger.Debug().
+			p.logger.Trace().
 				Str("file", rarFile.Name).
 				Int("volume_parts", len(rarFile.VolumeParts)).
 				Int("segments", len(fileSegments)).
@@ -281,7 +284,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 				Msg("RAR file geometry")
 			for pi, part := range rarFile.VolumeParts {
 				volOff := volumeOffsetMap[part.PartNumber]
-				p.logger.Debug().
+				p.logger.Trace().
 					Str("file", rarFile.Name).
 					Int("part_index", pi).
 					Int("part_number", part.PartNumber).

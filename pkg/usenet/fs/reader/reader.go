@@ -15,9 +15,13 @@ import (
 )
 
 // verificationFetchLogThreshold gates the "concurrent segment fetch blocked"
-// debug line - only log when the foreground fetch in a verification read
-// actually stalled (prefetch fell behind), not on every instant cache hit.
-const verificationFetchLogThreshold = 150 * time.Millisecond
+// debug line. A verification read's prefetch is routinely a few hundred ms
+// behind the foreground on a cold forward-scan - logging every one of those
+// buried a sweep under 70k lines (half the log). The aggregate lag is
+// already visible as read_wait on the ffprobe checker's per-file verdict
+// line; this line is now reserved for a genuine multi-second stall, which is
+// worth seeing on its own.
+const verificationFetchLogThreshold = 2 * time.Second
 
 var decryptionBufPool = sync.Pool{}
 
