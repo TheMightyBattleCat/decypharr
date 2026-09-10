@@ -119,7 +119,7 @@ const (
 	decodeDetectCapDivisor = 2
 
 	// decodeHeadCapNum/decodeHeadCapDen cut the head scan at 1.5x headBytes.
-	// The scan's interval is sized in seconds from the file's AVERAGE bitrate,
+	// The scan's interval is sized from the file's AVERAGE bitrate,
 	// so an opening that runs above average needs more than headBytes to reach
 	// the interval's end; the slack keeps a healthy scan from being cut short.
 	decodeHeadCapNum = 3
@@ -362,9 +362,11 @@ type ffprobeOutput struct {
 }
 
 type ffprobeStream struct {
-	CodecType   string `json:"codec_type"`
-	CodecName   string `json:"codec_name"`
-	Disposition struct {
+	CodecType    string `json:"codec_type"`
+	CodecName    string `json:"codec_name"`
+	AvgFrameRate string `json:"avg_frame_rate"`
+	RFrameRate   string `json:"r_frame_rate"`
+	Disposition  struct {
 		AttachedPic int `json:"attached_pic"`
 	} `json:"disposition"`
 }
@@ -487,6 +489,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		return false, ffprobeReasonNoVideoStream, true, ""
 	}
 	scope.coverArt = coverArtDecoders(probe.Streams)
+	scope.fps = videoFrameRate(probe.Streams)
 
 	durationSec, err := strconv.ParseFloat(strings.TrimSpace(probe.Format.Duration), 64)
 	if err != nil || durationSec <= 0 {
@@ -553,9 +556,41 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 }
 
 type ffprobeTailOutput struct {
-	Packets []struct {
-		PtsTime string `json:"pts_time"`
-	} `json:"packets"`
+	Packets []ffprobeTailPacket `json:"packets"`
+}
+
+type ffprobeTailPacket struct {
+	PtsTime string `json:"pts_time"`
+	DtsTime string `json:"dts_time"`
+}
+
+// ffprobeTailNearEnd is how close to the probed duration a packet must sit for
+// tailIntact to call the stream complete.
+const ffprobeTailNearEnd = 45 * time.Second
+
+// packetNearEnd reports whether any packet's timestamp lies within
+// ffprobeTailNearEnd of probed. A packet without a PTS is placed by its DTS:
+// Matroska stores VC-1 (and any other V_MS/VFW/FOURCC track) in VfW mode, and
+// ffmpeg gives those packets a DTS only, so reading PTS alone found no packet
+// near the end of any VC-1 file and turned a too-short runtime into a broken
+// verdict.
+func packetNearEnd(packets []ffprobeTailPacket, probed time.Duration) bool {
+	for _, p := range packets {
+		sec, err := strconv.ParseFloat(strings.TrimSpace(p.PtsTime), 64)
+		if err != nil {
+			if sec, err = strconv.ParseFloat(strings.TrimSpace(p.DtsTime), 64); err != nil {
+				continue
+			}
+		}
+		diff := probed - time.Duration(sec*float64(time.Second))
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= ffprobeTailNearEnd {
+			return true
+		}
+	}
+	return false
 }
 
 // tailIntact corroborates a too-short verdict by demuxing a window of stream
@@ -576,13 +611,13 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 		start = 0
 	}
 	readSpan := ffprobeTailWindow + 15*time.Second
-	interval := fmt.Sprintf("%.0f%%+%.0f", start.Seconds(), readSpan.Seconds())
+	interval := decodeInterval(start, readSpan, decodeScopeFromContext(ctx).frameRate())
 
 	args := f.probeArgs(entryFolder, fileName, []string{
 		"-v", "error",
 		"-read_intervals", interval,
 		"-select_streams", "V:0",
-		"-show_entries", "packet=pts_time",
+		"-show_entries", "packet=pts_time,dts_time",
 		"-of", "json",
 	})
 
@@ -609,23 +644,7 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		return false
 	}
-
-	const nearEndTolerance = 45 * time.Second
-	for _, p := range out.Packets {
-		sec, err := strconv.ParseFloat(strings.TrimSpace(p.PtsTime), 64)
-		if err != nil {
-			continue
-		}
-		pts := time.Duration(sec * float64(time.Second))
-		diff := probed - pts
-		if diff < 0 {
-			diff = -diff
-		}
-		if diff <= nearEndTolerance {
-			return true
-		}
-	}
-	return false
+	return packetNearEnd(out.Packets, probed)
 }
 
 // decodeScope is what one verification learns and reuses across its probes.
@@ -642,6 +661,74 @@ type decodeScope struct {
 	// cover prints a decoder error on every probe of a file whose video is
 	// fine. Set by check from the metadata probe.
 	coverArt map[string]bool
+	// fps is the selected video stream's frame rate, or 0 when the metadata
+	// probe gave none usable. Set by check; decodeInterval ends every read
+	// interval by a frame count derived from it.
+	fps float64
+}
+
+func (s *decodeScope) frameRate() float64 {
+	if s == nil {
+		return 0
+	}
+	return s.fps
+}
+
+// Frame rates outside this range are treated as unknown: a container's guess
+// for a variable-rate or field-coded stream can be far off, and a wrong rate
+// sizes every window by the same factor.
+const (
+	decodeMinFrameRate = 5
+	decodeMaxFrameRate = 120
+)
+
+// videoFrameRate returns the frame rate of the stream -select_streams V:0
+// picks - the first video stream that is not an attached picture - from its
+// avg_frame_rate, else its r_frame_rate, or 0 when neither is a usable
+// "num/den" inside [decodeMinFrameRate, decodeMaxFrameRate].
+func videoFrameRate(streams []ffprobeStream) float64 {
+	for _, s := range streams {
+		if s.CodecType != "video" || s.Disposition.AttachedPic != 0 {
+			continue
+		}
+		for _, r := range []string{s.AvgFrameRate, s.RFrameRate} {
+			if fps := parseFrameRate(r); fps >= decodeMinFrameRate && fps <= decodeMaxFrameRate {
+				return fps
+			}
+		}
+		return 0
+	}
+	return 0
+}
+
+// parseFrameRate reads ffprobe's "num/den" rational, 0 when it is not one.
+func parseFrameRate(r string) float64 {
+	num, den, ok := strings.Cut(strings.TrimSpace(r), "/")
+	if !ok {
+		return 0
+	}
+	n, err1 := strconv.ParseFloat(num, 64)
+	d, err2 := strconv.ParseFloat(den, 64)
+	if err1 != nil || err2 != nil || d <= 0 || n <= 0 {
+		return 0
+	}
+	return n / d
+}
+
+// decodeInterval builds one -read_intervals entry: from start, for span. With
+// a known frame rate the span is a frame count ("START%+#N"), which ffprobe
+// ends by counting the selected stream's packets. A span in seconds
+// ("START%+S") ends at the first packet whose PTS reaches start+span, and
+// Matroska VfW-mode tracks (VC-1 in every REMUX checked) carry no PTS, so such
+// an interval never ended: the detect probe read to its cut and called a file
+// with intact Cues unseekable, and the head scan read to its cut and never
+// reached a verdict. Without a frame rate the seconds form is the only option.
+func decodeInterval(start, span time.Duration, fps float64) string {
+	if fps > 0 {
+		frames := max(1, int(math.Ceil(span.Seconds()*fps)))
+		return fmt.Sprintf("%.0f%%+#%d", start.Seconds(), frames)
+	}
+	return fmt.Sprintf("%.0f%%+%.0f", start.Seconds(), span.Seconds())
 }
 
 type seekState int
@@ -745,7 +832,7 @@ const (
 
 // spreadIntervals builds the evenly-spaced -read_intervals list that samples
 // the whole duration - the normal decode check.
-func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64) []string {
+func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64, fps float64) []string {
 	// Adaptive window count: a large file (REMUX) gets fewer windows so the
 	// probe pulls ~120-150 MB of cold random I/O over WebDAV instead of
 	// ~300-450 MB. Still spans the whole duration.
@@ -762,7 +849,7 @@ func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64
 	intervals := make([]string, n)
 	for i := range n {
 		startSec := duration * time.Duration(i) / time.Duration(n)
-		intervals[i] = fmt.Sprintf("%.0f%%+%.0f", startSec.Seconds(), ffprobeDecodeWindowSpan.Seconds())
+		intervals[i] = decodeInterval(startSec, ffprobeDecodeWindowSpan, fps)
 	}
 	return intervals
 }
@@ -886,10 +973,12 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 //
 // It samples evenly-spaced windows across the duration - EXCEPT on a file
 // ffmpeg cannot seek in. With no usable container index (Matroska without
-// Cues: most VC-1/MPEG-2 REMUXes, ~3% of AVC ones; and web episodes that
-// behave the same way on this read path, cause unknown) ffmpeg reaches each
-// window by reading forward from the last, so the sample degenerates into a
-// read of 84-100% of the file. Reaching byte offset X in such a file costs X,
+// Cues, some AVC REMUXes, and web episodes that behave the same way on this
+// read path, cause unknown) ffmpeg reaches each window by reading forward from
+// the last, so the sample degenerates into a read of 84-100% of the file.
+// VC-1 REMUXes were once counted here too; they have intact Cues, and only
+// looked unseekable because intervals sized in seconds never end on their
+// PTS-less packets (see decodeInterval). Reaching byte offset X in such a file costs X,
 // so no sampling scheme can verify more than a prefix; the only real choice is
 // how large a prefix to pay for. Whether a file seeks is measured in bytes,
 // not time: each probe below runs under its own byte budget (a phase, see
@@ -904,7 +993,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 //     Being cut means it does not: the head scan. A decode error on an uncut
 //     body that stopped the decode is a real verdict; a timeout or
 //     cancellation short of the cut proves nothing.
-//   - Head scan: one interval from offset 0 over the seconds headBytes covers
+//   - Head scan: one interval from offset 0 over the frames headBytes covers
 //     at the file's average bitrate, cut at 1.5x headBytes, reported as
 //     partial coverage. If it is cut or times out it reaches no verdict, and
 //     the verification is exhausted so no retry pays for the same scan again.
@@ -955,9 +1044,10 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	if run == nil {
 		run = f.runDecodeProbe
 	}
+	fps := decodeScopeFromContext(ctx).frameRate()
 
 	spread := func() (bool, string, bool, string) {
-		intervals := f.spreadIntervals(duration, fileBytes)
+		intervals := f.spreadIntervals(duration, fileBytes, fps)
 		if len(intervals) == 0 {
 			return true, "", true, decodeCoverageFull
 		}
@@ -1018,8 +1108,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		// Straight to the head scan below.
 	default:
 		detect, ok, reason, conclusive = runPhase(decodePhaseDetect, []string{
-			fmt.Sprintf("%.0f%%+%.0f", 0.0, ffprobeDecodeWindowSpan.Seconds()),
-			fmt.Sprintf("%.0f%%+%.0f", detectOffset.Seconds(), ffprobeDecodeWindowSpan.Seconds()),
+			decodeInterval(0, ffprobeDecodeWindowSpan, fps),
+			decodeInterval(detectOffset, ffprobeDecodeWindowSpan, fps),
 		}, detectCap)
 		switch {
 		case detect.Exceeded():
@@ -1056,14 +1146,13 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		headSec = minSec
 	}
 	headCap := headBytes / decodeHeadCapDen * decodeHeadCapNum
+	headInterval := decodeInterval(0, time.Duration(headSec*float64(time.Second)), fps)
 	budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-		Int64("file_bytes", fileBytes).Float64("head_seconds", headSec).
+		Int64("file_bytes", fileBytes).Float64("head_seconds", headSec).Str("head_interval", headInterval).
 		Int64("head_cap_mb", headCap>>20).Bool("detect_reused", detect == nil), detect).
 		Msg("Repair: file has no usable container index; scanning a bounded head instead of the full file")
 
-	head, ok, reason, conclusive := runPhase(decodePhaseHead, []string{
-		fmt.Sprintf("%.0f%%+%.0f", 0.0, headSec),
-	}, headCap)
+	head, ok, reason, conclusive := runPhase(decodePhaseHead, []string{headInterval}, headCap)
 	if head.Exceeded() || (ok && !conclusive) {
 		// Cut, timed out, cancelled before the end of its interval, or errors
 		// that decoded through to it: no verdict, and a retry would only pay
