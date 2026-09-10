@@ -760,7 +760,11 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 // verification no longer has a single hard byte ceiling. A healthy unseekable
 // file costs a detect cut plus a head scan (~1 + ~3 GiB at the defaults); a
 // broken one can cost that twice, because checkConfirmed retries a broken
-// verdict once, before it is marked broken (at most 2 x (1 + 4.5) GiB).
+// verdict once, before it is marked broken (at most 2 x (1 + 4.5) GiB). That
+// retry is kept on purpose: a false broken verdict deletes and re-searches a
+// 14-34 GB grab, and a multi-GiB scan touches thousands of segments, so a
+// transient fetch error surfacing as a decode error is likelier here than on a
+// sparse sample, not less.
 //
 // Every phase checks its own budget before anything ffprobe reported: a cut
 // body yields container errors that describe our truncation, so a spent phase
