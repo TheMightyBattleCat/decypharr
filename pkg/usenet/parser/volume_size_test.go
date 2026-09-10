@@ -202,7 +202,7 @@ func TestMeasureUnsizedVolumes_FinalFirstThenShortestWithinTheCap(t *testing.T) 
 	if !slices.Equal(order, want) {
 		t.Fatalf("fetched %v, want %v (final first, then shortest, at most %d)", order, want, maxVolumeMeasurements)
 	}
-	if n != 0 || err == nil {
-		t.Fatalf("got n=%d err=%v, want the joined fetch errors", n, err)
+	if n != 0 || err == nil || strings.Contains(err.Error(), "\n") || !strings.HasPrefix(err.Error(), "4 of 4 volumes unmeasured") {
+		t.Fatalf("got n=%d err=%q, want one single-line error counting all 4 failures", n, err)
 	}
 }

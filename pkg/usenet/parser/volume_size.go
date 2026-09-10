@@ -2,7 +2,6 @@ package parser
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 
@@ -86,16 +85,25 @@ func measureUnsizedVolumes(ctx context.Context, group *FileGroup, fetch yencHead
 		return len(group.Files[ia].Segments) < len(group.Files[ib].Segments)
 	})
 
-	measured := 0
-	var errs []error
-	for _, i := range candidates[:min(len(candidates), maxVolumeMeasurements)] {
+	tried := candidates[:min(len(candidates), maxVolumeMeasurements)]
+	measured, failed := 0, 0
+	var firstErr error
+	for _, i := range tried {
 		if err := measureFile(ctx, m, group.Files[i], fetch); err != nil {
-			errs = append(errs, err)
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		measured++
 	}
-	return measured, errors.Join(errs...)
+	if firstErr != nil {
+		// One line rather than one per volume: the caller logs this at WARN on
+		// the import path.
+		return measured, fmt.Errorf("%d of %d volumes unmeasured, first: %w", failed, len(tried), firstErr)
+	}
+	return measured, nil
 }
 
 // measureFile fetches file's first article header and records its decoded
