@@ -154,6 +154,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		return group.Files[i].Number < group.Files[j].Number
 	})
 
+	measureArchiveVolumes(ctx, group, p.manager, p.logger)
+
 	volumes := buildArchiveVolumeDescriptors(group)
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no RAR volumes found")
@@ -252,6 +254,15 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			streamSize += seg.Bytes
 		}
 
+		if rarFile.UncompressedSize > 0 && streamSize > 0 && rarFile.UncompressedSize > streamSize {
+			p.logger.Warn().
+				Str("group", group.BaseName).
+				Str("file", rarFile.Name).
+				Int64("header_bytes", rarFile.UncompressedSize).
+				Int64("stream_bytes", streamSize).
+				Int64("missing_bytes", rarFile.UncompressedSize-streamSize).
+				Msg("RAR file is shorter than its archive header says; serving only the bytes its articles cover")
+		}
 		size := rarFile.UncompressedSize
 		if size <= 0 || (streamSize > 0 && size > streamSize) {
 			// Clamp to streamable size to avoid advertising bytes we can't serve.

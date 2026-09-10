@@ -79,6 +79,8 @@ func (p *ZIPParser) Process(ctx context.Context, group *FileGroup, password stri
 		return group.Files[i].Filename < group.Files[j].Filename
 	})
 
+	measureArchiveVolumes(ctx, group, p.manager, p.logger)
+
 	volumes := buildArchiveVolumeDescriptors(group)
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no volumes built from group")

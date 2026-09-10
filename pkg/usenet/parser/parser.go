@@ -82,6 +82,13 @@ type fileAnalysisResult struct {
 	fileSize     int64 // Total decoded size of the NZB file entry.
 	lastFileSize int64 // Total decoded size of the last NZB file entry in the group.
 	segmentSize  int64 // Decoded size of a single yEnc part/segment.
+
+	// measured holds the decoded size of each file whose own yEnc header was
+	// fetched, keyed by fileMetaKey. fileSize and lastFileSize describe the
+	// files enrichGroupWithFileInfo probed, which need not be the files at the
+	// first and last index once an archive processor reorders its volumes -
+	// see measureUnsizedVolumes.
+	measured map[string]int64
 }
 
 type contentResult struct {
@@ -1220,6 +1227,8 @@ func (p *NZBParser) enrichGroupWithFileInfo(ctx context.Context, group *FileGrou
 		lastFileSize: lastFileSize,
 		segmentSize:  segmentSize,
 	}
+	group.metadata.measure(firstFile, fileSize)
+	group.metadata.measure(lastFile, lastFileSize)
 	return nil
 }
 

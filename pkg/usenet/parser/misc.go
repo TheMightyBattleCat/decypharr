@@ -147,8 +147,15 @@ func getNZBSegments(index int, file nzbparser.NzbFile, group *FileGroup) (int64,
 	currentOffset := int64(0)
 	metadata := group.getMetadata()
 
+	// A file measured from its own yEnc header is sized by that measurement.
+	// Position is only a fallback for estimated metadata: an archive processor
+	// may have reordered the volumes since enrichGroupWithFileInfo measured "the
+	// last file", so the file at the last index need not be that file (see
+	// measureUnsizedVolumes).
 	fileSize := metadata.fileSize
-	if index == len(group.Files)-1 {
+	if measured := metadata.measuredSize(file); measured > 0 {
+		fileSize = measured
+	} else if index == len(group.Files)-1 && len(metadata.measured) == 0 {
 		fileSize = metadata.lastFileSize
 	}
 
