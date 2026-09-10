@@ -16,6 +16,7 @@ import (
 	grab "github.com/cavaliergopher/grab/v3"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sourcegraph/conc/pool"
@@ -567,7 +568,7 @@ func (d *Downloader) markAsError(entry *storage.Entry, err error) {
 func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) error {
 	files := entry.GetActiveFiles()
 	torrentSymlinkPath := entry.DownloadPath()
-	d.logger.Info().Str("mount_path", mountPath).Msgf("Creating symlinks for %d files in %s", len(files), torrentSymlinkPath)
+	d.logger.Debug().Str("mount_path", mountPath).Msgf("Creating symlinks for %d files in %s", len(files), torrentSymlinkPath)
 
 	// Create symlink directory
 	err := os.MkdirAll(torrentSymlinkPath, os.ModePerm)
@@ -641,7 +642,8 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 				}
 				filePaths = append(filePaths, fileSymlinkPath)
 				delete(remainingFiles, entryName)
-				d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
+				d.logger.Info().Str("entry", entry.GetFolder()).Str(logger.FieldSubject, file.Name).
+					Str(logger.FieldStatus, logger.StatusOK).Msg("File is ready")
 				continue
 			}
 

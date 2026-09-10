@@ -314,7 +314,7 @@ func (m *Manager) processAction(entry *storage.Entry) {
 	entry.Status = debridTypes.TorrentStatusDownloaded
 	entry.UpdatedAt = time.Now()
 	_ = m.queue.Update(entry)
-	m.logger.Info().
+	m.logger.Debug().
 		Str("name", entry.Name).
 		Str("action", string(entry.Action)).
 		Msg("Download completed, processing action")

@@ -666,7 +666,9 @@ func (r *Repair) runSweep(trigger storage.RepairRunTrigger, opts RepairRunOption
 		r.executeSweep(runCtx, run, opts, stopState)
 	})
 
-	r.logger.Info().Str("run_id", run.ID).Str("trigger", string(trigger)).Msg("Repair sweep started")
+	r.logger.Info().Str("run_id", run.ID).Str("trigger", string(trigger)).
+		Str(logger.FieldStatus, logger.StatusStart).Str(logger.FieldNote, string(trigger)).
+		Msg("Repair sweep started")
 	return run.ID, nil
 }
 
@@ -693,6 +695,7 @@ func (r *Repair) finalizeRun(run *storage.RepairRun, status storage.RepairRunSta
 		r.logger.Warn().Err(err).Str("run_id", run.ID).Msg("Failed to persist final run state")
 	}
 	_ = r.manager.storage.PruneRepairRuns(repairHistoryRetained)
+	r.logRunFinished(run)
 
 	if r.manager.Notifications != nil {
 		if event := notificationEventFor(status); event != "" {
@@ -708,6 +711,31 @@ func (r *Repair) finalizeRun(run *storage.RepairRun, status storage.RepairRunSta
 	// decode, appendLog.ReadAt buffers). Hand the freed heap back to the OS
 	// so RSS doesn't sit at the post-repair peak.
 	debug.FreeOSMemory()
+}
+
+// logRunFinished is a sweep's closing INFO line: how it ended, how long it
+// ran and what it found.
+func (r *Repair) logRunFinished(run *storage.RepairRun) {
+	ev, status := r.logger.Info(), logger.StatusOK
+	switch run.Status {
+	case storage.RepairRunFailed:
+		ev, status = r.logger.Warn(), logger.StatusFail
+	case storage.RepairRunCancelled:
+		status = logger.StatusWarn
+	}
+	if !run.StartedAt.IsZero() && run.CompletedAt.After(run.StartedAt) {
+		ev = ev.Dur(logger.FieldTook, run.CompletedAt.Sub(run.StartedAt))
+	}
+	reason := run.Error
+	if reason == "" {
+		reason = run.CancelReason
+	}
+	if reason != "" {
+		ev = ev.Str("reason", reason)
+	}
+	ev.Str("run_id", run.ID).Str(logger.FieldStatus, status).
+		Str(logger.FieldNote, fmt.Sprintf("%d probed • %d broken • %d repaired", run.Stats.Probed, run.Stats.Broken, run.Stats.Repaired)).
+		Msgf("Repair sweep %s", run.Status)
 }
 
 func notificationEventFor(status storage.RepairRunStatus) config.NotificationEvent {

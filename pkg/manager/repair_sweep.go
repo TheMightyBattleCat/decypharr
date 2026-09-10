@@ -19,6 +19,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -657,6 +658,7 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			registerVerifyBudget(res.infoHash, name, budget)
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
+			started := time.Now()
 			ok, reason, conclusive, coverage := checker.checkConfirmed(ctx, c.name, name, exp, skipDecode, sig, budget)
 			unregisterDeadSignal(res.infoHash, name, sig)
 			unregisterVerifyBudget(res.infoHash, name, budget)
@@ -677,6 +679,7 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				res.broken = true
 				res.reason = "sweep_dead_segment_ffprobe_override"
 			}
+			r.logFileVerdict(c.name, name, exp.Bytes, budget, time.Since(started), res, skipDecode)
 		}
 	} else if res.broken {
 		if checker := ffprobeCheckerFromContext(ctx); checker != nil {
@@ -685,10 +688,39 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			// An ffprobe container read would only spend the sweep's time
 			// pulling known-dead articles to reach the same verdict - skip it
 			// and let the existing broken classification stand.
-			r.logger.Info().Str("entry", c.name).Str("file", name).Msg("Repair: skipping ffprobe — STAT confirmed dead segments")
+			r.logger.Debug().Str("entry", c.name).Str("file", name).Msg("Repair: skipping ffprobe — STAT confirmed dead segments")
+			r.logFileVerdict(c.name, name, expectedRuntimeFor(c, name).Bytes, nil, 0, res, false)
 		}
 	}
 	return res
+}
+
+// logFileVerdict writes the one INFO line a sweep gives each file it checks,
+// for someone following the journal: the verdict, the file, and what the check
+// cost. The checker's DEBUG lines keep the per-probe detail in the log file.
+func (r *Repair) logFileVerdict(entryName, file string, size int64, budget *VerifyBudget, took time.Duration, res fileResult, skipDecode bool) {
+	ev := r.logger.Info().Str("entry", entryName).Str(logger.FieldSubject, file)
+	if size > 0 {
+		ev = ev.Int64(logger.FieldSize, size)
+	}
+	if rate := budget.MiBPerSec(); rate > 0 {
+		ev = ev.Float64(logger.FieldRate, rate)
+	}
+	if took > 0 {
+		ev = ev.Dur(logger.FieldTook, took)
+	}
+	switch {
+	case res.broken:
+		ev.Str(logger.FieldStatus, logger.StatusFail).Str("reason", res.reason).Msg("broken")
+	case skipDecode:
+		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "decode verified earlier").Msg("healthy")
+	case !res.decodeConclusive:
+		ev.Str(logger.FieldStatus, logger.StatusWarn).Str(logger.FieldNote, "decode not verified").Msg("inconclusive")
+	case res.decodeCoverage == decodeCoveragePartial:
+		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "start of file only").Msg("verified")
+	default:
+		ev.Str(logger.FieldStatus, logger.StatusOK).Msg("verified")
+	}
 }
 
 func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult) fileResult {
@@ -1356,6 +1388,8 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 				Str("entry", name).
 				Int("broken_files", h.BrokenCount).
 				Int("total_files", h.FileCount).
+				Str(logger.FieldStatus, logger.StatusWarn).
+				Str(logger.FieldNote, fmt.Sprintf("%d of %d files re-searched", h.BrokenCount, h.FileCount)).
 				Msg("Repair: partially repaired entry - blocklisted + re-searched broken files, entry kept")
 		}
 		return
@@ -1366,7 +1400,8 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 			r.logger.Warn().Err(err).Str("entry", name).Str("infohash", hash).Msg("Repair: failed to delete fully-broken entry after re-search")
 			continue
 		}
-		r.logger.Info().Str("entry", name).Str("infohash", hash).Msg("Repair: deleted fully-broken entry after re-search")
+		r.logger.Info().Str("entry", name).Str("infohash", hash).Str(logger.FieldStatus, logger.StatusWarn).
+			Msg("Repair: deleted fully-broken entry after re-search")
 	}
 	// Entry fully removed: drop any lingering health record so a
 	// cut-short sweep can't try to re-heal a torrent that's gone.

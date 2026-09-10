@@ -421,7 +421,7 @@ func New() (*Usenet, error) {
 	if err != nil {
 		return nil, err
 	}
-	_logger.Info().Str("yenc_decoder", yenc.Backend()).Msg("yEnc decoder selected")
+	_logger.Info().Str("yenc_decoder", yenc.Backend()).Msg("yEnc decoder selected: " + yenc.Backend())
 
 	maxConns := usenetConfig.MaxConnections
 	if maxConns <= 0 {
@@ -708,7 +708,7 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 		return nil, nil, fmt.Errorf("failed to save NZB to storage: %w", err)
 	}
 
-	u.logger.Info().
+	u.logger.Debug().
 		Str("nzb_id", nzb.ID).
 		Str("name", nzb.Name).
 		Int("groups", len(groups)).
@@ -718,7 +718,7 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 
 // Process processes archive files in an NZB (full parse)
 func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[string]*parser.FileGroup) (*storage.NZB, error) {
-	u.logger.Info().
+	u.logger.Debug().
 		Str("nzb_id", nzb.ID).
 		Str("name", nzb.Name).
 		Msg("Processing archive files in NZB")
@@ -758,7 +758,10 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		Str("nzb_id", updatedNZB.ID).
 		Str("name", updatedNZB.Name).
 		Int("files", len(updatedNZB.Files)).
-		Msg("Successfully processed NZB archives (full parse)")
+		Str(logger.FieldStatus, logger.StatusOK).
+		Int64(logger.FieldSize, updatedNZB.TotalSize).
+		Str(logger.FieldNote, fmt.Sprintf("%d files", len(updatedNZB.Files))).
+		Msg("NZB parsed and available")
 	return updatedNZB, nil
 }
 

@@ -537,7 +537,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	// bands (extended cuts, specials, padded finales). Never auto-delete on
 	// ambiguity - log it and let the file stand.
 	if ratio < 0.9 || ratio > 1.1 {
-		f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Float64("ratio", ratio).Msg("Repair: ffprobe duration differs from expected but within tolerance; not marking broken")
 	}
 	if !skipDecode {
 		return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)

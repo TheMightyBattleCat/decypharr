@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 )
@@ -131,14 +132,16 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 				http.Error(w, streamErr.Error(), http.StatusInternalServerError)
 			}
 			if !streamErr.IsSilent() {
-				h.logger.Rate(logKey).Error().Err(err).Msgf("Error streaming file: %s", logKey)
+				h.logger.Rate(logKey).Error().Err(err).Str("entry", info.Parent()).Str(logger.FieldSubject, info.Name()).
+					Msg("Error streaming file")
 			}
 			return
 		}
 
 		// Generic error - only write if we haven't started the response
 		if !customerror.IsSilentError(err) {
-			h.logger.Rate(logKey).Error().Err(err).Msgf("Error streaming file: %s", logKey)
+			h.logger.Rate(logKey).Error().Err(err).Str("entry", info.Parent()).Str(logger.FieldSubject, info.Name()).
+				Msg("Error streaming file")
 		}
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return

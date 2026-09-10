@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
@@ -29,6 +30,8 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 	m.logger.Info().
 		Str("name", req.Name).
 		Str("category", req.Arr.Name).
+		Str(logger.FieldStatus, logger.StatusStart).
+		Str(logger.FieldNote, req.Arr.Name).
 		Msg("Adding new NZB to usenet")
 
 	meta, groups, err := m.usenet.ParseWithID(ctx, req.Id, req.Name, req.NZBContent, req.Arr.Name)

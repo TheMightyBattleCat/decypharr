@@ -13,6 +13,7 @@ import (
 	"github.com/Tensai75/nzbparser"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/crypto"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -261,6 +262,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 				Int64("header_bytes", rarFile.UncompressedSize).
 				Int64("stream_bytes", streamSize).
 				Int64("missing_bytes", rarFile.UncompressedSize-streamSize).
+				Str(logger.FieldNote, logger.FormatBytes(rarFile.UncompressedSize-streamSize)+" missing").
 				Msg("RAR file is shorter than its archive header says; serving only the bytes its articles cover")
 		}
 		size := rarFile.UncompressedSize

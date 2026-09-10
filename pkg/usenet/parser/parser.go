@@ -498,8 +498,11 @@ func buildPar2RefsWithFetch(
 	}
 
 	aborted = atomic.LoadInt32(&abortedFlag) != 0
+	// Falling back to an estimate for some files is routine (a slow or
+	// transient probe, a missing PAR2 volume); only an abort - enough
+	// confirmed-missing articles to stop probing - is worth a warning.
 	logEvt := logger.Debug()
-	if fellBack > 0 {
+	if aborted {
 		logEvt = logger.Warn()
 	}
 	logEvt.
