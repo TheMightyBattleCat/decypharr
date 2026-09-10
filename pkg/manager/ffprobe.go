@@ -778,7 +778,11 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 		// V, not v: never select an attached picture (cover art), which an
 		// MP4 can list ahead of its video track.
 		"-select_streams", "V:0",
-		"-show_entries", "frame=pts_time",
+		// best_effort_timestamp_time exists from ffprobe 4.x through 8.x, and
+		// is filled from the DTS when a packet carries none. pts_time did not
+		// exist before 5.0, so on the production install's 4.2 every frame printed an empty
+		// line. See parseDecodeProgress.
+		"-show_entries", "frame=best_effort_timestamp_time",
 		"-of", "csv=p=0",
 	})
 
@@ -793,14 +797,18 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
 
-	// One stdout line per decoded frame. When ffprobe is stopped mid-scan
-	// (timeout, or the body cut) stdout holds whatever it managed to print, so
-	// this is the only per-probe measure of how far the decode actually got.
-	frames := bytes.Count(stdout.Bytes(), []byte("\n"))
+	// When ffprobe is stopped mid-scan (timeout, or the body cut) stdout holds
+	// whatever it managed to print, so this is the only per-probe measure of
+	// how far the decode actually got.
+	progress := parseDecodeProgress(stdout.Bytes())
 	evt := func() *zerolog.Event {
-		return budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+		ev := f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Str("phase", phase).Int("windows", len(intervals)).Dur("timeout", timeout).
-			Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Int("frames", frames), budget)
+			Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Int("frames", progress.frames)
+		if progress.timestamps > 0 {
+			ev = ev.Float64("decoded_to_s", progress.lastTS)
+		}
+		return budgetStats(ev, budget)
 	}
 
 	if cctx.Err() != nil {
@@ -834,7 +842,8 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 		evt().Str("ignored", ignored).Msg("Repair: ignoring a decoder error from the file's cover art")
 	}
 	if stderrStr != "" {
-		evt().Msg("Repair: ffprobe decode check found a decode error")
+		lines, n := stderrSummary(stderrStr)
+		evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
 
@@ -1123,6 +1132,66 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	return s
+}
+
+// decodeProgress is what a decode probe's stdout says about how far it got.
+type decodeProgress struct {
+	frames     int     // decoded frames printed
+	timestamps int     // frames that carried a timestamp
+	lastTS     float64 // the last timestamp printed, in seconds
+}
+
+// parseDecodeProgress reads the csv that -show_entries
+// frame=best_effort_timestamp_time prints: one line per decoded frame, holding
+// the timestamp or N/A. A frame's side data (captions, HDR metadata) adds
+// empty lines on ffprobe 4.2 - two per frame on many Blu-ray AVC REMUXes - and
+// a trailing comma on newer versions, so empty lines are not frames and only
+// the first field is read.
+func parseDecodeProgress(stdout []byte) decodeProgress {
+	var p decodeProgress
+	for line := range strings.SplitSeq(string(stdout), "\n") {
+		field, _, _ := strings.Cut(strings.TrimSpace(line), ",")
+		if field == "" {
+			continue
+		}
+		p.frames++
+		if ts, err := strconv.ParseFloat(field, 64); err == nil {
+			p.timestamps++
+			p.lastTS = ts
+		}
+	}
+	return p
+}
+
+// stderrSummaryLines and stderrSummaryLineLen bound what a decode-error log
+// line carries of ffprobe's stderr.
+const (
+	stderrSummaryLines   = 8
+	stderrSummaryLineLen = 200
+)
+
+// stderrSummary joins the first stderrSummaryLines non-empty lines of stderr,
+// each cut to stderrSummaryLineLen bytes, with " | ", and counts every
+// non-empty line. The verdict keeps only the first line; this is for the log,
+// where the lines after it say whether a container error came alone or with
+// codec errors.
+func stderrSummary(stderr string) (string, int) {
+	var kept []string
+	n := 0
+	for line := range strings.SplitSeq(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		n++
+		if len(kept) < stderrSummaryLines {
+			if len(line) > stderrSummaryLineLen {
+				line = line[:stderrSummaryLineLen]
+			}
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, " | "), n
 }
 
 // ffprobeCheckerCtxKey carries an optional *ffprobeChecker down through the
