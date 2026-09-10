@@ -611,18 +611,28 @@ func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *Yenc
 }
 
 func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
+	n, _, err := c.StreamBodyMeta(messageID, w)
+	return n, err
+}
+
+// StreamBodyMeta is StreamBody that also returns the article's yEnc headers
+// (no snippet), so the caller can check it received the part it asked for.
+// Providers can hold a different upload's article under a reused Message-ID;
+// it decodes cleanly and passes its own size and CRC checks, so only its part
+// number and size give it away. meta is nil when no body was read.
+func (c *Connection) StreamBodyMeta(messageID string, w io.Writer) (int64, *YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return 0, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
+		return 0, nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
 	}
 
 	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
 	if err != nil {
-		return 0, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
+		return 0, nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
 	}
 
 	if code != 222 {
-		return 0, classifyNNTPError(code, string(message))
+		return 0, nil, classifyNNTPError(code, string(message))
 	}
 
 	dec := nntpyenc.AcquireDecoder(c.reader)
@@ -630,9 +640,9 @@ func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
 	defer nntpyenc.ReleaseDecoder(dec)
 	n, err := c.copyBodyWithIdleDeadline(w, dec, timeouts.StreamBodyTimeout)
 	if err != nil {
-		return n, classifyTransferError("streaming yenc decode failed", err)
+		return n, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
-	return n, nil
+	return n, metadataFromDecoder(dec, nil), nil
 }
 
 // readDotBytes reads dot-terminated NNTP data using textproto.DotReader

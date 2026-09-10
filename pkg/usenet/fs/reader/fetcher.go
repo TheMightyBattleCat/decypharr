@@ -121,6 +121,10 @@ type SegmentFetcher struct {
 	timeoutStreak   map[int]int
 	timeoutStreakMu sync.Mutex
 
+	// Committed articles whose yEnc part number matched their segment number,
+	// counted up to partNumberTrust - see articleMismatch.
+	partNumbersMatched atomic.Int32
+
 	// Background prefetch
 	prefetchCh     chan int
 	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
@@ -330,7 +334,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 
 			// Stream the decoded body into the chosen tier.
-			n, err := conn.StreamBody(messageID, writer)
+			n, meta, err := conn.StreamBodyMeta(messageID, writer)
 			if err != nil {
 				writer.Discard()
 				if ctxErr := downloadCtx.Err(); ctxErr != nil {
@@ -353,8 +357,28 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 				}
 			}
 
+			// A different upload's article under the same Message-ID decodes
+			// cleanly. Refuse it before it is committed, as a 430 from this
+			// provider, so failover asks the next one; if none has the right
+			// part it is confirmed missing like any other dead article.
+			if reason := articleMismatch(meta, seg, sf.partNumbersMatched.Load() >= partNumberTrust); reason != "" {
+				writer.Discard()
+				sf.logger.Debug().
+					Str("component", "fetcher").
+					Int("segment", segIdx).
+					Str("reason", reason).
+					Msg("Provider returned a different upload's article; trying the next provider")
+				return &nntp.Error{
+					Type:    nntp.ErrorTypeArticleNotFound,
+					Message: "article belongs to a different upload: " + reason,
+				}
+			}
+
 			// Commit (updates cache state to StateOnDisk).
 			writer.Finalize()
+			if meta != nil && meta.Part > 0 && meta.Part == int64(seg.Number) && sf.partNumbersMatched.Load() < partNumberTrust {
+				sf.partNumbersMatched.Add(1)
+			}
 
 			return nil
 		})
