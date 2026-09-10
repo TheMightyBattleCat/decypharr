@@ -20,6 +20,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/internal/nntp/yenc"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
@@ -420,6 +421,7 @@ func New() (*Usenet, error) {
 	if err != nil {
 		return nil, err
 	}
+	_logger.Info().Str("yenc_decoder", yenc.Backend()).Msg("yEnc decoder selected")
 
 	maxConns := usenetConfig.MaxConnections
 	if maxConns <= 0 {

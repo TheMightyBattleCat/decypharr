@@ -49,6 +49,14 @@ func AcquireDecoder(r io.Reader) *Decoder {
 	return adapter.yencDec
 }
 
+// Backend names the yEnc decoder in use, for the startup log.
+func Backend() string {
+	if UsePureGo {
+		return "pure-go (YENC_PURE_GO=true; no CRC32 or size check)"
+	}
+	return "rapidyenc (SIMD; verifies CRC32 and part size)"
+}
+
 // ReleaseDecoder returns the underlying rapidyenc decoder to the pool.
 func ReleaseDecoder(dec *Decoder) {
 	if dec == nil {
