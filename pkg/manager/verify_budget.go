@@ -72,11 +72,14 @@ func unregisterVerifyBudget(infoHash, fileName string, b *VerifyBudget) {
 	verifyBudgetRegistry.CompareAndDelete(deadSignalKey(infoHash, fileName), b)
 }
 
-// VerifyBudgetForVerificationRead returns the budget a probe caller registered
-// for infoHash/fileName, or nil. Called by the WebDAV handler on an
-// internal-bearer (ffprobe verification) read.
+// VerifyBudgetForVerificationRead returns the budget a range request for
+// infoHash/fileName should meter against - the phase the probe's checker has
+// open (see VerifyBudget.BeginPhase), else the file budget the caller
+// registered - or nil when no verification is registered. Called by the WebDAV
+// handler on every internal-bearer (ffprobe verification) request, so each
+// request picks up whichever phase is open when it starts.
 func VerifyBudgetForVerificationRead(infoHash, fileName string) *VerifyBudget {
 	v, _ := verifyBudgetRegistry.Load(deadSignalKey(infoHash, fileName))
 	b, _ := v.(*VerifyBudget)
-	return b
+	return b.ForRequest()
 }

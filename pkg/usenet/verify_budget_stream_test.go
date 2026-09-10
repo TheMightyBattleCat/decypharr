@@ -48,6 +48,34 @@ func TestMeteredReader_StopsAtBudget(t *testing.T) {
 	}
 }
 
+// Once a budget is spent - by the request that crossed the cap, or declared
+// spent by the checker - the next range request of the same probe must be
+// refused before it reads anything, not after pulling one more buffer.
+func TestMeteredReader_RefusesASpentBudgetBeforeReading(t *testing.T) {
+	for name, spend := range map[string]func(*reader.VerifyBudget){
+		"cut":       func(b *reader.VerifyBudget) { b.Add(101) },
+		"exhausted": func(b *reader.VerifyBudget) { b.Exhaust() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := reader.NewVerifyBudget(100)
+			spend(b)
+			src := strings.NewReader(strings.Repeat("x", 1000))
+			m := &meteredReader{inner: src, budget: b}
+
+			n, err := m.Read(make([]byte, 64))
+			if n != 0 {
+				t.Fatalf("a spent budget delivered %d bytes", n)
+			}
+			if !errors.Is(err, reader.ErrVerifyBudgetExhausted) {
+				t.Fatalf("expected ErrVerifyBudgetExhausted, got %v", err)
+			}
+			if consumed := 1000 - src.Len(); consumed != 0 {
+				t.Fatalf("the refused read still pulled %d bytes from the source", consumed)
+			}
+		})
+	}
+}
+
 // A nil budget must leave the read path exactly as it was before the cap
 // existed: read to EOF, no sentinel.
 func TestMeteredReader_NilBudgetReadsToEOF(t *testing.T) {

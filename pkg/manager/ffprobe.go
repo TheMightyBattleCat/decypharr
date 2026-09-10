@@ -90,6 +90,33 @@ const (
 	ffprobeDecodeTimeoutPerGB = 5 * time.Second
 	ffprobeDecodeTimeoutCap   = 10 * time.Minute
 
+	// Bounds for the decode check on a file with no usable container index,
+	// where ffmpeg can only reach byte offset X by reading X (see
+	// decodeWindows). These are the fallbacks when repair.decode_detect_bytes
+	// or repair.decode_head_bytes is unset or unparseable.
+	defaultDecodeDetectBytes = 2 << 30 // 2 GiB
+	defaultDecodeHeadBytes   = 3 << 30 // 3 GiB
+
+	// decodeDetectCapDivisor cuts the seek-detect probe at detectBytes/2. The
+	// cut has to sit BELOW the read an unseekable file needs to reach the
+	// detect window (detectBytes): at or above it, a forward scanner would
+	// reach the window uncut, complete, and be classified as seekable.
+	// Measured on the 2026-09-09/10 sweep, the largest single range GET per
+	// file split cleanly in two: files that seek stayed at or under 24 MB
+	// (p90 16 MB for the 3-10 GB ones), files that forward-scan issued GETs of
+	// 128 MB and up and read 84-100% of the file, with nothing in between. Half
+	// the implied read sits well over a seekable file's whole detect probe and
+	// 2x under the forward scan, which also absorbs an opening that runs below
+	// the file's average bitrate.
+	decodeDetectCapDivisor = 2
+
+	// decodeHeadCapNum/decodeHeadCapDen cut the head scan at 1.5x headBytes.
+	// The scan's interval is sized in seconds from the file's AVERAGE bitrate,
+	// so an opening that runs above average needs more than headBytes to reach
+	// the interval's end; the slack keeps a healthy scan from being cut short.
+	decodeHeadCapNum = 3
+	decodeHeadCapDen = 2
+
 	// The metadata probe (-show_format/-show_streams, no -read_intervals) only
 	// reads the container header plus a tail moov atom, so it doesn't scale
 	// with total bytes the way the decode windows do - but on a 20 GB+ REMUX
@@ -143,6 +170,13 @@ type ffprobeChecker struct {
 	timeout time.Duration
 	baseURL string // e.g. "http://127.0.0.1:8282/webdav/"
 
+	// detectBytes and headBytes bound the decode check on a file with no
+	// usable container index. Resolved once from repair.decode_detect_bytes /
+	// repair.decode_head_bytes at construction; zero means the built-in
+	// default. See decodeWindows.
+	detectBytes int64
+	headBytes   int64
+
 	// authToken is the manager's ephemeral, in-memory, per-process bearer
 	// token (see webdav.Handler.isInternalBearer), sent via ffprobe's
 	// -headers flag. It replaces the user's WebDAV password, which is only
@@ -167,6 +201,13 @@ type ffprobeChecker struct {
 	authToken string
 
 	logger zerolog.Logger
+
+	// runProbeFn, when set, replaces runDecodeProbe. Production code leaves
+	// this nil; tests set it to drive decodeWindows' detect/spread/head tree
+	// without shelling out to a real ffprobe - a fake spends the budget it is
+	// handed to stand in for the read path cutting the probe. Same convention
+	// as tailIntactFn.
+	runProbeFn func(ctx context.Context, entryFolder, fileName, phase string, intervals []string, timeout time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool)
 
 	// tailIntactFn, when set, replaces the tailIntact method. Production
 	// code leaves this nil (check calls f.tailIntact directly); tests set it
@@ -245,12 +286,29 @@ func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger, def
 	authToken := m.InternalToken()
 
 	return &ffprobeChecker{
-		binPath:   resolved,
-		timeout:   timeout,
-		baseURL:   fmt.Sprintf("http://127.0.0.1:%s%swebdav/", cfg.Port, cfg.URLBase),
-		authToken: authToken,
-		logger:    log,
+		binPath:     resolved,
+		timeout:     timeout,
+		baseURL:     fmt.Sprintf("http://127.0.0.1:%s%swebdav/", cfg.Port, cfg.URLBase),
+		detectBytes: parseSizeOr(log, "decode_detect_bytes", cfg.Repair.DecodeDetectBytes, defaultDecodeDetectBytes),
+		headBytes:   parseSizeOr(log, "decode_head_bytes", cfg.Repair.DecodeHeadBytes, defaultDecodeHeadBytes),
+		authToken:   authToken,
+		logger:      log,
 	}
+}
+
+// parseSizeOr resolves a repair.<key> size string ("3GB"), falling back to def
+// on an empty value, or on an unparseable one with a WARN naming the key.
+func parseSizeOr(log zerolog.Logger, key, raw string, def int64) int64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return def
+	}
+	if n, err := config.ParseSize(s); err == nil && n > 0 {
+		return n
+	}
+	log.Warn().Str("value", raw).Int64("default_bytes", def).
+		Msgf("Repair: invalid repair.%s; using the built-in default", key)
+	return def
 }
 
 // probeTarget builds the WebDAV URL for entryFolder/fileName that both check
@@ -313,7 +371,13 @@ func budgetStats(ev *zerolog.Event, b *VerifyBudget) *zerolog.Event {
 		Int64("range_gets", b.Reads()).
 		Int64("read_wait_ms", b.Wait().Milliseconds())
 	if b.Limit() > 0 {
-		ev = ev.Int64("budget_mb", b.Limit()>>20).Bool("budget_cut", b.Exceeded())
+		ev = ev.Int64("budget_mb", b.Limit()>>20).Bool("budget_cut", b.Cut())
+	}
+	// An Exhaust is a stop, not a byte cut. Give it its own key so a line with
+	// budget_cut=false and served_mb far below budget_mb still says why the
+	// verification ended.
+	if b.Exceeded() && !b.Cut() {
+		ev = ev.Bool("budget_exhausted", true)
 	}
 	if s := b.MiBPerSec(); s > 0 {
 		ev = ev.Float64("mib_s", s)
@@ -333,7 +397,12 @@ func budgetStats(ev *zerolog.Event, b *VerifyBudget) *zerolog.Event {
 // verification. A definite verdict - clean, or broken for a concrete reason -
 // is conclusive=true; a skipDecode call that never ran the decode windows is
 // conclusive=false.
-func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
+//
+// coverage is how much of the file a decode verdict covered -
+// decodeCoverageFull, or decodeCoveragePartial for a bounded head scan of a
+// file with no usable container index (see decodeWindows). Empty whenever the
+// result did not come from a decode pass.
+func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, budget *VerifyBudget) (ok bool, reason string, conclusive bool, coverage string) {
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
 	metaTimeout := f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap)
@@ -354,7 +423,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes), budget).
 				Msg("Repair: ffprobe timed out; treating as inconclusive")
 		}
-		return true, "", false
+		return true, "", false, ""
 	}
 
 	if metaElapsed >= ffprobeMetadataSlowThreshold {
@@ -371,16 +440,16 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Dur("elapsed", metaElapsed), budget).
 			Msg("Repair: ffprobe metadata probe exceeded its read budget; treating as inconclusive")
-		return true, "", false
+		return true, "", false, ""
 	}
 
 	if runErr != nil {
-		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true
+		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true, ""
 	}
 
 	var probe ffprobeOutput
 	if err := json.Unmarshal(stdout.Bytes(), &probe); err != nil {
-		return false, ffprobeReasonUnreadable + ": " + firstLine(err.Error()), true
+		return false, ffprobeReasonUnreadable + ": " + firstLine(err.Error()), true, ""
 	}
 
 	hasVideo, hasAudio := false, false
@@ -393,15 +462,15 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		}
 	}
 	if !hasVideo && !hasAudio {
-		return false, ffprobeReasonNoStreams, true
+		return false, ffprobeReasonNoStreams, true, ""
 	}
 	if !hasVideo {
-		return false, ffprobeReasonNoVideoStream, true
+		return false, ffprobeReasonNoVideoStream, true, ""
 	}
 
 	durationSec, err := strconv.ParseFloat(strings.TrimSpace(probe.Format.Duration), 64)
 	if err != nil || durationSec <= 0 {
-		return false, ffprobeReasonNoDuration, true
+		return false, ffprobeReasonNoDuration, true, ""
 	}
 	duration := time.Duration(durationSec * float64(time.Second))
 
@@ -411,14 +480,14 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			ceiling = ffprobeCeilingSonarr
 		}
 		if duration > ceiling {
-			return false, ffprobeReasonAbsurdDuration, true
+			return false, ffprobeReasonAbsurdDuration, true, ""
 		}
 		if !skipDecode {
 			return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 		}
 		// Decode verification was skipped for this call, so nothing was
 		// deep-verified - not conclusive.
-		return true, "", false
+		return true, "", false, ""
 	}
 
 	expectedDur := time.Duration(expected.Seconds) * time.Second
@@ -429,7 +498,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		tooLongRatio = ffprobeTooLongRatioUnconfirmed
 	}
 	if ratio >= tooLongRatio && duration-expectedDur >= ffprobeTooLongMinOverage {
-		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx)", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true
+		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx)", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true, ""
 	}
 	if ratio <= ffprobeTooShortRatio && expectedDur-duration >= ffprobeTooShortMinUnder {
 		tailFn := f.tailIntactFn
@@ -446,9 +515,9 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 			if !skipDecode {
 				return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 			}
-			return true, "", false
+			return true, "", false, ""
 		}
-		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true
+		return false, fmt.Sprintf("%s: probe=%dm expected=%dm (%.1fx); tail_unreadable", ffprobeReasonRuntimeMismatch, int(duration.Minutes()), int(expectedDur.Minutes()), ratio), true, ""
 	}
 
 	// Grey zone: meaningfully different from expected but inside the safety
@@ -460,7 +529,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	if !skipDecode {
 		return f.decodeWindows(ctx, entryFolder, fileName, duration, expected.Bytes, budget)
 	}
-	return true, "", false
+	return true, "", false, ""
 }
 
 type ffprobeTailOutput struct {
@@ -539,46 +608,57 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 	return false
 }
 
-// decodeWindows probes evenly-spaced windows of the video stream, forcing
-// actual frame decode (not just demux). The demux-only check above reads
-// container metadata and packet headers but never asks the codec to
-// reconstruct a frame, so a file with a valid container but corrupt
-// compressed data passes undetected. This method closes that gap.
-//
-// Like every other probe in this file, timeout and cancellation are
-// inconclusive (ok=true, fail-open): a slow WebDAV read must never
-// auto-delete a file that might be fine. conclusive distinguishes a real
-// decode verdict (clean, or a concrete decode error) from a timed-out or
-// cancelled pass that proved nothing - the caller uses it to decide
-// whether an ok=true here counts as a passed decode verification.
-func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
-	if duration <= 0 {
-		return true, "", true
-	}
+// decodeCoverageFull / decodeCoveragePartial label how much of a file a decode
+// verdict covers. "partial" means the file has no usable container index and
+// only a bounded prefix was scanned - see decodeWindows.
+const (
+	decodeCoverageFull    = "full"
+	decodeCoveragePartial = "partial"
+)
 
+// Decode probe phases, as named in logs and handed to runDecodeProbe.
+const (
+	decodePhaseSpread = "spread"
+	decodePhaseDetect = "detect"
+	decodePhaseHead   = "head"
+)
+
+// spreadIntervals builds the evenly-spaced -read_intervals list that samples
+// the whole duration - the normal decode check.
+func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64) []string {
 	// Adaptive window count: a large file (REMUX) gets fewer windows so the
 	// probe pulls ~120-150 MB of cold random I/O over WebDAV instead of
 	// ~300-450 MB. Still spans the whole duration.
-	windowCount := ffprobeDecodeWindowCount
+	n := ffprobeDecodeWindowCount
 	if fileBytes > ffprobeDecodeWindowLargeFileSize {
-		windowCount = ffprobeDecodeWindowCountLarge
+		n = ffprobeDecodeWindowCountLarge
 	}
-
-	n := windowCount
-	durSec := int(duration.Seconds())
-	if durSec < n {
+	if durSec := int(duration.Seconds()); durSec < n {
 		n = durSec
 	}
 	if n <= 0 {
-		return true, "", true
+		return nil
 	}
-
 	intervals := make([]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		startSec := duration * time.Duration(i) / time.Duration(n)
 		intervals[i] = fmt.Sprintf("%.0f%%+%.0f", startSec.Seconds(), ffprobeDecodeWindowSpan.Seconds())
 	}
+	return intervals
+}
 
+// runDecodeProbe executes one frame-decode ffprobe over intervals and
+// classifies the outcome. phase names the probe in logs; budget is the one the
+// read path meters this probe's range requests against (the file budget for
+// the spread, a phase budget for detect and head) and is reported on the log
+// line.
+//
+// A spent budget is checked before stderr or the exit code: once we cut the
+// body, whatever ffprobe reports describes our truncation, not the file, so
+// the result can only be inconclusive. decodeWindows re-checks the budget
+// itself before acting on the result, because for seek detection the cut is
+// the signal.
+func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileName, phase string, intervals []string, timeout time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
 	args := f.probeArgs(entryFolder, fileName, []string{
 		"-v", "error",
 		"-read_intervals", strings.Join(intervals, ","),
@@ -586,12 +666,6 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		"-show_entries", "frame=pts_time",
 		"-of", "csv=p=0",
 	})
-
-	// Scale the timeout with file size: base + sizeGB*perGB, clamped. A
-	// REMUX has far more compressed data to pull through the decode windows
-	// than a WEB episode, so a flat budget times out on the big ones and
-	// wastes time on the small ones.
-	timeout := f.scaledTimeout(fileBytes, ffprobeDecodeTimeoutPerGB, ffprobeDecodeTimeoutCap)
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -604,11 +678,19 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
 
+	// One stdout line per decoded frame. When ffprobe is stopped mid-scan
+	// (timeout, or the body cut) stdout holds whatever it managed to print, so
+	// this is the only per-probe measure of how far the decode actually got.
+	frames := bytes.Count(stdout.Bytes(), []byte("\n"))
+	evt := func() *zerolog.Event {
+		return budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Str("phase", phase).Int("windows", len(intervals)).Dur("timeout", timeout).
+			Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Int("frames", frames), budget)
+	}
+
 	if cctx.Err() != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-				Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
-				Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
+			evt().Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
 		return true, "", false
 	}
@@ -620,34 +702,188 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	// ever be inconclusive - never a broken verdict, which would blocklist a
 	// grab on the strength of our own cap.
 	if budget.Exceeded() {
-		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
-			Msg("Repair: ffprobe decode check exceeded its read budget; treating as inconclusive")
+		evt().Msg("Repair: ffprobe decode check hit its read budget")
 		return true, "", false
 	}
 
 	// Decode errors surface on stderr even when the exit code is 0 (ffprobe
 	// reports per-frame codec errors but still exits cleanly when it can
 	// continue demuxing). Check stderr first.
-	stderrStr := strings.TrimSpace(stderr.String())
-	if stderrStr != "" {
-		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
-			Msg("Repair: ffprobe decode check found a decode error")
+	if stderrStr := strings.TrimSpace(stderr.String()); stderrStr != "" {
+		evt().Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
 
 	if runErr != nil {
-		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Err(runErr), budget).
-			Msg("Repair: ffprobe decode check exited non-zero")
+		evt().Err(runErr).Msg("Repair: ffprobe decode check exited non-zero")
 		return false, ffprobeReasonDecodeError, true
 	}
 
-	budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-		Int("windows", n).Dur("timeout", timeout).Int64("file_bytes", fileBytes).Dur("elapsed", elapsed), budget).
-		Msg("Repair: ffprobe decode check passed")
+	evt().Msg("Repair: ffprobe decode check passed")
 	return true, "", true
+}
+
+// decodeWindows verifies the video stream actually decodes to frames, not just
+// that the container demuxes. The demux-only check above reads container
+// metadata and packet headers but never asks the codec to reconstruct a frame,
+// so a file with a valid container but corrupt compressed data passes
+// undetected. This method closes that gap.
+//
+// It samples evenly-spaced windows across the duration - EXCEPT on a file
+// ffmpeg cannot seek in. With no usable container index (Matroska without
+// Cues: most VC-1/MPEG-2 REMUXes, ~3% of AVC ones; and web episodes that
+// behave the same way on this read path, cause unknown) ffmpeg reaches each
+// window by reading forward from the last, so the sample degenerates into a
+// read of 84-100% of the file. Reaching byte offset X in such a file costs X,
+// so no sampling scheme can verify more than a prefix; the only real choice is
+// how large a prefix to pay for. Whether a file seeks is measured in bytes,
+// not time: each probe below runs under its own byte budget (a phase, see
+// VerifyBudget.BeginPhase), which the read path cuts it against.
+//
+//   - No budget, or fileBytes <= headBytes: the normal spread on the file
+//     budget, exactly as before. Detection needs a budget to cut against, and
+//     a file this small costs no more to sample in full than a head scan.
+//   - Otherwise a detect probe: two windows, offset 0 and one placed so an
+//     unseekable file must read detectBytes to reach it, cut at half that.
+//     Completing inside the cut means the file seeks: the normal spread.
+//     Being cut means it does not: the head scan. A decode error on an uncut
+//     body is a real verdict; a timeout or cancellation short of the cut
+//     proves nothing.
+//   - Head scan: one interval from offset 0 over the seconds headBytes covers
+//     at the file's average bitrate, cut at 1.5x headBytes, reported as
+//     partial coverage. If it is cut or times out it reaches no verdict, and
+//     the verification is exhausted so no retry pays for the same scan again.
+//
+// Phases are independent of the file budget: their bytes are not charged to
+// it and its limit does not cap them, so the spread keeps exactly the cap it
+// had and no sizing of one phase can starve another. The price is that one
+// verification no longer has a single hard byte ceiling. A healthy unseekable
+// file costs a detect cut plus a head scan (~1 + ~3 GiB at the defaults); a
+// broken one can cost that twice, because checkConfirmed retries a broken
+// verdict once, before it is marked broken (at most 2 x (1 + 4.5) GiB).
+//
+// Every phase checks its own budget before anything ffprobe reported: a cut
+// body yields container errors that describe our truncation, so a spent phase
+// budget can route to the next phase or end inconclusive, never return broken.
+//
+// Like every other probe in this file, timeout and cancellation are
+// inconclusive (ok=true, fail-open): a slow WebDAV read must never
+// auto-delete a file that might be fine. conclusive distinguishes a real
+// decode verdict from a pass that proved nothing. coverage names the pass a
+// verdict came from - decodeCoverageFull for the spread, decodeCoveragePartial
+// for the head scan - and is empty when the check ended before either ran.
+func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileName string, duration time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool, coverage string) {
+	if duration <= 0 {
+		return true, "", true, decodeCoverageFull
+	}
+	// Phases do not draw on the file budget, so a verification that is already
+	// spent - cut, or exhausted by an earlier head scan - must stop here rather
+	// than open a phase and read again.
+	if budget.Exceeded() {
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int64("file_bytes", fileBytes), budget).
+			Msg("Repair: ffprobe decode check skipped; verification read budget already spent")
+		return true, "", false, ""
+	}
+
+	run := f.runProbeFn
+	if run == nil {
+		run = f.runDecodeProbe
+	}
+
+	spread := func() (bool, string, bool, string) {
+		intervals := f.spreadIntervals(duration, fileBytes)
+		if len(intervals) == 0 {
+			return true, "", true, decodeCoverageFull
+		}
+		// Scale the timeout with file size: base + sizeGB*perGB, clamped. A
+		// REMUX has far more compressed data to pull through the decode windows
+		// than a WEB episode, so a flat budget times out on the big ones and
+		// wastes time on the small ones.
+		timeout := f.scaledTimeout(fileBytes, ffprobeDecodeTimeoutPerGB, ffprobeDecodeTimeoutCap)
+		ok, reason, conclusive := run(ctx, entryFolder, fileName, decodePhaseSpread, intervals, timeout, fileBytes, budget)
+		return ok, reason, conclusive, decodeCoverageFull
+	}
+
+	headBytes := f.headBytes
+	if headBytes <= 0 {
+		headBytes = defaultDecodeHeadBytes
+	}
+	detectBytes := f.detectBytes
+	if detectBytes <= 0 {
+		detectBytes = defaultDecodeDetectBytes
+	}
+
+	if budget == nil || fileBytes <= headBytes {
+		return spread()
+	}
+	detectOffset := time.Duration(float64(duration) * float64(detectBytes) / float64(fileBytes))
+	detectCap := detectBytes / decodeDetectCapDivisor
+	if detectOffset <= 0 || detectOffset >= duration || detectCap <= 0 {
+		return spread()
+	}
+
+	// runPhase runs one probe under its own phase budget, which the read path
+	// meters every range request of that probe against. The timeout is only a
+	// backstop for a stuck read - the cut is what bounds the phase - so it is
+	// the ceiling every decode probe already has, generous enough that a slow
+	// but progressing forward scan still reaches its cut or its verdict
+	// (sweep forward scans have run below 17 MiB/s).
+	runPhase := func(phase string, intervals []string, limit int64) (p *VerifyBudget, ok bool, reason string, conclusive bool) {
+		p = budget.BeginPhase(limit)
+		defer budget.EndPhase(p)
+		ok, reason, conclusive = run(ctx, entryFolder, fileName, phase, intervals, ffprobeDecodeTimeoutCap, fileBytes, p)
+		return p, ok, reason, conclusive
+	}
+
+	detect, ok, reason, conclusive := runPhase(decodePhaseDetect, []string{
+		fmt.Sprintf("%.0f%%+%.0f", 0.0, ffprobeDecodeWindowSpan.Seconds()),
+		fmt.Sprintf("%.0f%%+%.0f", detectOffset.Seconds(), ffprobeDecodeWindowSpan.Seconds()),
+	}, detectCap)
+	switch {
+	case detect.Exceeded():
+		// Cut before reaching the window: no usable index. Go to the head scan
+		// whatever ffprobe said - an error on a body we cut describes the cut -
+		// and since the head scan re-reads this prefix from offset 0 under a
+		// fresh budget, a real error in it is found again there.
+	case !ok:
+		// A decode error at offset 0 or at the detect window, on an intact
+		// body. Whether the file seeks no longer matters.
+		return false, reason, conclusive, ""
+	case !conclusive:
+		// Timed out or cancelled short of the cut: says nothing about the
+		// file, and in particular not that it cannot seek.
+		return true, "", false, ""
+	default:
+		// Reached the window inside the cut: the file seeks, and everything
+		// from here is the normal check.
+		return spread()
+	}
+
+	headSec := duration.Seconds() * float64(headBytes) / float64(fileBytes)
+	if minSec := ffprobeDecodeWindowSpan.Seconds(); headSec < minSec {
+		headSec = minSec
+	}
+	headCap := headBytes / decodeHeadCapDen * decodeHeadCapNum
+	budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+		Int64("file_bytes", fileBytes).Float64("head_seconds", headSec).
+		Int64("head_cap_mb", headCap>>20), detect).
+		Msg("Repair: file has no usable container index; scanning a bounded head instead of the full file")
+
+	head, ok, reason, conclusive := runPhase(decodePhaseHead, []string{
+		fmt.Sprintf("%.0f%%+%.0f", 0.0, headSec),
+	}, headCap)
+	if head.Exceeded() || (ok && !conclusive) {
+		// Cut, timed out, or cancelled before the end of its interval: no
+		// verdict, and a retry would only pay for the same prefix again.
+		// Exhaust the verification so no retry layer repeats the scan.
+		budget.Exhaust()
+		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
+			Int64("file_bytes", fileBytes), head).
+			Msg("Repair: bounded head scan reached no verdict; treating as inconclusive and not retrying")
+		return true, "", false, decodeCoveragePartial
+	}
+	return ok, reason, conclusive, decodeCoveragePartial
 }
 
 // checkConfirmed retries once before declaring a file broken: a transient
@@ -675,15 +911,18 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // forced-broken dead-segment verdict is conclusive=true (a confirmed 430
 // is a definite signal). A retry abandoned because ctx was cancelled
 // mid-wait is conclusive=false.
-func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
-	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
+//
+// coverage is threaded through from check alongside conclusive; the
+// budget-spent and cancelled returns carry none.
+func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal, budget *VerifyBudget) (ok bool, reason string, conclusive bool, coverage string) {
+	ok, reason, conclusive, coverage = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification read; forcing broken verdict")
-		return false, ffprobeReasonDeadSegment, true
+		return false, ffprobeReasonDeadSegment, true, coverage
 	}
 	if ok {
-		return true, "", conclusive
+		return true, "", conclusive, coverage
 	}
 	// This must come BEFORE the unreadable short-circuit below. A spent
 	// budget means we truncated the body ourselves, and the single most
@@ -696,21 +935,21 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if budget.Exceeded() {
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: skipping ffprobe retry — verification read budget already spent")
-		return true, "", false
+		return true, "", false, ""
 	}
 	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
 		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
-		return false, reason, conclusive
+		return false, reason, conclusive, coverage
 	}
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("Repair: ffprobe check failed; retrying once before declaring broken")
 
 	select {
 	case <-ctx.Done():
-		return true, "", false
+		return true, "", false, ""
 	case <-time.After(ffprobeRetryDelay):
 	}
 
-	ok, reason, conclusive = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
+	ok, reason, conclusive, coverage = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
 	f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Bool("ok", ok).Str("reason", reason).Msg("Repair: ffprobe retry result")
 	// A budget spent during the retry taints that pass the same way - the
 	// metadata probe can fail on a body we cut short - so it can only be
@@ -718,17 +957,17 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if budget.Exceeded() {
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: ffprobe retry exceeded its read budget; treating as inconclusive")
-		return true, "", false
+		return true, "", false, ""
 	}
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).
 			Msg("Repair: dead segment (NNTP 430) observed during ffprobe verification retry; forcing broken verdict")
-		return false, ffprobeReasonDeadSegment, true
+		return false, ffprobeReasonDeadSegment, true, coverage
 	}
 	if ok {
-		return true, "", conclusive
+		return true, "", conclusive, coverage
 	}
-	return false, reason, conclusive
+	return false, reason, conclusive, coverage
 }
 
 func firstLine(s string) string {

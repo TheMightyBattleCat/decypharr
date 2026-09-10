@@ -48,7 +48,7 @@ func TestCheck_TooShort_TailIntact_NotBroken(t *testing.T) {
 		return true
 	})
 
-	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, _, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
 	}, false, nil)
@@ -66,7 +66,7 @@ func TestCheck_TooShort_TailBroken_MarkedBroken(t *testing.T) {
 		return false
 	})
 
-	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, _, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
 	}, false, nil)
@@ -89,7 +89,7 @@ func TestCheck_NormalRuntime_DoesNotCallTailIntact(t *testing.T) {
 		return true
 	})
 
-	ok, reason, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, _, _ := f.check(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
 	}, false, nil)

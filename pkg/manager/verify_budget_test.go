@@ -55,7 +55,7 @@ func TestCheckConfirmed_ExhaustedBudgetIsInconclusiveNotBroken(t *testing.T) {
 	budget := NewVerifyBudget(100)
 	budget.Add(1000) // spend it before the probe runs
 
-	ok, reason, conclusive := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, conclusive, _ := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds:               3600,
 		EpisodeCountConfirmed: true,
 		Bytes:                 4 * 1024 * 1024 * 1024,
@@ -129,7 +129,7 @@ func TestCheckConfirmed_ExhaustedBudget_UnreadableStillInconclusive(t *testing.T
 	budget := NewVerifyBudget(100)
 	budget.Add(1000) // spent before the probe runs
 
-	ok, reason, conclusive := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, conclusive, _ := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds: 3600,
 		Bytes:   4 * 1024 * 1024 * 1024,
 	}, false, nil, budget)
@@ -153,7 +153,7 @@ func TestCheckConfirmed_NoBudget_UnreadableStillBroken(t *testing.T) {
 		logger:  zerolog.Nop(),
 	}
 
-	ok, reason, _ := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
+	ok, reason, _, _ := f.checkConfirmed(context.Background(), "Some.Show.S01E01", "episode.mkv", expectedRuntime{
 		Seconds: 3600,
 		Bytes:   4 * 1024 * 1024 * 1024,
 	}, false, nil, nil)
@@ -174,5 +174,55 @@ func TestRegisterVerifyBudget_IgnoresNilAndEmptyHash(t *testing.T) {
 	registerVerifyBudget("hash", "episode.mkv", nil)
 	if got := VerifyBudgetForVerificationRead("hash", "episode.mkv"); got != nil {
 		t.Fatalf("a nil budget must not be registered, got %v", got)
+	}
+}
+
+// The WebDAV handler resolves a request's budget once, as the request starts,
+// so a probe run under a phase must be handed that phase - and the file budget
+// again once the phase ends.
+func TestVerifyBudgetForVerificationRead_FollowsTheOpenPhase(t *testing.T) {
+	const hash, file = "phase-hash", "episode.mkv"
+	parent := NewVerifyBudget(1 << 30)
+	registerVerifyBudget(hash, file, parent)
+	defer unregisterVerifyBudget(hash, file, parent)
+
+	phase := parent.BeginPhase(1 << 20)
+	if got := VerifyBudgetForVerificationRead(hash, file); got != phase {
+		t.Fatalf("lookup during a phase returned %p, want the phase %p", got, phase)
+	}
+	parent.EndPhase(phase)
+	if got := VerifyBudgetForVerificationRead(hash, file); got != parent {
+		t.Fatalf("lookup after the phase returned %p, want the file budget %p", got, parent)
+	}
+}
+
+// budget_cut reads as "the byte cap cut this read". An Exhaust is a stop, not
+// a cut, and must not masquerade as one - a line with served_mb far below
+// budget_mb would then read as a byte cut. It gets its own key.
+func TestBudgetStats_TellsAnExhaustFromACut(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		spend         func(*VerifyBudget)
+		wantCut       bool
+		wantExhausted bool
+	}{
+		{"byte cut", func(b *VerifyBudget) { b.Add(b.Limit() + 1) }, true, false},
+		{"exhausted", func(b *VerifyBudget) { b.Exhaust() }, false, true},
+		{"unspent", func(*VerifyBudget) {}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			log := zerolog.New(&out)
+			b := NewVerifyBudget(1 << 20)
+			tc.spend(b)
+			budgetStats(log.Info(), b).Msg("verdict")
+
+			if got := strings.Contains(out.String(), `"budget_cut":true`); got != tc.wantCut {
+				t.Fatalf("budget_cut=true present: %v, want %v in %s", got, tc.wantCut, out.String())
+			}
+			if got := strings.Contains(out.String(), `"budget_exhausted":true`); got != tc.wantExhausted {
+				t.Fatalf("budget_exhausted=true present: %v, want %v in %s", got, tc.wantExhausted, out.String())
+			}
+		})
 	}
 }

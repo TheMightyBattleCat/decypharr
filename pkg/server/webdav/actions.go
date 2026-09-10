@@ -85,7 +85,9 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 		}
 		// Same bridge for the probe's byte budget: it is shared across every
 		// range request of one verification, so a runaway decode read is
-		// bounded for the file as a whole (see manager.VerifyBudget).
+		// bounded for the file as a whole (see manager.VerifyBudget). Resolved
+		// per request, so a request made while the checker has a phase open
+		// (seek detection, a bounded head scan) meters against that phase.
 		if b := manager.VerifyBudgetForVerificationRead(info.InfoHash(), info.Name()); b != nil {
 			ctx = manager.ContextWithVerifyBudget(ctx, b)
 		}

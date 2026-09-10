@@ -89,6 +89,14 @@ type fileResult struct {
 	// probeEntry's DecodeVerifiedAt stamp. Zero-value false when no decode
 	// pass was attempted (skipDecode, or no ffprobe checker attached).
 	decodeConclusive bool
+
+	// decodeCoverage records how much of the file that decode pass covered:
+	// decodeCoverageFull for the normal spread across the whole duration,
+	// decodeCoveragePartial when the file has no usable container index and
+	// only a bounded head was scanned. Empty when no decode ran. rollupDecode
+	// reduces it to the weakest value across the entry's healthy files, which
+	// probeEntry persists alongside DecodeVerifiedAt.
+	decodeCoverage string
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -451,7 +459,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		evt.Str("entry", c.item.Name).Msg("Repair: decode already verified for this fingerprint, skipping decode windows")
 	}
 
-	results, decodeRan := r.probeFiles(ctx, c, names, opts, decodeVerified)
+	results, decodeRan, decodeCoverage := r.probeFiles(ctx, c, names, opts, decodeVerified)
 	if autoRepair {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -480,6 +488,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		if decodeRan {
 			h.DecodeVerifiedAt = h.LastCheckedAt
 			h.DecodeVerifiedFingerprint = currentFP
+			h.DecodeVerifiedCoverage = decodeCoverage
 		}
 	case storage.HealthBroken:
 		h.LastFailedAt = h.LastCheckedAt
@@ -488,6 +497,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	if final != storage.HealthHealthy {
 		h.DecodeVerifiedAt = time.Time{}
 		h.DecodeVerifiedFingerprint = ""
+		h.DecodeVerifiedCoverage = ""
 	}
 
 	r.saveHealth(h)
@@ -495,8 +505,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
-// repairFilesPerEntry concurrent workers.
-func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) ([]fileResult, bool) {
+// repairFilesPerEntry concurrent workers. Alongside the results it returns
+// what probeEntry may stamp for the entry's decode verification - see
+// rollupDecode.
+func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) ([]fileResult, bool, string) {
 	// If decode verification is disabled in config, force skip for sweeps -
 	// unless this is an explicit operator force-decode recheck, which is a
 	// deliberate "deep-check this one thing right now" and overrides the
@@ -520,38 +532,57 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	}
 	_ = g.Wait()
 
-	// decodeRan gates probeEntry's DecodeVerifiedAt stamp. It's true only
-	// when a frame-decode pass was attempted for this entry (skipDecode
-	// false, after the config override above) AND every file that
-	// contributes to a healthy rollup completed its decode windows
-	// conclusively - i.e. not cut short by an ffprobe timeout or a context
-	// cancellation, which return inconclusively (see ffprobeChecker.check).
-	// One healthy file with an inconclusive decode blocks the stamp for the
-	// whole entry, so a slow cold REMUX read that times out mid-sweep no
-	// longer arms the 30-day skip as though it had verified clean. This also
-	// covers the case where no ffprobe checker was attached (FFProbeCheck
-	// off): the STAT-healthy files carry decodeConclusive=false and block
-	// the stamp.
-	//
-	// Non-healthy files don't gate this: a broken rollup clears the stamp
-	// anyway, and a file that errored out before reaching ffprobe
-	// (usenet_probe_error, protocol_skipped, ...) is already outside the
-	// healthy verdict rollupStatus computes. A transiently-errored file in
-	// an otherwise-healthy entry can therefore still leave the entry stamped
-	// without that file's decode having run; it self-heals at the TTL and
-	// never suppresses that file's own STAT probe, so the residual window is
-	// narrow and bounded.
-	decodeRan := false
-	if !skipDecode {
-		decodeRan = true
-		for _, fr := range results {
-			if fr.healthy && !fr.decodeConclusive {
-				decodeRan = false
-				break
-			}
+	decodeRan, coverage := rollupDecode(results, skipDecode)
+	return results, decodeRan, coverage
+}
+
+// rollupDecode reduces an entry's per-file decode outcomes to what probeEntry
+// may stamp: whether a decode verification ran for the entry, and how much of
+// the entry it covered.
+//
+// decodeRan gates probeEntry's DecodeVerifiedAt stamp. It's true only
+// when a frame-decode pass was attempted for this entry (skipDecode
+// false, after probeFiles' config override) AND every file that
+// contributes to a healthy rollup completed its decode windows
+// conclusively - i.e. not cut short by an ffprobe timeout or a context
+// cancellation, which return inconclusively (see ffprobeChecker.check).
+// One healthy file with an inconclusive decode blocks the stamp for the
+// whole entry, so a slow cold REMUX read that times out mid-sweep no
+// longer arms the 30-day skip as though it had verified clean. This also
+// covers the case where no ffprobe checker was attached (FFProbeCheck
+// off): the STAT-healthy files carry decodeConclusive=false and block
+// the stamp.
+//
+// Non-healthy files don't gate this: a broken rollup clears the stamp
+// anyway, and a file that errored out before reaching ffprobe
+// (usenet_probe_error, protocol_skipped, ...) is already outside the
+// healthy verdict rollupStatus computes. A transiently-errored file in
+// an otherwise-healthy entry can therefore still leave the entry stamped
+// without that file's decode having run; it self-heals at the TTL and
+// never suppresses that file's own STAT probe, so the residual window is
+// narrow and bounded.
+//
+// coverage is the WEAKEST value across the healthy files: one file scanned as
+// a bounded head makes the entry partial, since the stamp is per entry and
+// must not claim more than was actually read. Empty whenever decodeRan is
+// false.
+func rollupDecode(results []fileResult, skipDecode bool) (decodeRan bool, coverage string) {
+	if skipDecode {
+		return false, ""
+	}
+	coverage = decodeCoverageFull
+	for _, fr := range results {
+		if !fr.healthy {
+			continue
+		}
+		if !fr.decodeConclusive {
+			return false, ""
+		}
+		if fr.decodeCoverage == decodeCoveragePartial {
+			coverage = decodeCoveragePartial
 		}
 	}
-	return results, decodeRan
+	return true, coverage
 }
 
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
@@ -626,10 +657,11 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			registerVerifyBudget(res.infoHash, name, budget)
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
-			ok, reason, conclusive := checker.checkConfirmed(ctx, c.name, name, exp, skipDecode, sig, budget)
+			ok, reason, conclusive, coverage := checker.checkConfirmed(ctx, c.name, name, exp, skipDecode, sig, budget)
 			unregisterDeadSignal(res.infoHash, name, sig)
 			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive
+			res.decodeCoverage = coverage
 
 			if !ok {
 				res.healthy = false

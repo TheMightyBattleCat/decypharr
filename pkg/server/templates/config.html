@@ -1422,6 +1422,26 @@
                             </div>
 
                             <div>
+                                <label class="label" for="repair.decode_head_bytes">
+                                    <span class="font-medium">Decode head scan size (unseekable files)</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="repair.decode_head_bytes" id="repair.decode_head_bytes"
+                                       placeholder="3GB">
+                                <span class="label-text-alt opacity-70">Files with no usable container index (Matroska without Cues — most VC-1/MPEG-2 REMUXes) cannot be seeked, so sampling across them would read the whole file. Those get one decode scan of this many leading bytes instead, recorded as partial coverage. Files at or under this size skip seek detection and are sampled normally. Default 3GB.</span>
+                            </div>
+
+                            <div>
+                                <label class="label" for="repair.decode_detect_bytes">
+                                    <span class="font-medium">Decode seek-detect distance</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="repair.decode_detect_bytes" id="repair.decode_detect_bytes"
+                                       placeholder="2GB">
+                                <span class="label-text-alt opacity-70">Where the seek-detect probe places its second window, as the bytes an unseekable file would have to read to reach it. The probe is cut at half this distance: a file that reaches the window before the cut seeks normally and gets the usual full sample. Default 2GB.</span>
+                            </div>
+
+                            <div>
                                 <label class="label" for="repair.strategy">
                                     <span class="font-medium">Strategy</span>
                                 </label>

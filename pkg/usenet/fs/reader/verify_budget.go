@@ -7,12 +7,13 @@ import (
 	"time"
 )
 
-// ErrVerifyBudgetExhausted is returned by a verification read once it has
-// delivered VerifyBudget.Limit bytes. It is deliberately not an NNTP or I/O
-// error: nothing about it says the file is bad, only that the probe reading it
-// stopped being worth the bytes. Stream converts it into a clean end-of-body,
-// and the ffprobe checker turns the resulting (truncated, therefore
-// untrustworthy) ffprobe verdict into "inconclusive".
+// ErrVerifyBudgetExhausted is returned by a verification read once its budget
+// is spent: it has delivered VerifyBudget.Limit bytes, or the checker declared
+// it spent (Exhaust). It is deliberately not an NNTP or I/O error: nothing
+// about it says the file is bad, only that the probe reading it stopped being
+// worth the bytes. Stream converts it into a clean end-of-body, and the ffprobe
+// checker decides what the cut means - an inconclusive verdict, or, for the
+// seek-detect probe, a file with no usable container index.
 var ErrVerifyBudgetExhausted = errors.New("verification read budget exhausted")
 
 // VerifyBudget caps the total bytes one ffprobe verification may pull for a
@@ -36,13 +37,30 @@ var ErrVerifyBudgetExhausted = errors.New("verification read budget exhausted")
 // as inconclusive, never as "broken", because the truncated stream will make
 // ffprobe report container errors that say nothing about the file.
 //
+// Phases: some probes are short on purpose, and their byte cost is itself the
+// signal - a seek-detect probe that cannot reach its window inside a small cap
+// is reading forward rather than seeking. Those run under a phase: a separate
+// budget opened with BeginPhase, which range requests meter against instead of
+// this one while it is open (see ForRequest). A phase is independent of its
+// parent in both directions - its bytes are not charged to the parent, and the
+// parent's limit does not cap it - so sizing one can never starve or distort
+// the other.
+//
 // The zero value is unusable; construct with NewVerifyBudget. A nil
 // *VerifyBudget means "no budget" and every method is a safe no-op, so callers
 // that have no size to bound against can pass nil.
 type VerifyBudget struct {
 	limit    int64
 	used     atomic.Int64
-	exceeded atomic.Bool
+	exceeded atomic.Bool // delivered bytes passed limit: a byte cut
+
+	// exhausted is set by Exhaust: the verification was declared spent without
+	// a byte cut. Kept apart from exceeded so a log line can say which it was.
+	exhausted atomic.Bool
+
+	// phase is the budget range requests meter against while one is open, nil
+	// otherwise. See BeginPhase.
+	phase atomic.Pointer[VerifyBudget]
 
 	// Accounting, so one line at the end of a verification can stand in for
 	// the per-range-request logging the read path used to emit (ffprobe
@@ -63,10 +81,11 @@ func NewVerifyBudget(limit int64) *VerifyBudget {
 	return &VerifyBudget{limit: limit}
 }
 
-// Add records n bytes delivered and reports whether the budget is still
-// within its limit. Once exceeded it stays exceeded (one-way latch), so every
-// later range request for the same probe short-circuits immediately rather
-// than each spending its own budget. Always true on a nil receiver.
+// Add records n bytes delivered and reports whether the budget may still be
+// read against. Once the limit is passed it stays exceeded (one-way latch), so
+// every later range request for the same probe short-circuits immediately
+// rather than each spending its own budget. Also false once Exhaust has been
+// called. Always true on a nil receiver.
 func (b *VerifyBudget) Add(n int64) bool {
 	if b == nil {
 		return true
@@ -75,7 +94,18 @@ func (b *VerifyBudget) Add(n int64) bool {
 		b.exceeded.Store(true)
 		return false
 	}
-	return !b.exceeded.Load()
+	return !b.Exceeded()
+}
+
+// Exhaust marks the budget spent without charging it any bytes: the checker
+// has decided this verification must not read again (a bounded scan that
+// reached no verdict would only pay for the same bytes on a retry). Latches
+// Exceeded, so every retry guard keyed on it stops; Cut stays false. Safe on
+// nil.
+func (b *VerifyBudget) Exhaust() {
+	if b != nil {
+		b.exhausted.Store(true)
+	}
 }
 
 // Observe records that a metered read delivered n bytes after spending
@@ -91,9 +121,63 @@ func (b *VerifyBudget) Observe(n int64, waited time.Duration) {
 	b.firstAt.CompareAndSwap(0, time.Now().UnixNano())
 }
 
-// Exceeded reports whether the budget was ever blown. False on nil.
+// Exceeded reports whether the budget may no longer be read against: its byte
+// limit was passed, or Exhaust was called. False on nil. Every guard that
+// downgrades a verdict to inconclusive keys on this.
 func (b *VerifyBudget) Exceeded() bool {
+	return b != nil && (b.exceeded.Load() || b.exhausted.Load())
+}
+
+// Cut reports whether delivered bytes actually passed the limit - the part of
+// Exceeded that is a byte cut rather than an Exhaust. False on nil.
+func (b *VerifyBudget) Cut() bool {
 	return b != nil && b.exceeded.Load()
+}
+
+// BeginPhase opens a phase budget of limit bytes and makes it what every range
+// request of this verification meters against (ForRequest) until EndPhase. The
+// phase is independent of b: its bytes are not charged to b and b's limit does
+// not cap it. Phases do not draw on b, so a phase opened on an already-spent b
+// starts exhausted - otherwise opening one would let a spent verification read
+// again. Returns nil, opening nothing, on a nil receiver or a non-positive
+// limit.
+func (b *VerifyBudget) BeginPhase(limit int64) *VerifyBudget {
+	if b == nil {
+		return nil
+	}
+	p := NewVerifyBudget(limit)
+	if p == nil {
+		return nil
+	}
+	if b.Exceeded() {
+		p.exhausted.Store(true)
+	}
+	b.phase.Store(p)
+	return p
+}
+
+// EndPhase closes p if it is still the open phase. A stale EndPhase - p was
+// already replaced by a later BeginPhase - leaves the newer phase open. Safe
+// with a nil receiver or a nil p.
+func (b *VerifyBudget) EndPhase(p *VerifyBudget) {
+	if b == nil || p == nil {
+		return
+	}
+	b.phase.CompareAndSwap(p, nil)
+}
+
+// ForRequest returns the budget a range request starting now should meter
+// against: the open phase if there is one, else b itself. The read path
+// resolves this once per request, so a request keeps metering against the
+// budget it started under even if the phase changes mid-body. nil on nil.
+func (b *VerifyBudget) ForRequest() *VerifyBudget {
+	if b == nil {
+		return nil
+	}
+	if p := b.phase.Load(); p != nil {
+		return p
+	}
+	return b
 }
 
 // Reads returns the number of metered reads that delivered bytes. 0 on nil.

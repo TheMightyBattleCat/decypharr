@@ -258,6 +258,23 @@ type RepairConfig struct {
 	// always done, but removing the underlying entry is opt-in.
 	CleanupSuperseded     bool `json:"cleanup_superseded,omitempty"`
 	NNTPConnectionPercent int  `json:"nntp_connection_percent,omitempty"`
+	// DecodeDetectBytes and DecodeHeadBytes bound the decode check on files
+	// with no usable container index (Matroska without Cues - most
+	// VC-1/MPEG-2 REMUXes and a few AVC ones). ffmpeg cannot map a timestamp
+	// to a byte offset in those, so every sampling window reads forward from
+	// the previous one and the probe degenerates into a full-file read.
+	//
+	// DecodeDetectBytes places the seek-detect probe's second window where an
+	// unseekable file would have to read this many bytes to reach it, and the
+	// probe is cut at half that: reaching the window before the cut means the
+	// file seeks. DecodeHeadBytes is how much of an unseekable file is decoded
+	// instead, from offset 0, stamped as partial coverage. Both are byte
+	// budgets the read path enforces, not timeouts.
+	//
+	// Defaults 2GB / 3GB. Files at or under DecodeHeadBytes skip detection.
+	DecodeDetectBytes string `json:"decode_detect_bytes,omitempty"`
+	DecodeHeadBytes   string `json:"decode_head_bytes,omitempty"`
+
 	// VerificationConnections is the max concurrent NNTP fetches an ffprobe
 	// verification read (import gate / sweep decode check) may drive through
 	// its background prefetch. Verification reads disable padding, so they
@@ -398,7 +415,9 @@ type RepairConfig struct {
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
-		r.NNTPConnectionPercent == 0 && r.VerificationConnections == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
+		r.NNTPConnectionPercent == 0 && r.VerificationConnections == 0 &&
+		r.DecodeDetectBytes == "" && r.DecodeHeadBytes == "" &&
+		r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" &&
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport && r.FFProbeDecodeCheck == nil &&
@@ -941,6 +960,13 @@ func (c *Config) applyRepairDefaults() {
 
 	if c.Repair.VerificationConnections <= 0 {
 		c.Repair.VerificationConnections = 32
+	}
+
+	if strings.TrimSpace(c.Repair.DecodeDetectBytes) == "" {
+		c.Repair.DecodeDetectBytes = "2GB"
+	}
+	if strings.TrimSpace(c.Repair.DecodeHeadBytes) == "" {
+		c.Repair.DecodeHeadBytes = "3GB"
 	}
 
 	// Materialize the "default true when unset" pointers so config.json

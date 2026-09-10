@@ -92,6 +92,133 @@ func TestVerifyBudget_NilObserveIsSafe(t *testing.T) {
 	}
 }
 
+func TestVerifyBudget_ExhaustLatchesWithoutACut(t *testing.T) {
+	b := NewVerifyBudget(1 << 30)
+	b.Add(10)
+	b.Exhaust()
+	if !b.Exceeded() {
+		t.Fatal("Exhaust must latch Exceeded")
+	}
+	if b.Cut() {
+		t.Fatal("Exhaust charged no bytes past the limit; Cut must stay false")
+	}
+	if b.Add(1) {
+		t.Fatal("an exhausted budget must refuse further reads")
+	}
+	if b.Used() != 11 {
+		t.Fatalf("Used() = %d, want 11 (Add still records what was delivered)", b.Used())
+	}
+}
+
+func TestVerifyBudget_CutOnlyByPassingTheLimit(t *testing.T) {
+	b := NewVerifyBudget(100)
+	b.Add(100)
+	if b.Cut() || b.Exceeded() {
+		t.Fatal("reaching the limit exactly is not a cut")
+	}
+	b.Add(1)
+	if !b.Cut() || !b.Exceeded() {
+		t.Fatal("passing the limit must be both a cut and exceeded")
+	}
+}
+
+// A phase is what range requests meter against while it is open, and it is
+// independent of its parent in both directions.
+func TestVerifyBudget_PhaseRoutingAndIndependence(t *testing.T) {
+	parent := NewVerifyBudget(64)
+	if parent.ForRequest() != parent {
+		t.Fatal("with no phase open, requests must meter against the budget itself")
+	}
+
+	p := parent.BeginPhase(1000)
+	if p == nil || p == parent {
+		t.Fatalf("BeginPhase returned %v, want a distinct phase budget", p)
+	}
+	if parent.ForRequest() != p {
+		t.Fatal("an open phase must be what requests meter against")
+	}
+	if p.Limit() != 1000 {
+		t.Fatalf("phase Limit() = %d, want 1000", p.Limit())
+	}
+
+	// Larger than the parent's limit and not capped by it...
+	if !p.Add(500) {
+		t.Fatal("a phase must not be capped by its parent's limit")
+	}
+	// ...and spending it charges the parent nothing.
+	p.Add(501)
+	if !p.Cut() {
+		t.Fatal("the phase must latch its own cut")
+	}
+	if parent.Used() != 0 || parent.Exceeded() {
+		t.Fatalf("phase bytes leaked into the parent: used=%d exceeded=%v", parent.Used(), parent.Exceeded())
+	}
+
+	parent.EndPhase(p)
+	if parent.ForRequest() != parent {
+		t.Fatal("after EndPhase requests must meter against the budget itself again")
+	}
+}
+
+// EndPhase is a compare-and-swap: ending a phase that was already replaced
+// must not close its replacement.
+func TestVerifyBudget_StaleEndPhaseKeepsTheNewerPhase(t *testing.T) {
+	parent := NewVerifyBudget(1 << 30)
+	first := parent.BeginPhase(10)
+	second := parent.BeginPhase(20)
+	parent.EndPhase(first)
+	if parent.ForRequest() != second {
+		t.Fatal("a stale EndPhase closed the newer phase")
+	}
+	parent.EndPhase(second)
+	if parent.ForRequest() != parent {
+		t.Fatal("EndPhase of the open phase must close it")
+	}
+}
+
+// Phases do not draw on their parent, so a spent verification must not be
+// able to read again just by opening one.
+func TestVerifyBudget_PhaseOfASpentBudgetStartsSpent(t *testing.T) {
+	for name, spend := range map[string]func(*VerifyBudget){
+		"cut":       func(b *VerifyBudget) { b.Add(101) },
+		"exhausted": func(b *VerifyBudget) { b.Exhaust() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			parent := NewVerifyBudget(100)
+			spend(parent)
+			p := parent.BeginPhase(1 << 30)
+			defer parent.EndPhase(p)
+			if !p.Exceeded() {
+				t.Fatal("a phase opened on a spent verification must refuse reads")
+			}
+			if p.Cut() {
+				t.Fatal("the phase itself read nothing; it must be exhausted, not cut")
+			}
+		})
+	}
+}
+
+func TestVerifyBudget_NilAndEmptyPhasesAreSafe(t *testing.T) {
+	var b *VerifyBudget
+	if b.BeginPhase(10) != nil {
+		t.Fatal("a nil budget must open no phase")
+	}
+	b.EndPhase(nil)
+	b.Exhaust()
+	if b.ForRequest() != nil || b.Cut() || b.Exceeded() {
+		t.Fatal("nil budget phase and latch accessors must all be zero")
+	}
+
+	parent := NewVerifyBudget(100)
+	if p := parent.BeginPhase(0); p != nil {
+		t.Fatalf("a non-positive phase limit must open no phase, got %v", p)
+	}
+	if parent.ForRequest() != parent {
+		t.Fatal("a refused BeginPhase must leave requests on the budget itself")
+	}
+	parent.EndPhase(nil) // must neither panic nor close anything
+}
+
 func TestVerifyBudget_ContextRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	if got := VerifyBudgetFromContext(ctx); got != nil {

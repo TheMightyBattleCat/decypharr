@@ -271,6 +271,13 @@ type EntryHealth struct {
 	DecodeVerifiedAt          time.Time `json:"decode_verified_at,omitempty"`
 	DecodeVerifiedFingerprint string    `json:"decode_verified_fp,omitempty"`
 
+	// DecodeVerifiedCoverage records how much of the entry the stamped decode
+	// pass actually covered: "full" for the normal spread across the whole
+	// duration, "partial" when a file has no usable container index and only a
+	// bounded head was scanned (see manager.decodeWindows). Empty on records
+	// stamped before this field existed - those were full spreads.
+	DecodeVerifiedCoverage string `json:"decode_verified_coverage,omitempty"`
+
 	FileCount     int          `json:"file_count"`
 	BrokenCount   int          `json:"broken_count"`
 	BrokenFiles   []BrokenFile `json:"broken_files,omitempty"`
@@ -405,8 +412,8 @@ func (s *Storage) ClearEntryHealthByStatuses(statuses []HealthStatus) (int, erro
 	return cleared, nil
 }
 
-// ClearAllDecodeVerification zeroes DecodeVerifiedAt and
-// DecodeVerifiedFingerprint on every EntryHealth record that has them set,
+// ClearAllDecodeVerification zeroes DecodeVerifiedAt, DecodeVerifiedFingerprint
+// and DecodeVerifiedCoverage on every EntryHealth record that has a stamp,
 // without deleting the record itself. Returns the count of modified entries.
 func (s *Storage) ClearAllDecodeVerification() (int, error) {
 	// Collect candidates during read pass - cannot modify during ForEach.
@@ -428,6 +435,7 @@ func (s *Storage) ClearAllDecodeVerification() (int, error) {
 		}
 		state.DecodeVerifiedAt = time.Time{}
 		state.DecodeVerifiedFingerprint = ""
+		state.DecodeVerifiedCoverage = ""
 		if err := s.SaveEntryHealth(state); err != nil {
 			return cleared, err
 		}

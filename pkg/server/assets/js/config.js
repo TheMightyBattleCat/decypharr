@@ -163,6 +163,8 @@ class ConfigManager {
         if ($('repair.workers')) $('repair.workers').value = repair.workers || 5;
         if ($('repair.nntp_connection_percent')) $('repair.nntp_connection_percent').value = repair.nntp_connection_percent || 20;
         if ($('repair.verification_connections')) $('repair.verification_connections').value = repair.verification_connections || 32;
+        if ($('repair.decode_head_bytes')) $('repair.decode_head_bytes').value = repair.decode_head_bytes || '';
+        if ($('repair.decode_detect_bytes')) $('repair.decode_detect_bytes').value = repair.decode_detect_bytes || '';
         if ($('repair.strategy')) $('repair.strategy').value = repair.strategy || 'per_entry';
         if ($('repair.stop_schedule')) $('repair.stop_schedule').value = repair.stop_schedule || '';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
@@ -187,6 +189,8 @@ class ConfigManager {
             workers: parseInt($('repair.workers')?.value, 10) || 0,
             nntp_connection_percent: parseInt($('repair.nntp_connection_percent')?.value, 10) || 0,
             verification_connections: parseInt($('repair.verification_connections')?.value, 10) || 0,
+            decode_head_bytes: $('repair.decode_head_bytes')?.value.trim() || '',
+            decode_detect_bytes: $('repair.decode_detect_bytes')?.value.trim() || '',
             strategy: $('repair.strategy')?.value || 'per_entry',
             stop_schedule: $('repair.stop_schedule')?.value.trim() || '',
             auto_repair: $('repair.auto_repair')?.checked || false,

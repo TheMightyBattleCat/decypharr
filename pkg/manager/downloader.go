@@ -443,7 +443,10 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 
 		sig := NewDeadSegmentSignal()
 		registerDeadSignal(infoHash, fileName, sig)
-		ok, reason, conclusive = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig, budget)
+		// Coverage is not used here: the import gate never stamps
+		// DecodeVerifiedAt, it only keys on conclusive - which a bounded head
+		// scan of an unseekable file does set, ending the retry loop for it.
+		ok, reason, conclusive, _ = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig, budget)
 		unregisterDeadSignal(infoHash, fileName, sig)
 
 		if !ok {
@@ -452,9 +455,11 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 		if conclusive || attempt >= ffprobeImportInconclusiveRetries {
 			return true, conclusive, reason
 		}
-		// A spent budget is terminal for this file: retrying would be cut off
-		// at the first read, so admit-and-flag-dirty now instead of sleeping
-		// out the backoffs to reach the same answer.
+		// A spent budget is terminal for this file: cut, a retry would be
+		// refused at its first read; exhausted by a bounded head scan that
+		// reached no verdict, a retry would only pay for the same scan again.
+		// Admit-and-flag-dirty now instead of sleeping out the backoffs to
+		// reach the same answer.
 		if budget.Exceeded() {
 			budgetStats(d.logger.Debug().Str("entry", entry.Name).Str("file", fileName), budget).
 				Msg("Import: ffprobe verification hit its read budget; admitting and flagging dirty")

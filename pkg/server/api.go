@@ -631,6 +631,19 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Invalid verification_connections (must be between 0 and 500)", http.StatusBadRequest)
 		return
 	}
+	for _, f := range []struct{ name, value string }{
+		{"decode_detect_bytes", req.DecodeDetectBytes},
+		{"decode_head_bytes", req.DecodeHeadBytes},
+	} {
+		v := strings.TrimSpace(f.value)
+		if v == "" {
+			continue
+		}
+		if n, err := config.ParseSize(v); err != nil || n <= 0 {
+			http.Error(w, fmt.Sprintf("Invalid %s (expected a size like \"3GB\")", f.name), http.StatusBadRequest)
+			return
+		}
+	}
 	switch req.Par2RepairMode {
 	case "", config.Par2RepairModeAutoAll, config.Par2RepairModeAutoThreshold, config.Par2RepairModeManual:
 	default:
@@ -1204,9 +1217,10 @@ func (s *Server) handleClearRepairState(w http.ResponseWriter, r *http.Request) 
 	utils.JSONResponse(w, result, http.StatusOK)
 }
 
-// handleClearDecodeVerification zeroes the DecodeVerifiedAt and
-// DecodeVerifiedFingerprint fields on all EntryHealth records, forcing
-// the next sweep to re-run decode verification on every entry.
+// handleClearDecodeVerification zeroes the DecodeVerifiedAt,
+// DecodeVerifiedFingerprint and DecodeVerifiedCoverage fields on all
+// EntryHealth records, forcing the next sweep to re-run decode verification on
+// every entry.
 func (s *Server) handleClearDecodeVerification(w http.ResponseWriter, r *http.Request) {
 	svc := s.manager.Repair()
 	if svc == nil {

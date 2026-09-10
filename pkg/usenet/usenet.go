@@ -308,6 +308,13 @@ type meteredReader struct {
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
+	// A budget already spent - by an earlier range request of this probe, or
+	// declared spent by the checker - must not deliver another byte. Checking
+	// only after the read would let every request ffprobe issues past the cut
+	// fetch and deliver one more buffer before stopping.
+	if m.budget.Exceeded() {
+		return 0, reader.ErrVerifyBudgetExhausted
+	}
 	t := time.Now()
 	n, err := m.inner.Read(p)
 	waited := time.Since(t)
@@ -1716,16 +1723,23 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// A blown verification budget ends the body early on purpose. It is not a
 	// stream failure and must not reach the article-not-found / failedFiles
-	// handling below: the probe caller sees Exceeded() and downgrades its
-	// verdict to inconclusive.
+	// handling below: the probe caller sees Exceeded() and decides what the
+	// cut means - an inconclusive verdict, or, for seek detection, a file
+	// with no usable index.
 	if meter != nil && errors.Is(err, reader.ErrVerifyBudgetExhausted) {
 		err = nil
-		u.logger.Debug().
-			Str("nzb_id", nzoID).
+		// Debug once, for the request that actually crossed the cap. Every
+		// request ffprobe issues after that is refused before its first byte,
+		// and there can be many, so those are Trace.
+		ev := u.logger.Debug()
+		if meter.bytes == 0 {
+			ev = u.logger.Trace()
+		}
+		ev.Str("nzb_id", nzoID).
 			Str("file", filename).
 			Int64("budget_bytes", meter.budget.Limit()).
 			Int64("used_bytes", meter.budget.Used()).
-			Msg("Repair: verification read hit its byte budget; ending body early (verdict will be inconclusive)")
+			Msg("Repair: verification read hit its byte budget; ending body early")
 	}
 
 	if verifyRead && meter != nil && meter.bytes > 0 {
