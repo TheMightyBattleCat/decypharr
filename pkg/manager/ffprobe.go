@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -37,6 +38,12 @@ const (
 	// genuinely-dead posting from any other broken verdict (see the import
 	// gate's dead-posting handling).
 	ffprobeReasonDeadSegment = "dead_segment_detected: NNTP 430 during verification read"
+
+	// ffprobeReasonDecodedThrough is not a broken verdict. runDecodeProbe
+	// returns it with ok=true and conclusive=false when ffprobe printed errors
+	// but still decoded to the end of its interval, so decodeWindows can end
+	// the verification instead of letting a retry pay for the same result.
+	ffprobeReasonDecodedThrough = "ffprobe_errors_decoded_through"
 )
 
 const (
@@ -800,7 +807,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	// When ffprobe is stopped mid-scan (timeout, or the body cut) stdout holds
 	// whatever it managed to print, so this is the only per-probe measure of
 	// how far the decode actually got.
-	progress := parseDecodeProgress(stdout.Bytes())
+	progress := parseDecodeProgress(stdout.Bytes(), len(intervals))
 	evt := func() *zerolog.Event {
 		ev := f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Str("phase", phase).Int("windows", len(intervals)).Dur("timeout", timeout).
@@ -843,6 +850,21 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	}
 	if stderrStr != "" {
 		lines, n := stderrSummary(stderrStr)
+		// Errors that did not stop the decode are not evidence the file is
+		// broken. A broken verdict deletes and re-searches the grab, and the
+		// retry cannot tell a deterministic false error from real damage
+		// (Brom and Lionmarsh, 2026-09-10: "File ended prematurely" on 3 GB
+		// head scans that decoded to their end, byte-identical on retry, no
+		// reader-side fault). A decode that stopped short of its interval is
+		// still broken.
+		if reached, known := reachedFirstIntervalEnd(intervals, progress); known && reached {
+			budgetStats(f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Str("phase", phase).
+				Int("windows", len(intervals)).Dur("elapsed", elapsed).
+				Int("frames", progress.frames).Float64("decoded_to_s", progress.lastTS).
+				Int("stderr_lines", n).Str("stderr", lines), budget).
+				Msg("Repair: ffprobe printed errors but decoded to the end of its window; not treating the file as broken")
+			return true, ffprobeReasonDecodedThrough, false
+		}
 		evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
@@ -880,8 +902,8 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 //     unseekable file must read detectBytes to reach it, cut at half that.
 //     Completing inside the cut means the file seeks: the normal spread.
 //     Being cut means it does not: the head scan. A decode error on an uncut
-//     body is a real verdict; a timeout or cancellation short of the cut
-//     proves nothing.
+//     body that stopped the decode is a real verdict; a timeout or
+//     cancellation short of the cut proves nothing.
 //   - Head scan: one interval from offset 0 over the seconds headBytes covers
 //     at the file's average bitrate, cut at 1.5x headBytes, reported as
 //     partial coverage. If it is cut or times out it reaches no verdict, and
@@ -903,6 +925,11 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 // Every phase checks its own budget before anything ffprobe reported: a cut
 // body yields container errors that describe our truncation, so a spent phase
 // budget can route to the next phase or end inconclusive, never return broken.
+//
+// Errors ffprobe printed while still decoding to the end of its first interval
+// are not a verdict in any phase (see runDecodeProbe): the file is left
+// unverified, logged at WARN, and the verification is exhausted so neither
+// checkConfirmed nor the import gate reads it again for the same answer.
 //
 // Like every other probe in this file, timeout and cancellation are
 // inconclusive (ok=true, fail-open): a slow WebDAV read must never
@@ -940,6 +967,11 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		// wastes time on the small ones.
 		timeout := f.scaledTimeout(fileBytes, ffprobeDecodeTimeoutPerGB, ffprobeDecodeTimeoutCap)
 		ok, reason, conclusive := run(ctx, entryFolder, fileName, decodePhaseSpread, intervals, timeout, fileBytes, budget)
+		if ok && reason == ffprobeReasonDecodedThrough {
+			// A retry would print the same errors over the same frames.
+			budget.Exhaust()
+			return true, "", false, decodeCoverageFull
+		}
 		return ok, reason, conclusive, decodeCoverageFull
 	}
 
@@ -1004,7 +1036,12 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 			return false, reason, conclusive, ""
 		case !conclusive:
 			// Timed out or cancelled short of the cut: says nothing about the
-			// file, and in particular not that it cannot seek.
+			// file, and in particular not that it cannot seek. Errors that
+			// decoded through end the verification instead, since a retry
+			// would see them again.
+			if reason == ffprobeReasonDecodedThrough {
+				budget.Exhaust()
+			}
 			return true, "", false, ""
 		default:
 			// Reached the window inside the cut: the file seeks, and everything
@@ -1028,9 +1065,10 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		fmt.Sprintf("%.0f%%+%.0f", 0.0, headSec),
 	}, headCap)
 	if head.Exceeded() || (ok && !conclusive) {
-		// Cut, timed out, or cancelled before the end of its interval: no
-		// verdict, and a retry would only pay for the same prefix again.
-		// Exhaust the verification so no retry layer repeats the scan.
+		// Cut, timed out, cancelled before the end of its interval, or errors
+		// that decoded through to it: no verdict, and a retry would only pay
+		// for the same prefix again. Exhaust the verification so no retry
+		// layer repeats the scan.
 		budget.Exhaust()
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Int64("file_bytes", fileBytes), head).
@@ -1139,7 +1177,22 @@ type decodeProgress struct {
 	frames     int     // decoded frames printed
 	timestamps int     // frames that carried a timestamp
 	lastTS     float64 // the last timestamp printed, in seconds
+
+	// The same for the first interval alone. ffprobe 4.2 decodes only the
+	// first interval of a -read_intervals list: it drains the decoder at the
+	// end of each interval and never resets it, so later intervals are
+	// demuxed but print no frames. Newer versions decode them all. Progress
+	// against the first interval means the same thing on both.
+	firstFrames     int
+	firstTimestamps int
+	firstStartTS    float64
+	firstEndTS      float64
 }
+
+// decodeIntervalGap is the timestamp jump that separates one interval's frames
+// from the next interval's. Frames within an interval are a frame duration
+// apart; the spread's windows are minutes apart.
+const decodeIntervalGap = 10 * time.Second
 
 // parseDecodeProgress reads the csv that -show_entries
 // frame=best_effort_timestamp_time prints: one line per decoded frame, holding
@@ -1147,20 +1200,97 @@ type decodeProgress struct {
 // empty lines on ffprobe 4.2 - two per frame on many Blu-ray AVC REMUXes - and
 // a trailing comma on newer versions, so empty lines are not frames and only
 // the first field is read.
-func parseDecodeProgress(stdout []byte) decodeProgress {
+//
+// intervals is how many intervals the probe asked for. With one, every frame
+// belongs to it, whatever its timestamps do; with more, the first interval
+// ends at the first jump of decodeIntervalGap forward or any jump back.
+func parseDecodeProgress(stdout []byte, intervals int) decodeProgress {
 	var p decodeProgress
+	inFirst := true
 	for line := range strings.SplitSeq(string(stdout), "\n") {
 		field, _, _ := strings.Cut(strings.TrimSpace(line), ",")
 		if field == "" {
 			continue
 		}
 		p.frames++
-		if ts, err := strconv.ParseFloat(field, 64); err == nil {
+		ts, err := strconv.ParseFloat(field, 64)
+		hasTS := err == nil
+		if hasTS {
+			if inFirst && intervals > 1 && p.firstTimestamps > 0 &&
+				(ts-p.firstEndTS > decodeIntervalGap.Seconds() || ts < p.firstEndTS-1) {
+				inFirst = false
+			}
 			p.timestamps++
 			p.lastTS = ts
 		}
+		if !inFirst {
+			continue
+		}
+		p.firstFrames++
+		if hasTS {
+			if p.firstTimestamps == 0 {
+				p.firstStartTS = ts
+			}
+			p.firstTimestamps++
+			p.firstEndTS = ts
+		}
 	}
 	return p
+}
+
+// intervalLength returns the length a -read_intervals entry asks for: frames
+// for "START%+#N", seconds for "START%+S". ok is false for anything else.
+func intervalLength(interval string) (frames int, seconds float64, ok bool) {
+	_, length, found := strings.Cut(interval, "%+")
+	if !found {
+		return 0, 0, false
+	}
+	if n, isFrames := strings.CutPrefix(length, "#"); isFrames {
+		if v, err := strconv.Atoi(n); err == nil && v > 0 {
+			return v, 0, true
+		}
+		return 0, 0, false
+	}
+	if v, err := strconv.ParseFloat(length, 64); err == nil && v > 0 {
+		return 0, v, true
+	}
+	return 0, 0, false
+}
+
+// Slack for reachedFirstIntervalEnd: a decode counts as having reached its
+// interval's end at 90% of the frames asked for (a decoder can drop frames it
+// cannot reference right after a seek) or 90% of the seconds less a quarter
+// second (the last frame's timestamp sits one frame duration before the end).
+const (
+	decodeReachedFraction = 0.9
+	decodeReachedSlackSec = 0.25
+)
+
+// reachedFirstIntervalEnd reports whether a probe decoded to the end of the
+// first of its intervals. known is false when that cannot be told: an interval
+// format intervalLength does not read, or a seconds interval with fewer than
+// two timestamps to measure.
+//
+// Only the first interval is judged because it is the only one ffprobe 4.2
+// decodes (see decodeProgress). Comparing against every interval would call a
+// healthy multi-window spread stopped short on 4.2.
+func reachedFirstIntervalEnd(intervals []string, p decodeProgress) (reached, known bool) {
+	if len(intervals) == 0 {
+		return false, false
+	}
+	frames, seconds, ok := intervalLength(intervals[0])
+	if !ok {
+		return false, false
+	}
+	if frames > 0 {
+		need := int(math.Ceil(decodeReachedFraction * float64(frames)))
+		return p.firstFrames >= need, true
+	}
+	if p.firstTimestamps < 2 {
+		return false, false
+	}
+	span := p.firstEndTS - p.firstStartTS
+	return span >= decodeReachedFraction*seconds-decodeReachedSlackSec, true
 }
 
 // stderrSummaryLines and stderrSummaryLineLen bound what a decode-error log
