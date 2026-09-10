@@ -537,6 +537,16 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 		}
 	}
 
+	// The metadata can list bytes a previous run never wrote to disk (see
+	// dropRangesNotOnDisk); seeding the buffer with them would serve zeros.
+	if missing := dropRangesNotOnDisk(cachePath, &info.Rs); missing > 0 {
+		c.logger.Warn().
+			Str("entry", entryName).
+			Str("file", filename).
+			Int64("size_bytes", missing).
+			Msg("Cache listed bytes that never reached disk; downloading them again")
+	}
+
 	// Translate persisted ranges into the buffer's seed format.
 	seed := make([]buffer.Range, 0, len(info.Rs))
 	for _, r := range info.Rs {
@@ -879,6 +889,23 @@ func (c *Cache) PurgeCache() map[string]any {
 		"purge_empty_dirs_removed":  int64(summary.scan.emptyDirsRemoved),
 		"purge_orphan_meta_removed": int64(summary.scan.orphanMetadataRemoved),
 	}
+}
+
+// FlushAll writes every open item's in-memory bytes to its data file. It is the
+// first step of shutdown, ahead of the unmount: closing an item also flushes,
+// but only after its downloaders stop, and the unmount gives up after its
+// timeout while items can still be mid-close. Bytes left in RAM at exit are
+// lost, and the metadata writer has already recorded them as present.
+func (c *Cache) FlushAll() {
+	c.items.Range(func(key string, item *CacheItem) bool {
+		if item.buf == nil {
+			return true
+		}
+		if err := item.buf.Flush(); err != nil && !errors.Is(err, buffer.ErrClosed) {
+			c.logger.Warn().Err(err).Str("key", key).Msg("Could not write cached bytes to disk before shutdown")
+		}
+		return true
+	})
 }
 
 // Close shuts down the cache
@@ -1455,6 +1482,15 @@ func (item *CacheItem) Close() error {
 		if dls != nil {
 			if err := dls.Close(nil); err != nil && item.closeErr == nil {
 				item.closeErr = err
+			}
+		}
+
+		// Put the buffer's RAM-only bytes on disk before the final metadata
+		// write, which lists them as cached. The other way round, an exit
+		// between the two leaves metadata that claims a hole.
+		if item.buf != nil {
+			if err := item.buf.Flush(); err != nil && !errors.Is(err, buffer.ErrClosed) {
+				item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("Could not write cached bytes to disk before saving cache metadata")
 			}
 		}
 

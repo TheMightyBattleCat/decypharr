@@ -766,6 +766,22 @@ func (b *Buffer) DropBehind(offset, margin int64) {
 	}
 }
 
+// Flush writes every dirty in-memory block to the disk file, without fsync.
+// That is enough for the bytes to outlive the process (they sit in the kernel
+// page cache); Sync is the variant that also survives a power loss.
+//
+// Owners that persist their own record of which ranges are present (DFS's
+// cache metadata) call this before writing that record, so the record never
+// describes bytes that exist only in this Buffer's RAM.
+func (b *Buffer) Flush() error {
+	if b.closed.Load() {
+		return ErrClosed
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flushAllLocked()
+}
+
 // Sync forces all dirty in-memory blocks to disk and calls fsync.
 // Returns the first error encountered.
 func (b *Buffer) Sync() error {
@@ -773,23 +789,24 @@ func (b *Buffer) Sync() error {
 		return ErrClosed
 	}
 	b.mu.Lock()
-	// Flush every dirty block under the exclusive lock — flushBlockLocked
-	// requires it (releasing mu around the pwrite risks a torn write; see
-	// its doc comment).
-	var dirty []*block
-	for _, blk := range b.blocks {
-		if !blk.isClean() {
-			dirty = append(dirty, blk)
-		}
+	err := b.flushAllLocked()
+	b.mu.Unlock()
+	if err != nil {
+		return err
 	}
-	for _, blk := range dirty {
+	return b.file.Sync()
+}
+
+// flushAllLocked writes every dirty block to disk. Caller holds b.mu
+// exclusively — flushBlockLocked requires it (releasing mu around the pwrite
+// risks a torn write; see its doc comment).
+func (b *Buffer) flushAllLocked() error {
+	for _, blk := range b.blocks {
 		if err := b.flushBlockLocked(blk); err != nil {
-			b.mu.Unlock()
 			return err
 		}
 	}
-	b.mu.Unlock()
-	return b.file.Sync()
+	return nil
 }
 
 // Close flushes any pending dirty blocks, closes the disk file, and (if

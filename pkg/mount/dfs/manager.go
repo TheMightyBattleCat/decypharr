@@ -85,6 +85,14 @@ func (m *Manager) Stop() error {
 		Str("backend", string(m.backend.Type())).
 		Msg("Stopping FUSE filesystem")
 
+	// Write every open cache item's RAM-only bytes to disk first. The unmount
+	// below closes the VFS inside a 10s budget and shutdown carries on when that
+	// runs out, so bytes still in RAM would be lost while the cache metadata
+	// already lists them.
+	if m.vfs != nil {
+		m.vfs.FlushCaches()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

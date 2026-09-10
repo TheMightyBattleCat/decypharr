@@ -157,6 +157,14 @@ func (m *Manager) ReleaseFile(info *manager.FileInfo) {
 	}
 }
 
+// FlushCaches writes every open cache item's in-memory bytes to disk. See
+// Cache.FlushAll.
+func (m *Manager) FlushCaches() {
+	if m.cache != nil {
+		m.cache.FlushAll()
+	}
+}
+
 // Close shuts down the manager
 func (m *Manager) Close() error {
 	m.cancel()
