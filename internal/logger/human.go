@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -105,6 +106,10 @@ var componentCategories = map[string]string{
 // messagePrefixes are stripped from console messages: the category already
 // says what they say. The log file keeps messages verbatim.
 var messagePrefixes = []string{"[repair] ", "Repair: ", "Import: ", "Usenet: ", "PAR2: ", "Precache: "}
+
+// ffmpegAddress matches the " @ 0x55e40f1cda80" instance address ffmpeg puts
+// in its log prefixes: noise on a console line, kept in the log file.
+var ffmpegAddress = regexp.MustCompile(` @ 0x[0-9A-Fa-f]+`)
 
 // subjectFields are tried in order for a line's subject.
 var subjectFields = []string{FieldSubject, "entry", "file", "name", "entry_name"}
@@ -213,7 +218,7 @@ func (h *humanWriter) render(b *bytes.Buffer, evt map[string]any) {
 
 	var why []string
 	for _, key := range []string{"reason", zerolog.ErrorFieldName} {
-		if v := oneLine(text(evt[key])); v != "" {
+		if v := ffmpegAddress.ReplaceAllString(oneLine(text(evt[key])), ""); v != "" {
 			why = append(why, truncate(v, 160))
 			used[key] = true
 		}

@@ -203,3 +203,29 @@ func TestUseColor(t *testing.T) {
 		}
 	}
 }
+
+// ffmpeg's instance addresses are noise on the console; the file keeps them.
+func TestHumanWriter_ReasonDropsFFmpegAddresses(t *testing.T) {
+	var out bytes.Buffer
+	log := consoleLogger(&out, "repair", false, zerolog.InfoLevel)
+	log.Info().Time("time", testClock).Str(FieldStatus, StatusFail).
+		Str("reason", "ffprobe_decode_error: [h264 @ 0x5622da6b4f00] Reference 2 >= 2").Msg("broken")
+	if want := "10:42:09 REPAIR   ✗ broken (ffprobe_decode_error: [h264] Reference 2 >= 2)\n"; out.String() != want {
+		t.Fatalf("got  %q\nwant %q", out.String(), want)
+	}
+}
+
+func TestFormatDuration_WholeSecondsFromTen(t *testing.T) {
+	if got := FormatDuration(31 * time.Second); got != "31s" {
+		t.Fatalf("FormatDuration(31s) = %q, want 31s", got)
+	}
+}
+
+func TestCount(t *testing.T) {
+	if got := Count(1, "file"); got != "1 file" {
+		t.Fatalf("Count(1) = %q", got)
+	}
+	if got := Count(3, "file"); got != "3 files" {
+		t.Fatalf("Count(3) = %q", got)
+	}
+}

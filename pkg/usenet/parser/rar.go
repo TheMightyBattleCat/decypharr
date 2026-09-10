@@ -263,7 +263,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 				Int64("stream_bytes", streamSize).
 				Int64("missing_bytes", rarFile.UncompressedSize-streamSize).
 				Str(logger.FieldNote, logger.FormatBytes(rarFile.UncompressedSize-streamSize)+" missing").
-				Msg("RAR file is shorter than its archive header says; serving only the bytes its articles cover")
+				Msg("RAR file is shorter than its archive header says")
 		}
 		size := rarFile.UncompressedSize
 		if size <= 0 || (streamSize > 0 && size > streamSize) {

@@ -760,7 +760,7 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		Int("files", len(updatedNZB.Files)).
 		Str(logger.FieldStatus, logger.StatusOK).
 		Int64(logger.FieldSize, updatedNZB.TotalSize).
-		Str(logger.FieldNote, fmt.Sprintf("%d files", len(updatedNZB.Files))).
+		Str(logger.FieldNote, logger.Count(len(updatedNZB.Files), "file")).
 		Msg("NZB parsed and available")
 	return updatedNZB, nil
 }

@@ -26,6 +26,14 @@ func FormatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", v, "KMGTP"[exp])
 }
 
+// Count renders n with its noun, plural unless n is 1: "1 file", "3 files".
+func Count(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
 // FormatRate renders a throughput in MiB/s: "16.3 MiB/s", "112 MiB/s".
 func FormatRate(mibPerSec float64) string {
 	if mibPerSec >= 100 {
@@ -35,13 +43,15 @@ func FormatRate(mibPerSec float64) string {
 }
 
 // FormatDuration renders a duration the way a person says it: "850ms",
-// "9.2s", "3m12s", "1h04m".
+// "9.2s", "31s", "3m12s", "1h04m".
 func FormatDuration(d time.Duration) string {
 	switch {
 	case d < time.Second:
 		return fmt.Sprintf("%dms", d.Milliseconds())
-	case d < time.Minute:
+	case d < 10*time.Second:
 		return fmt.Sprintf("%.1fs", d.Seconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
 	case d < time.Hour:
 		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 	default:
