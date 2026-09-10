@@ -446,16 +446,20 @@ func (s *Storage) ClearAllDecodeVerification() (int, error) {
 
 // CountDecodeVerified returns the number of EntryHealth records that carry a
 // decode-clean fingerprint (DecodeVerifiedAt set), i.e. how many entries
-// ClearAllDecodeVerification would affect.
-func (s *Storage) CountDecodeVerified() int {
-	count := 0
+// ClearAllDecodeVerification would affect, and how many of those were stamped
+// from a bounded head scan (DecodeVerifiedCoverage "partial": the file has no
+// usable seek index, so only its start was decoded).
+func (s *Storage) CountDecodeVerified() (verified, partial int) {
 	_ = s.ForEachEntryHealth(func(state *EntryHealth) error {
 		if state != nil && !state.DecodeVerifiedAt.IsZero() {
-			count++
+			verified++
+			if state.DecodeVerifiedCoverage == "partial" {
+				partial++
+			}
 		}
 		return nil
 	})
-	return count
+	return verified, partial
 }
 
 // MarkEntryDirty flags an entry's health as out-of-date so the next sweep will

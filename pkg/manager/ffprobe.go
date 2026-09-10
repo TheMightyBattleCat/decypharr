@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -350,9 +351,15 @@ type ffprobeOutput struct {
 	Format struct {
 		Duration string `json:"duration"`
 	} `json:"format"`
-	Streams []struct {
-		CodecType string `json:"codec_type"`
-	} `json:"streams"`
+	Streams []ffprobeStream `json:"streams"`
+}
+
+type ffprobeStream struct {
+	CodecType   string `json:"codec_type"`
+	CodecName   string `json:"codec_name"`
+	Disposition struct {
+		AttachedPic int `json:"attached_pic"`
+	} `json:"disposition"`
 }
 
 // budgetStats annotates a verdict log event with the verification read's
@@ -403,6 +410,11 @@ func budgetStats(ev *zerolog.Event, b *VerifyBudget) *zerolog.Event {
 // file with no usable container index (see decodeWindows). Empty whenever the
 // result did not come from a decode pass.
 func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, budget *VerifyBudget) (ok bool, reason string, conclusive bool, coverage string) {
+	scope := decodeScopeFromContext(ctx)
+	if scope == nil {
+		scope = &decodeScope{}
+		ctx = contextWithDecodeScope(ctx, scope)
+	}
 	args := f.probeArgs(entryFolder, fileName, []string{"-v", "error", "-print_format", "json", "-show_format", "-show_streams"})
 
 	metaTimeout := f.scaledTimeout(expected.Bytes, ffprobeMetadataTimeoutPerGB, ffprobeMetadataTimeoutCap)
@@ -467,6 +479,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	if !hasVideo {
 		return false, ffprobeReasonNoVideoStream, true, ""
 	}
+	scope.coverArt = coverArtDecoders(probe.Streams)
 
 	durationSec, err := strconv.ParseFloat(strings.TrimSpace(probe.Format.Duration), 64)
 	if err != nil || durationSec <= 0 {
@@ -561,7 +574,7 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 	args := f.probeArgs(entryFolder, fileName, []string{
 		"-v", "error",
 		"-read_intervals", interval,
-		"-select_streams", "v:0",
+		"-select_streams", "V:0",
 		"-show_entries", "packet=pts_time",
 		"-of", "json",
 	})
@@ -606,6 +619,106 @@ func (f *ffprobeChecker) tailIntact(ctx context.Context, entryFolder, fileName s
 		}
 	}
 	return false
+}
+
+// decodeScope is what one verification learns and reuses across its probes.
+// checkConfirmed opens one for both of its passes; check opens its own when
+// called without one.
+type decodeScope struct {
+	// seek is the detect probe's classification of the file, kept so a retry
+	// of the check does not pay for detection again. seekUnknown until a
+	// detect probe classifies the file.
+	seek seekState
+	// coverArt names the decoders of attached-picture streams (cover art)
+	// whose codec no other stream shares. ffprobe decodes attached pictures
+	// while it opens the file, whatever -select_streams asks for, so a corrupt
+	// cover prints a decoder error on every probe of a file whose video is
+	// fine. Set by check from the metadata probe.
+	coverArt map[string]bool
+}
+
+type seekState int
+
+const (
+	seekUnknown seekState = iota
+	canSeek
+	cannotSeek
+)
+
+func (s *decodeScope) seekResult() seekState {
+	if s == nil {
+		return seekUnknown
+	}
+	return s.seek
+}
+
+func (s *decodeScope) rememberSeek(v seekState) {
+	if s != nil {
+		s.seek = v
+	}
+}
+
+type decodeScopeCtxKey struct{}
+
+func contextWithDecodeScope(ctx context.Context, s *decodeScope) context.Context {
+	return context.WithValue(ctx, decodeScopeCtxKey{}, s)
+}
+
+func decodeScopeFromContext(ctx context.Context) *decodeScope {
+	s, _ := ctx.Value(decodeScopeCtxKey{}).(*decodeScope)
+	return s
+}
+
+// coverArtDecoders returns the codec names of the file's attached-picture
+// streams that no other stream shares, or nil. Only those can be attributed:
+// ffmpeg prefixes a decoder's log lines with the decoder's name, not the
+// stream's index.
+func coverArtDecoders(streams []ffprobeStream) map[string]bool {
+	var covers map[string]bool
+	for _, s := range streams {
+		if s.Disposition.AttachedPic == 1 && s.CodecName != "" {
+			if covers == nil {
+				covers = make(map[string]bool)
+			}
+			covers[s.CodecName] = true
+		}
+	}
+	for _, s := range streams {
+		if s.Disposition.AttachedPic == 0 {
+			delete(covers, s.CodecName)
+		}
+	}
+	if len(covers) == 0 {
+		return nil
+	}
+	return covers
+}
+
+// decoderLogLine matches the "[<decoder> @ 0x<address>] " prefix ffmpeg puts
+// on a decoder's log lines.
+var decoderLogLine = regexp.MustCompile(`^\[([A-Za-z0-9_]+) @ 0x[0-9A-Fa-f]+\] `)
+
+// dropDecoderLines removes from stderr the lines printed by any of decoders
+// and returns what is left, trimmed, plus the first line removed. A line with
+// no decoder prefix is always kept: only output attributable to one of
+// decoders may be dropped.
+func dropDecoderLines(stderr string, decoders map[string]bool) (kept, dropped string) {
+	stderr = strings.TrimSpace(stderr)
+	if len(decoders) == 0 || stderr == "" {
+		return stderr, ""
+	}
+	lines := strings.Split(stderr, "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		if m := decoderLogLine.FindStringSubmatch(line); m != nil && decoders[m[1]] {
+			if dropped == "" {
+				dropped = line
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n")), dropped
 }
 
 // decodeCoverageFull / decodeCoveragePartial label how much of a file a decode
@@ -662,7 +775,9 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	args := f.probeArgs(entryFolder, fileName, []string{
 		"-v", "error",
 		"-read_intervals", strings.Join(intervals, ","),
-		"-select_streams", "v:0",
+		// V, not v: never select an attached picture (cover art), which an
+		// MP4 can list ahead of its video track.
+		"-select_streams", "V:0",
 		"-show_entries", "frame=pts_time",
 		"-of", "csv=p=0",
 	})
@@ -708,8 +823,17 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 
 	// Decode errors surface on stderr even when the exit code is 0 (ffprobe
 	// reports per-frame codec errors but still exits cleanly when it can
-	// continue demuxing). Check stderr first.
-	if stderrStr := strings.TrimSpace(stderr.String()); stderrStr != "" {
+	// continue demuxing). Check stderr first, less what a cover-art decoder
+	// printed (see decodeScope.coverArt).
+	var coverArt map[string]bool
+	if scope := decodeScopeFromContext(ctx); scope != nil {
+		coverArt = scope.coverArt
+	}
+	stderrStr, ignored := dropDecoderLines(stderr.String(), coverArt)
+	if ignored != "" {
+		evt().Str("ignored", ignored).Msg("Repair: ignoring a decoder error from the file's cover art")
+	}
+	if stderrStr != "" {
 		evt().Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
@@ -759,8 +883,9 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 // had and no sizing of one phase can starve another. The price is that one
 // verification no longer has a single hard byte ceiling. A healthy unseekable
 // file costs a detect cut plus a head scan (~1 + ~3 GiB at the defaults); a
-// broken one can cost that twice, because checkConfirmed retries a broken
-// verdict once, before it is marked broken (at most 2 x (1 + 4.5) GiB). That
+// broken one pays for the head scan twice, because checkConfirmed retries a
+// broken verdict once before it is marked broken, though the retry reuses the
+// first pass's detect result (at most 1 + 2 x 4.5 GiB; see decodeScope). That
 // retry is kept on purpose: a false broken verdict deletes and re-searches a
 // 14-34 GB grab, and a multi-GiB scan touches thousands of segments, so a
 // transient fetch error surfacing as a decode error is likelier here than on a
@@ -840,28 +965,44 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		return p, ok, reason, conclusive
 	}
 
-	detect, ok, reason, conclusive := runPhase(decodePhaseDetect, []string{
-		fmt.Sprintf("%.0f%%+%.0f", 0.0, ffprobeDecodeWindowSpan.Seconds()),
-		fmt.Sprintf("%.0f%%+%.0f", detectOffset.Seconds(), ffprobeDecodeWindowSpan.Seconds()),
-	}, detectCap)
-	switch {
-	case detect.Exceeded():
-		// Cut before reaching the window: no usable index. Go to the head scan
-		// whatever ffprobe said - an error on a body we cut describes the cut -
-		// and since the head scan re-reads this prefix from offset 0 under a
-		// fresh budget, a real error in it is found again there.
-	case !ok:
-		// A decode error at offset 0 or at the detect window, on an intact
-		// body. Whether the file seeks no longer matters.
-		return false, reason, conclusive, ""
-	case !conclusive:
-		// Timed out or cancelled short of the cut: says nothing about the
-		// file, and in particular not that it cannot seek.
-		return true, "", false, ""
-	default:
-		// Reached the window inside the cut: the file seeks, and everything
-		// from here is the normal check.
+	// checkConfirmed's retry runs this whole check again. Once a detect probe
+	// has classified the file, the retry reuses that rather than paying for
+	// detection twice - up to a 1 GiB cut on a file that cannot seek.
+	scope := decodeScopeFromContext(ctx)
+	var detect *VerifyBudget
+	switch scope.seekResult() {
+	case canSeek:
 		return spread()
+	case cannotSeek:
+		// Straight to the head scan below.
+	default:
+		detect, ok, reason, conclusive = runPhase(decodePhaseDetect, []string{
+			fmt.Sprintf("%.0f%%+%.0f", 0.0, ffprobeDecodeWindowSpan.Seconds()),
+			fmt.Sprintf("%.0f%%+%.0f", detectOffset.Seconds(), ffprobeDecodeWindowSpan.Seconds()),
+		}, detectCap)
+		switch {
+		case detect.Exceeded():
+			// Cut before reaching the window: no usable index. Go to the head
+			// scan whatever ffprobe said - an error on a body we cut describes
+			// the cut - and since the head scan re-reads this prefix from
+			// offset 0 under a fresh budget, a real error in it is found again
+			// there.
+			scope.rememberSeek(cannotSeek)
+		case !ok:
+			// A decode error at offset 0 or at the detect window, on an intact
+			// body. Whether the file seeks no longer matters, so nothing is
+			// remembered and a retry detects again.
+			return false, reason, conclusive, ""
+		case !conclusive:
+			// Timed out or cancelled short of the cut: says nothing about the
+			// file, and in particular not that it cannot seek.
+			return true, "", false, ""
+		default:
+			// Reached the window inside the cut: the file seeks, and everything
+			// from here is the normal check.
+			scope.rememberSeek(canSeek)
+			return spread()
+		}
 	}
 
 	headSec := duration.Seconds() * float64(headBytes) / float64(fileBytes)
@@ -871,7 +1012,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 	headCap := headBytes / decodeHeadCapDen * decodeHeadCapNum
 	budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 		Int64("file_bytes", fileBytes).Float64("head_seconds", headSec).
-		Int64("head_cap_mb", headCap>>20), detect).
+		Int64("head_cap_mb", headCap>>20).Bool("detect_reused", detect == nil), detect).
 		Msg("Repair: file has no usable container index; scanning a bounded head instead of the full file")
 
 	head, ok, reason, conclusive := runPhase(decodePhaseHead, []string{
@@ -919,6 +1060,8 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 // coverage is threaded through from check alongside conclusive; the
 // budget-spent and cancelled returns carry none.
 func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileName string, expected expectedRuntime, skipDecode bool, deadSignal *DeadSegmentSignal, budget *VerifyBudget) (ok bool, reason string, conclusive bool, coverage string) {
+	// One scope for both passes, so the retry reuses what the first learned.
+	ctx = contextWithDecodeScope(ctx, &decodeScope{})
 	ok, reason, conclusive, coverage = f.check(ctx, entryFolder, fileName, expected, skipDecode, budget)
 	if deadSignal.Detected() {
 		f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Bool("ffprobe_ok", ok).

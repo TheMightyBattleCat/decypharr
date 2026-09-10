@@ -607,6 +607,14 @@ class RepairManager {
         // Decode-verified count lives outside health_counts
         const dvEl = document.querySelector('[data-clear-state-count="decode_verified"]');
         if (dvEl) dvEl.textContent = counts.decode_verified_count ?? 0;
+        // Of those, markers stamped from a bounded head scan: the file has no
+        // usable seek index, so only its first few GB were decoded.
+        const partialEl = document.querySelector('[data-clear-state-count="decode_verified_partial"]');
+        if (partialEl) {
+            const partial = counts.decode_verified_partial_count ?? 0;
+            partialEl.textContent = `${partial} partial`;
+            partialEl.classList.toggle('hidden', partial === 0);
+        }
     }
 
     renderRunStats(container, stats) {

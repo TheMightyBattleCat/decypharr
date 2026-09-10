@@ -366,10 +366,20 @@ class FileBrowser {
             unknown: 'badge-ghost',
         };
         const cls = colors[state.status] || 'badge-ghost';
-        const tooltip = state.last_checked_at
-            ? `last checked ${new Date(state.last_checked_at).toLocaleString()}`
-            : 'never checked';
-        return `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(tooltip)}">${this.escapeHtml(state.status || 'unknown')}</span>`;
+        // Go encodes a zero time.Time as year 1 rather than omitting it.
+        const when = (t) => (t && !t.startsWith('0001-') ? new Date(t).toLocaleString() : '');
+        const lastChecked = when(state.last_checked_at);
+        let tooltip = lastChecked ? `last checked ${lastChecked}` : 'never checked';
+        const decodeVerified = when(state.decode_verified_at);
+        const partial = decodeVerified && state.decode_verified_coverage === 'partial';
+        if (decodeVerified) {
+            tooltip += `; decode verified ${decodeVerified}${partial ? ' (start of file only)' : ''}`;
+        }
+        let html = `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(tooltip)}">${this.escapeHtml(state.status || 'unknown')}</span>`;
+        if (partial) {
+            html += ` <span class="badge badge-warning badge-outline badge-sm" title="${this.escapeAttr('This file has no usable seek index, so decode verification only scanned its first few GB')}">partial</span>`;
+        }
+        return html;
     }
 
     async recheckEntry(name) {
