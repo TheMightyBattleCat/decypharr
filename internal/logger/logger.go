@@ -2,6 +2,7 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,44 +49,41 @@ func sharedRotatingLogFile() *lumberjack.Logger {
 	return rotatingLogFile
 }
 
+// New returns a logger for one component, writing to two sinks:
+//
+//   - stdout (the journal under systemd): one short human line per event at
+//     log_level (see humanWriter), coloured per log_color.
+//   - logs/decypharr.log: every field of every event at log_file_level
+//     (log_level when unset), in the greppable
+//     "2006-01-02 15:04:05 | LEVEL | [prefix] message key=value" form.
+//
+// Running the console at info and the file at debug gives a readable live
+// journal without losing any diagnostic detail on disk.
 func New(prefix string) zerolog.Logger {
-	level := config.Get().LogLevel
+	cfg := config.Get()
+	consoleLevel := parseLevel(cfg.LogLevel, zerolog.InfoLevel)
+	fileLevel := parseLevel(cfg.LogFileLevel, consoleLevel)
 
-	rotatingLogFile := sharedRotatingLogFile()
-
-	consoleWriter := zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: "2006-01-02 15:04:05",
-		NoColor:    false, // Set to true if you don't want colors
-		FormatLevel: func(i any) string {
-			var colorCode string
-			switch strings.ToLower(fmt.Sprintf("%s", i)) {
-			case "debug":
-				colorCode = "\033[36m"
-			case "info":
-				colorCode = "\033[32m"
-			case "warn":
-				colorCode = "\033[33m"
-			case "error":
-				colorCode = "\033[31m"
-			case "fatal":
-				colorCode = "\033[35m"
-			case "panic":
-				colorCode = "\033[41m"
-			default:
-				colorCode = "\033[37m" // White
-			}
-			return fmt.Sprintf("%s| %-6s|\033[0m", colorCode, strings.ToUpper(fmt.Sprintf("%s", i)))
-		},
-		FormatMessage: func(i any) string {
-			return fmt.Sprintf("[%s] %v", prefix, i)
-		},
+	console := levelWriter{
+		w:   newHumanWriter(os.Stdout, prefix, useColor(cfg.LogColor, os.Getenv, os.Stdout)),
+		min: consoleLevel,
 	}
+	file := levelWriter{w: newFileWriter(sharedRotatingLogFile(), prefix), min: fileLevel}
 
-	fileWriter := zerolog.ConsoleWriter{
-		Out:        rotatingLogFile,
+	return zerolog.New(zerolog.MultiLevelWriter(console, file)).
+		With().
+		Timestamp().
+		Logger().
+		Level(min(consoleLevel, fileLevel))
+}
+
+// newFileWriter renders the log file's line format, unchanged so existing
+// greps and analysis scripts keep working. Never coloured.
+func newFileWriter(out io.Writer, prefix string) zerolog.ConsoleWriter {
+	return zerolog.ConsoleWriter{
+		Out:        out,
 		TimeFormat: "2006-01-02 15:04:05",
-		NoColor:    true, // No colors in file output
+		NoColor:    true,
 		FormatLevel: func(i any) string {
 			return strings.ToUpper(fmt.Sprintf("| %-6s|", i))
 		},
@@ -93,30 +91,6 @@ func New(prefix string) zerolog.Logger {
 			return fmt.Sprintf("[%s] %v", prefix, i)
 		},
 	}
-
-	multi := zerolog.MultiLevelWriter(consoleWriter, fileWriter)
-
-	logger := zerolog.New(multi).
-		With().
-		Timestamp().
-		Logger().
-		Level(zerolog.InfoLevel)
-
-	// Set the log level
-	level = strings.ToLower(level)
-	switch level {
-	case "debug":
-		logger = logger.Level(zerolog.DebugLevel)
-	case "info":
-		logger = logger.Level(zerolog.InfoLevel)
-	case "warn":
-		logger = logger.Level(zerolog.WarnLevel)
-	case "error":
-		logger = logger.Level(zerolog.ErrorLevel)
-	case "trace":
-		logger = logger.Level(zerolog.TraceLevel)
-	}
-	return logger
 }
 
 func Default() zerolog.Logger {

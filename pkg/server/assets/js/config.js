@@ -205,7 +205,7 @@ class ConfigManager {
 
     populateGeneralSettings(config) {
         const fields = [
-            'log_level', 'url_base', 'bind_address', 'port',
+            'log_level', 'log_file_level', 'log_color', 'url_base', 'bind_address', 'port',
             'min_file_size', 'max_file_size', 'folder_naming',
             'refresh_dirs', 'disable_webdav', 'app_url'
         ];
@@ -1188,6 +1188,8 @@ class ConfigManager {
         return {
             // General settings
             log_level: document.querySelector('[name="log_level"]').value,
+            log_file_level: document.querySelector('[name="log_file_level"]').value,
+            log_color: document.querySelector('[name="log_color"]').value,
             url_base: document.querySelector('[name="url_base"]').value,
             bind_address: document.querySelector('[name="bind_address"]').value,
             app_url: document.querySelector('[name="app_url"]').value,

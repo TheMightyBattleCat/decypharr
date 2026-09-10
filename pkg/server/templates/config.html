@@ -106,6 +106,34 @@
                                 </div>
                             </div>
 
+                            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="label" for="log-file-level">
+                                        <span class="font-medium">Log File Level</span>
+                                    </label>
+                                    <select class="select w-full" name="log_file_level" id="log-file-level">
+                                        <option value="">Same as Log Level</option>
+                                        <option value="info">Info</option>
+                                        <option value="debug">Debug</option>
+                                        <option value="warn">Warning</option>
+                                        <option value="error">Error</option>
+                                        <option value="trace">Trace</option>
+                                    </select>
+                                    <span class="text-xs opacity-60">Level for logs/decypharr.log. Log Level Info with Log File Level Debug keeps the console concise and the full detail on disk. Applies after a restart.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="log-color">
+                                        <span class="font-medium">Console Log Colour</span>
+                                    </label>
+                                    <select class="select w-full" name="log_color" id="log-color">
+                                        <option value="">Auto</option>
+                                        <option value="always">Always</option>
+                                        <option value="never">Never</option>
+                                    </select>
+                                    <span class="text-xs opacity-60">Auto colours a terminal or the systemd journal and honours NO_COLOR. Applies after a restart.</span>
+                                </div>
+                            </div>
+
                             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                                 <div>
                                     <label class="label" for="urlBase">

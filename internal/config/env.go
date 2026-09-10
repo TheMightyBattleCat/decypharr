@@ -36,6 +36,12 @@ func (c *Config) applyEnvOverrides() {
 	if val := getEnv("LOG_LEVEL"); val != "" {
 		c.LogLevel = val
 	}
+	if val := getEnv("LOG_FILE_LEVEL"); val != "" {
+		c.LogFileLevel = val
+	}
+	if val := getEnv("LOG_COLOR"); val != "" {
+		c.LogColor = val
+	}
 	if val := getEnv("USE_AUTH"); val != "" {
 		c.UseAuth = parseBool(val)
 	}

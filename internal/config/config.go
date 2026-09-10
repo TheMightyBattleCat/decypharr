@@ -468,7 +468,13 @@ type Config struct {
 	AppURL      string `json:"app_url,omitempty"`
 	Port        string `json:"port,omitempty"`
 
-	LogLevel string   `json:"log_level,omitempty"`
+	LogLevel string `json:"log_level,omitempty"`
+	// LogFileLevel is the level logs/decypharr.log records; empty means
+	// LogLevel. It lets the journal stay at info while the file keeps debug.
+	LogFileLevel string `json:"log_file_level,omitempty"`
+	// LogColor is "auto" (empty), "always" or "never": ANSI colour on console
+	// lines. auto honours NO_COLOR and colours a terminal or journald.
+	LogColor string   `json:"log_color,omitempty"`
 	Debrids  []Debrid `json:"debrids,omitzero"`
 
 	Arrs        []Arr       `json:"arrs,omitzero"`
