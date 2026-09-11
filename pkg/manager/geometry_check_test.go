@@ -70,24 +70,27 @@ func TestClassifyGeometry(t *testing.T) {
 		tail    bool
 		short   int64
 		splices int
+		single  bool
 	}{
-		{"intact", geoFile(size, 1, 2, 3, 1, 2), matroskaHead(size - 48), "", false, 0, 0},
+		{"intact", geoFile(size, 1, 2, 3, 1, 2), matroskaHead(size - 48), "", false, 0, 0, false},
 		// Dear Judge S01E06: the next volume's first article sorted in after the part's own.
-		{"spliced, no head needed", geoFile(size, 1, 1, 2, 3, 1, 1, 2), nil, reasonSplicedVolumes, false, 0, 2},
-		{"tail clamp, 22,841 B", geoFile(size-22841, 1, 2, 3), matroskaHead(size - 48), "", true, 22841, 0},
-		{"just under an article", geoFile(size-(geoArticle-1), 1, 2, 3), matroskaHead(size - 48), "", true, geoArticle - 1, 0},
-		{"one article", geoFile(size-geoArticle, 1, 2, 3), matroskaHead(size - 48), reasonMissingVolume, false, geoArticle, 0},
-		{"a dropped volume (Signal S01E09)", geoFile(size-52223882, 1, 2, 3), matroskaHead(size - 48), reasonMissingVolume, false, 52223882, 0},
-		{"served 1 B longer", geoFile(size+1, 1, 2, 3), matroskaHead(size - 48), "", false, 0, 0},
-		{"no head", geoFile(size-22841, 1, 2, 3), nil, "", false, 0, 0},
-		{"not Matroska", geoFile(size-22841, 1, 2, 3), []byte("RIFF...."), "", false, 0, 0},
-		{"no slices", &storage.NZBFile{Size: size}, matroskaHead(size), "", false, 0, 0},
+		{"spliced, no head needed", geoFile(size, 1, 1, 2, 3, 1, 1, 2), nil, reasonSplicedVolumes, false, 0, 2, false},
+		// Man of Sun Dao: the final volume took a trailing single-article file.
+		{"one splice is flagged only", geoFile(size, 1, 2, 3, 1, 1, 2), matroskaHead(size - 48), "", false, 0, 1, true},
+		{"tail clamp, 22,841 B", geoFile(size-22841, 1, 2, 3), matroskaHead(size - 48), "", true, 22841, 0, false},
+		{"just under an article", geoFile(size-(geoArticle-1), 1, 2, 3), matroskaHead(size - 48), "", true, geoArticle - 1, 0, false},
+		{"one article", geoFile(size-geoArticle, 1, 2, 3), matroskaHead(size - 48), reasonMissingVolume, false, geoArticle, 0, false},
+		{"a dropped volume (Signal S01E09)", geoFile(size-52223882, 1, 2, 3), matroskaHead(size - 48), reasonMissingVolume, false, 52223882, 0, false},
+		{"served 1 B longer", geoFile(size+1, 1, 2, 3), matroskaHead(size - 48), "", false, 0, 0, false},
+		{"no head", geoFile(size-22841, 1, 2, 3), nil, "", false, 0, 0, false},
+		{"not Matroska", geoFile(size-22841, 1, 2, 3), []byte("RIFF...."), "", false, 0, 0, false},
+		{"no slices", &storage.NZBFile{Size: size}, matroskaHead(size), "", false, 0, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			v := classifyGeometry(c.file, c.head)
-			if v.reason != c.reason || v.tailTruncated != c.tail || v.shortBytes != c.short || v.splices != c.splices {
-				t.Fatalf("got %+v, want reason=%q tail=%v short=%d splices=%d", v, c.reason, c.tail, c.short, c.splices)
+			if v.reason != c.reason || v.tailTruncated != c.tail || v.shortBytes != c.short || v.splices != c.splices || v.singleSplice != c.single {
+				t.Fatalf("got %+v, want reason=%q tail=%v short=%d splices=%d single=%v", v, c.reason, c.tail, c.short, c.splices, c.single)
 			}
 		})
 	}

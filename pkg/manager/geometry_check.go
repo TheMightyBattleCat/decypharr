@@ -32,6 +32,7 @@ func keepReleaseReason(reason string) bool {
 type geometryVerdict struct {
 	reason        string // reasonSplicedVolumes or reasonMissingVolume: broken
 	tailTruncated bool   // short by less than an article: flagged, not broken
+	singleSplice  bool   // one duplicate boundary: flagged, not broken
 	splices       int
 	shortBytes    int64
 }
@@ -131,8 +132,16 @@ func classifyGeometry(f *storage.NZBFile, head []byte) geometryVerdict {
 	if f == nil || len(f.Segments) == 0 {
 		return v
 	}
-	if v.splices = spliceBoundaries(f.Segments); v.splices > 0 {
+	// Several boundaries is unambiguous (Dear Judge: 101). A single one is
+	// often the last volume swallowing a small trailing group file (Man of
+	// Sun Dao, Netfall): wrong bytes too, but near the end and the least
+	// proven shape, so it is flagged rather than re-grabbed.
+	switch v.splices = spliceBoundaries(f.Segments); {
+	case v.splices > 1:
 		v.reason = reasonSplicedVolumes
+		return v
+	case v.splices == 1:
+		v.singleSplice = true
 		return v
 	}
 	if head == nil {

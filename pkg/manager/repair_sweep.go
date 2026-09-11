@@ -685,6 +685,9 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 						Msg("Repair: file ends before its Matroska index (tail truncated at import); skipping decode checks, re-grab by hand if seeking matters")
 					res.decodeConclusive = false
 					return res
+				case geo.singleSplice:
+					r.logger.Warn().Str("entry", c.name).Str("file", name).
+						Msg("Repair: one volume boundary serves another volume's article (assembled wrong at import); not re-grabbed automatically, re-grab by hand")
 				}
 			}
 
