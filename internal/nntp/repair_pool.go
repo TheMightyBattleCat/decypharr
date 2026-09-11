@@ -191,24 +191,29 @@ func (p *RepairPool) Stop() {
 
 // worker pulls chunks until the pool stops. A worker with a home takes chunks
 // only while that home is STAT-eligible; otherwise it waits, except for the
-// one explorer per home that takes a chunk to re-measure it (see tryExplore).
-// The pool's worker count is the concurrency cap; no token accounting.
+// one explorer per home that takes a chunk to re-measure it (see tryExplore) -
+// none for a home over its hard quota. The pool's worker count is the
+// concurrency cap; no token accounting.
 func (p *RepairPool) worker(c *Client, home *ProviderPool) {
 	defer p.wg.Done()
 	for {
 		exploring := false
 		if home != nil {
 			ok, lat, fastest := c.statEligible(home)
+			blocked := !ok && c.statHomeBlocked(home)
 			if home.stat.eligible.Swap(ok) != ok {
 				msg := "STAT routing: provider is fast enough, taking BatchStat chunks"
-				if !ok {
+				switch {
+				case blocked:
+					msg = "STAT routing: provider is over its hard bandwidth quota, no longer taking BatchStat chunks"
+				case !ok:
 					msg = "STAT routing: provider is too slow, no longer taking BatchStat chunks"
 				}
 				c.logger.Debug().Str("provider", home.config.Host).Dur("stat_latency", lat).
 					Dur("fastest", fastest).Msg(msg)
 			}
 			if !ok {
-				if !home.stat.tryExplore(time.Now()) {
+				if blocked || !home.stat.tryExplore(time.Now()) {
 					select {
 					case <-p.quit:
 						return

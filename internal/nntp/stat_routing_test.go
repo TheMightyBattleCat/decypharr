@@ -30,7 +30,8 @@ func TestMain(m *testing.M) {
 // fakeNNTP is a plain-TCP NNTP server that answers STAT after a fixed delay.
 type fakeNNTP struct {
 	ln        net.Listener
-	delay     time.Duration
+	delay     time.Duration   // before a 223
+	missDelay time.Duration   // before a 430 (real providers answer misses far slower)
 	missing   map[string]bool // message IDs (without brackets) answered 430
 	dropAfter int64           // close each connection after this many STATs (0: never)
 	stats     atomic.Int64
@@ -86,13 +87,14 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 			if s.dropAfter > 0 && served >= s.dropAfter {
 				return
 			}
-			time.Sleep(s.delay)
 			served++
 			s.stats.Add(1)
 			id := strings.Trim(strings.TrimPrefix(line, "STAT "), "<>")
 			if s.missing[id] {
+				time.Sleep(s.missDelay)
 				_, _ = w.WriteString("430 no such article\r\n")
 			} else {
+				time.Sleep(s.delay)
 				_, _ = w.WriteString("223 0 <" + id + ">\r\n")
 			}
 		case line == "QUIT":
@@ -388,5 +390,108 @@ func TestRepairPoolRoutesAwayFromSlowProvider(t *testing.T) {
 	}
 	if got := slow.stats.Load() - before; got != 0 {
 		t.Fatalf("slow provider served %d STATs on the second call, want 0", got)
+	}
+}
+
+// Misses take real providers 40-100x longer to answer than hits; only hits may
+// feed the latency, or every fall-through chunk makes a fast provider look slow.
+func TestBatchStatOnProviderTimesOnlyHits(t *testing.T) {
+	srv := startFakeNNTP(t, 0, "gone1@test", "gone2@test", "gone3@test")
+	srv.missDelay = 150 * time.Millisecond
+	p := config.UsenetProvider{Host: "127.0.0.1", Port: srv.port(), Priority: 1, MaxConnections: 2}
+	c := newStatTestClient(t, []config.UsenetProvider{p}, 100)
+	st := &c.pools[p.Host].stat
+
+	if _, err := c.batchStatOnProvider(context.Background(), p, []string{"a@test", "gone1@test", "gone2@test", "b@test"}); err != nil {
+		t.Fatalf("batchStatOnProvider: %v", err)
+	}
+	if got := time.Duration(st.nsPerStat.Load()); got <= 0 || got > 40*time.Millisecond {
+		t.Fatalf("recorded latency %v with two slow misses in the chunk, want the hits' time only", got)
+	}
+
+	// A chunk of nothing but misses leaves the average alone and still counts
+	// as a fresh look, so no explorer is sent straight back. No repair pool
+	// here: its own explorer would hold the role and hide the answer.
+	fresh := &Client{pools: map[string]*ProviderPool{}, providers: []config.UsenetProvider{p}, logger: zerolog.Nop()}
+	fresh.pools[p.Host] = &ProviderPool{slots: make(chan struct{}, p.MaxConnections), max: p.MaxConnections, config: p}
+	t.Cleanup(func() { _ = fresh.Close() })
+	fst := &fresh.pools[p.Host].stat
+	if _, err := fresh.batchStatOnProvider(context.Background(), p, []string{"gone3@test"}); err != nil {
+		t.Fatalf("batchStatOnProvider: %v", err)
+	}
+	if fst.nsPerStat.Load() != 0 {
+		t.Fatalf("all-miss chunk recorded latency %v, want none", time.Duration(fst.nsPerStat.Load()))
+	}
+	if fst.tryExplore(time.Now()) {
+		t.Fatal("explorer allowed straight after an all-miss chunk")
+	}
+}
+
+// quotaTracker returns a bandwidth tracker (no file, no saver) with one
+// provider at used/limit bytes in the current daily window.
+func quotaTracker(host string, used, limit, reserve int64) *BandwidthTracker {
+	q := providerQuota{limitBytes: limit, reserveBytes: reserve, period: "day"}
+	bp := &bwProvider{quota: q}
+	bp.used.Store(used)
+	bp.periodStart.Store(currentWindowStart(time.Now(), q).UnixNano())
+	return &BandwidthTracker{byHost: map[string]*bwProvider{host: bp}, stop: make(chan struct{}), logger: zerolog.Nop()}
+}
+
+func TestStatEligibleHardQuota(t *testing.T) {
+	providers := []config.UsenetProvider{
+		{Host: "capped", Priority: 1, MaxConnections: 10},
+		{Host: "mid", Priority: 2, MaxConnections: 10},
+		{Host: "slower", Priority: 3, MaxConnections: 10},
+	}
+	// No repair pool: this test swaps c.bw, which running workers read.
+	c := &Client{pools: map[string]*ProviderPool{}, providers: providers, logger: zerolog.Nop()}
+	for _, p := range providers {
+		c.pools[p.Host] = &ProviderPool{slots: make(chan struct{}, p.MaxConnections), max: p.MaxConnections, config: p}
+	}
+	c.statHomes = c.statHomePools()
+	setLatency(c, "capped", 5*time.Millisecond)
+	setLatency(c, "mid", 30*time.Millisecond)
+	setLatency(c, "slower", 100*time.Millisecond)
+
+	// Reserve band (used past limit-reserve, below limit): still a STAT home.
+	c.bw = quotaTracker("capped", 95, 100, 10)
+	if ok, _, _ := c.statEligible(c.pools["capped"]); !ok {
+		t.Error("provider in its reserve band excluded; only a hard-quota block should exclude it")
+	}
+	if ok, _, _ := c.statEligible(c.pools["slower"]); ok {
+		t.Error("slower (100ms) eligible while capped (5ms) sets the cutoff at 40ms")
+	}
+
+	// Hard quota: not eligible, and no longer the fastest the others are cut
+	// against (100ms is within 4x of mid's 30ms).
+	c.bw = quotaTracker("capped", 100, 100, 10)
+	if ok, _, _ := c.statEligible(c.pools["capped"]); ok {
+		t.Error("provider over its hard quota still eligible")
+	}
+	if ok, _, _ := c.statEligible(c.pools["slower"]); !ok {
+		t.Error("a hard-quota provider still sets the cutoff for the others")
+	}
+}
+
+// A home over its hard quota sends no explorer: the pool gives it no chunks.
+func TestRepairPoolSkipsHardQuotaHome(t *testing.T) {
+	capped := startFakeNNTP(t, 0)
+	open := startFakeNNTP(t, 0)
+	pc, po := twoLocalProviders(t, capped, open)
+	c := &Client{pools: map[string]*ProviderPool{}, providers: []config.UsenetProvider{pc, po}, logger: zerolog.Nop()}
+	for _, p := range c.providers {
+		c.pools[p.Host] = &ProviderPool{slots: make(chan struct{}, p.MaxConnections), max: p.MaxConnections, config: p}
+	}
+	c.bw = quotaTracker(pc.Host, 100, 100, 10)
+	c.statHomes = c.statHomePools()
+	c.repairPool = c.newRepairPool(100)
+	t.Cleanup(func() { _ = c.Close() })
+
+	res, err := c.BatchStat(context.Background(), ids("quota", 400))
+	if err != nil || res.FoundCount != 400 {
+		t.Fatalf("BatchStat: found %d/400, err %v", res.FoundCount, err)
+	}
+	if got := capped.stats.Load(); got != 0 {
+		t.Fatalf("hard-quota provider served %d STATs, want 0", got)
 	}
 }

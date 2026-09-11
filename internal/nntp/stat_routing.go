@@ -91,6 +91,31 @@ func (c *Client) recordStatSample(provider config.UsenetProvider, perStat time.D
 	}
 }
 
+// recordStatHits records the average time of a chunk's found articles. A chunk
+// that found nothing leaves the average alone but still counts as a fresh look
+// at the provider, so a provider answering 430 for everything doesn't hand its
+// explorer one chunk after another.
+func (c *Client) recordStatHits(provider config.UsenetProvider, hitTime time.Duration, hits int) {
+	pp, ok := c.pools[provider.Host]
+	if !ok {
+		return
+	}
+	if hits == 0 {
+		pp.stat.sampledAt.Store(time.Now().UnixNano())
+		return
+	}
+	pp.stat.record(hitTime/time.Duration(hits), time.Now())
+}
+
+// statHomeBlocked reports whether home is over its hard bandwidth quota. A
+// blocked provider serves no downloads, so it takes no STAT chunks either
+// (fall-through still asks it, so verdicts don't change). A provider in its
+// reserve band keeps taking them: a STAT reply is tens of bytes, ~0.5 GB/h
+// metered on eweka at ~4k STAT/s against a ~550 GB reserve (a production install).
+func (c *Client) statHomeBlocked(pp *ProviderPool) bool {
+	return c.bw != nil && c.bw.Tier(pp.config.Host) == QuotaBlocked
+}
+
 // statHomePools returns the pools repair-pool workers are homed on: every
 // primary provider with connections, or every provider with connections when
 // all are backups. Priority order.
@@ -113,17 +138,21 @@ func (c *Client) statHomePools() []*ProviderPool {
 }
 
 // statEligible reports whether home currently answers STAT fast enough to take
-// chunks, and the latencies behind the decision.
+// chunks, and the latencies behind the decision. A home over its hard quota is
+// never eligible and doesn't count towards the fastest.
 func (c *Client) statEligible(home *ProviderPool) (ok bool, lat, fastest time.Duration) {
 	l := home.stat.nsPerStat.Load()
 	var best int64
 	for _, pp := range c.statHomes {
+		if c.statHomeBlocked(pp) {
+			continue
+		}
 		if v := pp.stat.nsPerStat.Load(); v > 0 && (best == 0 || v < best) {
 			best = v
 		}
 	}
-	if l == 0 {
-		return false, 0, time.Duration(best)
+	if l == 0 || c.statHomeBlocked(home) {
+		return false, time.Duration(l), time.Duration(best)
 	}
 	ref := max(best, int64(statLatencyFloor))
 	return l <= statSlowFactor*ref, time.Duration(l), time.Duration(best)

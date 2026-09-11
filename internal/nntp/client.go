@@ -228,9 +228,11 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		sockReadBuf:      parseSockBuf(cfg.Usenet.SocketReadBuffer),
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
 	}
+	// bw first: repair-pool workers read it (statHomeBlocked) from the moment
+	// they start.
+	cm.bw = newBandwidthTracker(providers, cm.logger)
 	cm.statHomes = cm.statHomePools()
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
-	cm.bw = newBandwidthTracker(providers, cm.logger)
 
 	// Start background reaper
 	go cm.reaper()
@@ -1426,9 +1428,12 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 }
 
 // batchStatOnProvider STATs messageIDs one at a time on a single connection to
-// provider, and records the provider's per-STAT latency for routing (timed from
-// when the connection is in hand, so waiting for a slot doesn't count). A
-// connection that can't be had or breaks mid-chunk records statErrorPenalty.
+// provider, and records the provider's per-STAT latency for routing. Only found
+// articles are timed: providers answer "no such article" 40-100x slower than a
+// hit (a production install: eweka ~450 ms, newshosting ~1.2 s, against ~10 ms), so misses
+// - and every fall-through chunk is all misses - would make a fast provider look
+// slow. A connection that can't be had or breaks mid-chunk records
+// statErrorPenalty.
 func (c *Client) batchStatOnProvider(ctx context.Context, provider config.UsenetProvider, messageIDs []string) ([]StatResult, error) {
 	conn, providerCfg, err := c.getConnectionFromProvider(ctx, provider)
 	if err != nil {
@@ -1437,23 +1442,25 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 		}
 		return nil, err
 	}
-	started := time.Now()
 
+	var hitTime time.Duration
+	hits := 0
 	results := make([]StatResult, len(messageIDs))
 	for i, msgID := range messageIDs {
 		results[i].MessageID = msgID
 		if ctx.Err() != nil {
-			if i > 0 {
-				c.recordStatSample(provider, time.Since(started)/time.Duration(i))
-			}
+			c.recordStatHits(provider, hitTime, hits)
 			results[i].Available = false
 			results[i].Error = ctx.Err()
 			c.release(conn)
 			return results, ctx.Err()
 		}
 
+		sent := time.Now()
 		_, _, statErr := conn.Stat(msgID)
 		if statErr == nil {
+			hitTime += time.Since(sent)
+			hits++
 			results[i].Available = true
 			continue
 		}
@@ -1478,7 +1485,7 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 		return results, connErr
 	}
 
-	c.recordStatSample(provider, time.Since(started)/time.Duration(len(messageIDs)))
+	c.recordStatHits(provider, hitTime, hits)
 	c.returnOrReleaseConn(conn, providerCfg)
 	return results, nil
 }
