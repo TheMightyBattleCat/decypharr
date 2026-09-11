@@ -22,4 +22,8 @@ type RARVolumePart struct {
 	Compressed        bool
 	PartNumber        int
 	CompressionMethod string
+	// TrimmedBytes is how much of the header's data size the RAR4 parser cut
+	// off because it ran past the volume's size in our geometry. A real
+	// archive never needs that, so non-zero means that size is wrong.
+	TrimmedBytes int64
 }

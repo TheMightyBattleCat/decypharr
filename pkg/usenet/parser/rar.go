@@ -161,6 +161,12 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no RAR volumes found")
 	}
+	if dropped := droppedVolumes(group, volumes); len(dropped) > 0 {
+		p.logger.Warn().
+			Str("group", group.BaseName).
+			Strs("files", dropped).
+			Msg("Archive files left out: their article lists have holes, duplicate numbers or blank message IDs")
+	}
 
 	filename := group.BaseName
 	filename = utils.RemoveInvalidChars(path.Base(filename))
@@ -218,6 +224,20 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 	}
 
+	if p.manager != nil {
+		resized, err := measureCrossedVolumes(ctx, group, archiveInfo.Files, volumeInfos, headerFetch(p.manager))
+		if err != nil {
+			p.logger.Warn().Err(err).Str("group", group.BaseName).
+				Msg("Could not measure archive volumes that file parts run past")
+		}
+		if resized {
+			baseSegments, volumeInfos, _ = buildBaseSegments(group)
+			untrimParts(archiveInfo.Files, volumeInfos)
+			p.logger.Info().Str("group", group.BaseName).
+				Msg("Re-sized archive volumes from their yEnc headers: file parts ran past their estimated ends")
+		}
+	}
+
 	// Build volume offset map
 	volumeOffsetMap := buildVolumeOffsetMap(volumeInfos)
 
@@ -240,6 +260,10 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			name = filename
 		}
 
+		if err := checkPartsInsideVolumes(rarFile, volumeInfos); err != nil {
+			return nil, err
+		}
+
 		// Build segments for this file across all its volume parts
 		fileSegments, err := p.buildSegmentsForFile(rarFile, baseSegments, volumeOffsetMap)
 		if err != nil {
@@ -255,14 +279,18 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			streamSize += seg.Bytes
 		}
 
-		if rarFile.UncompressedSize > 0 && streamSize > 0 && rarFile.UncompressedSize > streamSize {
+		missing, err := checkStreamCoversHeader(rarFile, streamSize, group.getMetadata().segmentSize)
+		if err != nil {
+			return nil, err
+		}
+		if missing > 0 {
 			p.logger.Warn().
 				Str("group", group.BaseName).
 				Str("file", rarFile.Name).
 				Int64("header_bytes", rarFile.UncompressedSize).
 				Int64("stream_bytes", streamSize).
-				Int64("missing_bytes", rarFile.UncompressedSize-streamSize).
-				Str(logger.FieldNote, logger.FormatBytes(rarFile.UncompressedSize-streamSize)+" missing").
+				Int64("missing_bytes", missing).
+				Str(logger.FieldNote, logger.FormatBytes(missing)+" missing").
 				Msg("RAR file is shorter than its archive header says")
 		}
 		size := rarFile.UncompressedSize
@@ -461,6 +489,11 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	isHeaderEncrypted := false
 	for _, result := range results {
 		if result.err != nil {
+			// The files' parts in this volume go missing; a stored file that
+			// needed them then fails checkStreamCoversHeader.
+			p.logger.Warn().Err(result.err).
+				Str("volume", volumes[result.index].Name).
+				Msg("Could not read an archive volume's headers; its file parts are left out")
 			continue
 		}
 		if result.isHeaderEncrypted {

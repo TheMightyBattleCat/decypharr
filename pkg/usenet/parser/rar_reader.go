@@ -717,9 +717,11 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 				// We must limit it to what's actually available in this volume
 				remainingInVolume := volumeSize - offsetInVol
 				if file.PackedSize > remainingInVolume {
+					trimmed := file.PackedSize - remainingInVolume
 					file.PackedSize = remainingInVolume
 					// Also update the volume part size
 					if len(file.VolumeParts) > 0 {
+						file.VolumeParts[0].TrimmedBytes = trimmed
 						file.VolumeParts[0].PackedSize = remainingInVolume
 						file.VolumeParts[0].UnpackedSize = remainingInVolume // Treat as stored stream
 					}
