@@ -665,10 +665,13 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			}
 
 			// Import geometry: slices spliced from another volume (stored meta,
-			// free) and, when this probe decodes anyway, a served length short
-			// of the Matroska Segment (one article's prefix, in memory).
+			// free) and a served length short of the Matroska Segment (one
+			// article's prefix, in memory). The length check runs even when
+			// decoding is skipped: a decode stamp does not prove the file is
+			// whole - on a production install 26 of 29 files missing a volume or more
+			// carried one - and ffprobe reads the same article right after.
 			if entry.IsNZB() {
-				geo := r.checkImportGeometry(ctx, res.infoHash, name, !skipDecode)
+				geo := r.checkImportGeometry(ctx, res.infoHash, name, true)
 				switch {
 				case geo.reason != "":
 					r.logger.Warn().Str("entry", c.name).Str("file", name).Str("reason", geo.reason).
