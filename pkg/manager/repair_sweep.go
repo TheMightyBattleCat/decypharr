@@ -883,6 +883,13 @@ func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, n
 }
 
 func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {
+	// No configured debrid holds it, or re-insertion already gave up: broken
+	// for a blocklisting re-grab, without asking any debrid.
+	if reason := debridGoneReason(entry, r.debridConfigured); reason != "" {
+		res.broken = true
+		res.reason = reason
+		return res
+	}
 	client := r.manager.ProviderClient(entry.ActiveProvider)
 	if client == nil {
 		res.reason = "provider_client_not_found"
@@ -965,7 +972,7 @@ func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storag
 func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) {
 	byHash := make(map[string][]int)
 	for i, res := range results {
-		if !res.broken || res.protocol != config.ProtocolTorrent || res.infoHash == "" {
+		if !res.broken || res.protocol != config.ProtocolTorrent || res.infoHash == "" || noReinsertReason(res.reason) {
 			continue
 		}
 		byHash[res.infoHash] = append(byHash[res.infoHash], i)

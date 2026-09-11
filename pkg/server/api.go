@@ -1127,6 +1127,51 @@ func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, run, http.StatusOK)
 }
 
+// handleListDebridGone lists torrent entries no configured debrid can serve
+// (their debrid is gone from config, or re-insertion gave up), from stored
+// entries only. ?limit=N caps the names returned (default 50); totals always
+// cover every entry.
+func (s *Server) handleListDebridGone(w http.ResponseWriter, r *http.Request) {
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	res, err := svc.FindDebridGone()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	res.Entries = res.Entries[:min(limit, len(res.Entries))]
+	utils.JSONResponse(w, res, http.StatusOK)
+}
+
+// handleFixDebridGone marks up to ?limit=N (default 50) unservable torrent
+// entries broken and runs Fix broken on them: delete, blocklist and re-search
+// through their Arr. 409 while another repair run is active.
+func (s *Server) handleFixDebridGone(w http.ResponseWriter, r *http.Request) {
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	res, err := svc.FixDebridGone(s.manager.Context(), limit)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "already running") {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	utils.JSONResponse(w, res, http.StatusOK)
+}
+
 // handleClearBroken clears currently broken files without asking the Arr to
 // re-search for replacements. Body: {"names": ["...", ...]}. Empty/missing
 // names ⇒ clear every broken entry in storage.
