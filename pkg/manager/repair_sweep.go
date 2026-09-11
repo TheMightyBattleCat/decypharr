@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1691,14 +1692,7 @@ func (r *Repair) collectBrokenHealths(names []string, requireArrFile bool) (*xsy
 			if len(h.BrokenFiles) == 0 {
 				return nil
 			}
-			hasArrFile := false
-			for _, bf := range h.BrokenFiles {
-				if bf.ArrName != "" && bf.ArrFileID != 0 {
-					hasArrFile = true
-					break
-				}
-			}
-			if !hasArrFile {
+			if !slices.ContainsFunc(h.BrokenFiles, hasArrFile) {
 				return nil
 			}
 		}
@@ -1749,11 +1743,11 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		ctx = r.parentCtx
 	}
 
-	// Skip entries with no Arr-known broken files — there's nothing the fix
-	// pass can delete and re-search for them.
-	healths, wantedCount := r.collectBrokenHealths(names, true)
+	// Every broken entry is a candidate, including ones recorded without Arr
+	// identifiers: the background pass looks those up before acting.
+	healths, wantedCount := r.collectBrokenHealths(names, false)
 	if healths.Size() == 0 {
-		return nil, errors.New("no fixable broken entries")
+		return nil, errors.New("no broken entries to fix")
 	}
 
 	r.mu.Lock()
@@ -1799,16 +1793,20 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			r.mu.Unlock()
 			cancel()
 		}()
+		r.resolveBrokenArrContext(runCtx, healths)
 		// Drop or trim any candidate the Arrs no longer reference before
 		// acting on it - "Fix" must never blocklist or re-search on behalf
 		// of a file the Arr already replaced with a working copy.
+		before := healths.Size()
 		r.filterSupersededHealths(runCtx, healths)
+		run.Stats.Cleared += before - healths.Size()
+		unowned := r.unownedBrokenHealths(healths)
 		r.repairBroken(runCtx, run, healths, false)
 		if runCtx.Err() != nil {
 			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
 			return
 		}
-		r.finalizeRun(run, storage.RepairRunCompleted, "", "")
+		r.finalizeRun(run, storage.RepairRunCompleted, unownedSummary(unowned), "")
 		r.logger.Info().
 			Str("run_id", run.ID).
 			Int("candidates", run.Stats.Candidates).
@@ -1817,6 +1815,115 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			Msg("FixBroken: completed")
 	})
 	return run, nil
+}
+
+// hasArrFile reports whether bf carries what healBrokenEntry needs to delete
+// and re-search it through its Arr.
+func hasArrFile(bf storage.BrokenFile) bool {
+	return bf.ArrName != "" && bf.ArrFileID != 0
+}
+
+// resolveBrokenArrContext looks up the Arr identifiers a manual Fix needs for
+// broken files recorded without them. Several paths mark a file broken
+// without resolving its Arr (a 430 found by a verification read, a
+// managed-source sweep, a tripped regrab guard), and healBrokenEntry skips a
+// file with no Arr file id, so Fix used to do nothing for such an entry.
+// Each eligible Arr's library is listed once, and only when a candidate needs
+// it.
+func (r *Repair) resolveBrokenArrContext(ctx context.Context, healths *xsync.Map[string, *storage.EntryHealth]) {
+	missingArrFile := func(bf storage.BrokenFile) bool { return !hasArrFile(bf) }
+	pending := make(map[string]*storage.EntryHealth)
+	healths.Range(func(name string, h *storage.EntryHealth) bool {
+		if slices.ContainsFunc(h.BrokenFiles, missingArrFile) {
+			pending[name] = h
+		}
+		return true
+	})
+	for _, a := range r.eligibleArrs(nil) {
+		if len(pending) == 0 || ctx.Err() != nil {
+			return
+		}
+		cands, err := r.collectArrMediaCandidates(ctx, a, "")
+		if err != nil {
+			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Fix: could not list the Arr's media to resolve broken files")
+			continue
+		}
+		for name, h := range pending {
+			if n := fillBrokenArrContext(h, cands[name]); n > 0 {
+				r.logger.Info().Str("entry", name).Str("arr", a.Name).Int("files", n).
+					Msg("Fix: found the Arr for broken files recorded without one")
+			}
+			if !slices.ContainsFunc(h.BrokenFiles, missingArrFile) {
+				delete(pending, name)
+			}
+		}
+	}
+}
+
+// fillBrokenArrContext copies c's Arr identifiers onto each broken file in h
+// that has none and returns how many it filled. A file is filled only when
+// the entry still serves the same upload the broken verdict was made on (equal
+// InfoHash): a same-named replacement must not be deleted on the old copy's
+// verdict, and filterSupersededHealths clears that case instead.
+func fillBrokenArrContext(h *storage.EntryHealth, c *candidate) int {
+	if h == nil || c == nil || c.arrName == "" || c.item == nil {
+		return 0
+	}
+	filled := 0
+	for i := range h.BrokenFiles {
+		bf := &h.BrokenFiles[i]
+		if hasArrFile(*bf) {
+			continue
+		}
+		cf, ok := c.contentMap[bf.FileName]
+		if !ok || cf.FileId == 0 {
+			continue
+		}
+		current, ok := c.item.Files[bf.FileName]
+		if !ok || current == nil || bf.InfoHash == "" || current.InfoHash != bf.InfoHash {
+			continue
+		}
+		bf.ArrName = c.arrName
+		bf.ArrKind = c.arrKind
+		bf.MediaID = cf.Id
+		bf.EpisodeID = cf.EpisodeId
+		bf.ArrFileID = cf.FileId
+		bf.TargetPath = cf.TargetPath
+		bf.SourcePath = cf.Path
+		if bf.Size == 0 {
+			bf.Size = cf.Size
+		}
+		filled++
+	}
+	return filled
+}
+
+// unownedBrokenHealths returns, sorted, the entries in healths that Fix cannot
+// act on because none of their broken files has an Arr file, logging each.
+func (r *Repair) unownedBrokenHealths(healths *xsync.Map[string, *storage.EntryHealth]) []string {
+	var out []string
+	healths.Range(func(name string, h *storage.EntryHealth) bool {
+		if !slices.ContainsFunc(h.BrokenFiles, hasArrFile) {
+			r.logger.Warn().Str("entry", name).Str("reason", h.FailureReason).
+				Msg("Fix: no Arr owns this entry's broken files; nothing to delete or re-search")
+			out = append(out, name)
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+// unownedSummary is the run error recorded for entries Fix could not act on.
+func unownedSummary(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0] + ": no Arr owns its broken files, nothing to re-search"
+	default:
+		return fmt.Sprintf("%d entries have no Arr owning their broken files, nothing to re-search (first: %s)", len(names), names[0])
+	}
 }
 
 // ClearBroken removes currently-broken files from the local mount state. It
