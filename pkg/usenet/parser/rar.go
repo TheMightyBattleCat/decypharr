@@ -161,6 +161,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no RAR volumes found")
 	}
+	// Before the reorder below: volumes carry group.Files indices only until
+	// group.Files is replaced in true volume order.
 	if dropped := droppedVolumes(group, volumes); len(dropped) > 0 {
 		p.logger.Warn().
 			Str("group", group.BaseName).
@@ -243,6 +245,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 
 	files := make([]*storage.NZBFile, 0, len(archiveInfo.Files))
 	hasNoneStored := false
+	var shortErr error // first file left out for missing articles or volumes
 
 	// Parse each file in the RAR archive
 	for _, rarFile := range archiveInfo.Files {
@@ -260,6 +263,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			name = filename
 		}
 
+		// Volume sizes the parts do not fit make the whole set's geometry
+		// untrustworthy, not just this file's: fail the archive.
 		if err := checkPartsInsideVolumes(rarFile, volumeInfos); err != nil {
 			return nil, err
 		}
@@ -281,7 +286,14 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 
 		missing, err := checkStreamCoversHeader(rarFile, streamSize, group.getMetadata().segmentSize)
 		if err != nil {
-			return nil, err
+			// Only this file lacks articles; the rest of a season pack in one
+			// archive still imports. Alone, it fails the archive with this error.
+			p.logger.Warn().Err(err).Str("group", group.BaseName).
+				Msg("Leaving out a RAR file that is missing articles or volumes")
+			if shortErr == nil {
+				shortErr = err
+			}
+			continue
 		}
 		if missing > 0 {
 			p.logger.Warn().
@@ -359,6 +371,9 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	}
 
 	if len(files) == 0 {
+		if shortErr != nil {
+			return nil, shortErr
+		}
 		if hasNoneStored {
 			return nil, fmt.Errorf("RAR archive contains no stored (uncompressed) files; cannot stream")
 		}
