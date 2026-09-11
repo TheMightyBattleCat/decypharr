@@ -939,6 +939,7 @@ class RepairManager {
                 <td class="${run.stats?.broken ? 'text-error font-medium' : ''}">${run.stats?.broken ?? 0}</td>
                 <td class="${run.stats?.repaired ? 'text-success font-medium' : ''}">${run.stats?.repaired ?? 0}</td>
                 <td class="${run.stats?.cleared ? 'text-warning font-medium' : ''}">${run.stats?.cleared ?? 0}</td>
+                <td class="${run.stats?.unverified ? 'text-warning font-medium' : ''}">${run.stats?.unverified ?? 0}</td>
                 <td>${duration}</td>
                 <td class="text-xs text-error">${run.error || ''}</td>
             `;

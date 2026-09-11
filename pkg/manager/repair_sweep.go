@@ -309,7 +309,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 				return gctx.Err()
 			}
 
-			h, decodeSkipped := r.probeEntry(gctx, run.ID, c, heal, opts, autoRepair, sc)
+			h, decode := r.probeEntry(gctx, run.ID, c, heal, opts, autoRepair, sc)
 			if h == nil {
 				// Entry vanished or had no files between enumeration and probe;
 				// skip without counting. Release any loaded body.
@@ -330,8 +330,11 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 
 			runMu.Lock()
 			run.Stats.Probed++
-			if decodeSkipped {
+			if decode.skipped {
 				run.Stats.DecodeSkipped++
+			}
+			if decode.unverified {
+				run.Stats.Unverified++
 			}
 			switch h.Status {
 			case storage.HealthHealthy:
@@ -358,12 +361,10 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // parallel), runs auto-heal on broken torrents (only when autoRepair is set),
 // then persists final health.
 //
-// The second return value reports whether the expensive decode-verification
-// windows were skipped for this entry because its decode fingerprint still
-// matched (see RepairRunOptions.ForceDecodeVerification). The caller folds
-// that into run.Stats.DecodeSkipped so a recheck summary shows how many
-// entries had their deep verification suppressed.
-func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool, sc *supersessionContext) (*storage.EntryHealth, bool) {
+// The second return value reports what happened to the entry's decode
+// verification; the caller folds it into run.Stats.DecodeSkipped and
+// run.Stats.Unverified.
+func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool, sc *supersessionContext) (*storage.EntryHealth, entryDecode) {
 	s := r.manager.storage
 	// Lazily load the entry body. Enumeration only recorded the name, so the
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
@@ -371,7 +372,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	if c.item == nil {
 		item, err := s.GetEntryItem(c.name)
 		if err != nil || item == nil || len(item.Files) == 0 {
-			return nil, false
+			return nil, entryDecode{}
 		}
 		c.item = item
 	}
@@ -461,7 +462,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		evt.Str("entry", c.item.Name).Msg("Repair: decode already verified for this fingerprint, skipping decode windows")
 	}
 
-	results, decodeRan, decodeCoverage := r.probeFiles(ctx, c, names, opts, decodeVerified)
+	results, decodeRan, decodeCoverage, decodeAttempted := r.probeFiles(ctx, c, names, opts, decodeVerified)
 	if autoRepair {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -503,14 +504,27 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 
 	r.saveHealth(h)
-	return h, !decodeRan
+	return h, entryDecode{
+		skipped:    !decodeAttempted,
+		unverified: final == storage.HealthHealthy && decodeAttempted && !decodeRan,
+	}
+}
+
+// entryDecode is what became of one probed entry's decode verification.
+type entryDecode struct {
+	// skipped: no decode windows ran - verified earlier for this fingerprint,
+	// or decode checks are off.
+	skipped bool
+	// unverified: the entry is healthy, but a decode that ran reached no
+	// verdict for at least one of its files (see rollupDecode).
+	unverified bool
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers. Alongside the results it returns
 // what probeEntry may stamp for the entry's decode verification - see
-// rollupDecode.
-func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) ([]fileResult, bool, string) {
+// rollupDecode - and whether decode windows were run at all.
+func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, opts RepairRunOptions, skipDecode bool) ([]fileResult, bool, string, bool) {
 	// If decode verification is disabled in config, force skip for sweeps -
 	// unless this is an explicit operator force-decode recheck, which is a
 	// deliberate "deep-check this one thing right now" and overrides the
@@ -535,7 +549,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	_ = g.Wait()
 
 	decodeRan, coverage := rollupDecode(results, skipDecode)
-	return results, decodeRan, coverage
+	return results, decodeRan, coverage, !skipDecode
 }
 
 // rollupDecode reduces an entry's per-file decode outcomes to what probeEntry
@@ -2750,6 +2764,7 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 		Int("broken", run.Stats.Broken).
 		Int("repaired", run.Stats.Repaired).
 		Int("decode_skipped", run.Stats.DecodeSkipped).
+		Int("unverified", run.Stats.Unverified).
 		Bool("fix", fix).
 		Bool("force_decode", forceDecode).
 		Int64("skipped_superseded_files", sc.skipped.Load()).
