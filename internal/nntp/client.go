@@ -32,7 +32,8 @@ type ProviderPool struct {
 	slots       chan struct{}      // Semaphore: capacity = max connections
 	max         int
 	config      config.UsenetProvider
-	activeConns sync.Map // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
+	activeConns sync.Map    // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
+	stat        statLatency // measured STAT latency, for BatchStat routing (stat_routing.go)
 }
 
 // Client manages a pool of NNTP connections.
@@ -55,6 +56,9 @@ type Client struct {
 	// sized its own pool to the entire bank capacity. The shared pool
 	// caps total worker goroutines to exactly pool.Capacity().
 	repairPool *RepairPool
+	// statHomes are the pools repair-pool workers are homed on (see
+	// statHomePools); fixed at construction.
+	statHomes []*ProviderPool
 
 	// TCP socket buffer sizes (bytes) applied to every new connection. 0 means
 	// "leave OS autotuning untouched". Sized from cfg.Usenet.Socket*Buffer.
@@ -224,6 +228,7 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		sockReadBuf:      parseSockBuf(cfg.Usenet.SocketReadBuffer),
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
 	}
+	cm.statHomes = cm.statHomePools()
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
 	cm.bw = newBandwidthTracker(providers, cm.logger)
 
@@ -1314,7 +1319,9 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	return result, nil
 }
 
-func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []string) ([]StatResult, error) {
+// batchStatAcrossProviders STATs one chunk: on home first, then whatever is
+// still unresolved on each remaining provider in statOrder.
+func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []string, home config.UsenetProvider) ([]StatResult, error) {
 	results := make([]StatResult, len(messageIDs))
 	states := make([]batchStatState, len(messageIDs))
 	unresolved := make([]int, len(messageIDs))
@@ -1323,7 +1330,7 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 		unresolved[i] = i
 	}
 
-	for _, provider := range c.providers {
+	for _, provider := range c.statOrder(home) {
 		if len(unresolved) == 0 {
 			break
 		}
@@ -1418,16 +1425,27 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 	return results, nil
 }
 
+// batchStatOnProvider STATs messageIDs one at a time on a single connection to
+// provider, and records the provider's per-STAT latency for routing (timed from
+// when the connection is in hand, so waiting for a slot doesn't count). A
+// connection that can't be had or breaks mid-chunk records statErrorPenalty.
 func (c *Client) batchStatOnProvider(ctx context.Context, provider config.UsenetProvider, messageIDs []string) ([]StatResult, error) {
 	conn, providerCfg, err := c.getConnectionFromProvider(ctx, provider)
 	if err != nil {
+		if ctx.Err() == nil {
+			c.recordStatSample(provider, statErrorPenalty)
+		}
 		return nil, err
 	}
+	started := time.Now()
 
 	results := make([]StatResult, len(messageIDs))
 	for i, msgID := range messageIDs {
 		results[i].MessageID = msgID
 		if ctx.Err() != nil {
+			if i > 0 {
+				c.recordStatSample(provider, time.Since(started)/time.Duration(i))
+			}
 			results[i].Available = false
 			results[i].Error = ctx.Err()
 			c.release(conn)
@@ -1455,10 +1473,12 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 			results[j].Available = false
 			results[j].Error = connErr
 		}
+		c.recordStatSample(provider, statErrorPenalty)
 		c.release(conn)
 		return results, connErr
 	}
 
+	c.recordStatSample(provider, time.Since(started)/time.Duration(len(messageIDs)))
 	c.returnOrReleaseConn(conn, providerCfg)
 	return results, nil
 }

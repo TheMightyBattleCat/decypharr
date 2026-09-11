@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
+
+	"github.com/sirrobot01/decypharr/internal/config"
 )
 
 // repairDefaultPercent is used when cfg.Repair.NNTPConnectionPercent is unset.
@@ -45,9 +48,11 @@ type repairTask struct {
 // errRepairPoolClosed is returned by Submit after Stop has been called.
 var errRepairPoolClosed = errors.New("repair pool closed")
 
-// newRepairPool starts a worker pool sized to `percent` of the client's
-// total provider connections, with a small floor so non-repair BatchStat
-// callers still have a couple of workers available.
+// newRepairPool starts the worker pool. Each STAT home (every primary
+// provider, see statHomePools) gets `percent` of its own connections as
+// workers, so the pool never holds more than that share of any one provider
+// and leaves the rest for playback. Workers take chunks only while their home
+// answers STAT fast enough (see stat_routing.go).
 func (c *Client) newRepairPool(percent int) *RepairPool {
 	if c == nil {
 		return nil
@@ -58,16 +63,22 @@ func (c *Client) newRepairPool(percent int) *RepairPool {
 	if percent > 100 {
 		percent = 100
 	}
-	total := c.TotalConnections()
-	capacity := repairPoolMinWorkers
-	if total > 0 {
-		sized := (total*percent + 99) / 100
-		if sized > capacity {
-			capacity = sized
-		}
-		if capacity > total {
-			capacity = total
-		}
+	type homeWorkers struct {
+		home *ProviderPool
+		n    int
+	}
+	var plan []homeWorkers
+	capacity := 0
+	for _, pp := range c.statHomes {
+		n := max((pp.max*percent+99)/100, 1)
+		plan = append(plan, homeWorkers{pp, n})
+		capacity += n
+	}
+	if capacity == 0 {
+		// No provider with connections: keep a couple of homeless workers so
+		// callers don't have to branch. They ask providers in priority order.
+		capacity = repairPoolMinWorkers
+		plan = []homeWorkers{{nil, capacity}}
 	}
 
 	p := &RepairPool{
@@ -79,8 +90,10 @@ func (c *Client) newRepairPool(percent int) *RepairPool {
 		quit:    make(chan struct{}),
 	}
 	p.wg.Add(capacity)
-	for i := 0; i < capacity; i++ {
-		go p.worker(c)
+	for _, h := range plan {
+		for range h.n {
+			go p.worker(c, h.home)
+		}
 	}
 	return p
 }
@@ -126,7 +139,10 @@ func (c *Client) TotalConnections() int {
 	return total
 }
 
-// Capacity returns the number of concurrent workers in the pool.
+// Capacity returns the number of workers in the pool, including those whose
+// home is currently too slow to take chunks. pickStatBatchSize sizes chunks
+// from it; counting idle workers only makes chunks smaller (never below
+// statBatchMinSize), which leaves the eligible workers more to take, not less.
 func (p *RepairPool) Capacity() int {
 	if p == nil {
 		return 0
@@ -173,27 +189,69 @@ func (p *RepairPool) Stop() {
 	p.wg.Wait()
 }
 
-// worker pulls chunks until the pool stops. Each task is processed by
-// calling batchStatAcrossProviders directly; bank-token accounting is no
-// longer needed because the pool's worker count IS the concurrency cap.
-func (p *RepairPool) worker(c *Client) {
+// worker pulls chunks until the pool stops. A worker with a home takes chunks
+// only while that home is STAT-eligible; otherwise it waits, except for the
+// one explorer per home that takes a chunk to re-measure it (see tryExplore).
+// The pool's worker count is the concurrency cap; no token accounting.
+func (p *RepairPool) worker(c *Client, home *ProviderPool) {
 	defer p.wg.Done()
 	for {
+		exploring := false
+		if home != nil {
+			ok, lat, fastest := c.statEligible(home)
+			if home.stat.eligible.Swap(ok) != ok {
+				msg := "STAT routing: provider is fast enough, taking BatchStat chunks"
+				if !ok {
+					msg = "STAT routing: provider is too slow, no longer taking BatchStat chunks"
+				}
+				c.logger.Debug().Str("provider", home.config.Host).Dur("stat_latency", lat).
+					Dur("fastest", fastest).Msg(msg)
+			}
+			if !ok {
+				if !home.stat.tryExplore(time.Now()) {
+					select {
+					case <-p.quit:
+						return
+					case <-time.After(statIneligibleRecheck):
+					}
+					continue
+				}
+				exploring = true
+			}
+		}
 		select {
 		case <-p.quit:
+			if exploring {
+				home.stat.exploring.Store(false)
+			}
 			return
 		case t := <-p.tasks:
-			if t.done == nil {
-				continue
+			p.run(c, home, t)
+			if exploring {
+				home.stat.exploring.Store(false)
 			}
-			// Caller may have cancelled while we were waiting. Surface
-			// it as the task's error without doing the work.
-			if err := t.ctx.Err(); err != nil {
-				t.done(nil, err)
-				continue
-			}
-			results, err := c.batchStatAcrossProviders(t.ctx, t.msgIDs)
-			t.done(results, err)
 		}
 	}
+}
+
+// run processes one chunk for a worker homed on home (nil: the priority-1
+// provider).
+func (p *RepairPool) run(c *Client, home *ProviderPool, t repairTask) {
+	if t.done == nil {
+		return
+	}
+	// Caller may have cancelled while we were waiting. Surface it as the
+	// task's error without doing the work.
+	if err := t.ctx.Err(); err != nil {
+		t.done(nil, err)
+		return
+	}
+	var homeCfg config.UsenetProvider
+	if home != nil {
+		homeCfg = home.config
+	} else if len(c.providers) > 0 {
+		homeCfg = c.providers[0]
+	}
+	results, err := c.batchStatAcrossProviders(t.ctx, t.msgIDs, homeCfg)
+	t.done(results, err)
 }
