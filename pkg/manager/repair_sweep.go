@@ -99,6 +99,13 @@ type fileResult struct {
 	// reduces it to the weakest value across the entry's healthy files, which
 	// probeEntry persists alongside DecodeVerifiedAt.
 	decodeCoverage string
+
+	// unverifiedReason says why a healthy file is left unverified
+	// (storage.UnverifiedFile.Reason): its decode check reached no verdict, or
+	// it ends before its Matroska index. Empty when the file was verified or
+	// no decode check was due. shortBytes is the tail-truncation shortfall.
+	unverifiedReason string
+	shortBytes       int64
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -474,6 +481,8 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.FileCount = len(names)
 	h.BrokenFiles = broken
 	h.BrokenCount = len(broken)
+	h.UnverifiedFiles = unverifiedFiles(c, results)
+	h.UnverifiedRunID = runID
 	h.Fingerprint = currentFP
 	h.LastCheckedAt = time.Now()
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
@@ -506,7 +515,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	r.saveHealth(h)
 	return h, entryDecode{
 		skipped:    !decodeAttempted,
-		unverified: final == storage.HealthHealthy && decodeAttempted && !decodeRan,
+		unverified: h.IsUnverified(),
 	}
 }
 
@@ -515,8 +524,8 @@ type entryDecode struct {
 	// skipped: no decode windows ran - verified earlier for this fingerprint,
 	// or decode checks are off.
 	skipped bool
-	// unverified: the entry is healthy, but a decode that ran reached no
-	// verdict for at least one of its files (see rollupDecode).
+	// unverified: the entry is healthy, but the probe left at least one of its
+	// files unverified (storage.EntryHealth.IsUnverified).
 	unverified bool
 }
 
@@ -683,10 +692,13 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 					return res
 				case geo.tailTruncated:
 					// Plays, but its index is cut, so every decode check forward-
-					// scans and ends inconclusive. Not stamped: counted Unverified.
+					// scans and ends inconclusive. Not stamped: listed Unverified,
+					// even on an entry whose decode was verified earlier.
 					r.logger.Warn().Str("entry", c.name).Str("file", name).Int64("short_bytes", geo.shortBytes).
-						Msg("Repair: file ends before its Matroska index (tail truncated at import); skipping decode checks, re-grab by hand if seeking matters")
+						Msg("Repair: file ends before its Matroska index (tail truncated at import); skipping decode checks, replace it from Unverified if seeking matters")
 					res.decodeConclusive = false
+					res.unverifiedReason = reasonTailTruncated
+					res.shortBytes = geo.shortBytes
 					return res
 				case geo.singleSplice:
 					r.logger.Warn().Str("entry", c.name).Str("file", name).
@@ -704,11 +716,15 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
 			started := time.Now()
-			ok, reason, conclusive, coverage := checker.checkConfirmed(ctx, c.name, name, exp, skipDecode, sig, budget)
+			cause := &unverifiedCause{}
+			ok, reason, conclusive, coverage := checker.checkConfirmed(contextWithUnverifiedCause(ctx, cause), c.name, name, exp, skipDecode, sig, budget)
 			unregisterDeadSignal(res.infoHash, name, sig)
 			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive
 			res.decodeCoverage = coverage
+			if ok && !conclusive && !skipDecode {
+				res.unverifiedReason = cause.get()
+			}
 
 			if !ok {
 				res.healthy = false
@@ -760,7 +776,7 @@ func (r *Repair) logFileVerdict(entryName, file string, size int64, budget *Veri
 	case skipDecode:
 		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "decode verified earlier").Msg("healthy")
 	case !res.decodeConclusive:
-		ev.Str(logger.FieldStatus, logger.StatusWarn).Str(logger.FieldNote, "decode not verified").Msg("inconclusive")
+		ev.Str(logger.FieldStatus, logger.StatusWarn).Str(logger.FieldNote, "decode not verified").Str("reason", res.unverifiedReason).Msg("inconclusive")
 	case res.decodeCoverage == decodeCoveragePartial:
 		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "start of file only").Msg("verified")
 	default:
@@ -1455,6 +1471,12 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 			}
 		}
 		if len(hashes) == 0 {
+			shouldDelete = false
+		}
+		// A tail-truncated file still played when it was replaced. Keep its
+		// entry so a re-grab that never lands leaves a copy to import by hand;
+		// the replacement supersedes it when it does.
+		if !slices.ContainsFunc(h.BrokenFiles, func(bf storage.BrokenFile) bool { return bf.Reason != reasonTailTruncated }) {
 			shouldDelete = false
 		}
 	}

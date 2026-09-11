@@ -37,6 +37,9 @@ type RepairStatus struct {
 	// DecodeVerifiedPartialCount is how many of DecodeVerifiedCount were
 	// stamped from a bounded head scan rather than a spread over the file.
 	DecodeVerifiedPartialCount int `json:"decode_verified_partial_count"`
+	// UnverifiedCount is how many healthy entries have a file their last probe
+	// could not verify (storage.EntryHealth.IsUnverified).
+	UnverifiedCount int `json:"unverified_count"`
 }
 
 // RepairRunOptions are one-off options for a manually-started repair run.
@@ -435,12 +438,13 @@ func (r *Repair) stopActiveRepairSweep() {
 // Status reports the current repair state for the API.
 func (r *Repair) Status() RepairStatus {
 	cfg := r.cfg()
-	verified, partial := r.manager.storage.CountDecodeVerified()
+	verified, partial, unverified := r.manager.storage.CountDecodeVerified(r.manager.EntryNameHasBackingEntry)
 	st := RepairStatus{
 		Enabled:                    cfg.Enabled,
 		HealthCounts:               r.manager.storage.CountEntryHealthByStatus(),
 		DecodeVerifiedCount:        verified,
 		DecodeVerifiedPartialCount: partial,
+		UnverifiedCount:            unverified,
 	}
 	if next := r.nextScheduledRun(); next != nil {
 		st.NextRunAt = next

@@ -19,13 +19,18 @@ const (
 	// reasonMissingVolume: the file is served an article or more short of
 	// its own Matroska Segment - a volume was left out at import.
 	reasonMissingVolume = "import_missing_volume"
+	// reasonTailTruncated: the file ends less than an article before its
+	// Matroska Segment, cutting its index (Cues and/or Tags): it plays but does
+	// not seek. The sweep leaves it healthy and unverified; only a manual
+	// Replace re-grabs it (ReplaceUnverified).
+	reasonTailTruncated = "import_tail_truncated"
 )
 
 // keepReleaseReason reports whether a broken file's reason is an import
 // fault rather than damage in the posting, so its re-grab must not blocklist
 // the release.
 func keepReleaseReason(reason string) bool {
-	return reason == reasonSplicedVolumes || reason == reasonMissingVolume
+	return reason == reasonSplicedVolumes || reason == reasonMissingVolume || reason == reasonTailTruncated
 }
 
 // geometryVerdict is what checkImportGeometry found for one file.

@@ -1172,6 +1172,57 @@ func (s *Server) handleFixDebridGone(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, res, http.StatusOK)
 }
 
+// handleListUnverified lists healthy entries with a file the last probe could
+// not verify, each file with its reason (storage.EntryHealth.UnverifiedFiles).
+func (s *Server) handleListUnverified(w http.ResponseWriter, r *http.Request) {
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	list, err := svc.ListUnverified()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if list == nil {
+		list = []*storage.EntryHealth{}
+	}
+	utils.JSONResponse(w, list, http.StatusOK)
+}
+
+// handleReplaceUnverified re-grabs the tail-truncated files of unverified
+// entries without blocklisting their releases. Body: {"names": [...],
+// "limit": N}; no names means every such entry, limit defaults to 25. 409
+// while another repair run is active.
+func (s *Server) handleReplaceUnverified(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Names []string `json:"names,omitempty"`
+		Limit int      `json:"limit,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	svc := s.manager.Repair()
+	if svc == nil {
+		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	res, err := svc.ReplaceUnverified(s.manager.Context(), req.Names, req.Limit)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "already running") {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	utils.JSONResponse(w, res, http.StatusOK)
+}
+
 // handleClearBroken clears currently broken files without asking the Arr to
 // re-search for replacements. Body: {"names": ["...", ...]}. Empty/missing
 // names ⇒ clear every broken entry in storage.

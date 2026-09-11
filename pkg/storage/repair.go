@@ -63,10 +63,11 @@ type RepairRunStats struct {
 	// the operator how many entries were only shallow-checked (a force-decode
 	// recheck drives this to zero).
 	DecodeSkipped int `json:"decode_skipped,omitempty"`
-	// Unverified counts entries left healthy whose decode verification ran but
-	// reached no verdict: cut short by a read budget or timeout, or decoded
-	// through with errors. They are not stamped, so the next sweep probes them
-	// again.
+	// Unverified counts entries left healthy with a file the probe could not
+	// verify (EntryHealth.UnverifiedFiles): a decode check cut short by a read
+	// budget or timeout, decoded through with errors, or a file that ends
+	// before its Matroska index. They are not stamped, so the next sweep that
+	// reaches them probes them again.
 	Unverified int `json:"unverified,omitempty"`
 }
 
@@ -263,6 +264,19 @@ type BrokenFile struct {
 	SourcePath string  `json:"source_path,omitempty"`
 }
 
+// UnverifiedFile is a file a probe left healthy without verifying it: its
+// decode check reached no verdict, or it ends before its Matroska index.
+// Reason says which (manager's unverified* constants).
+type UnverifiedFile struct {
+	FileName string `json:"file_name"`
+	InfoHash string `json:"info_hash,omitempty"`
+	Reason   string `json:"reason"`
+	Size     int64  `json:"size,omitempty"`
+	// ShortBytes is how far the served file ends before its Matroska Segment,
+	// for a tail-truncated file.
+	ShortBytes int64 `json:"short_bytes,omitempty"`
+}
+
 // EntryHealth is the source of truth for repair decisions. It is keyed by
 // EntryName (the folder-name shared across files of the same release) and is
 // updated live during a sweep — once when probing starts, once when it
@@ -288,6 +302,12 @@ type EntryHealth struct {
 	BrokenFiles   []BrokenFile `json:"broken_files,omitempty"`
 	FailureReason string       `json:"failure_reason,omitempty"`
 
+	// UnverifiedFiles lists the files the last probe left unverified, and
+	// UnverifiedRunID the run that probed them. Rewritten on every probe; only
+	// meaningful while Status is healthy (see IsUnverified).
+	UnverifiedFiles []UnverifiedFile `json:"unverified_files,omitempty"`
+	UnverifiedRunID string           `json:"unverified_run_id,omitempty"`
+
 	Dirty       bool   `json:"dirty"`
 	DirtyReason string `json:"dirty_reason,omitempty"`
 
@@ -300,6 +320,14 @@ type EntryHealth struct {
 	PreviousStatus HealthStatus `json:"previous_status,omitempty"`
 
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// IsUnverified reports whether this entry belongs on the Unverified list:
+// healthy, with at least one file its last probe could not verify. A record
+// that has since gone broken or been cleared keeps its stale list but drops
+// off.
+func (h *EntryHealth) IsUnverified() bool {
+	return h != nil && h.Status == HealthHealthy && len(h.UnverifiedFiles) > 0
 }
 
 // IsDue reports whether this entry should be visited by the next sweep, given a
@@ -451,20 +479,28 @@ func (s *Storage) ClearAllDecodeVerification() (int, error) {
 
 // CountDecodeVerified returns the number of EntryHealth records that carry a
 // decode-clean fingerprint (DecodeVerifiedAt set), i.e. how many entries
-// ClearAllDecodeVerification would affect, and how many of those were stamped
+// ClearAllDecodeVerification would affect, how many of those were stamped
 // from a bounded head scan (DecodeVerifiedCoverage "partial": the file has no
-// usable seek index, so only its start was decoded).
-func (s *Storage) CountDecodeVerified() (verified, partial int) {
+// usable seek index, so only its start was decoded), and how many entries are
+// on the Unverified list (IsUnverified). hasEntry, when non-nil, drops
+// Unverified records whose entry no longer exists, as the list does.
+func (s *Storage) CountDecodeVerified(hasEntry func(name string) bool) (verified, partial, unverified int) {
 	_ = s.ForEachEntryHealth(func(state *EntryHealth) error {
-		if state != nil && !state.DecodeVerifiedAt.IsZero() {
+		if state == nil {
+			return nil
+		}
+		if !state.DecodeVerifiedAt.IsZero() {
 			verified++
 			if state.DecodeVerifiedCoverage == "partial" {
 				partial++
 			}
 		}
+		if state.IsUnverified() && (hasEntry == nil || hasEntry(state.EntryName)) {
+			unverified++
+		}
 		return nil
 	})
-	return verified, partial
+	return verified, partial, unverified
 }
 
 // MarkEntryDirty flags an entry's health as out-of-date so the next sweep will

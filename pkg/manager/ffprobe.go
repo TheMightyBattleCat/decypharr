@@ -455,6 +455,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 				Dur("timeout", metaTimeout).Dur("elapsed", metaElapsed).Int64("file_bytes", expected.Bytes), budget).
 				Msg("Repair: ffprobe timed out; treating as inconclusive")
 		}
+		noteUnverified(ctx, timeoutCause(ctx))
 		return true, "", false, ""
 	}
 
@@ -472,6 +473,7 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Dur("elapsed", metaElapsed), budget).
 			Msg("Repair: ffprobe metadata probe exceeded its read budget; treating as inconclusive")
+		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false, ""
 	}
 
@@ -944,6 +946,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
 			evt().Msg("Repair: ffprobe decode check timed out; treating as inconclusive")
 		}
+		noteUnverified(ctx, timeoutCause(ctx))
 		return true, "", false
 	}
 
@@ -955,6 +958,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	// grab on the strength of our own cap.
 	if budget.Exceeded() {
 		evt().Msg("Repair: ffprobe decode check hit its read budget")
+		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false
 	}
 
@@ -985,6 +989,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 				Int("frames", progress.frames).Float64("decoded_to_s", progress.lastTS).
 				Int("stderr_lines", n).Str("stderr", lines), budget).
 				Msg("Repair: ffprobe printed errors but decoded to the end of its window; not treating the file as broken")
+			noteUnverified(ctx, unverifiedDecodeErrors)
 			return true, ffprobeReasonDecodedThrough, false
 		}
 		evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check found a decode error")
@@ -1072,6 +1077,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Int64("file_bytes", fileBytes), budget).
 			Msg("Repair: ffprobe decode check skipped; verification read budget already spent")
+		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false, ""
 	}
 
@@ -1095,6 +1101,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		if ok && reason == ffprobeReasonDecodedThrough {
 			// A retry would print the same errors over the same frames.
 			budget.Exhaust()
+			noteUnverified(ctx, unverifiedDecodeErrors)
 			return true, "", false, decodeCoverageFull
 		}
 		return ok, reason, conclusive, decodeCoverageFull
@@ -1166,6 +1173,9 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 			// would see them again.
 			if reason == ffprobeReasonDecodedThrough {
 				budget.Exhaust()
+				noteUnverified(ctx, unverifiedDecodeErrors)
+			} else {
+				noteUnverified(ctx, timeoutCause(ctx))
 			}
 			return true, "", false, ""
 		default:
@@ -1197,6 +1207,14 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
 			Int64("file_bytes", fileBytes), head).
 			Msg("Repair: bounded head scan reached no verdict; treating as inconclusive and not retrying")
+		switch {
+		case reason == ffprobeReasonDecodedThrough:
+			noteUnverified(ctx, unverifiedDecodeErrors)
+		case ctx.Err() != nil:
+			noteUnverified(ctx, unverifiedCancelled)
+		default:
+			noteUnverified(ctx, unverifiedNoSeekIndex)
+		}
 		return true, "", false, decodeCoveragePartial
 	}
 	return ok, reason, conclusive, decodeCoveragePartial
@@ -1253,6 +1271,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if budget.Exceeded() {
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: skipping ffprobe retry — verification read budget already spent")
+		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false, ""
 	}
 	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
@@ -1263,6 +1282,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 
 	select {
 	case <-ctx.Done():
+		noteUnverified(ctx, unverifiedCancelled)
 		return true, "", false, ""
 	case <-time.After(ffprobeRetryDelay):
 	}
@@ -1275,6 +1295,7 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	if budget.Exceeded() {
 		budgetStats(f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason), budget).
 			Msg("Repair: ffprobe retry exceeded its read budget; treating as inconclusive")
+		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false, ""
 	}
 	if deadSignal.Detected() {
