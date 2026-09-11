@@ -35,6 +35,11 @@
                         <i class="bi bi-bug mr-1"></i>View broken
                         <span id="brokenCountBadge" class="badge badge-error badge-sm ml-1 hidden">0</span>
                     </button>
+                    <button id="viewUnverifiedBtn" class="btn btn-outline btn-sm"
+                            title="See healthy entries with a file the sweep could not verify">
+                        <i class="bi bi-question-diamond mr-1"></i>View unverified
+                        <span id="unverifiedCountBadge" class="badge badge-warning badge-sm ml-1 hidden">0</span>
+                    </button>
                     <button id="fixBrokenBtn" class="btn btn-error btn-outline btn-sm"
                             title="Trigger Arr delete + re-search on currently broken entries">
                         <i class="bi bi-bandaid mr-1"></i>Fix broken
@@ -49,7 +54,7 @@
                 </div>
             </div>
 
-            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mt-4" id="healthCountsGrid">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 mt-4" id="healthCountsGrid">
                 <!-- filled by JS -->
             </div>
 
@@ -160,7 +165,7 @@
                         <th>Broken</th>
                         <th>Repaired</th>
                         <th>Cleared</th>
-                        <th title="Healthy, but the decode check reached no verdict (cut short, or decoded with errors); probed again next sweep">Unverified</th>
+                        <th title="Healthy, but a file could not be verified: the decode check reached no verdict, or the file ends before its Matroska index. Click a count to list the entries still unverified from that run.">Unverified</th>
                         <th>Duration</th>
                         <th>Error</th>
                     </tr>
@@ -805,6 +810,77 @@
         <div id="brokenPaginationBar" class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 mt-2 border-t border-base-200 hidden">
             <div id="brokenPaginationInfo" class="text-xs opacity-70"></div>
             <div id="brokenPaginationControls" class="join"></div>
+        </div>
+    </div>
+    <form method="dialog" class="modal-backdrop">
+        <button>close</button>
+    </form>
+</dialog>
+
+<!-- Unverified entries modal -->
+<dialog id="unverifiedModal" class="modal">
+    <div class="modal-box max-w-6xl">
+        <form method="dialog">
+            <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="Close">✕</button>
+        </form>
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-3 pr-10">
+            <h3 class="font-bold text-lg flex items-center gap-2">
+                <i class="bi bi-question-diamond text-warning"></i>Unverified entries
+                <span id="unverifiedModalCount" class="badge badge-warning badge-sm">0</span>
+            </h3>
+            <div class="flex flex-wrap items-center gap-2">
+                <select id="unverifiedReasonFilter" class="select select-bordered select-sm" style="width: 14rem" aria-label="Filter by reason">
+                    <option value="all">All reasons</option>
+                </select>
+                <button id="replaceUnverifiedBtn" class="btn btn-warning btn-outline btn-sm" disabled
+                        title="Pick the Tail truncated reason to replace those files">
+                    <i class="bi bi-arrow-repeat mr-1"></i><span id="replaceUnverifiedLabel">Replace all</span>
+                </button>
+                <button id="refreshUnverifiedBtn" class="btn btn-outline btn-sm">
+                    <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
+                </button>
+            </div>
+        </div>
+        <p class="text-xs opacity-70 mb-2">
+            Healthy entries with a file the last check could not verify. Only a tail-truncated file
+            (it ends before its Matroska index, so it plays but does not seek) can be replaced; the
+            other reasons say nothing about the file, so recheck those instead.
+        </p>
+        <div id="unverifiedReplaceWarning" class="alert alert-warning text-sm py-2 mb-2 hidden">
+            <i class="bi bi-exclamation-triangle"></i>
+            <span>These files play now. Replace deletes each from its Arr and re-searches the same release
+                without blocklisting it, so each is missing from your library until its re-grab lands
+                (minutes to hours). Batches of up to 25; the decypharr entry is kept.</span>
+        </div>
+        <div id="unverifiedRunFilterBar" class="alert text-sm py-2 mb-2 hidden">
+            <i class="bi bi-funnel"></i>
+            <span id="unverifiedRunFilterText"></span>
+            <button id="clearUnverifiedRunFilterBtn" class="btn btn-xs btn-ghost">Show all runs</button>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="table table-hover">
+                <thead class="bg-base-200">
+                <tr>
+                    <th></th>
+                    <th>Entry</th>
+                    <th>Files</th>
+                    <th>Unverified</th>
+                    <th>Reason</th>
+                    <th title="How far a tail-truncated file ends before its Matroska Segment">Short by</th>
+                    <th>Last checked</th>
+                    <th class="text-right">Actions</th>
+                </tr>
+                </thead>
+                <tbody id="unverifiedTableBody"></tbody>
+            </table>
+            <div id="noUnverifiedMessage" class="text-center py-12 hidden text-base-content/70">
+                <i class="bi bi-check2-circle text-3xl block mb-2 text-success"></i>
+                <span id="noUnverifiedText">No unverified entries.</span>
+            </div>
+        </div>
+        <div id="unverifiedPaginationBar" class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 mt-2 border-t border-base-200 hidden">
+            <div id="unverifiedPaginationInfo" class="text-xs opacity-70"></div>
+            <div id="unverifiedPaginationControls" class="join"></div>
         </div>
     </div>
     <form method="dialog" class="modal-backdrop">

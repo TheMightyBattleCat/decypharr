@@ -9,6 +9,18 @@ const PRECACHE_GIB = 1024 * 1024 * 1024;
 // TTL" input is in seconds for a human to read.
 const NS_PER_SECOND = 1e9;
 const PLEX_TOKEN_PLACEHOLDER = '********';
+// The only unverified reason Replace acts on, and how many entries one Replace
+// re-grabs (manager.reasonTailTruncated, defaultReplaceUnverifiedLimit).
+const REASON_TAIL_TRUNCATED = 'import_tail_truncated';
+const REPLACE_UNVERIFIED_BATCH = 25;
+const UNVERIFIED_REASON_LABELS = {
+    import_tail_truncated: 'Tail truncated',
+    no_seek_index: 'No seek index',
+    decode_timeout: 'Timed out',
+    read_budget_spent: 'Read budget spent',
+    decoded_with_errors: 'Decoded with errors',
+    decode_inconclusive: 'Inconclusive',
+};
 
 class RepairManager {
     constructor() {
@@ -16,6 +28,9 @@ class RepairManager {
         this.statusTimer = null;
         this.activeRunId = null;
         this.brokenState = {items: [], page: 1, pageSize: 25};
+        // reason filters the list ('all' or one reason); runId, when set, keeps
+        // only entries last recorded by that run (opened from Run History).
+        this.unverifiedState = {items: [], page: 1, pageSize: 25, reason: 'all', runId: '', runLabel: ''};
         this.repairConfig = {};
         this.repairConfigDefaults = {};
         this.precacheConfig = {};
@@ -59,6 +74,24 @@ class RepairManager {
         );
         $('clearStateBtn')?.addEventListener('click', () => this.openClearStateModal());
         $('viewBrokenBtn')?.addEventListener('click', () => this.openBrokenModal());
+        $('viewUnverifiedBtn')?.addEventListener('click', () => this.openUnverifiedModal());
+        $('refreshUnverifiedBtn')?.addEventListener('click', () => this.loadUnverified());
+        $('unverifiedReasonFilter')?.addEventListener('change', (e) => {
+            this.unverifiedState.reason = e.target.value;
+            this.unverifiedState.page = 1;
+            this.renderUnverifiedPage();
+        });
+        $('clearUnverifiedRunFilterBtn')?.addEventListener('click', () => {
+            this.unverifiedState.runId = '';
+            this.unverifiedState.page = 1;
+            this.renderUnverified();
+        });
+        this.bindOverlayConfirmButton(
+            $('replaceUnverifiedBtn'),
+            () => this.replaceUnverifiedBatch(),
+            'replace',
+            (names) => this.replaceUnverified(names),
+        );
         $('refreshHistoryBtn')?.addEventListener('click', () => this.loadHistory());
         $('refreshBrokenBtn')?.addEventListener('click', () => this.loadBroken());
         $('clearSupersededBtn')?.addEventListener('click', () => this.clearSuperseded());
@@ -538,6 +571,7 @@ class RepairManager {
         if (wasRunning && !isRunning) {
             this.loadHistory();
             if (this.isBrokenModalOpen()) this.loadBroken();
+            if (this.isUnverifiedModalOpen()) this.loadUnverified();
         }
         if (this.statusTimer) {
             clearTimeout(this.statusTimer);
@@ -570,6 +604,11 @@ class RepairManager {
         if (clear) clear.disabled = !!status.active_run;
         const view = document.getElementById('viewBrokenBtn');
         if (view) view.disabled = brokenCount === 0;
+        const unverifiedCount = status.unverified_count || 0;
+        this.updateUnverifiedCount(unverifiedCount);
+        const viewUnverified = document.getElementById('viewUnverifiedBtn');
+        if (viewUnverified) viewUnverified.disabled = unverifiedCount === 0;
+        this.updateReplaceUnverifiedButton();
         this.updateClearStateCounts(status || {});
 
         if (status.active_run) {
@@ -606,6 +645,24 @@ class RepairManager {
             `;
             grid.appendChild(card);
         }
+        // Unverified entries are healthy, so they are not in health_counts.
+        const tile = document.createElement('div');
+        tile.className = 'stat bg-base-200 rounded-box p-3 cursor-pointer hover:bg-base-300 transition-colors';
+        tile.setAttribute('role', 'button');
+        tile.tabIndex = 0;
+        tile.title = 'Healthy entries with a file the last check could not verify';
+        tile.innerHTML = `
+            <div class="stat-title text-xs">Unverified</div>
+            <div class="stat-value text-lg ${unverifiedCount ? 'text-warning' : ''}">${unverifiedCount}</div>
+        `;
+        tile.addEventListener('click', () => this.openUnverifiedModal());
+        tile.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                this.openUnverifiedModal();
+            }
+        });
+        grid.appendChild(tile);
     }
 
     updateClearStateCounts(counts) {
@@ -860,13 +917,315 @@ class RepairManager {
         `;
     }
 
+    // ---- Unverified entries ------------------------------------------------
+
+    // openUnverifiedModal shows the Unverified list, optionally narrowed to the
+    // entries last recorded by one run ({runId, runLabel}).
+    openUnverifiedModal({runId = '', runLabel = ''} = {}) {
+        const modal = document.getElementById('unverifiedModal');
+        if (!modal) return;
+        Object.assign(this.unverifiedState, {runId, runLabel, page: 1});
+        this.loadUnverified();
+        if (typeof modal.showModal === 'function') {
+            if (!modal.open) modal.showModal();
+        } else {
+            modal.setAttribute('open', '');
+        }
+    }
+
+    isUnverifiedModalOpen() {
+        const modal = document.getElementById('unverifiedModal');
+        return !!(modal && modal.open);
+    }
+
+    updateUnverifiedCount(n) {
+        const badge = document.getElementById('unverifiedCountBadge');
+        if (badge) {
+            badge.textContent = n;
+            badge.classList.toggle('hidden', n === 0);
+        }
+    }
+
+    async loadUnverified() {
+        try {
+            const list = await this.fetchJSON(`${this.api}/repair/unverified`);
+            this.unverifiedState.items = (list || []).sort((a, b) => (a.entry_name || '').localeCompare(b.entry_name || ''));
+            this.updateUnverifiedCount(this.unverifiedState.items.length);
+            this.renderUnverified();
+        } catch (e) {
+            console.error('Failed to load unverified entries', e);
+        }
+    }
+
+    unverifiedReasonLabel(reason) {
+        return UNVERIFIED_REASON_LABELS[reason] || reason || '-';
+    }
+
+    // unverifiedInRun is the list before the reason filter: every entry, or
+    // only those the selected run recorded.
+    unverifiedInRun() {
+        const {items, runId} = this.unverifiedState;
+        return runId ? items.filter((h) => h.unverified_run_id === runId) : items;
+    }
+
+    filteredUnverified() {
+        const {reason} = this.unverifiedState;
+        const items = this.unverifiedInRun();
+        if (reason === 'all') return items;
+        return items.filter((h) => (h.unverified_files || []).some((f) => f.reason === reason));
+    }
+
+    // sortReasons puts the reason Replace acts on first, then the rest by
+    // count (most first) when counts are given.
+    sortReasons(reasons, counts = {}) {
+        return reasons.sort((a, b) => {
+            if (a === REASON_TAIL_TRUNCATED) return -1;
+            if (b === REASON_TAIL_TRUNCATED) return 1;
+            return (counts[b] || 0) - (counts[a] || 0);
+        });
+    }
+
+    // renderUnverified rebuilds the reason filter (with a count per reason, so
+    // a small Replace-eligible count reads as such) and the run filter bar,
+    // then the current page.
+    renderUnverified() {
+        const st = this.unverifiedState;
+        const items = this.unverifiedInRun();
+        const counts = {};
+        for (const h of items) {
+            for (const r of new Set((h.unverified_files || []).map((f) => f.reason))) {
+                counts[r] = (counts[r] || 0) + 1;
+            }
+        }
+        const select = document.getElementById('unverifiedReasonFilter');
+        if (select) {
+            if (st.reason !== 'all' && !counts[st.reason]) st.reason = 'all';
+            const options = [`<option value="all">All reasons (${items.length})</option>`];
+            for (const r of this.sortReasons(Object.keys(counts), counts)) {
+                options.push(`<option value="${this.escapeAttr(r)}">${this.escape(this.unverifiedReasonLabel(r))} (${counts[r]})</option>`);
+            }
+            select.innerHTML = options.join('');
+            select.value = st.reason;
+        }
+        const bar = document.getElementById('unverifiedRunFilterBar');
+        const text = document.getElementById('unverifiedRunFilterText');
+        if (bar && text) {
+            bar.classList.toggle('hidden', !st.runId);
+            text.textContent = st.runId
+                ? `Entries still unverified from the run started ${st.runLabel}. An entry checked again since is listed under its latest run.`
+                : '';
+        }
+        this.renderUnverifiedPage();
+    }
+
+    renderUnverifiedPage() {
+        const st = this.unverifiedState;
+        const tbody = document.getElementById('unverifiedTableBody');
+        const empty = document.getElementById('noUnverifiedMessage');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+
+        const items = this.filteredUnverified();
+        const count = document.getElementById('unverifiedModalCount');
+        if (count) count.textContent = items.length;
+        document.getElementById('unverifiedReplaceWarning')?.classList.toggle('hidden', st.reason !== REASON_TAIL_TRUNCATED);
+        this.updateReplaceUnverifiedButton();
+
+        const totalPages = Math.max(1, Math.ceil(items.length / st.pageSize));
+        st.page = Math.min(Math.max(1, st.page), totalPages);
+        if (!items.length) {
+            const text = document.getElementById('noUnverifiedText');
+            if (text) text.textContent = st.runId ? 'No entry is still unverified from this run.' : 'No unverified entries.';
+            empty?.classList.remove('hidden');
+            this.renderUnverifiedPagination(0);
+            return;
+        }
+        empty?.classList.add('hidden');
+
+        const start = (st.page - 1) * st.pageSize;
+        for (const h of items.slice(start, start + st.pageSize)) {
+            const files = h.unverified_files || [];
+            const rowId = `unverified-row-${this.slug(h.entry_name)}`;
+            const replaceable = files.some((f) => f.reason === REASON_TAIL_TRUNCATED);
+            const reasons = this.sortReasons([...new Set(files.map((f) => f.reason))]);
+            const reasonText = this.unverifiedReasonLabel(reasons[0]) + (reasons.length > 1 ? ` +${reasons.length - 1}` : '');
+            const shortBy = Math.max(0, ...files.map((f) => f.short_bytes || 0));
+            const lastChecked = h.last_checked_at ? new Date(h.last_checked_at).toLocaleString() : '-';
+
+            const tr = document.createElement('tr');
+            tr.className = 'cursor-pointer hover:bg-base-200';
+            tr.innerHTML = `
+                <td class="w-8">
+                    <i class="bi bi-chevron-right transition-transform" id="${rowId}-caret"></i>
+                </td>
+                <td class="font-mono text-sm break-all">${this.escape(h.entry_name)}</td>
+                <td>${h.file_count ?? 0}</td>
+                <td class="text-warning font-medium">${files.length}</td>
+                <td class="text-xs">${this.escape(reasonText)}</td>
+                <td class="text-xs">${shortBy ? this.formatBytes(shortBy) : '-'}</td>
+                <td class="text-xs">${lastChecked}</td>
+                <td class="text-right whitespace-nowrap">
+                    <button class="btn btn-xs btn-outline" data-action="recheck" aria-label="Recheck ${this.escapeAttr(h.entry_name)}" title="Check this entry again">
+                        <i class="bi bi-search-heart"></i>
+                    </button>
+                    ${replaceable ? `<button class="btn btn-xs btn-warning btn-outline" data-action="replace" aria-label="Replace ${this.escapeAttr(h.entry_name)}" title="Delete and re-search the tail-truncated files, keeping the release">
+                        <i class="bi bi-arrow-repeat"></i>
+                    </button>` : ''}
+                </td>
+            `;
+            tbody.appendChild(tr);
+
+            const detail = document.createElement('tr');
+            detail.id = rowId;
+            detail.className = 'hidden';
+            detail.innerHTML = `
+                <td colspan="8" class="bg-base-200/40 p-0">
+                    <div class="p-4 space-y-2">${this.renderUnverifiedFiles(files)}</div>
+                </td>
+            `;
+            tbody.appendChild(detail);
+
+            tr.addEventListener('click', (ev) => {
+                if (ev.target.closest('[data-action]')) return;
+                const hidden = detail.classList.toggle('hidden');
+                const caret = document.getElementById(`${rowId}-caret`);
+                if (caret) caret.style.transform = hidden ? '' : 'rotate(90deg)';
+            });
+            tr.querySelector('[data-action="recheck"]')?.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                this.recheckOne(h.entry_name);
+            });
+            this.bindOverlayConfirmButton(
+                tr.querySelector('[data-action="replace"]'),
+                () => [h.entry_name],
+                'replace',
+                (names) => this.replaceUnverified(names),
+            );
+        }
+        this.renderUnverifiedPagination(items.length);
+    }
+
+    renderUnverifiedPagination(total) {
+        const bar = document.getElementById('unverifiedPaginationBar');
+        const info = document.getElementById('unverifiedPaginationInfo');
+        const controls = document.getElementById('unverifiedPaginationControls');
+        if (!bar || !info || !controls) return;
+        if (total === 0) {
+            bar.classList.add('hidden');
+            return;
+        }
+        bar.classList.remove('hidden');
+        const {page, pageSize} = this.unverifiedState;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const start = (page - 1) * pageSize + 1;
+        info.textContent = `Showing ${start}-${Math.min(start + pageSize - 1, total)} of ${total}`;
+        if (totalPages <= 1) {
+            controls.innerHTML = '';
+            return;
+        }
+        let html = `<button class="join-item btn btn-sm ${page === 1 ? 'btn-disabled' : ''}"
+                            onclick="window.repairManager.goToUnverifiedPage(${page - 1})">«</button>`;
+        for (let i = 1; i <= totalPages; i++) {
+            if (i === 1 || i === totalPages || (i >= page - 2 && i <= page + 2)) {
+                html += `<button class="join-item btn btn-sm ${i === page ? 'btn-active' : ''}"
+                                onclick="window.repairManager.goToUnverifiedPage(${i})">${i}</button>`;
+            } else if (i === page - 3 || i === page + 3) {
+                html += `<button class="join-item btn btn-sm btn-disabled">…</button>`;
+            }
+        }
+        html += `<button class="join-item btn btn-sm ${page === totalPages ? 'btn-disabled' : ''}"
+                         onclick="window.repairManager.goToUnverifiedPage(${page + 1})">»</button>`;
+        controls.innerHTML = html;
+    }
+
+    goToUnverifiedPage(p) {
+        const totalPages = Math.max(1, Math.ceil(this.filteredUnverified().length / this.unverifiedState.pageSize));
+        if (p < 1 || p > totalPages || p === this.unverifiedState.page) return;
+        this.unverifiedState.page = p;
+        this.renderUnverifiedPage();
+    }
+
+    renderUnverifiedFiles(files) {
+        if (!files.length) {
+            return `<div class="text-sm opacity-60">No file details.</div>`;
+        }
+        const rows = files.map((f) => `
+            <tr>
+                <td class="font-mono text-xs break-all">${this.escape(f.file_name || '')}</td>
+                <td class="text-xs">${this.escape(this.unverifiedReasonLabel(f.reason))}</td>
+                <td class="text-xs">${f.short_bytes ? this.formatBytes(f.short_bytes) : '-'}</td>
+                <td class="text-xs">${f.size ? this.formatBytes(f.size) : '-'}</td>
+            </tr>
+        `).join('');
+        return `
+            <div class="overflow-x-auto">
+                <table class="table table-xs">
+                    <thead><tr><th>File</th><th>Reason</th><th>Short by</th><th>Size</th></tr></thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    // replaceUnverifiedBatch is what the bulk Replace acts on: the first batch
+    // of listed entries with a tail-truncated file, in list order. Empty
+    // unless the Tail truncated reason is selected.
+    replaceUnverifiedBatch() {
+        if (this.unverifiedState.reason !== REASON_TAIL_TRUNCATED) return [];
+        return this.filteredUnverified().slice(0, REPLACE_UNVERIFIED_BATCH).map((h) => h.entry_name);
+    }
+
+    // updateReplaceUnverifiedButton enables the bulk Replace only for the Tail
+    // truncated reason with no run active, and never labels a capped batch
+    // "all".
+    updateReplaceUnverifiedButton() {
+        const btn = document.getElementById('replaceUnverifiedBtn');
+        const label = document.getElementById('replaceUnverifiedLabel');
+        if (!btn || !label || btn.dataset.confirming === 'true') return;
+        const tail = this.unverifiedState.reason === REASON_TAIL_TRUNCATED;
+        const total = tail ? this.filteredUnverified().length : 0;
+        const running = !!this.latestStatus?.active_run;
+        btn.disabled = !tail || total === 0 || running;
+        btn.title = !tail ? 'Pick the Tail truncated reason to replace those files'
+            : running ? 'Wait for the current repair run to finish' : '';
+        label.textContent = total > REPLACE_UNVERIFIED_BATCH
+            ? `Replace next ${REPLACE_UNVERIFIED_BATCH} of ${total}`
+            : `Replace all${total ? ` (${total})` : ''}`;
+    }
+
+    async replaceUnverified(names) {
+        const btn = document.getElementById('replaceUnverifiedBtn');
+        if (btn) btn.disabled = true;
+        try {
+            const res = await fetch(`${this.api}/repair/unverified/replace`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({names, limit: names.length}),
+            });
+            const text = await res.text();
+            if (!res.ok) throw new Error(text.trim() || `HTTP ${res.status}`);
+            const data = text ? JSON.parse(text) : {};
+            const queued = data.queued?.length ?? 0;
+            this.toast(`Replacing ${queued} entr${queued === 1 ? 'y' : 'ies'}: deleting and re-searching through their Arr, releases kept`, 'success');
+            await Promise.all([this.loadStatus(), this.loadHistory(), this.loadUnverified()]);
+        } catch (e) {
+            this.toast(`Replace failed: ${e.message}`, 'error');
+        } finally {
+            this.updateReplaceUnverifiedButton();
+        }
+    }
+
     async recheckOne(name) {
         try {
             const res = await fetch(`${this.api}/repair/health/${encodeURIComponent(name)}/check`, {method: 'POST'});
             if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
             this.toast(`Recheck started for ${name}`, 'success');
             // Recheck flips the entry to repairing; refresh shortly so the row updates.
-            setTimeout(() => { this.loadBroken(); this.loadStatus(); }, 800);
+            setTimeout(() => {
+                this.loadBroken();
+                if (this.isUnverifiedModalOpen()) this.loadUnverified();
+                this.loadStatus();
+            }, 800);
         } catch (e) {
             this.toast(`Recheck failed: ${e.message}`, 'error');
         }
@@ -939,10 +1298,15 @@ class RepairManager {
                 <td class="${run.stats?.broken ? 'text-error font-medium' : ''}">${run.stats?.broken ?? 0}</td>
                 <td class="${run.stats?.repaired ? 'text-success font-medium' : ''}">${run.stats?.repaired ?? 0}</td>
                 <td class="${run.stats?.cleared ? 'text-warning font-medium' : ''}">${run.stats?.cleared ?? 0}</td>
-                <td class="${run.stats?.unverified ? 'text-warning font-medium' : ''}">${run.stats?.unverified ?? 0}</td>
+                <td>${run.stats?.unverified
+                    ? `<button type="button" class="link link-hover text-warning font-medium" data-unverified-run title="List the entries still unverified from this run">${run.stats.unverified}</button>`
+                    : 0}</td>
                 <td>${duration}</td>
                 <td class="text-xs text-error">${run.error || ''}</td>
             `;
+            tr.querySelector('[data-unverified-run]')?.addEventListener('click', () => {
+                this.openUnverifiedModal({runId: run.id, runLabel: start ? start.toLocaleString() : run.id});
+            });
             tbody.appendChild(tr);
         }
     }
