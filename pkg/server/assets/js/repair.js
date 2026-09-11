@@ -51,7 +51,12 @@ class RepairManager {
         const $ = (id) => document.getElementById(id);
         $('runNowBtn')?.addEventListener('click', () => this.openRunModal());
         $('stopRunBtn')?.addEventListener('click', () => this.stopRun());
-        $('fixBrokenBtn')?.addEventListener('click', () => this.fixBroken());
+        this.bindOverlayConfirmButton(
+            $('fixBrokenBtn'),
+            () => Array.from({length: this.latestStatus?.health_counts?.broken || 0}),
+            'delete & re-search',
+            () => this.fixBroken(),
+        );
         $('clearStateBtn')?.addEventListener('click', () => this.openClearStateModal());
         $('viewBrokenBtn')?.addEventListener('click', () => this.openBrokenModal());
         $('refreshHistoryBtn')?.addEventListener('click', () => this.loadHistory());
@@ -403,8 +408,12 @@ class RepairManager {
         }
     }
 
+    // fixBroken sends delete + re-search for every broken entry to its Arr.
+    // The click is confirmed inline (bindOverlayConfirmButton), not with
+    // window.confirm(), which a browser or extension can suppress silently.
+    // The page is not reloaded, so the toast stays readable; the status poll
+    // picks up the run and refreshes history when it ends.
     async fixBroken() {
-        if (!confirm('Send delete + re-search for every currently broken entry to its Arr?')) return;
         const btn = document.getElementById('fixBrokenBtn');
         if (btn) btn.disabled = true;
         try {
@@ -414,9 +423,9 @@ class RepairManager {
                 body: JSON.stringify({}),
             });
             const text = await res.text();
-            if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
-            this.toast('Fix-broken started', 'success');
-            window.location.reload();
+            if (!res.ok) throw new Error(text.trim() || `HTTP ${res.status}`);
+            this.toast('Fix started: deleting and re-searching broken entries through their Arr', 'success');
+            await Promise.all([this.loadStatus(), this.loadHistory()]);
         } catch (e) {
             this.toast(`Fix failed: ${e.message}`, 'error');
             if (btn) btn.disabled = false;
@@ -763,10 +772,12 @@ class RepairManager {
                 ev.stopPropagation();
                 this.recheckOne(h.entry_name);
             });
-            tr.querySelector('[data-action="fix"]')?.addEventListener('click', (ev) => {
-                ev.stopPropagation();
-                this.fixOne(h.entry_name);
-            });
+            this.bindOverlayConfirmButton(
+                tr.querySelector('[data-action="fix"]'),
+                () => [h.entry_name],
+                'delete & re-search',
+                () => this.fixOne(h.entry_name),
+            );
         }
         this.renderBrokenPagination();
     }
@@ -861,17 +872,17 @@ class RepairManager {
         }
     }
 
+    // fixOne is fixBroken for a single row of the broken-entries modal.
     async fixOne(name) {
-        if (!confirm(`Send delete + re-search for "${name}" to its Arr?`)) return;
         try {
             const res = await fetch(`${this.api}/repair/fix`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({names: [name]}),
             });
-            if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+            if (!res.ok) throw new Error((await res.text()).trim() || `HTTP ${res.status}`);
             this.toast(`Fix started for ${name}`, 'success');
-            window.location.reload();
+            await Promise.all([this.loadStatus(), this.loadHistory()]);
         } catch (e) {
             this.toast(`Fix failed: ${e.message}`, 'error');
         }
@@ -1194,8 +1205,7 @@ class RepairManager {
     }
 
     toast(message, type = 'info') {
-        if (typeof window.toast === 'function') return window.toast(message, type);
-        if (typeof window.showToast === 'function') return window.showToast(message, type);
+        if (typeof window.createToast === 'function') return window.createToast(message, type);
         console.log(`[${type}]`, message);
     }
 
@@ -1819,6 +1829,7 @@ class RepairManager {
             }
             if (btn.dataset.confirming === 'true') {
                 btn.dataset.confirming = '';
+                if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
                 onConfirm(items);
                 return;
             }

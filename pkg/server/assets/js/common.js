@@ -31,17 +31,69 @@ class DecypharrUtils {
         // Add toast CSS styles
         this.addToastStyles();
 
-        // Global toast handler
+        // Global toast handler. Browser extensions run scripts inside the page
+        // and their failures reach these listeners too (e.g. "No Listener:
+        // tabs:outgoing.message.ready" on every page load), so only errors
+        // thrown from Decypharr's own scripts get a toast; the rest stay in
+        // the console.
         window.addEventListener('error', (e) => {
             console.error('Global error:', e.error);
+            if (!this.isOwnScriptError(e.filename, e.error)) return;
             this.createToast(`Unexpected error: ${e.error?.message || 'Unknown error'}`, 'error');
         });
 
         // Handle unhandled promise rejections
         window.addEventListener('unhandledrejection', (e) => {
             console.error('Unhandled promise rejection:', e.reason);
+            if (!this.isOwnScriptError('', e.reason)) return;
             this.createToast(`Promise rejected: ${e.reason?.message || 'Unknown error'}`, 'error');
         });
+
+        // A toast hosted inside a modal disappears when the modal closes;
+        // hand the container back before that happens. 'close' does not
+        // bubble, so listen in the capture phase.
+        document.addEventListener('close', (e) => {
+            if (this.toastContainer && e.target instanceof HTMLDialogElement && e.target.contains(this.toastContainer)) {
+                this.placeToastContainer(e.target);
+            }
+        }, true);
+    }
+
+    // isOwnScriptError reports whether an error came from a script served
+    // under this app's /assets/ path, judged by the error event's filename or
+    // the stack trace. Anything without that evidence is treated as foreign.
+    isOwnScriptError(filename, error) {
+        let assets;
+        try {
+            assets = new URL(this.joinURL(this.urlBase || '/', 'assets/'), window.location.origin).href;
+        } catch {
+            return false;
+        }
+        return [filename, error?.stack].some((s) => typeof s === 'string' && s.includes(assets));
+    }
+
+    // placeToastContainer moves the toast container into the topmost open
+    // modal dialog, or back to <body> when there is none. A dialog opened with
+    // showModal() sits in the browser's top layer above every z-index, so a
+    // toast left in <body> would render behind it and never be seen.
+    // closing is a dialog that is about to close and must not host it.
+    placeToastContainer(closing = null) {
+        if (!this.toastContainer) return;
+        const modals = [...document.querySelectorAll('dialog[open]')]
+            .filter((d) => d !== closing && this.isModalDialog(d));
+        const host = modals.length ? modals[modals.length - 1] : document.body;
+        if (this.toastContainer.parentElement !== host) {
+            host.appendChild(this.toastContainer);
+        }
+    }
+
+    isModalDialog(dialog) {
+        try {
+            return dialog.matches(':modal');
+        } catch {
+            // Browsers without :modal: treat any open dialog as modal.
+            return true;
+        }
     }
 
     // Add toast styles to document
@@ -155,10 +207,11 @@ class DecypharrUtils {
         type = ['success', 'warning', 'error', 'info'].includes(type) ? type : 'success';
         duration = duration || toastTimeouts[type];
 
-        // Ensure toast container exists
+        // Ensure toast container exists and is visible above any open modal
         if (!this.toastContainer) {
             this.createToastContainer();
         }
+        this.placeToastContainer();
 
         const toastId = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
