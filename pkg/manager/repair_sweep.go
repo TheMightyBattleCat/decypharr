@@ -664,6 +664,30 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				return res
 			}
 
+			// Import geometry: slices spliced from another volume (stored meta,
+			// free) and, when this probe decodes anyway, a served length short
+			// of the Matroska Segment (one article's prefix, in memory).
+			if entry.IsNZB() {
+				geo := r.checkImportGeometry(ctx, res.infoHash, name, !skipDecode)
+				switch {
+				case geo.reason != "":
+					r.logger.Warn().Str("entry", c.name).Str("file", name).Str("reason", geo.reason).
+						Int("spliced_boundaries", geo.splices).Int64("short_bytes", geo.shortBytes).
+						Msg("Repair: file was assembled wrong at import; the posting is fine, so a re-grab keeps the release")
+					res.healthy = false
+					res.broken = true
+					res.reason = geo.reason
+					return res
+				case geo.tailTruncated:
+					// Plays, but its index is cut, so every decode check forward-
+					// scans and ends inconclusive. Not stamped: counted Unverified.
+					r.logger.Warn().Str("entry", c.name).Str("file", name).Int64("short_bytes", geo.shortBytes).
+						Msg("Repair: file ends before its Matroska index (tail truncated at import); skipping decode checks, re-grab by hand if seeking matters")
+					res.decodeConclusive = false
+					return res
+				}
+			}
+
 			exp := expectedRuntimeFor(c, name)
 			// The sweep runs the same decode check as the import gate, so it
 			// gets the same byte cap - otherwise a file the gate admitted on
@@ -1123,7 +1147,15 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	parRepaired := false
 	var fixed map[string]struct{}
 	if !bulkOverride {
-		fixed = r.warmSweepRepair(ctx, h.BrokenFiles)
+		// PAR2 cannot fix a file assembled wrong at import; don't spend a
+		// pass on one.
+		damaged := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
+		for _, bf := range h.BrokenFiles {
+			if !keepReleaseReason(bf.Reason) {
+				damaged = append(damaged, bf)
+			}
+		}
+		fixed = r.warmSweepRepair(ctx, damaged)
 	}
 	if len(fixed) > 0 {
 		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
@@ -1157,9 +1189,16 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 	// An entry's broken files normally all belong to one Arr, but a merged
 	// candidate can span more — group defensively.
 	byArr := make(map[string][]arr.ContentFile)
+	keepRelease := make(map[string]map[int]bool) // Arr -> FileIds re-grabbed without blocklisting
 	for _, bf := range h.BrokenFiles {
 		if bf.ArrName == "" || bf.ArrFileID == 0 {
 			continue
+		}
+		if keepReleaseReason(bf.Reason) {
+			if keepRelease[bf.ArrName] == nil {
+				keepRelease[bf.ArrName] = make(map[int]bool)
+			}
+			keepRelease[bf.ArrName][bf.ArrFileID] = true
 		}
 		byArr[bf.ArrName] = append(byArr[bf.ArrName], arr.ContentFile{
 			Id:        bf.MediaID,
@@ -1186,7 +1225,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		if a == nil {
 			continue
 		}
-		actioned, cancelled := r.repairArrFiles(ctx, run, statsMu, a, files)
+		actioned, cancelled := r.repairArrFiles(ctx, run, statsMu, a, files, keepRelease[arrName])
 		if cancelled {
 			return
 		}
@@ -1278,7 +1317,13 @@ func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
 // bounded by the sweep's worker count; Sonarr/Radarr handle that many in-flight
 // API calls fine, and the actual search/grab work is paced by the Arr's own
 // command queue regardless of how the calls arrive.
-func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile) (actioned bool, cancelled bool) {
+//
+// Files in keepRelease (by FileId) were assembled wrong at import from a
+// posting that is fine: they are deleted and re-searched, never blocklisted,
+// so the Arr can grab the same release and the fixed parser imports it right.
+// A grab they share with a blocklisted file is still blocklisted - the Arr
+// has one history record for the whole grab - and that is logged.
+func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile, keepRelease map[int]bool) (actioned bool, cancelled bool) {
 	// Look up the grab history per broken file. Files whose grab record exists
 	// get blocklisted via MarkHistoryFailed (which Sonarr/Radarr auto-re-searches
 	// when "Redownload Failed" is on — the default). Files with no grab record
@@ -1287,6 +1332,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// HistoryIDs are deduped per arr — a season-pack grab covers multiple broken
 	// files but only needs one history/failed POST.
 	historyIDs := make(map[int]struct{})
+	keptGrabs := make(map[int]string) // grab history ID -> a keep-release file in it
 	needSearch := make([]arr.ContentFile, 0)
 	for _, f := range files {
 		if ctx != nil && ctx.Err() != nil {
@@ -1308,7 +1354,18 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			needSearch = append(needSearch, f)
 			continue
 		}
+		if keepRelease[f.FileId] {
+			keptGrabs[id] = f.Name
+			needSearch = append(needSearch, f)
+			continue
+		}
 		historyIDs[id] = struct{}{}
+	}
+	for id, name := range keptGrabs {
+		if _, blocklisted := historyIDs[id]; blocklisted {
+			r.logger.Warn().Str("arr", a.Name).Int("history_id", id).Str("file", name).
+				Msg("Repair: blocklisting a grab that also holds a file only assembled wrong at import - another file in it is damaged")
+		}
 	}
 
 	// Clear the EpisodeFile/MovieFile rows first so the upcoming re-search isn't

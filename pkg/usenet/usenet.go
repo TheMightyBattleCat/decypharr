@@ -1122,6 +1122,26 @@ func (u *Usenet) FetchArticle(ctx context.Context, messageID string) ([]byte, er
 	return out, nil
 }
 
+// FetchArticlePrefix returns the first n decoded bytes of one NNTP article,
+// held in memory only: no segment cache, no DFS cache, no prefetch. The rest
+// of the body is drained and discarded (the connection stays reusable), so
+// it still costs one article of bandwidth.
+func (u *Usenet) FetchArticlePrefix(ctx context.Context, messageID string, n int) ([]byte, error) {
+	var prefix []byte
+	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		meta, err := conn.GetHeaderPrefix(messageID, n)
+		if err != nil {
+			return err
+		}
+		prefix = meta.Snippet
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return prefix, nil
+}
+
 // MissingSegment identifies one confirmed-missing article found during a
 // CheckFileDetailed probe, in enough detail to record against the overlay
 // store (pkg/usenet/overlay.Store.RecordDead).
