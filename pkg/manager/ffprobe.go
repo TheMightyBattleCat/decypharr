@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -105,6 +106,9 @@ const (
 	defaultDecodeDetectBytes = 2 << 30 // 2 GiB
 	defaultDecodeHeadBytes   = 3 << 30 // 3 GiB
 
+	// maxDecodeThreads caps decodeThreadsFor.
+	maxDecodeThreads = 4
+
 	// decodeDetectCapDivisor cuts the seek-detect probe at detectBytes/2. The
 	// cut has to sit BELOW the read an unseekable file needs to reach the
 	// detect window (detectBytes): at or above it, a forward scanner would
@@ -184,6 +188,10 @@ type ffprobeChecker struct {
 	// default. See decodeWindows.
 	detectBytes int64
 	headBytes   int64
+
+	// decodeThreads is the -threads value for frame-decode probes (1 leaves
+	// ffprobe's single-threaded default). See decodeThreadsFor.
+	decodeThreads int
 
 	// authToken is the manager's ephemeral, in-memory, per-process bearer
 	// token (see webdav.Handler.isInternalBearer), sent via ffprobe's
@@ -299,8 +307,11 @@ func buildFFProbeChecker(cfg *config.Config, m *Manager, log zerolog.Logger, def
 		baseURL:     fmt.Sprintf("http://127.0.0.1:%s%swebdav/", cfg.Port, cfg.URLBase),
 		detectBytes: parseSizeOr(log, "decode_detect_bytes", cfg.Repair.DecodeDetectBytes, defaultDecodeDetectBytes),
 		headBytes:   parseSizeOr(log, "decode_head_bytes", cfg.Repair.DecodeHeadBytes, defaultDecodeHeadBytes),
-		authToken:   authToken,
-		logger:      log,
+		// cfg.Repair.Workers is defaulted to 5 when unset (config.go), so
+		// workers is never 0 here in production.
+		decodeThreads: decodeThreadsFor(runtime.NumCPU(), cfg.Repair.Workers),
+		authToken:     authToken,
+		logger:        log,
 	}
 }
 
@@ -854,6 +865,42 @@ func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64
 	return intervals
 }
 
+// decodeProbeFlags is the ffprobe flag list for one frame-decode probe over
+// intervals, without the auth header and target URL (see probeArgs).
+func (f *ffprobeChecker) decodeProbeFlags(intervals []string) []string {
+	flags := []string{"-v", "error"}
+	if f.decodeThreads > 1 {
+		// ffprobe leaves the decoder single-threaded unless told otherwise.
+		// Measured on the production install (8 cores, 3 probes in parallel, HEVC): 159 fps
+		// in total single-threaded, 256 fps with 3 threads each; frames
+		// printed and stderr identical.
+		flags = append(flags, "-threads", strconv.Itoa(f.decodeThreads))
+	}
+	return append(flags,
+		"-read_intervals", strings.Join(intervals, ","),
+		// V, not v: never select an attached picture (cover art), which an
+		// MP4 can list ahead of its video track.
+		"-select_streams", "V:0",
+		// best_effort_timestamp_time exists from ffprobe 4.x through 8.x, and
+		// is filled from the DTS when a packet carries none. pts_time did not
+		// exist before 5.0, so on the production install's 4.2 every frame printed an empty
+		// line. See parseDecodeProgress.
+		"-show_entries", "frame=best_effort_timestamp_time",
+		"-of", "csv=p=0",
+	)
+}
+
+// decodeThreadsFor shares the machine's cores between the repair workers
+// that run decode probes at the same time: ceil(cpus / workers), between 1
+// and maxDecodeThreads. Beyond ~4 threads per probe the production install measured no gain.
+func decodeThreadsFor(cpus, workers int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	n := (cpus + workers - 1) / workers
+	return max(1, min(n, maxDecodeThreads))
+}
+
 // runDecodeProbe executes one frame-decode ffprobe over intervals and
 // classifies the outcome. phase names the probe in logs; budget is the one the
 // read path meters this probe's range requests against (the file budget for
@@ -866,19 +913,7 @@ func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64
 // itself before acting on the result, because for seek detection the cut is
 // the signal.
 func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileName, phase string, intervals []string, timeout time.Duration, fileBytes int64, budget *VerifyBudget) (ok bool, reason string, conclusive bool) {
-	args := f.probeArgs(entryFolder, fileName, []string{
-		"-v", "error",
-		"-read_intervals", strings.Join(intervals, ","),
-		// V, not v: never select an attached picture (cover art), which an
-		// MP4 can list ahead of its video track.
-		"-select_streams", "V:0",
-		// best_effort_timestamp_time exists from ffprobe 4.x through 8.x, and
-		// is filled from the DTS when a packet carries none. pts_time did not
-		// exist before 5.0, so on the production install's 4.2 every frame printed an empty
-		// line. See parseDecodeProgress.
-		"-show_entries", "frame=best_effort_timestamp_time",
-		"-of", "csv=p=0",
-	})
+	args := f.probeArgs(entryFolder, fileName, f.decodeProbeFlags(intervals))
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -897,7 +932,7 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 	progress := parseDecodeProgress(stdout.Bytes(), len(intervals))
 	evt := func() *zerolog.Event {
 		ev := f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).
-			Str("phase", phase).Int("windows", len(intervals)).Dur("timeout", timeout).
+			Str("phase", phase).Int("windows", len(intervals)).Int("threads", max(1, f.decodeThreads)).Dur("timeout", timeout).
 			Int64("file_bytes", fileBytes).Dur("elapsed", elapsed).Int("frames", progress.frames)
 		if progress.timestamps > 0 {
 			ev = ev.Float64("decoded_to_s", progress.lastTS)
