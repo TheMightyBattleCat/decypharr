@@ -712,6 +712,17 @@ func (m *Manager) GetTorrentsCount() (int, error) {
 
 // DeleteEntry deletes a torrent by infohash
 func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
+	if err := m.deleteEntry(infohash, removePlacements); err != nil {
+		return err
+	}
+	// Refresh entry cache
+	m.RefreshEntries(true)
+	return nil
+}
+
+// deleteEntry is DeleteEntry without the entry cache and mount refresh, for
+// callers deleting many entries that refresh once at the end.
+func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	torr, err := m.GetEntry(infohash)
 	if err != nil {
 		return err
@@ -741,12 +752,7 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 		}
 	}
 
-	if err := m.storage.Delete(infohash); err != nil {
-		return err
-	}
-	// Refresh entry cache
-	m.RefreshEntries(true)
-	return nil
+	return m.storage.Delete(infohash)
 }
 
 func (m *Manager) DeleteTorrents(infohashes []string, removeFromDebrid bool) error {

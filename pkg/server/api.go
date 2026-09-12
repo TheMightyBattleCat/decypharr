@@ -1128,16 +1128,17 @@ func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListDebridGone lists torrent entries no configured debrid can serve
-// (their debrid is gone from config, or re-insertion gave up), from stored
-// entries only. ?limit=N caps the names returned (default 50); totals always
-// cover every entry.
+// (their debrid is gone from config, or re-insertion gave up) and what a bulk
+// fix would do with each: delete the orphans no Arr points at, re-grab the
+// rest. Lists every Arr's library first, so it takes about a minute.
+// ?limit=N caps both name lists (default 50); totals always cover every entry.
 func (s *Server) handleListDebridGone(w http.ResponseWriter, r *http.Request) {
 	svc := s.manager.Repair()
 	if svc == nil {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	res, err := svc.FindDebridGone()
+	res, err := svc.FindDebridGone(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1147,20 +1148,31 @@ func (s *Server) handleListDebridGone(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 	res.Entries = res.Entries[:min(limit, len(res.Entries))]
+	res.Orphans = res.Orphans[:min(limit, len(res.Orphans))]
 	utils.JSONResponse(w, res, http.StatusOK)
 }
 
-// handleFixDebridGone marks up to ?limit=N (default 50) unservable torrent
-// entries broken and runs Fix broken on them: delete, blocklist and re-search
-// through their Arr. 409 while another repair run is active.
+// handleFixDebridGone runs one bulk batch over unservable torrent entries.
+// With ?delete=1 it deletes up to ?delete_limit=N (default 200) orphans no
+// Arr points at; it then marks up to ?limit=N (default 50) entries an Arr
+// still points at broken and runs Fix broken on them: delete, blocklist and
+// re-search through their Arr. 409 while another repair run is active.
 func (s *Server) handleFixDebridGone(w http.ResponseWriter, r *http.Request) {
 	svc := s.manager.Repair()
 	if svc == nil {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	res, err := svc.FixDebridGone(s.manager.Context(), limit)
+	q := r.URL.Query()
+	opts := manager.DebridGoneFixOptions{Delete: q.Get("delete") == "1" || q.Get("delete") == "true"}
+	opts.Limit, _ = strconv.Atoi(q.Get("limit"))
+	opts.DeleteLimit, _ = strconv.Atoi(q.Get("delete_limit"))
+	res, err := svc.FixDebridGone(s.manager.Context(), opts)
+	if err != nil && res.Deleted > 0 {
+		// The deletes happened; report them with why the re-grab did not start.
+		res.Error = err.Error()
+		err = nil
+	}
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {

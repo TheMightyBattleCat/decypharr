@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -331,7 +332,11 @@ func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]stru
 // concurrently, so this reports completion order, not a sequential "current
 // Arr"; existing callers that don't need progress just omit it.
 func (r *Repair) buildArrReferencedSet(ctx context.Context, onArrDone ...func(done, total int, name string)) (map[string]map[string]string, error) {
-	arrs := r.eligibleArrs(nil)
+	return r.buildArrReferencedSetFor(ctx, r.eligibleArrs(nil), onArrDone...)
+}
+
+// buildArrReferencedSetFor is buildArrReferencedSet over the given Arrs.
+func (r *Repair) buildArrReferencedSetFor(ctx context.Context, arrs []*arr.Arr, onArrDone ...func(done, total int, name string)) (map[string]map[string]string, error) {
 	if len(arrs) == 0 {
 		return nil, fmt.Errorf("no eligible arrs configured")
 	}
