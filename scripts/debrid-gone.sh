@@ -5,7 +5,7 @@
 #
 # Usage:
 #   scripts/debrid-gone.sh list [--limit N]
-#   scripts/debrid-gone.sh fix [--delete] [--limit N] [--delete-limit N] [--batches N]
+#   scripts/debrid-gone.sh fix [--delete] [--limit N] [--delete-limit N] [--batches N] [--wait-max MIN]
 #
 # list  Dry run. Counts what a fix would do and names some of each:
 #         orphaned  no Arr points at the entry: deleted by fix --delete
@@ -14,10 +14,11 @@
 #       Lists every Arr's library first, so it takes about a minute.
 #
 # fix   Runs up to --batches batches (default 1). Each batch deletes up to
-#       --delete-limit orphans (default 200, only with --delete) and marks up
+#       --delete-limit orphans (default 10, only with --delete) and marks up
 #       to --limit entries broken (default 50), which starts a Fix broken run.
-#       Waits for any active repair run before each batch. Stops on an error,
-#       a failed delete, or when nothing is left.
+#       Waits up to --wait-max minutes (default 20) for any active repair run
+#       before each batch. Stops on an error, a failed delete, or when nothing
+#       is left.
 #
 # Deletes touch decypharr's store only: nothing is removed from a debrid
 # account, and no Arr file is touched.
@@ -33,8 +34,11 @@ usage() {
 }
 
 # api METHOD PATH: prints the body, then the HTTP status on the last line.
+# ssh hands its arguments to the remote shell as one string, so they are
+# quoted for it: an unquoted & in a query would end the command there.
 api() {
-	ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" bash -s -- "$1" "$2" <<'REMOTE'
+	# shellcheck disable=SC2029
+	ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "bash -s -- $(printf '%q %q' "$1" "$2")" <<'REMOTE'
 set -euo pipefail
 T=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["api_token"])' "${DECYPHARR_DIR:-$HOME/decypharr}/auth.json")
 curl -sS -X "$1" -H "Authorization: Bearer $T" -w '\n%{http_code}' "http://127.0.0.1:8686$2"
@@ -69,7 +73,9 @@ field() {
 	python3 -c 'import json,sys; v=json.load(sys.stdin).get(sys.argv[1]); print(v if v is not None else "")' "$1"
 }
 
+# wait_idle: waits up to $wait_max minutes for the active repair run to end.
 wait_idle() {
+	local deadline=$(($(date +%s) + wait_max * 60))
 	while :; do
 		local out code body active
 		out=$(api GET /api/repair/status)
@@ -78,6 +84,11 @@ wait_idle() {
 		[[ $code == 200 ]] || { echo "repair status: HTTP $code: $body" >&2; exit 1; }
 		active=$(python3 -c 'import json,sys; r=json.load(sys.stdin).get("active_run") or {}; print(r.get("id",""), r.get("source",""), r.get("stage",""))' <<<"$body")
 		[[ -z ${active// } ]] && return
+		if (($(date +%s) >= deadline)); then
+			echo "gave up after ${wait_max} min waiting for repair run: $active" >&2
+			echo "stop it (Repair page, or POST /api/repair/stop) or pass a larger --wait-max" >&2
+			exit 1
+		fi
 		echo "$(date +%T) waiting for repair run: $active"
 		sleep 30
 	done
@@ -88,15 +99,17 @@ cmd="${1:-}"
 shift
 
 limit=""
-delete_limit=""
+delete_limit=10
 delete=0
 batches=1
+wait_max=20
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--limit) limit="$2"; shift 2 ;;
 		--delete-limit) delete_limit="$2"; shift 2 ;;
 		--delete) delete=1; shift ;;
 		--batches) batches="$2"; shift 2 ;;
+		--wait-max) wait_max="$2"; shift 2 ;;
 		*) usage ;;
 	esac
 done
@@ -111,9 +124,8 @@ case "$cmd" in
 		summary <<<"$body"
 		;;
 	fix)
-		query="delete=${delete}"
+		query="delete=${delete}&delete_limit=${delete_limit}"
 		[[ -n $limit ]] && query+="&limit=${limit}"
-		[[ -n $delete_limit ]] && query+="&delete_limit=${delete_limit}"
 		for ((b = 1; b <= batches; b++)); do
 			wait_idle
 			echo "$(date +%T) batch $b/$batches: POST fix?$query (lists every Arr's library first)..."
