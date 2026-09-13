@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -18,6 +19,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 	"github.com/sourcegraph/conc/iter"
 )
 
@@ -54,6 +56,10 @@ const (
 	// fail fast into that fallback rather than eating the connection's full
 	// StreamBodyTimeout.
 	par2ProbeTimeout = 5 * time.Second
+	// par2MD5PrefixSize is the number of decoded bytes fetched per file for
+	// PAR2 MD5-16k name recovery. PAR2 FileDesc packets store MD5 of the
+	// first 16KB (or the whole file if shorter).
+	par2MD5PrefixSize = 16384
 	// par2ProbeMaxFailedFetches is how many confirmed-missing articles
 	// (genuine 430/423) buildPar2RefsWithFetch tolerates before giving up
 	// on PAR2 probing for the rest of the release. At 20, partial source
@@ -756,7 +762,8 @@ func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) ma
 
 	// Merge obfuscated RAR groups - when subjects are random strings,
 	// each RAR volume gets its own group. This merges them back together.
-	groups = p.mergeObfuscatedRarGroups(groups)
+	// Pass the raw file list so PAR2 name recovery can find PAR2 files.
+	groups = p.mergeObfuscatedRarGroups(ctx, groups, files)
 
 	return groups
 }
@@ -768,7 +775,11 @@ func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) ma
 // Obfuscation detection: When an NZB has random subjects (e.g., "yXIBWWn7qKVUVpS6")
 // instead of descriptive filenames (e.g., "movie.part01.rar"), each RAR volume
 // ends up in its own single-file group. This function merges those back together.
-func (p *NZBParser) mergeObfuscatedRarGroups(groups map[string]*FileGroup) map[string]*FileGroup {
+//
+// When PAR2 files are available, it attempts to recover real filenames from the
+// PAR2 FileDesc table via MD5-16k matching. Recovered names (e.g. ".part01.rar")
+// provide proper volume ordering; without them, NZB upload order is the fallback.
+func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[string]*FileGroup, rawFiles nzbparser.NzbFiles) map[string]*FileGroup {
 	// Collect all single-file RAR groups (potential obfuscation victims)
 	var singleFileRarGroups []*FileGroup
 	var otherGroups []*FileGroup
@@ -781,55 +792,232 @@ func (p *NZBParser) mergeObfuscatedRarGroups(groups map[string]*FileGroup) map[s
 		}
 	}
 
-	// If we have multiple single-file RAR groups, this is likely obfuscation
-	// Merge them into a single group
-	if len(singleFileRarGroups) > 1 {
-		p.logger.Debug().
-			Int("single_file_rar_groups", len(singleFileRarGroups)).
-			Msg("Detected potential obfuscated RAR archive, merging groups")
-
-		// Create a merged group using the first group as base
-		mergedGroup := &FileGroup{
-			BaseName:       singleFileRarGroups[0].BaseName,
-			ActualFilename: singleFileRarGroups[0].ActualFilename,
-			Type:           storage.NZBFileTypeRar,
-			Files:          make([]nzbparser.NzbFile, 0, len(singleFileRarGroups)),
-			Groups:         make(map[string]struct{}),
-		}
-
-		// Merge all files from single-file RAR groups
-		for _, group := range singleFileRarGroups {
-			mergedGroup.Files = append(mergedGroup.Files, group.Files...)
-			for g := range group.Groups {
-				mergedGroup.Groups[g] = struct{}{}
-			}
-		}
-
-		// Sort merged files by their NZB file Number (index in original NZB)
-		// This preserves upload order which typically matches volume order
-		// for multi-volume RAR archives uploaded sequentially
-		sort.Slice(mergedGroup.Files, func(i, j int) bool {
-			// Use the NZB file Number field which represents order in NZB
-			return mergedGroup.Files[i].Number < mergedGroup.Files[j].Number
-		})
-
-		// Rebuild the groups map with the merged group
-		result := make(map[string]*FileGroup)
-		result[mergedGroup.BaseName] = mergedGroup
-		for _, group := range otherGroups {
-			result[group.BaseName] = group
-		}
-
-		p.logger.Info().
-			Int("merged_files", len(mergedGroup.Files)).
-			Str("group_name", mergedGroup.BaseName).
-			Msg("Merged obfuscated RAR groups into single group")
-
-		return result
+	if len(singleFileRarGroups) <= 1 {
+		return groups
 	}
 
-	// No merging needed
-	return groups
+	p.logger.Debug().
+		Int("single_file_rar_groups", len(singleFileRarGroups)).
+		Msg("Detected potential obfuscated RAR archive, merging groups")
+
+	// Try PAR2 name recovery before falling back to blind merge.
+	if recovered := p.tryPar2NameRecovery(ctx, singleFileRarGroups, otherGroups, rawFiles); recovered != nil {
+		return recovered
+	}
+
+	// Fallback: merge into a single group sorted by NZB upload order.
+	mergedGroup := &FileGroup{
+		BaseName:       singleFileRarGroups[0].BaseName,
+		ActualFilename: singleFileRarGroups[0].ActualFilename,
+		Type:           storage.NZBFileTypeRar,
+		Files:          make([]nzbparser.NzbFile, 0, len(singleFileRarGroups)),
+		Groups:         make(map[string]struct{}),
+	}
+
+	for _, group := range singleFileRarGroups {
+		mergedGroup.Files = append(mergedGroup.Files, group.Files...)
+		for g := range group.Groups {
+			mergedGroup.Groups[g] = struct{}{}
+		}
+	}
+
+	sort.Slice(mergedGroup.Files, func(i, j int) bool {
+		return mergedGroup.Files[i].Number < mergedGroup.Files[j].Number
+	})
+
+	result := make(map[string]*FileGroup)
+	result[mergedGroup.BaseName] = mergedGroup
+	for _, group := range otherGroups {
+		result[group.BaseName] = group
+	}
+
+	p.logger.Info().
+		Int("merged_files", len(mergedGroup.Files)).
+		Str("group_name", mergedGroup.BaseName).
+		Msg("Merged obfuscated RAR groups into single group")
+
+	return result
+}
+
+// tryPar2NameRecovery attempts to recover real filenames for obfuscated
+// single-file RAR groups using PAR2 FileDesc MD5-16k matching. Returns the
+// rebuilt groups map only when ALL volumes are recovered; partial recovery
+// is worse than upload-order because unrecovered files have garbage names
+// that interleave arbitrarily with recovered ones. Returns nil to fall back
+// to blind merging on any partial failure.
+func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups []*FileGroup, otherGroups []*FileGroup, rawFiles nzbparser.NzbFiles) map[string]*FileGroup {
+	// Find the base .par2 index file from the raw NZB file list.
+	// Only try the smallest base file (no .vol recovery volumes) and
+	// bail if it needs too many segments — this is the import path.
+	var par2IndexFile *nzbparser.NzbFile
+	for i := range rawFiles {
+		f := &rawFiles[i]
+		if len(f.Segments) == 0 {
+			continue
+		}
+		if p.detectFileType(f.Filename) != storage.NZBFileTypePar2 {
+			continue
+		}
+		lower := strings.ToLower(f.Filename)
+		if strings.Contains(lower, ".vol") {
+			continue
+		}
+		if par2IndexFile == nil || len(f.Segments) < len(par2IndexFile.Segments) {
+			par2IndexFile = f
+		}
+	}
+	if par2IndexFile == nil {
+		p.logger.Debug().Msg("PAR2 name recovery: no base PAR2 file found in NZB")
+		return nil
+	}
+	const maxPar2Segments = 10
+	if len(par2IndexFile.Segments) > maxPar2Segments {
+		p.logger.Debug().
+			Int("segments", len(par2IndexFile.Segments)).
+			Msg("PAR2 name recovery: base PAR2 file too large, skipping")
+		return nil
+	}
+
+	data, err := p.fetchPar2FileData(ctx, *par2IndexFile)
+	if err != nil {
+		p.logger.Debug().Err(err).Str("file", par2IndexFile.Filename).
+			Msg("PAR2 name recovery: failed to fetch PAR2 file")
+		return nil
+	}
+	idx, err := par2.ParseIndex([]par2.Source{{Name: par2IndexFile.Filename, Data: data}})
+	if err != nil || len(idx.Files) == 0 {
+		p.logger.Debug().Err(err).
+			Msg("PAR2 name recovery: failed to parse PAR2 index or no FileDesc entries")
+		return nil
+	}
+
+	// Build MD5-16k → real filename map from the PAR2 FileDesc table.
+	md5ToName := make(map[[16]byte]string, len(idx.Files))
+	for _, fd := range idx.Files {
+		if fd.Name != "" {
+			md5ToName[fd.MD5_16k] = fd.Name
+		}
+	}
+	if len(md5ToName) == 0 {
+		return nil
+	}
+
+	// For each single-file RAR group, fetch first 16KB, compute MD5,
+	// and look up the real filename.
+	type recoveredFile struct {
+		file     nzbparser.NzbFile
+		realName string
+		groups   map[string]struct{}
+	}
+	recovered := make([]recoveredFile, 0, len(singleFileRarGroups))
+
+	for _, group := range singleFileRarGroups {
+		if len(group.Files) == 0 || len(group.Files[0].Segments) == 0 {
+			p.logger.Debug().Msg("PAR2 name recovery: group with no files/segments, aborting")
+			return nil
+		}
+		f := group.Files[0]
+		seg := f.Segments[0]
+
+		var meta *nntp.YencMetadata
+		fetchErr := p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+			d, e := conn.GetHeaderPrefix(seg.Id, par2MD5PrefixSize)
+			meta = d
+			return e
+		})
+		if fetchErr != nil || meta == nil || len(meta.Snippet) < par2MD5PrefixSize {
+			p.logger.Debug().
+				Err(fetchErr).
+				Msg("PAR2 name recovery: short or failed 16KB fetch, aborting")
+			return nil
+		}
+
+		hash := md5.Sum(meta.Snippet)
+		realName, ok := md5ToName[hash]
+		if !ok {
+			p.logger.Debug().
+				Str("obfuscated", f.Filename).
+				Msg("PAR2 name recovery: MD5-16k mismatch, aborting")
+			return nil
+		}
+
+		recovered = append(recovered, recoveredFile{
+			file: f, realName: realName, groups: group.Groups,
+		})
+	}
+
+	p.logger.Info().
+		Int("recovered", len(recovered)).
+		Int("par2_files", len(idx.Files)).
+		Msg("PAR2 name recovery: recovered real filenames for all obfuscated RAR volumes")
+
+	// Build a set of existing group keys to detect type collisions.
+	result := make(map[string]*FileGroup)
+	for _, group := range otherGroups {
+		result[group.BaseName] = group
+	}
+
+	for _, rf := range recovered {
+		rf.file.Filename = rf.realName
+		groupKey := p.getBaseFilename(rf.realName)
+
+		if _, exists := result[groupKey]; exists {
+			p.logger.Debug().
+				Str("key", groupKey).
+				Msg("PAR2 name recovery: group key collision with existing group, aborting")
+			return nil
+		}
+		group := &FileGroup{
+			BaseName:       groupKey,
+			ActualFilename: rf.realName,
+			Type:           storage.NZBFileTypeRar,
+			Files:          []nzbparser.NzbFile{},
+			Groups:         make(map[string]struct{}),
+		}
+		result[groupKey] = group
+		group.Files = append(group.Files, rf.file)
+		for g := range rf.groups {
+			group.Groups[g] = struct{}{}
+		}
+	}
+
+	// Sort each RAR group's files by recovered filename — this gives
+	// correct volume order from .partNN.rar patterns.
+	for _, group := range result {
+		if group.Type != storage.NZBFileTypeRar || len(group.Files) <= 1 {
+			continue
+		}
+		sort.Slice(group.Files, func(i, j int) bool {
+			return group.Files[i].Filename < group.Files[j].Filename
+		})
+	}
+
+	return result
+}
+
+// fetchPar2FileData fetches all segments of a PAR2 file over NNTP and returns
+// the concatenated decoded data.
+func (p *NZBParser) fetchPar2FileData(ctx context.Context, f nzbparser.NzbFile) ([]byte, error) {
+	segs := make(nzbparser.NzbSegments, len(f.Segments))
+	copy(segs, f.Segments)
+	sort.Sort(segs)
+
+	var out []byte
+	for _, seg := range segs {
+		var data []byte
+		fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := p.manager.ExecuteWithFailover(fetchCtx, func(conn *nntp.Connection) error {
+			d, _, e := conn.GetDecodedBodyWithMetadata(seg.Id)
+			data = d
+			return e
+		})
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("fetch segment %s: %w", seg.Id, err)
+		}
+		out = append(out, data...)
+	}
+	return out, nil
 }
 
 // Batch process unknown files in parallel

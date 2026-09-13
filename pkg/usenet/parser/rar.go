@@ -245,6 +245,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 
 	files := make([]*storage.NZBFile, 0, len(archiveInfo.Files))
 	hasNoneStored := false
+	hasCompressedMedia := false
 	var shortErr error // first file left out for missing articles or volumes
 
 	// Parse each file in the RAR archive
@@ -255,6 +256,9 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		// Only process stored (uncompressed) files for streaming
 		if !rarFile.IsStored {
 			hasNoneStored = true
+			if utils.IsMediaFile(rarFile.Name) {
+				hasCompressedMedia = true
+			}
 			continue
 		}
 
@@ -370,6 +374,9 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		files = append(files, file)
 	}
 
+	if hasCompressedMedia {
+		return nil, fmt.Errorf("RAR archive contains compressed media files; cannot stream (re-pack with store/m0)")
+	}
 	if len(files) == 0 {
 		if shortErr != nil {
 			return nil, shortErr
