@@ -82,6 +82,8 @@ type NZBParser struct {
 	logger        zerolog.Logger
 	manager       *nntp.Client // Connection manager for parsing operations
 	maxConcurrent int          // Max concurrent connections
+	// volumeProbe overrides probeRarVolume in tests.
+	volumeProbe rarVolumeProbeFunc
 }
 
 type fileAnalysisResult struct {
@@ -827,6 +829,21 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 		return docIndex[fileMetaKey(singleFileRarGroups[i].Files[0])] < docIndex[fileMetaKey(singleFileRarGroups[j].Files[0])]
 	})
 
+	// A release's own small archives - name.proof.rar, name.subs.rar - are
+	// single-file RAR groups too, and merging them made one bogus two-volume
+	// archive of unrelated files (Der Schwaebische Nachmittagstee UNTAVC,
+	// X.Y.Z. 99 GMA on a production install). Keep an archive whose main header says it is
+	// not a volume out of the merge.
+	var standalone []string
+	singleFileRarGroups, otherGroups, standalone = p.separateStandaloneArchives(ctx, singleFileRarGroups, otherGroups)
+	if len(standalone) > 0 {
+		p.logger.Debug().Strs("archives", standalone).
+			Msg("Kept single-volume RAR archives out of the obfuscated volume merge")
+	}
+	if len(singleFileRarGroups) <= 1 {
+		return groups
+	}
+
 	p.logger.Debug().
 		Int("single_file_rar_groups", len(singleFileRarGroups)).
 		Msg("Detected potential obfuscated RAR archive, merging groups")
@@ -868,6 +885,84 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 		Msg("Merged obfuscated RAR groups into single group")
 
 	return result
+}
+
+// rarVolumeProbeFunc reports whether file's archive is one volume of a
+// multi-volume set, from its main header; known is false when that could not
+// be read.
+type rarVolumeProbeFunc func(ctx context.Context, file nzbparser.NzbFile) (isVolume, known bool)
+
+// probeRarVolume reads the first rarVolumeProbeBytes of file's first article.
+func (p *NZBParser) probeRarVolume(ctx context.Context, file nzbparser.NzbFile) (bool, bool) {
+	if p.manager == nil || len(file.Segments) == 0 {
+		return false, false
+	}
+	first := file.Segments[0]
+	for _, s := range file.Segments[1:] {
+		if s.Number < first.Number {
+			first = s
+		}
+	}
+	var prefix []byte
+	err := p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		d, e := conn.GetHeaderPrefix(first.Id, rarVolumeProbeBytes)
+		if d != nil {
+			prefix = d.Snippet
+		}
+		return e
+	})
+	if err != nil {
+		return false, false
+	}
+	return rarArchiveIsVolume(prefix)
+}
+
+// separateStandaloneArchives moves the groups whose archive is not a volume
+// from candidates to others, returning their names. A file named as a volume
+// (.partNN.rar, .rNN) is taken at its name, and so is a file with the article
+// count most candidates share - a set's inner volumes all have one size, so
+// only its last volume differs. The rest have their main header read,
+// concurrently (the fetch drains the whole first article). A header that
+// cannot be read leaves the group a candidate, as before.
+func (p *NZBParser) separateStandaloneArchives(ctx context.Context, candidates, others []*FileGroup) ([]*FileGroup, []*FileGroup, []string) {
+	probe := p.volumeProbe
+	if probe == nil {
+		probe = p.probeRarVolume
+	}
+	counts := map[int]int{}
+	for _, g := range candidates {
+		counts[len(g.Files[0].Segments)]++
+	}
+	innerCount, innerN := 0, 1
+	for n, c := range counts {
+		if c > innerN || (c == innerN && c > 1 && n > innerCount) {
+			innerCount, innerN = n, c
+		}
+	}
+	mapper := iter.Mapper[*FileGroup, bool]{MaxGoroutines: max(1, p.maxConcurrent)}
+	standalone := mapper.Map(candidates, func(g **FileGroup) bool {
+		f := (*g).Files[0]
+		lower := strings.ToLower(f.Filename)
+		if s := rarVolumeScheme(lower); s == rarSchemePart || (s == rarSchemeOld && !strings.HasSuffix(lower, ".rar")) {
+			return false
+		}
+		if innerN > 1 && len(f.Segments) == innerCount {
+			return false
+		}
+		isVolume, known := probe(ctx, f)
+		return known && !isVolume
+	})
+	kept := candidates[:0:0]
+	var names []string
+	for i, g := range candidates {
+		if standalone[i] {
+			others = append(others, g)
+			names = append(names, g.Files[0].Filename)
+			continue
+		}
+		kept = append(kept, g)
+	}
+	return kept, others, names
 }
 
 // tryPar2NameRecovery attempts to recover real filenames for obfuscated
