@@ -35,6 +35,9 @@ class RepairManager {
         this.repairConfigDefaults = {};
         this.precacheConfig = {};
         this.plexConfig = {};
+        // Stale Plex version reaper: last /plex/reap/status snapshot, the
+        // backlog rows ticked for removal (by rating key), and the list filter.
+        this.plexReap = {status: null, selected: new Set(), filter: 'reapable', timer: null};
         this.latestStatus = {};
         this.overlayFiles = [];
         this.overlaySelected = new Set();
@@ -127,6 +130,22 @@ class RepairManager {
             this.savePlexConfig();
         });
         $('plexTestBtn')?.addEventListener('click', () => this.testPlexConnection());
+        $('plexReapRefreshBtn')?.addEventListener('click', () => this.loadPlexReap());
+        $('plexReapScanBtn')?.addEventListener('click', () => this.startPlexReapScan());
+        $('plexReapApplyBtn')?.addEventListener('click', () => this.applyPlexReap());
+        $('plexReapFilter')?.addEventListener('change', (e) => {
+            this.plexReap.filter = e.target.value;
+            this.plexReap.selected.clear();
+            this.renderPlexReap();
+        });
+        $('plexReapSelectAll')?.addEventListener('change', (e) => this.togglePlexReapSelectAll(e.target.checked));
+        $('plexReapTableBody')?.addEventListener('change', (e) => {
+            const key = e.target?.dataset?.ratingKey;
+            if (!key) return;
+            if (e.target.checked) this.plexReap.selected.add(key);
+            else this.plexReap.selected.delete(key);
+            this.updatePlexReapApplyBtn();
+        });
         $('overlaySelectAllCheckbox')?.addEventListener('change', (e) => this.toggleOverlaySelectAll(e.target.checked));
         $('overlayClearSelectionBtn')?.addEventListener('click', () => this.clearOverlaySelection());
         $('overlayGCOrphansBtn')?.addEventListener('click', () => this.handleOverlayGCOrphans());
@@ -182,7 +201,7 @@ class RepairManager {
     }
 
     async loadAll() {
-        await Promise.all([this.loadRepairConfig(), this.loadPrecacheConfig(), this.loadPlexConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus()]);
+        await Promise.all([this.loadRepairConfig(), this.loadPrecacheConfig(), this.loadPlexConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs(), this.loadOverlayAll(), this.loadPrecacheStatus(), this.loadPlexReap()]);
         this.populateOverlayConfigForm();
         this.populatePrecacheConfigForm();
         this.populatePlexConfigForm();
@@ -2519,6 +2538,7 @@ class RepairManager {
             $('plexSessionTtl').value = ttlSeconds;
             $('plexSessionTtl').placeholder = '10';
         }
+        if ($('plexReapMode')) $('plexReapMode').value = p.plex_reap_mode || 'off';
         if ($('plexTestResult')) $('plexTestResult').textContent = '';
     }
 
@@ -2534,6 +2554,7 @@ class RepairManager {
                 // preserve-on-blank handling.
                 plex_token: $('plexToken')?.value || '',
                 plex_session_cache_ttl: Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds * NS_PER_SECOND : 0,
+                plex_reap_mode: $('plexReapMode')?.value || 'off',
             };
 
             const res = await fetch(`${this.api}/plex/config`, {
@@ -2554,11 +2575,201 @@ class RepairManager {
             this.plexConfig = data || payload;
             this.populatePlexConfigForm();
             window.createToast('Plex config saved', 'success');
+            this.loadPlexReap();
         } catch (e) {
             window.createToast(`Save failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
+    }
+
+    // ---- Stale Plex versions ---------------------------------------------
+
+    async loadPlexReap() {
+        try {
+            this.plexReap.status = await this.fetchJSON(`${this.api}/plex/reap/status`) || {};
+        } catch (e) {
+            console.error('Failed to load Plex reap status', e);
+            return;
+        }
+        this.renderPlexReap();
+        if (this.plexReap.timer) clearTimeout(this.plexReap.timer);
+        this.plexReap.timer = null;
+        const scan = this.plexReap.status.scan || {};
+        if (scan.running || scan.applying) {
+            this.plexReap.timer = setTimeout(() => this.loadPlexReap(), 3000);
+        }
+    }
+
+    // plexReapGroup buckets a backlog row for the filter select.
+    plexReapGroup(c) {
+        if (c.status === 'reapable') return 'reapable';
+        if (c.reason === 'all_versions_unavailable') return 'review';
+        if (c.status === 'reaped' || c.status === 'would_reap' || c.status === 'failed') return 'done';
+        return 'other';
+    }
+
+    plexReapReasonLabel(reason) {
+        const labels = {
+            no_unavailable_version: 'No unavailable version',
+            plex_not_marked_unavailable_yet: 'Plex has not marked it unavailable yet',
+            old_file_not_in_item: 'Old file not in this title',
+            all_versions_unavailable: 'Every version unavailable - review in Plex',
+            no_live_version_on_disk: 'Working version not readable on disk',
+            old_file_still_on_disk: 'Old file still on disk',
+            no_arr_tracks_title: 'No Arr tracks this title',
+            arr_still_references_old_file: 'Arr still references the old file',
+            arr_current_file_not_live_in_plex: "Arr's current file is not a working Plex version",
+            reimported_at_same_path: 'Replaced at the same path',
+            playing_now: 'Playing now',
+            lookup_failed: 'Lookup failed',
+            plex_delete_failed: 'Plex delete failed',
+            not_in_any_plex_library: 'Not in a Plex library',
+            not_found_in_plex: 'Not found in Plex',
+        };
+        return labels[reason] || reason || '';
+    }
+
+    plexReapStatusBadge(status) {
+        const cls = {
+            reapable: 'badge-warning', reaped: 'badge-success', would_reap: 'badge-info',
+            skipped: 'badge-ghost', waiting: 'badge-ghost', gave_up: 'badge-ghost', failed: 'badge-error',
+        }[status] || 'badge-ghost';
+        const label = {reapable: 'removable', would_reap: 'would remove', gave_up: 'gave up'}[status] || status;
+        return `<span class="badge badge-sm ${cls}">${this.escape(label)}</span>`;
+    }
+
+    renderPlexReap() {
+        const $ = (id) => document.getElementById(id);
+        const st = this.plexReap.status || {};
+        const scan = st.scan || {};
+        const candidates = scan.candidates || [];
+
+        const summary = $('plexReapSummary');
+        if (summary) {
+            const modeLabel = {off: 'off', dry_run: 'dry run', on: 'on'}[st.mode] || 'off';
+            const counts = {reapable: 0, review: 0, other: 0, done: 0};
+            candidates.forEach((c) => counts[this.plexReapGroup(c)]++);
+            let text = `Automatic removal: <b>${this.escape(modeLabel)}</b>.`;
+            if (scan.running) {
+                text += ` Scanning ${this.escape(scan.section || '')}: ${scan.scanned || 0} of ${scan.total || '?'} items...`;
+            } else if (scan.applying) {
+                text += ' Removing selected versions...';
+            } else if (scan.finished_at) {
+                text += ` Last scan ${this.escape(new Date(scan.finished_at).toLocaleString())}: ${counts.reapable} removable, ${counts.review} need review, ${counts.other} not removable, ${counts.done} processed.`;
+            }
+            if (scan.error) text += ` <span class="text-error">Scan error: ${this.escape(scan.error)}</span>`;
+            if (scan.applied) {
+                const a = scan.applied;
+                text += ` Last removal: ${a.reaped || 0} removed, ${a.skipped || 0} skipped, ${a.failed || 0} failed.`;
+            }
+            summary.innerHTML = text;
+        }
+
+        const filter = this.plexReap.filter;
+        const shown = candidates.filter((c) => filter === 'all' || this.plexReapGroup(c) === filter);
+        const body = $('plexReapTableBody');
+        if (body) {
+            body.innerHTML = shown.map((c) => {
+                const selectable = c.status === 'reapable';
+                const checked = this.plexReap.selected.has(c.rating_key) ? 'checked' : '';
+                const staleFiles = (c.stale || []).flatMap((m) => m.files || []);
+                const reason = c.reason ? `<div class="text-xs opacity-70">${this.escape(this.plexReapReasonLabel(c.reason))}</div>` : '';
+                const detail = c.detail ? `<div class="text-xs opacity-50 break-all">${this.escape(c.detail)}</div>` : '';
+                return `<tr>
+                    <td>${selectable ? `<input type="checkbox" class="checkbox checkbox-sm" data-rating-key="${this.escape(c.rating_key)}" ${checked}>` : ''}</td>
+                    <td class="text-sm">${this.escape(c.title)}</td>
+                    <td class="text-xs">${this.escape(c.section_title)}</td>
+                    <td class="font-mono text-xs break-all">${staleFiles.map((f) => this.escape(f.split('/').pop())).join('<br>')}</td>
+                    <td>${this.plexReapStatusBadge(c.status)}${reason}${detail}</td>
+                </tr>`;
+            }).join('');
+        }
+        const empty = $('plexReapEmpty');
+        if (empty) {
+            empty.classList.toggle('hidden', shown.length > 0);
+            empty.textContent = candidates.length === 0
+                ? (scan.running ? 'Scanning...' : 'No scan yet. Scan the library to list stale versions.')
+                : 'Nothing in this view.';
+        }
+        const selectAll = $('plexReapSelectAll');
+        if (selectAll) selectAll.checked = false;
+        if ($('plexReapScanBtn')) $('plexReapScanBtn').disabled = !!(scan.running || scan.applying);
+
+        const pending = $('plexReapPending');
+        if (pending) {
+            const jobs = st.pending || [];
+            pending.textContent = jobs.length
+                ? `${jobs.length} replaced file${jobs.length === 1 ? '' : 's'} waiting: ${jobs.map((j) => `${j.title_hint || (j.stale_paths || [])[0]?.split('/').pop() || ''} (${j.source}${j.last_reason ? ', ' + this.plexReapReasonLabel(j.last_reason) : ''})`).join('; ')}`
+                : 'No replaced files waiting.';
+        }
+        const decisions = $('plexReapDecisionsBody');
+        if (decisions) {
+            const rows = (st.decisions || []).slice(0, 50);
+            decisions.innerHTML = rows.length ? rows.map((d) => {
+                const files = (d.paths || []).map((f) => this.escape(f.split('/').pop())).join('<br>');
+                const reason = d.reason ? `<div class="text-xs opacity-70">${this.escape(this.plexReapReasonLabel(d.reason))}</div>` : '';
+                return `<tr>
+                    <td class="text-xs whitespace-nowrap">${this.escape(new Date(d.time).toLocaleString())}</td>
+                    <td class="text-xs">${this.escape(d.source)}</td>
+                    <td class="text-sm">${this.escape(d.title || '')}<div class="font-mono text-xs opacity-60 break-all">${files}</div></td>
+                    <td>${this.plexReapStatusBadge(d.status)}${reason}</td>
+                </tr>`;
+            }).join('') : '<tr><td colspan="4" class="text-center text-sm opacity-60">No decisions yet.</td></tr>';
+        }
+        this.updatePlexReapApplyBtn();
+    }
+
+    togglePlexReapSelectAll(checked) {
+        const candidates = (this.plexReap.status?.scan?.candidates) || [];
+        const filter = this.plexReap.filter;
+        candidates
+            .filter((c) => c.status === 'reapable' && (filter === 'all' || this.plexReapGroup(c) === filter))
+            .forEach((c) => checked ? this.plexReap.selected.add(c.rating_key) : this.plexReap.selected.delete(c.rating_key));
+        document.querySelectorAll('#plexReapTableBody input[data-rating-key]').forEach((el) => {
+            el.checked = checked;
+        });
+        this.updatePlexReapApplyBtn();
+    }
+
+    updatePlexReapApplyBtn() {
+        const btn = document.getElementById('plexReapApplyBtn');
+        if (!btn) return;
+        const scan = this.plexReap.status?.scan || {};
+        const n = this.plexReap.selected.size;
+        btn.disabled = n === 0 || !!(scan.running || scan.applying);
+        btn.innerHTML = `<i class="bi bi-trash3 mr-1"></i>Remove selected${n ? ` (${n})` : ''}`;
+    }
+
+    async startPlexReapScan() {
+        try {
+            const res = await fetch(`${this.api}/plex/reap/scan`, {method: 'POST'});
+            if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+            this.plexReap.selected.clear();
+            this.toast('Plex scan started', 'info');
+        } catch (e) {
+            this.toast(`Scan failed: ${e.message}`, 'error');
+        }
+        this.loadPlexReap();
+    }
+
+    async applyPlexReap() {
+        const keys = [...this.plexReap.selected];
+        if (!keys.length) return;
+        if (!confirm(`Remove the unavailable Plex version from ${keys.length} title${keys.length === 1 ? '' : 's'}? Each is re-checked first; working versions and watch history are kept.`)) return;
+        try {
+            const res = await fetch(`${this.api}/plex/reap/apply`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({rating_keys: keys}),
+            });
+            if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+            this.plexReap.selected.clear();
+            this.toast('Removing selected versions', 'info');
+        } catch (e) {
+            this.toast(`Remove failed: ${e.message}`, 'error');
+        }
+        this.loadPlexReap();
     }
 
     async testPlexConnection() {

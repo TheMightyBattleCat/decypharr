@@ -642,6 +642,7 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 				}
 				filePaths = append(filePaths, fileSymlinkPath)
 				delete(remainingFiles, entryName)
+				d.manager.arrLibraryMap.record(entry.Name, file.Name, fileSymlinkPath, fullPath)
 				d.logger.Info().Str("entry", entry.GetFolder()).Str(logger.FieldSubject, file.Name).
 					Str(logger.FieldStatus, logger.StatusOK).Msg("File is ready")
 				continue

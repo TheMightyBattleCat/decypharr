@@ -82,6 +82,15 @@ type Manager struct {
 	// every restart; never persisted.
 	internalToken string
 
+	// arrLibraryMap records where each downloaded file was linked into the
+	// library, so an Arr delete/upgrade webhook reporting only the renamed
+	// library file name can still be traced back to its entry.
+	arrLibraryMap *arrLibraryMap
+
+	// plexReaper removes a title's stale ("Unavailable") Plex versions after
+	// its file is replaced.
+	plexReaper *PlexReaper
+
 	// Debrid speed test results storage
 	debridSpeedTestResults *xsync.Map[string, debridTypes.SpeedTestResult]
 
@@ -217,6 +226,7 @@ func (m *Manager) init() {
 	m.scheduler = scheduler
 	m.cetScheduler = cetScheduler
 	m.migrator = NewMigrator(m.storage)
+	m.arrLibraryMap = newArrLibraryMap(m.logger)
 	m.downloader = NewDownloadManager(m)
 
 	// Initialize HTTP pool for streaming
@@ -271,6 +281,10 @@ func (m *Manager) init() {
 	// Initialize the read-ahead precache service (see precache.go). Depends
 	// on par2Repair/usenet already being set above.
 	m.precache = NewPrecache(m)
+
+	// Plex stale-version reaper (see plex_reap.go), consulting one Arr per
+	// distinct host so an Arr configured under two names is asked once.
+	m.plexReaper = NewPlexReaper(m.arr.DistinctByHost)
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
@@ -516,6 +530,10 @@ func (m *Manager) Stop() error {
 		m.precache.Stop()
 	}
 
+	if m.plexReaper != nil {
+		m.plexReaper.Stop()
+	}
+
 	// Close usenet connection manager if active
 	if m.usenet != nil {
 		m.logger.Info().Msg("Closing usenet connections")
@@ -751,6 +769,9 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete usenet/overlay state for entry")
 		}
 	}
+
+	// Entry is gone for good - forget any library paths recorded for it.
+	m.arrLibraryMap.removeEntry(torr.Name)
 
 	return m.storage.Delete(infohash)
 }

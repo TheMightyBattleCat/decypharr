@@ -61,6 +61,14 @@ func (m *Manager) Migrator() *Migrator {
 }
 
 // Arr returns the Arr storage instance
+// PlexReaper returns the Plex stale-version reaper.
+func (m *Manager) PlexReaper() *PlexReaper {
+	if m == nil {
+		return nil
+	}
+	return m.plexReaper
+}
+
 func (m *Manager) Arr() *arr.Storage {
 	return m.arr
 }

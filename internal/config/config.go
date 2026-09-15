@@ -493,6 +493,20 @@ type Config struct {
 	NZBUserAgent       string   `json:"nzb_user_agent,omitempty"` // User agent for downloading NZBs
 	Auth               *Auth    `json:"-"`
 
+	// WebhookToken, when set, is required as a ?token= query parameter on the
+	// Arr webhook endpoint (/webhooks/arr) - a request with a missing or
+	// mismatched token is rejected. Left empty, the endpoint accepts any
+	// request; a one-time startup warning is logged in that case so an
+	// unauthenticated cleanup endpoint on a public bind address isn't silent.
+	WebhookToken string `json:"webhook_token,omitempty"`
+
+	// ArrWebhookTeardown, when true, makes an Arr file-delete webhook tear
+	// down the matching usenet download straight away (see
+	// pkg/manager.HandleArrWebhookCleanup). Off by default: decypharr's own
+	// repair deletes the Arr file before re-searching, which fires the same
+	// webhook, and the stale-NZB sweep already reaps superseded downloads.
+	ArrWebhookTeardown bool `json:"arr_webhook_teardown,omitempty"`
+
 	DisableWebDav bool `json:"disable_webdav,omitempty"`
 
 	// Notifications configuration

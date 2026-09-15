@@ -102,6 +102,11 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Put("/plex/config", s.handleUpdatePlexConfig)
 			r.Post("/plex/test", s.handlePlexTestConnection)
 
+			// Plex stale-version reaper (see manager.PlexReaper)
+			r.Get("/plex/reap/status", s.handlePlexReapStatus)
+			r.Post("/plex/reap/scan", s.handlePlexReapScan)
+			r.Post("/plex/reap/apply", s.handlePlexReapApply)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)
@@ -135,6 +140,8 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/mount/cache/purge", s.handlePurgeMountCache)
 			r.Post("/refresh-token", s.handleRefreshAPIToken)
 			r.Post("/update-auth", s.handleUpdateAuth)
+			r.Post("/webhook-token/refresh", s.handleRefreshWebhookToken)
+			r.Post("/webhook-teardown", s.handleUpdateWebhookTeardown)
 		})
 	})
 

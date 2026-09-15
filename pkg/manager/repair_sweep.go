@@ -1406,6 +1406,18 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// blocklist + re-search so the Arr fetches a fresh copy. Aborting here was
 	// the cause of the playback-repair churn loop: delete fails → return →
 	// nothing re-searched → file stays broken → next playback 430 repeats.
+	// The re-grab's import is not an Arr "upgrade" (the file row is gone by
+	// then), so no webhook will name these old files. Remember them for the
+	// Plex reaper, which waits for the replacement before removing the
+	// "Unavailable" version they leave behind.
+	for _, f := range files {
+		if f.Path != "" {
+			r.manager.plexReaper.Enqueue(PlexReapNotice{
+				Source: ReapSourceRepair, StalePaths: []string{f.Path}, ArrName: a.Name, MediaID: f.Id,
+			})
+		}
+	}
+
 	if err := a.DeleteFiles(ctx, files); err != nil {
 		r.logger.Warn().Err(err).Str("arr", a.Name).
 			Msg("Repair: DeleteFiles failed (continuing to blocklist + re-search anyway)")

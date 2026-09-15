@@ -525,6 +525,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// them from the live config so auth isn't silently disabled on every save.
 	newConfig.UseAuth = currentConfig.UseAuth
 	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
+	// The frontend settings form doesn't include webhook_token, so it would
+	// be zero-valued (empty) in the decoded payload. Preserve it from the
+	// live config the same way Auth is preserved above, so saving any other
+	// setting doesn't silently disable Arr webhook authentication.
+	newConfig.WebhookToken = currentConfig.WebhookToken
+	// Saved by its own endpoint (handleUpdateWebhookTeardown), same reason.
+	newConfig.ArrWebhookTeardown = currentConfig.ArrWebhookTeardown
 	// The general settings form has no fields for these Repair knobs (they're
 	// only ever set via the dedicated repair-config / overlay endpoints), so
 	// they'd decode to zero-valued/"unset" here and get silently reset to
@@ -737,6 +744,15 @@ func (s *Server) handleUpdatePlexConfig(w http.ResponseWriter, r *http.Request) 
 	if req.Token == "" || req.Token == plexTokenPlaceholder {
 		req.Token = cfg.Plex.Token
 	}
+	switch req.ReapMode {
+	case config.PlexReapOff, config.PlexReapDryRun, config.PlexReapOn:
+	case "":
+		// An older page that doesn't send the field keeps the saved mode.
+		req.ReapMode = cfg.Plex.ReapMode
+	default:
+		http.Error(w, "invalid plex_reap_mode: "+string(req.ReapMode), http.StatusBadRequest)
+		return
+	}
 	cfg.Plex = req
 	if err := cfg.Save(); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save plex config")
@@ -756,6 +772,74 @@ func (s *Server) handleUpdatePlexConfig(w http.ResponseWriter, r *http.Request) 
 // handleSpeedTest) so the repair page's "Test connection" button can
 // validate settings before they're saved. A plexTokenPlaceholder token
 // falls back to the saved one so "Test" works without re-typing it.
+// handlePlexReapStatus reports the reaper's mode, pending jobs, recent
+// decisions and backlog scan.
+func (s *Server) handlePlexReapStatus(w http.ResponseWriter, r *http.Request) {
+	reaper := s.manager.PlexReaper()
+	if reaper == nil {
+		utils.JSONResponse(w, manager.PlexReapStatus{}, http.StatusOK)
+		return
+	}
+	utils.JSONResponse(w, reaper.Status(), http.StatusOK)
+}
+
+// handlePlexReapScan starts a backlog scan (read-only; nothing is removed).
+func (s *Server) handlePlexReapScan(w http.ResponseWriter, r *http.Request) {
+	reaper := s.manager.PlexReaper()
+	if reaper == nil || !config.Get().Plex.Enabled() {
+		http.Error(w, "Plex is not configured", http.StatusBadRequest)
+		return
+	}
+	if !reaper.StartScan() {
+		http.Error(w, "A scan is already running", http.StatusConflict)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"started": true}, http.StatusAccepted)
+}
+
+// handlePlexReapApply removes the stale versions of chosen backlog items
+// (rating_keys; empty = every reapable one), re-checking every guard first.
+func (s *Server) handlePlexReapApply(w http.ResponseWriter, r *http.Request) {
+	reaper := s.manager.PlexReaper()
+	if reaper == nil || !config.Get().Plex.Enabled() {
+		http.Error(w, "Plex is not configured", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		RatingKeys []string `json:"rating_keys"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if !reaper.StartApply(req.RatingKeys) {
+		http.Error(w, "A scan or apply is already running", http.StatusConflict)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"started": true}, http.StatusAccepted)
+}
+
+// handleUpdateWebhookTeardown saves ArrWebhookTeardown on its own, like the
+// webhook token, so the general settings form can't reset it.
+func (s *Server) handleUpdateWebhookTeardown(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := config.Get()
+	cfg.ArrWebhookTeardown = req.Enabled
+	if err := cfg.Save(); err != nil {
+		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, map[string]any{"enabled": cfg.ArrWebhookTeardown}, http.StatusOK)
+}
+
 func (s *Server) handlePlexTestConnection(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL   string `json:"url"`

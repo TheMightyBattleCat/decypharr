@@ -213,6 +213,12 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		m.precache.Start(ctx)
 	}
 
+	// Start the Plex stale-version reaper worker. Like precache it is always
+	// started; config.Plex.ReapMode gates it live per tick.
+	if m.plexReaper != nil {
+		m.plexReaper.Start(ctx)
+	}
+
 	// Start the scheduler
 	m.scheduler.Start()
 	m.cetScheduler.Start()

@@ -465,6 +465,18 @@
                     <span class="label-text-alt opacity-60 mt-1">How long a fetched Plex session list is reused before being refreshed.</span>
                 </div>
 
+                <div class="form-control sm:w-1/2 sm:pr-1.5">
+                    <label class="label py-1" for="plexReapMode">
+                        <span class="label-text font-medium">Remove stale versions</span>
+                    </label>
+                    <select class="select select-bordered" id="plexReapMode">
+                        <option value="off">Off</option>
+                        <option value="dry_run">Dry run - log what would be removed</option>
+                        <option value="on">On - remove them</option>
+                    </select>
+                    <span class="label-text-alt opacity-60 mt-1">After an upgrade, rename or re-grab replaces a title's file, remove the old "Unavailable" version from that title only. Needs the Arr webhook (Settings) and "Allow media deletion" in Plex.</span>
+                </div>
+
                 <div class="flex flex-wrap justify-end items-center gap-3">
                     <span id="plexTestResult" class="text-sm"></span>
                     <button type="button" class="btn btn-outline" id="plexTestBtn">
@@ -475,6 +487,85 @@
                     </button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Stale Plex versions -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                <h3 class="card-title text-xl">
+                    <i class="bi bi-trash3 mr-2 text-primary"></i>Stale Plex versions
+                </h3>
+                <div class="flex flex-wrap gap-2">
+                    <button type="button" class="btn btn-outline btn-sm" id="plexReapRefreshBtn">
+                        <i class="bi bi-arrow-clockwise mr-1"></i>Refresh
+                    </button>
+                    <button type="button" class="btn btn-outline btn-sm" id="plexReapScanBtn">
+                        <i class="bi bi-search mr-1"></i>Scan library
+                    </button>
+                    <button type="button" class="btn btn-warning btn-sm" id="plexReapApplyBtn" disabled>
+                        <i class="bi bi-trash3 mr-1"></i>Remove selected
+                    </button>
+                </div>
+            </div>
+            <p class="text-sm opacity-70 mt-1">
+                Versions Plex shows as "Unavailable" next to a working one. A scan only lists them; removing re-checks
+                every guard first: Plex marked the version unavailable, its file is gone from disk, no Arr still tracks
+                that file, the title keeps a working version, and nobody is playing it. Titles whose every version is
+                unavailable are listed for review and never removed here.
+            </p>
+            <div id="plexReapSummary" class="text-sm mt-2"></div>
+
+            <div class="flex flex-wrap items-center gap-2 mt-3">
+                <select class="select select-bordered select-sm" id="plexReapFilter">
+                    <option value="reapable">Removable</option>
+                    <option value="review">Needs review (all versions unavailable)</option>
+                    <option value="other">Not removable</option>
+                    <option value="done">Removed / processed</option>
+                    <option value="all">All</option>
+                </select>
+                <label class="label cursor-pointer gap-2">
+                    <input type="checkbox" class="checkbox checkbox-sm" id="plexReapSelectAll">
+                    <span class="label-text text-sm">Select all shown</span>
+                </label>
+            </div>
+
+            <div class="overflow-x-auto mt-2">
+                <table class="table table-sm">
+                    <thead>
+                    <tr>
+                        <th></th>
+                        <th>Title</th>
+                        <th>Library</th>
+                        <th>Unavailable version</th>
+                        <th>Status</th>
+                    </tr>
+                    </thead>
+                    <tbody id="plexReapTableBody"></tbody>
+                </table>
+            </div>
+            <div id="plexReapEmpty" class="text-center py-6 text-base-content/70">
+                No scan yet. Scan the library to list stale versions.
+            </div>
+
+            <div class="mt-4">
+                <h4 class="font-semibold">Recent decisions</h4>
+                <div id="plexReapPending" class="text-sm opacity-70 mt-1"></div>
+                <div class="overflow-x-auto mt-2">
+                    <table class="table table-sm">
+                        <thead>
+                        <tr>
+                            <th>When</th>
+                            <th>Source</th>
+                            <th>Title</th>
+                            <th>Result</th>
+                        </tr>
+                        </thead>
+                        <tbody id="plexReapDecisionsBody"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 
