@@ -193,6 +193,33 @@ func TestMeasureCrossedVolumes_DearJudge(t *testing.T) {
 	}
 }
 
+// A crossed volume measured from its own header keeps that size when the probe
+// for its article count measures differently: the probe's size is only for
+// volumes nobody measured.
+func TestMeasureCrossedVolumes_KeepsAVolumesOwnMeasurement(t *testing.T) {
+	group, file := dearJudge()
+	own := int64(fullVolume - 200) // still short of volume 2's part
+	group.metadata.measure(group.Files[1], own)
+	_, vols, _ := buildBaseSegments(group)
+
+	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{
+		"<yh.part1.rar-1>": {Size: fullVolume, Begin: 1, End: article},
+	})
+	if _, err := measureCrossedVolumes(context.Background(), group, []*RARFileEntry{file}, vols, fetch); err != nil {
+		t.Fatal(err)
+	}
+	if got := group.metadata.measuredSize(group.Files[1]); got != own {
+		t.Fatalf("volume 2 measured %d bytes after the probe, want its own %d", got, own)
+	}
+	if got := group.metadata.measuredSize(group.Files[2]); got != fullVolume {
+		t.Fatalf("volume 3 measured %d bytes, want the probe's %d", got, fullVolume)
+	}
+	_, vols, _ = buildBaseSegments(group)
+	if err := checkPartsInsideVolumes(file, vols); err == nil {
+		t.Fatal("checkPartsInsideVolumes passed a volume whose own header says it is too short")
+	}
+}
+
 // The measured final volume shares its subject file number with the inner
 // volumes' probe: the probe must still be fetched, not take the final
 // volume's size and hand it to every crossed volume.

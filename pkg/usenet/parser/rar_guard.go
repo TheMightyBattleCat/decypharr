@@ -58,7 +58,10 @@ func checkPartsInsideVolumes(file *RARFileEntry, volumeInfos []storage.ArchiveVo
 //
 // RAR writes every volume but the last at the same size, so one header per
 // article count sizes all crossed volumes with that count; at most
-// maxVolumeMeasurements fetches. Only runs on metadata that already holds
+// maxVolumeMeasurements fetches. Sizes that seemed to break this - ETHEL's
+// .rNN volumes reading 153-540 B apart - were PAR2 source estimates, not the
+// volumes: Nora S01E06's all hold the same 199,999,980 B of header and data.
+// A volume already measured from its own header is never overwritten. Only runs on metadata that already holds
 // header measurements, like measureUnsizedVolumes: interior articles sized
 // from an estimate cannot be fixed by an exact total. Returns whether it
 // recorded any size; a failed fetch leaves the volumes as they were.
@@ -115,7 +118,9 @@ func measureCrossedVolumes(ctx context.Context, group *FileGroup, files []*RARFi
 			recorded = true
 		}
 		for _, i := range vols[1:] {
-			if m.measuredSize(group.Files[i]) != size {
+			// A volume measured from its own header keeps that size: the probe's
+			// size only stands in for volumes nobody measured.
+			if m.measuredSize(group.Files[i]) == 0 {
 				m.measure(group.Files[i], size)
 				recorded = true
 			}
