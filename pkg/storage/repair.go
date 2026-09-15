@@ -275,6 +275,10 @@ type UnverifiedFile struct {
 	// ShortBytes is how far the served file ends before its Matroska Segment,
 	// for a tail-truncated file.
 	ShortBytes int64 `json:"short_bytes,omitempty"`
+	// Cause narrows a decoded_with_errors reason to what ffprobe printed (see
+	// manager.decodeErrorCause), and Detail holds the first lines of it.
+	Cause  string `json:"cause,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // EntryHealth is the source of truth for repair decisions. It is keyed by

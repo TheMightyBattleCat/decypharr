@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -32,6 +33,74 @@ const (
 	unverifiedInconclusive = "decode_inconclusive"
 )
 
+// What a decoded_with_errors file's ffprobe errors point at
+// (storage.UnverifiedFile.Cause), from decodeErrorCause.
+const (
+	// decodeCauseStreamEnded: the WebDAV body ended before the file did
+	// ("[http] Stream ends prematurely", "Read error"): the reader could not
+	// fetch part of the file. Playback stops at the same byte.
+	decodeCauseStreamEnded = "stream_ended"
+	// decodeCauseZeroFilled: Matroska found 0x00 where an element starts, a
+	// run of zeros where data should be.
+	decodeCauseZeroFilled = "zero_filled"
+	// decodeCauseFileEnded: "File ended prematurely", the served file is
+	// shorter than its own element sizes say.
+	decodeCauseFileEnded = "file_ended"
+	// decodeCauseContainer: an element or packet length that cannot be right,
+	// garbage where Matroska structure should be.
+	decodeCauseContainer = "container_errors"
+	// decodeCauseSeekWarnings: every line is a decoder message ffmpeg prints
+	// when decoding starts at a seek point without the frames before it
+	// (All Still on the Eastern Ridge: the same two lines once per seek,
+	// whether the window was 46 or 286 frames). Says nothing against the file.
+	decodeCauseSeekWarnings = "seek_warnings"
+	// decodeCauseCodec: other codec errors in the video stream.
+	decodeCauseCodec = "codec_errors"
+)
+
+var (
+	decodeStreamEndedLine = regexp.MustCompile(`Stream ends prematurely|Read error`)
+	decodeZeroFilledLine  = regexp.MustCompile(`0x00 at pos \d+ .*invalid as first byte of an EBML number`)
+	decodeFileEndedLine   = regexp.MustCompile(`File ended prematurely`)
+	decodeContainerLine   = regexp.MustCompile(`EBML number|exceeds containing master element|unknown-length element|Truncating packet|Invalid NAL unit size|Error splitting the input into NAL units`)
+	decodeSeekWarningLine = regexp.MustCompile(`mmco: unref short failure|number of reference frames \(\S+\) exceeds max|ignoring pic cod ext|first frame is no keyframe|^Last message repeated \d+ times`)
+)
+
+// decodeErrorCause classifies the stderr of a decode probe that printed errors
+// but decoded through, most severe first. A line naming the file's structure
+// or the reader outranks codec errors, which are often its consequence.
+func decodeErrorCause(stderr string) string {
+	var lines []string
+	for line := range strings.SplitSeq(stderr, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	anyLine := func(re *regexp.Regexp) bool {
+		return slices.ContainsFunc(lines, re.MatchString)
+	}
+	switch {
+	case anyLine(decodeStreamEndedLine):
+		return decodeCauseStreamEnded
+	case anyLine(decodeZeroFilledLine):
+		return decodeCauseZeroFilled
+	case anyLine(decodeFileEndedLine):
+		return decodeCauseFileEnded
+	case anyLine(decodeContainerLine):
+		return decodeCauseContainer
+	case len(lines) > 0 && !slices.ContainsFunc(lines, func(l string) bool {
+		// ffmpeg prefixes decoder lines "[h264 @ 0x...] "; the repeat line has none.
+		if i := strings.Index(l, "] "); i >= 0 && strings.HasPrefix(l, "[") {
+			l = l[i+2:]
+		}
+		return !decodeSeekWarningLine.MatchString(l)
+	}):
+		return decodeCauseSeekWarnings
+	default:
+		return decodeCauseCodec
+	}
+}
+
 // defaultReplaceUnverifiedLimit caps how many entries one Replace re-grabs.
 // Lower than defaultDebridGoneLimit: these files still play, and each is gone
 // from the library until its re-grab lands.
@@ -39,7 +108,13 @@ const defaultReplaceUnverifiedLimit = 25
 
 // unverifiedCause is where a decode check records why it is about to end
 // without a verdict. probeFile puts one on the context it hands the checker.
-type unverifiedCause struct{ reason string }
+type unverifiedCause struct {
+	reason string
+	// decodeCause and detail describe a decoded_with_errors reason; see
+	// noteDecodeErrors.
+	decodeCause string
+	detail      string
+}
 
 type unverifiedCauseCtxKey struct{}
 
@@ -53,6 +128,19 @@ func contextWithUnverifiedCause(ctx context.Context, c *unverifiedCause) context
 func noteUnverified(ctx context.Context, reason string) {
 	if c, _ := ctx.Value(unverifiedCauseCtxKey{}).(*unverifiedCause); c != nil {
 		c.reason = reason
+		if reason != unverifiedDecodeErrors {
+			c.decodeCause, c.detail = "", ""
+		}
+	}
+}
+
+// noteDecodeErrors records a decoded_with_errors reason with what ffprobe
+// printed: its cause from the full stderr, and summary, the lines logged.
+func noteDecodeErrors(ctx context.Context, stderr, summary string) {
+	if c, _ := ctx.Value(unverifiedCauseCtxKey{}).(*unverifiedCause); c != nil {
+		c.reason = unverifiedDecodeErrors
+		c.decodeCause = decodeErrorCause(stderr)
+		c.detail = summary
 	}
 }
 
@@ -87,6 +175,8 @@ func unverifiedFiles(c *candidate, results []fileResult) []storage.UnverifiedFil
 			InfoHash:   res.infoHash,
 			Reason:     res.unverifiedReason,
 			ShortBytes: res.shortBytes,
+			Cause:      res.unverifiedCause,
+			Detail:     res.unverifiedDetail,
 		}
 		if c != nil && c.item != nil {
 			if f := c.item.Files[res.name]; f != nil {

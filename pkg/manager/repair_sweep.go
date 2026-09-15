@@ -106,6 +106,10 @@ type fileResult struct {
 	// no decode check was due. shortBytes is the tail-truncation shortfall.
 	unverifiedReason string
 	shortBytes       int64
+	// unverifiedCause and unverifiedDetail say what ffprobe printed, for a
+	// decoded_with_errors reason.
+	unverifiedCause  string
+	unverifiedDetail string
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -724,6 +728,7 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			res.decodeCoverage = coverage
 			if ok && !conclusive && !skipDecode {
 				res.unverifiedReason = cause.get()
+				res.unverifiedCause, res.unverifiedDetail = cause.decodeCause, cause.detail
 			}
 
 			if !ok {

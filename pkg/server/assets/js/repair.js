@@ -21,6 +21,16 @@ const UNVERIFIED_REASON_LABELS = {
     decoded_with_errors: 'Decoded with errors',
     decode_inconclusive: 'Inconclusive',
 };
+// What ffprobe's errors point at on a decoded_with_errors file
+// (manager.decodeErrorCause): a label, and what it means for the file.
+const DECODE_CAUSE_INFO = {
+    seek_warnings: ['Seek warnings', 'Decoder messages from starting mid-stream without the frames before it. They say nothing against the file.'],
+    stream_ended: ['Stream ended early', 'Part of the file could not be read (a corrupt or missing article). Playback stops at the same point.'],
+    zero_filled: ['Zero-filled data', 'The file holds zeros where data should be: missing data at import or at source.'],
+    file_ended: ['File ended early', 'The file is shorter than its own structure says, often a volume or tail missing at import.'],
+    container_errors: ['Container damage', 'Matroska structure is garbled at some point in the file.'],
+    codec_errors: ['Codec errors', 'The video stream has errors that are not seek warnings. Check playback at that point.'],
+};
 
 class RepairManager {
     constructor() {
@@ -976,8 +986,17 @@ class RepairManager {
         }
     }
 
-    unverifiedReasonLabel(reason) {
-        return UNVERIFIED_REASON_LABELS[reason] || reason || '-';
+    // unverifiedReasonLabel names a filter key (see unverifiedKey).
+    unverifiedReasonLabel(key) {
+        const [reason, cause] = (key || '').split(':');
+        const label = UNVERIFIED_REASON_LABELS[reason] || reason || '-';
+        return cause ? `${label}: ${DECODE_CAUSE_INFO[cause]?.[0] || cause}` : label;
+    }
+
+    // unverifiedKey is what the reason filter groups a file by: its reason, and
+    // for decoded_with_errors also its cause.
+    unverifiedKey(f) {
+        return f.cause ? `${f.reason}:${f.cause}` : f.reason;
     }
 
     // unverifiedInRun is the list before the reason filter: every entry, or
@@ -991,7 +1010,7 @@ class RepairManager {
         const {reason} = this.unverifiedState;
         const items = this.unverifiedInRun();
         if (reason === 'all') return items;
-        return items.filter((h) => (h.unverified_files || []).some((f) => f.reason === reason));
+        return items.filter((h) => (h.unverified_files || []).some((f) => this.unverifiedKey(f) === reason));
     }
 
     // sortReasons puts the reason Replace acts on first, then the rest by
@@ -1012,7 +1031,7 @@ class RepairManager {
         const items = this.unverifiedInRun();
         const counts = {};
         for (const h of items) {
-            for (const r of new Set((h.unverified_files || []).map((f) => f.reason))) {
+            for (const r of new Set((h.unverified_files || []).map((f) => this.unverifiedKey(f)))) {
                 counts[r] = (counts[r] || 0) + 1;
             }
         }
@@ -1066,7 +1085,7 @@ class RepairManager {
             const files = h.unverified_files || [];
             const rowId = `unverified-row-${this.slug(h.entry_name)}`;
             const replaceable = files.some((f) => f.reason === REASON_TAIL_TRUNCATED);
-            const reasons = this.sortReasons([...new Set(files.map((f) => f.reason))]);
+            const reasons = this.sortReasons([...new Set(files.map((f) => this.unverifiedKey(f)))]);
             const reasonText = this.unverifiedReasonLabel(reasons[0]) + (reasons.length > 1 ? ` +${reasons.length - 1}` : '');
             const shortBy = Math.max(0, ...files.map((f) => f.short_bytes || 0));
             const lastChecked = h.last_checked_at ? new Date(h.last_checked_at).toLocaleString() : '-';
@@ -1168,14 +1187,23 @@ class RepairManager {
         if (!files.length) {
             return `<div class="text-sm opacity-60">No file details.</div>`;
         }
-        const rows = files.map((f) => `
+        const rows = files.map((f) => {
+            const help = DECODE_CAUSE_INFO[f.cause]?.[1];
+            const detail = help || f.detail ? `
+            <tr>
+                <td colspan="4" class="text-xs">
+                    ${help ? `<div class="opacity-70">${this.escape(help)}</div>` : ''}
+                    ${f.detail ? `<div class="font-mono break-all opacity-60 mt-1">${this.escape(f.detail)}</div>` : ''}
+                </td>
+            </tr>` : '';
+            return `
             <tr>
                 <td class="font-mono text-xs break-all">${this.escape(f.file_name || '')}</td>
-                <td class="text-xs">${this.escape(this.unverifiedReasonLabel(f.reason))}</td>
+                <td class="text-xs">${this.escape(this.unverifiedReasonLabel(this.unverifiedKey(f)))}</td>
                 <td class="text-xs">${f.short_bytes ? this.formatBytes(f.short_bytes) : '-'}</td>
                 <td class="text-xs">${f.size ? this.formatBytes(f.size) : '-'}</td>
-            </tr>
-        `).join('');
+            </tr>${detail}`;
+        }).join('');
         return `
             <div class="overflow-x-auto">
                 <table class="table table-xs">

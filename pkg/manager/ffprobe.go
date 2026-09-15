@@ -987,9 +987,10 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 			budgetStats(f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Str("phase", phase).
 				Int("windows", len(intervals)).Dur("elapsed", elapsed).
 				Int("frames", progress.frames).Float64("decoded_to_s", progress.lastTS).
+				Str("cause", decodeErrorCause(stderrStr)).
 				Int("stderr_lines", n).Str("stderr", lines), budget).
 				Msg("Repair: ffprobe printed errors but decoded to the end of its window; not treating the file as broken")
-			noteUnverified(ctx, unverifiedDecodeErrors)
+			noteDecodeErrors(ctx, stderrStr, lines)
 			return true, ffprobeReasonDecodedThrough, false
 		}
 		evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check found a decode error")

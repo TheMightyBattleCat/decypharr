@@ -218,10 +218,16 @@ func TestRunDecodeProbe_ErrorsThatDecodedThrough(t *testing.T) {
 				budget.Add(budget.Limit() + 1)
 			}
 
-			ok, reason, conclusive := f.runDecodeProbe(context.Background(), "E", "f.mkv", decodePhaseHead, tc.intervals, 5*time.Second, testBigFile, budget)
+			cause := &unverifiedCause{}
+			ok, reason, conclusive := f.runDecodeProbe(contextWithUnverifiedCause(context.Background(), cause), "E", "f.mkv", decodePhaseHead, tc.intervals, 5*time.Second, testBigFile, budget)
 			if ok != tc.wantOK || reason != tc.wantReason || conclusive != tc.wantConclusive {
 				t.Fatalf("got ok=%v reason=%q conclusive=%v, want ok=%v reason=%q conclusive=%v",
 					ok, reason, conclusive, tc.wantOK, tc.wantReason, tc.wantConclusive)
+			}
+			if reason == ffprobeReasonDecodedThrough {
+				if want := decodeErrorCause(tc.stderr); cause.decodeCause != want || cause.detail != strings.TrimSpace(tc.stderr) {
+					t.Fatalf("recorded cause=%q detail=%q, want cause=%q with the stderr line", cause.decodeCause, cause.detail, want)
+				}
 			}
 
 			raw, err := os.ReadFile(argsFile)
