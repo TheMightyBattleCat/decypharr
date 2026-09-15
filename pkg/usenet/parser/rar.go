@@ -143,6 +143,16 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		return nil, fmt.Errorf("no files")
 	}
 
+	// Before the sort and any measurement: a file named in another scheme would
+	// otherwise sort in as a volume of this archive.
+	if kept, dropped := dropOddSchemeVolumes(group.Files); len(dropped) > 0 {
+		p.logger.Warn().
+			Str("group", group.BaseName).
+			Strs("files", dropped).
+			Msg("Left out files named in another volume scheme than the rest of the archive")
+		group.Files = kept
+	}
+
 	// Sort RAR files by volume order (.rar first, then .r00, .r01, etc.)
 	// For obfuscated filenames that all get the same sort key, fall back to
 	// NZB file Number (upload order) which preserves the original volume sequence.

@@ -62,6 +62,77 @@ func getRARVolumeOrder(filename string) int {
 	return 999999
 }
 
+// RAR volume naming schemes, as rarVolumeScheme tells them apart.
+const (
+	rarSchemeNone    = ""
+	rarSchemePart    = "partNN.rar"
+	rarSchemeOld     = "rar/rNN"
+	rarSchemeNumeric = "NNN"
+)
+
+var rarPartSuffix = regexp.MustCompile(`\.part\d+\.rar$`)
+
+// rarVolumeScheme names the volume naming scheme filename follows, or
+// rarSchemeNone for a name that carries no volume order (an obfuscated name).
+func rarVolumeScheme(filename string) string {
+	lower := strings.ToLower(filename)
+	ext := filepath.Ext(lower)
+	switch {
+	case rarPartSuffix.MatchString(lower):
+		return rarSchemePart
+	case ext == ".rar":
+		return rarSchemeOld
+	case len(ext) == 4 && ext[1] == 'r' && numericExtPattern.MatchString("."+ext[2:]):
+		return rarSchemeOld
+	case numericExtPattern.MatchString(ext):
+		return rarSchemeNumeric
+	}
+	return rarSchemeNone
+}
+
+// dropOddSchemeVolumes removes from a RAR group the files whose volume naming
+// scheme differs from the one most of its named files use. One archive's
+// volumes are all named one way, so a file named another way is some other
+// archive that shares the base name - and getRARVolumeOrder sorts a plain
+// .rar (order 0) ahead of .part001.rar (order 1), which makes it the first
+// volume. Far from the Hurried Crowd KRaLiMaRKo posts a 1-article, 10 KB
+// "name.rar" beside "name.part001.rar" to "name.part134.rar".
+//
+// Files with no scheme (obfuscated names) are kept. A tie between schemes
+// leaves the group as it was: there is no majority to trust.
+func dropOddSchemeVolumes(files []nzbparser.NzbFile) (kept []nzbparser.NzbFile, dropped []string) {
+	counts := map[string]int{}
+	for _, f := range files {
+		if s := rarVolumeScheme(f.Filename); s != rarSchemeNone {
+			counts[s]++
+		}
+	}
+	if len(counts) < 2 {
+		return files, nil
+	}
+	majority, best, tie := "", 0, false
+	for s, n := range counts {
+		switch {
+		case n > best:
+			majority, best, tie = s, n, false
+		case n == best:
+			tie = true
+		}
+	}
+	if tie {
+		return files, nil
+	}
+	kept = make([]nzbparser.NzbFile, 0, len(files))
+	for _, f := range files {
+		if s := rarVolumeScheme(f.Filename); s != rarSchemeNone && s != majority {
+			dropped = append(dropped, f.Filename)
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept, dropped
+}
+
 func wrapNZBFile(f *storage.NZBFile) ([]*storage.NZBFile, error) {
 	if f == nil {
 		return nil, fmt.Errorf("nzb file is nil")
