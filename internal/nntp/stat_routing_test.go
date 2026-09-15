@@ -34,7 +34,9 @@ type fakeNNTP struct {
 	missDelay time.Duration   // before a 430 (real providers answer misses far slower)
 	missing   map[string]bool // message IDs (without brackets) answered 430
 	dropAfter int64           // close each connection after this many STATs (0: never)
+	bodies    map[string]string // message ID -> wire body for BODY, without the ".\r\n" terminator
 	stats     atomic.Int64
+	bodyReqs  atomic.Int64
 	wg        sync.WaitGroup
 }
 
@@ -97,6 +99,15 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 				time.Sleep(s.delay)
 				_, _ = w.WriteString("223 0 <" + id + ">\r\n")
 			}
+		case strings.HasPrefix(line, "BODY "):
+			s.bodyReqs.Add(1)
+			id := strings.Trim(strings.TrimPrefix(line, "BODY "), "<>")
+			body, ok := s.bodies[id]
+			if !ok {
+				_, _ = w.WriteString("430 no such article\r\n")
+				break
+			}
+			_, _ = w.WriteString("222 0 <" + id + ">\r\n" + body + ".\r\n")
 		case line == "QUIT":
 			_, _ = w.WriteString("205 bye\r\n")
 			_ = w.Flush()

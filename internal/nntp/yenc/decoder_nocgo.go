@@ -16,5 +16,9 @@ func Backend() string {
 	return "pure-go (built without cgo; no CRC32 or size check)"
 }
 
+// IsCorruptArticle is always false for the pure-Go backend, which checks
+// neither size nor CRC32.
+func IsCorruptArticle(err error) bool { return false }
+
 // ReleaseDecoder is a no-op for the pure-Go backend.
 func ReleaseDecoder(dec *Decoder) {}

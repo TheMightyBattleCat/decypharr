@@ -3,11 +3,22 @@
 package yenc
 
 import (
+	"errors"
 	"io"
 	"sync"
 
 	"github.com/Tensai75/rapidyenc"
 )
+
+// IsCorruptArticle reports whether err is rapidyenc rejecting the article it
+// decoded: short or long against its =ypart size, a CRC32 mismatch, or no
+// =yend trailer. That describes the copy this provider holds, not the
+// connection or the reader, and another backbone can hold an intact copy.
+func IsCorruptArticle(err error) bool {
+	return errors.Is(err, rapidyenc.ErrDataCorruption) ||
+		errors.Is(err, rapidyenc.ErrCrcMismatch) ||
+		errors.Is(err, rapidyenc.ErrDataMissing)
+}
 
 // rapidyencAdapter wraps a rapidyenc.Decoder to sync Meta after each Read.
 type rapidyencAdapter struct {

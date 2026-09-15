@@ -399,6 +399,18 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 						// Article not found - not retriable, try next provider
 						return retry.Unrecoverable(execErr)
 
+					case ErrorTypeYencDecode:
+						// A corrupt copy fails the same way on every retry here, so
+						// go to the next provider. Close the connection rather than
+						// pool it: a decode that ended early may have left body
+						// bytes unread on the wire.
+						if IsCorruptArticleError(execErr) {
+							releasedConn := currentConn
+							currentConn = nil
+							c.release(releasedConn)
+						}
+						return retry.Unrecoverable(execErr)
+
 					default:
 						// Non-retriable error
 						return retry.Unrecoverable(execErr)
@@ -443,6 +455,16 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				excludeForArticleNotFound(&exclusions, connProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
 				exclusions.excludeHost(connProvider.Host)
+			case ErrorTypeYencDecode:
+				if !IsCorruptArticleError(err) {
+					return err
+				}
+				// Providers on one backbone serve the same damaged copy
+				// (Tower of Coins part087 article 86: 767,964 of 768,000
+				// bytes on four providers, intact on three others), so skip
+				// the backbone as for a 430. If every provider's copy is
+				// corrupt, the last decode error is returned as before.
+				excludeForArticleNotFound(&exclusions, connProvider)
 			default:
 				// Non-retriable error, return immediately
 				return err

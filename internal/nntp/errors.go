@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
 )
 
 // Error types for NNTP operations
@@ -218,6 +220,15 @@ func IsArticleNotFoundError(err error) bool {
 		return nntpErr.Type == ErrorTypeArticleNotFound
 	}
 	return false
+}
+
+// IsCorruptArticleError reports whether err is a decode failure caused by the
+// article itself (wrong size, CRC mismatch, no =yend) rather than by the
+// connection or the destination writer, which classifyTransferError also
+// files under ErrorTypeYencDecode.
+func IsCorruptArticleError(err error) bool {
+	var nntpErr *Error
+	return errors.As(err, &nntpErr) && nntpErr.Type == ErrorTypeYencDecode && nntpyenc.IsCorruptArticle(err)
 }
 
 func IsAuthenticationError(err error) bool {
