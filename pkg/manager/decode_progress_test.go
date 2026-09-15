@@ -204,7 +204,12 @@ func TestRunDecodeProbe_ErrorsThatDecodedThrough(t *testing.T) {
 	}{
 		{"clean", []string{"0%+578"}, frameLines(0, 578.05), "", 0, false, true, "", true},
 		{"errors, decoded to the end", []string{"0%+578"}, frameLines(0, 578.05), eof, 0, false, true, ffprobeReasonDecodedThrough, false},
-		{"errors, 4.2 spread decoded its first window", spreadOf(15), frameLines(0, 2), "[h264 @ 0x1] mmco: unref short failure\n", 0, false, true, ffprobeReasonDecodedThrough, false},
+		{"errors, 4.2 spread decoded its first window", spreadOf(15), frameLines(0, 2), "[h264 @ 0x1] top block unavailable for requested intra mode\n", 0, false, true, ffprobeReasonDecodedThrough, false},
+		{"seek warnings only, decoded to the end", spreadOf(15), frameLines(0, 2), "[h264 @ 0x1] mmco: unref short failure\n[h264 @ 0x1] number of reference frames (0+4) exceeds max (3; probably corrupt input), discarding one\n", 0, false, true, "", true},
+		{"seek warnings with a codec error", []string{"0%+578"}, frameLines(0, 578.05), "[h264 @ 0x1] mmco: unref short failure\n[h264 @ 0x1] error while decoding MB 0 0, bytestream 49028\n", 0, false, true, ffprobeReasonDecodedThrough, false},
+		{"seek warnings, non-zero exit", []string{"0%+578"}, frameLines(0, 578.05), "[vc1 @ 0x1] warning: first frame is no keyframe\n", 1, false, true, ffprobeReasonDecodedThrough, false},
+		{"seek warnings, decode stopped short", []string{"0%+578"}, frameLines(0, 120), "[mpeg2video @ 0x1] ignoring pic cod ext after 0\n", 0, false, false, ffprobeReasonDecodeError + ": [mpeg2video @ 0x1] ignoring pic cod ext after 0", true},
+		{"seek warnings on a cut body", []string{"0%+578"}, frameLines(0, 120), "[h264 @ 0x1] mmco: unref short failure\n", 0, true, true, "", false},
 		{"errors, decode stopped short", []string{"0%+578"}, frameLines(0, 120), eof, 0, false, false, ffprobeReasonDecodeError + ": " + strings.TrimSpace(eof), true},
 		{"errors, nothing decoded", []string{"0%+2"}, "", eof, 1, false, false, ffprobeReasonDecodeError + ": " + strings.TrimSpace(eof), true},
 		{"non-zero exit, no stderr", []string{"0%+2"}, "", "", 1, false, false, ffprobeReasonDecodeError, true},
@@ -225,7 +230,7 @@ func TestRunDecodeProbe_ErrorsThatDecodedThrough(t *testing.T) {
 					ok, reason, conclusive, tc.wantOK, tc.wantReason, tc.wantConclusive)
 			}
 			if reason == ffprobeReasonDecodedThrough {
-				if want := decodeErrorCause(tc.stderr); cause.decodeCause != want || cause.detail != strings.TrimSpace(tc.stderr) {
+				if want, summary := decodeErrorCause(tc.stderr), first(stderrSummary(tc.stderr)); cause.decodeCause != want || cause.detail != summary {
 					t.Fatalf("recorded cause=%q detail=%q, want cause=%q with the stderr line", cause.decodeCause, cause.detail, want)
 				}
 			}

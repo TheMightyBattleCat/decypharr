@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+func first[A, B any](a A, _ B) A { return a }
+
 // Stderr from sweeps on a production install 2026-09-11..15, one or more files per case.
 func TestDecodeErrorCause(t *testing.T) {
 	for _, tc := range []struct {

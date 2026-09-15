@@ -983,7 +983,19 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 		// head scans that decoded to their end, byte-identical on retry, no
 		// reader-side fault). A decode that stopped short of its interval is
 		// still broken.
-		if reached, known := reachedFirstIntervalEnd(intervals, progress); known && reached {
+		reached, known := reachedFirstIntervalEnd(intervals, progress)
+		if known && reached && runErr == nil && decodeErrorCause(stderrStr) == decodeCauseSeekWarnings {
+			// Only the messages ffmpeg prints when decoding starts at a seek
+			// point, on a decode that reached its window and exited cleanly:
+			// a pass. Measured 2026-09-15 on 6 files (H.264 mmco and
+			// reference frames, MPEG-2 pic cod ext, VC-1 no keyframe): every
+			// window that printed them printed the same count when decoding
+			// 5x the frames from the same seek, and decoded every frame.
+			evt().Int("stderr_lines", n).Str("ignored", lines).
+				Msg("Repair: ffprobe printed only seek warnings and decoded to the end of its window; counting the check as passed")
+			return true, "", true
+		}
+		if known && reached {
 			budgetStats(f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Str("phase", phase).
 				Int("windows", len(intervals)).Dur("elapsed", elapsed).
 				Int("frames", progress.frames).Float64("decoded_to_s", progress.lastTS).

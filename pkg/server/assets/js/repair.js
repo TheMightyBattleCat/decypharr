@@ -24,7 +24,7 @@ const UNVERIFIED_REASON_LABELS = {
 // What ffprobe's errors point at on a decoded_with_errors file
 // (manager.decodeErrorCause): a label, and what it means for the file.
 const DECODE_CAUSE_INFO = {
-    seek_warnings: ['Seek warnings', 'Decoder messages from starting mid-stream without the frames before it. They say nothing against the file.'],
+    seek_warnings: ['Seek warnings', 'Decoder messages from starting mid-stream without the frames before it. The file is fine: its next check counts it as verified.'],
     stream_ended: ['Stream ended early', 'Part of the file could not be read (a corrupt or missing article). Playback stops at the same point.'],
     zero_filled: ['Zero-filled data', 'The file holds zeros where data should be: missing data at import or at source.'],
     file_ended: ['File ended early', 'The file is shorter than its own structure says, often a volume or tail missing at import.'],
