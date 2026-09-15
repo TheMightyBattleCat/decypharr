@@ -1030,11 +1030,6 @@ func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups
 
 	// For each single-file RAR group, fetch first 16KB, compute MD5,
 	// and look up the real filename.
-	type recoveredFile struct {
-		file     nzbparser.NzbFile
-		realName string
-		groups   map[string]struct{}
-	}
 	recovered := make([]recoveredFile, 0, len(singleFileRarGroups))
 
 	for _, group := range singleFileRarGroups {
@@ -1077,38 +1072,67 @@ func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups
 		Int("par2_files", len(idx.Files)).
 		Msg("PAR2 name recovery: recovered real filenames for all obfuscated RAR volumes")
 
-	// Build a set of existing group keys to detect type collisions.
-	result := make(map[string]*FileGroup)
+	result, collision := regroupRecoveredVolumes(recovered, otherGroups, p.getBaseFilename)
+	if result == nil {
+		p.logger.Debug().
+			Str("key", collision).
+			Msg("PAR2 name recovery: group key collision with existing group, aborting")
+		return nil
+	}
+	return result
+}
+
+// recoveredFile is one obfuscated RAR volume whose real name
+// tryPar2NameRecovery found in the release's PAR2 index.
+type recoveredFile struct {
+	file     nzbparser.NzbFile
+	realName string
+	groups   map[string]struct{}
+}
+
+// regroupRecoveredVolumes builds the RAR groups for volumes whose real names
+// were recovered: every volume of one archive (same base name) goes into one
+// group, sorted by name. It returns nil and the colliding key when a
+// recovered base name is already an existing group's, since merging into a
+// group of another type would mix unrelated files.
+//
+// Volumes of one archive share their base name, so collisions are checked
+// against otherGroups only - checking the groups built here aborted every
+// recovery at its second volume.
+func regroupRecoveredVolumes(recovered []recoveredFile, otherGroups []*FileGroup, baseName func(string) string) (map[string]*FileGroup, string) {
+	result := make(map[string]*FileGroup, len(otherGroups)+1)
 	for _, group := range otherGroups {
 		result[group.BaseName] = group
+	}
+	existing := make(map[string]bool, len(otherGroups))
+	for key := range result {
+		existing[key] = true
 	}
 
 	for _, rf := range recovered {
 		rf.file.Filename = rf.realName
-		groupKey := p.getBaseFilename(rf.realName)
-
-		if _, exists := result[groupKey]; exists {
-			p.logger.Debug().
-				Str("key", groupKey).
-				Msg("PAR2 name recovery: group key collision with existing group, aborting")
-			return nil
+		groupKey := baseName(rf.realName)
+		if existing[groupKey] {
+			return nil, groupKey
 		}
-		group := &FileGroup{
-			BaseName:       groupKey,
-			ActualFilename: rf.realName,
-			Type:           storage.NZBFileTypeRar,
-			Files:          []nzbparser.NzbFile{},
-			Groups:         make(map[string]struct{}),
+		group, ok := result[groupKey]
+		if !ok {
+			group = &FileGroup{
+				BaseName:       groupKey,
+				ActualFilename: rf.realName,
+				Type:           storage.NZBFileTypeRar,
+				Groups:         make(map[string]struct{}),
+			}
+			result[groupKey] = group
 		}
-		result[groupKey] = group
 		group.Files = append(group.Files, rf.file)
 		for g := range rf.groups {
 			group.Groups[g] = struct{}{}
 		}
 	}
 
-	// Sort each RAR group's files by recovered filename — this gives
-	// correct volume order from .partNN.rar patterns.
+	// Sort each RAR group's files by recovered filename; RARParser.Process
+	// orders them by volume number afterwards.
 	for _, group := range result {
 		if group.Type != storage.NZBFileTypeRar || len(group.Files) <= 1 {
 			continue
@@ -1117,8 +1141,7 @@ func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups
 			return group.Files[i].Filename < group.Files[j].Filename
 		})
 	}
-
-	return result
+	return result, ""
 }
 
 // fetchPar2FileData fetches all segments of a PAR2 file over NNTP and returns
