@@ -101,17 +101,6 @@ type contentResult struct {
 	file           nzbparser.NzbFile
 	fileType       storage.NZBFileType
 	actualFilename string
-	fileSize       int64 // decoded size of the part (from yEnc), if available
-	segmentSize    int64 // decoded size of a segment (from yEnc), if available
-	partNumber     int64 // yEnc part number, if available
-	partBegin      int64 // yEnc begin offset, if available
-}
-
-type filePartMeta struct {
-	fileSize    int64
-	segmentSize int64
-	partNumber  int64
-	partBegin   int64
 }
 
 type FileGroup struct {
@@ -120,7 +109,6 @@ type FileGroup struct {
 	Type           storage.NZBFileType
 	Files          []nzbparser.NzbFile
 	metadata       *fileAnalysisResult
-	fileMeta       map[string]filePartMeta
 	Groups         map[string]struct{}
 }
 
@@ -1133,7 +1121,6 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 				BaseName:       groupKey,
 				Type:           item.fileType,
 				Files:          []nzbparser.NzbFile{},
-				fileMeta:       make(map[string]filePartMeta),
 				Groups:         make(map[string]struct{}),
 			}
 			groups[groupKey] = group
@@ -1154,29 +1141,6 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 		group.Files = append(group.Files, item.file)
 		for _, g := range item.file.Groups {
 			group.Groups[g] = struct{}{}
-		}
-
-		if item.fileSize > 0 || item.segmentSize > 0 || item.partNumber > 0 || item.partBegin > 0 {
-			if group.fileMeta == nil {
-				group.fileMeta = make(map[string]filePartMeta)
-			}
-			metaKey := fileMetaKey(item.file)
-			if metaKey != "" {
-				meta := group.fileMeta[metaKey]
-				if meta.fileSize == 0 && item.fileSize > 0 {
-					meta.fileSize = item.fileSize
-				}
-				if meta.segmentSize == 0 && item.segmentSize > 0 {
-					meta.segmentSize = item.segmentSize
-				}
-				if meta.partNumber == 0 && item.partNumber > 0 {
-					meta.partNumber = item.partNumber
-				}
-				if meta.partBegin == 0 && item.partBegin > 0 {
-					meta.partBegin = item.partBegin
-				}
-				group.fileMeta[metaKey] = meta
-			}
 		}
 	}
 
