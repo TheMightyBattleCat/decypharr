@@ -8,7 +8,6 @@ import (
 	"io"
 
 	"github.com/sirrobot01/decypharr/internal/crypto"
-	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 )
 
@@ -16,7 +15,7 @@ import (
 // It can efficiently skip large data sections without downloading them
 type rarReader struct {
 	ctx      context.Context
-	manager  *nntp.Client
+	fetch    articleBodyFunc
 	volumes  []*types.Volume
 	position int64 // Current absolute position in the archive
 
@@ -26,10 +25,10 @@ type rarReader struct {
 	currentSegmentOffset int // Offset within current segment data
 }
 
-func newRarReader(ctx context.Context, manager *nntp.Client, volumes []*types.Volume) *rarReader {
+func newRarReader(ctx context.Context, fetch articleBodyFunc, volumes []*types.Volume) *rarReader {
 	return &rarReader{
 		ctx:                 ctx,
-		manager:             manager,
+		fetch:               fetch,
 		volumes:             volumes,
 		position:            0,
 		currentVolumeIndex:  0,
@@ -139,13 +138,10 @@ func (r *rarReader) loadNextSegment() error {
 
 		segment := volume.Segments[r.currentSegmentIndex]
 
-		// Download segment using manager
-		var data []byte
-		err := r.manager.ExecuteWithFailover(r.ctx, func(conn *nntp.Connection) error {
-			d, e := conn.GetDecodedBody(segment.MessageID)
-			data = d
-			return e
-		})
+		if r.fetch == nil {
+			return fmt.Errorf("failed to fetch segment: no article fetcher")
+		}
+		data, err := r.fetch(r.ctx, segment.MessageID)
 		if err != nil {
 			return fmt.Errorf("failed to fetch segment: %w", err)
 		}
@@ -684,8 +680,10 @@ func readVInt(r *bytes.Reader) (uint64, error) {
 
 // parseRAR4Stream parses RAR 4.x headers from a stream reader
 // This properly tracks offsets by reading headers sequentially and skipping data
-func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeName string, volumeSize int64) ([]*RARFileEntry, error) {
-	var files []*RARFileEntry
+//
+// volNum is the volume number stored in the volume's end-of-archive header,
+// when the walk reaches that header and its CRC checks out (hasVolNum).
+func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeName string, volumeSize int64) (files []*RARFileEntry, volNum int, hasVolNum bool, err error) {
 
 	// Stream position is already at 7 (after RAR4 signature)
 	// The signature is: "Rar!\x1A\x07\x00" (7 bytes)
@@ -743,17 +741,18 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 				if err == io.EOF {
 					break
 				}
-				return nil, fmt.Errorf("failed to skip RAR4 data section: %w", err)
+				return nil, 0, false, fmt.Errorf("failed to skip RAR4 data section: %w", err)
 			}
 		}
 
 		// Stop at end of archive
 		if header.Type == RAR4HeaderTypeEnd {
+			volNum, hasVolNum = rar4EndVolumeNumber(header)
 			break
 		}
 	}
 
-	return files, nil
+	return files, volNum, hasVolNum, nil
 }
 
 // readRAR4HeaderFromStream reads a single RAR 4.x header from stream

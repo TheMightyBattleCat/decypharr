@@ -99,6 +99,10 @@ type RARArchiveInfo struct {
 	// the (otherwise NZB-ordered) volumes/segments to the correct sequence. Nil
 	// means "ordering unknown — keep NZB/upload order" (the safe default).
 	VolumeOrder []int
+	// VolumeOrderKnown reports that every volume's number was read and they
+	// are distinct, so the order is verified even when VolumeOrder is nil
+	// because the volumes were already in order.
+	VolumeOrderKnown bool
 }
 
 // RARFileEntry represents a file within the RAR archive
@@ -122,15 +126,30 @@ type RARParser struct {
 	manager       *nntp.Client
 	maxConcurrent int
 	logger        zerolog.Logger
+	// fetchBody fetches an article's decoded body for reading RAR4 volume
+	// tails; nil without a manager.
+	fetchBody articleBodyFunc
 }
 
 // NewRARParser creates a new RAR parser
 func NewRARParser(manager *nntp.Client, maxConcurrent int, logger zerolog.Logger) *RARParser {
-	return &RARParser{
+	p := &RARParser{
 		manager:       manager,
 		maxConcurrent: maxConcurrent,
 		logger:        logger.With().Str("component", "rar_parser").Logger(),
 	}
+	if manager != nil {
+		p.fetchBody = func(ctx context.Context, messageID string) ([]byte, error) {
+			var data []byte
+			err := manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+				d, e := conn.GetDecodedBody(messageID)
+				data = d
+				return e
+			})
+			return data, err
+		}
+	}
+	return p
 }
 
 func (p *RARParser) Process(ctx context.Context, group *FileGroup, password string) ([]*storage.NZBFile, error) {
@@ -237,12 +256,13 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 	}
 
-	if archiveInfo.Version == RARVersion4 && archiveInfo.VolumeOrder == nil && !namesOrderVolumes(group.Files) {
-		// RAR5 main headers number their volumes (resolveVolumeOrder); RAR4
-		// headers carry nothing this parser reads. If the upload order is wrong,
-		// the file is assembled with its volumes out of order.
+	if archiveInfo.Version == RARVersion4 && !archiveInfo.VolumeOrderKnown && !namesOrderVolumes(group.Files) {
+		// parseArchive reads RAR4 volume numbers from end-of-archive headers;
+		// some volumes had none it could read (an old RAR without the field, or
+		// a tail that would not fetch). If the upload order is wrong, the file
+		// is assembled with its volumes out of order.
 		p.logger.Warn().Str("group", group.BaseName).Int("volumes", len(group.Files)).
-			Msg("RAR4 volumes carry no order in their names; assembled in the order the NZB lists them")
+			Msg("RAR4 volume order not verified: names carry none and not every volume's end header gave a number; assembled in the order the NZB lists them")
 	}
 
 	if p.manager != nil {
@@ -415,7 +435,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	}
 
 	// Detect RAR version from first volume
-	firstStream := newRarReader(ctx, p.manager, []*types.Volume{volumes[0]})
+	firstStream := newRarReader(ctx, p.fetchBody, []*types.Volume{volumes[0]})
 	sig := make([]byte, 8)
 	if _, err := io.ReadFull(firstStream, sig); err != nil {
 		return nil, fmt.Errorf("failed to read RAR signature: %w", err)
@@ -432,7 +452,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		files             []*RARFileEntry
 		isHeaderEncrypted bool
 		encryptionKey     []byte // AES-256 key for encrypted file data
-		volumeNumber      int    // true 0-based volume number from RAR5 main header
+		volumeNumber      int    // true 0-based volume number: RAR5 main header, RAR4 end-of-archive header
 		hasVolumeNumber   bool   // whether volumeNumber was parsed
 		err               error
 	}
@@ -462,7 +482,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		vol := input.vol
 
 		// Create stream reader for this specific volume
-		stream := newRarReader(ctx, p.manager, []*types.Volume{vol})
+		stream := newRarReader(ctx, p.fetchBody, []*types.Volume{vol})
 
 		// Skip signature (7 or 8 bytes depending on version)
 		sigSize := 8
@@ -494,7 +514,11 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 				return volumeResult{index: volIdx, files: volumeFiles, isHeaderEncrypted: isEncrypted, volumeNumber: result.VolumeNumber, hasVolumeNumber: result.HasVolumeNumber, err: nil}
 			}
 		case RARVersion4:
-			volumeFiles, err = p.parseRAR4Stream(stream, volIdx, vol.Name, vol.Size)
+			volumeFiles, volNum, hasVolNum, parseErr := p.parseRAR4Stream(stream, volIdx, vol.Name, vol.Size)
+			if parseErr != nil {
+				return volumeResult{index: volIdx, err: parseErr}
+			}
+			return volumeResult{index: volIdx, files: volumeFiles, volumeNumber: volNum, hasVolumeNumber: hasVolNum}
 		default:
 			err = fmt.Errorf("unsupported RAR version: %d", version)
 		}
@@ -506,17 +530,46 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		return volumeResult{index: volIdx, files: volumeFiles, isHeaderEncrypted: isEncrypted, err: nil}
 	})
 
-	// Determine whether we can establish the TRUE volume order from RAR5
-	// main-header volume numbers (see resolveVolumeOrder). Default: nil, which
-	// means "keep NZB/upload order" (correct for in-order archives incl .partNN).
+	// RAR4 volumes whose names carry no order: take each volume's number from
+	// its end-of-archive header. The header walk above reads that header when
+	// it reaches the volume's end; for the rest, read the volume's last
+	// article. Named RAR4 sets keep their name order, as before.
+	rar4Unnamed := version == RARVersion4 && len(volumes) > 1 && !volumeNamesOrder(volumes)
+	if rar4Unnamed {
+		var want []int
+		for i, r := range results {
+			if r.err == nil && !r.hasVolumeNumber {
+				want = append(want, i)
+			}
+		}
+		if len(want) > 0 && p.fetchBody != nil {
+			found := rar4TailVolumeNumbers(ctx, volumes, want, p.maxConcurrent, p.fetchBody)
+			for i := range results {
+				if n, ok := found[results[i].index]; ok {
+					results[i].volumeNumber, results[i].hasVolumeNumber = n, true
+				}
+			}
+			p.logger.Debug().Int("volumes", len(volumes)).Int("tails_read", len(want)).Int("numbered", len(found)).
+				Msg("Read RAR4 volume numbers from volume tails")
+		}
+	}
+
+	// Determine whether we can establish the TRUE volume order from volume
+	// numbers (see resolveVolumeOrder). Default: nil, which means "keep
+	// NZB/upload order" (correct for in-order archives incl .partNN).
 	entries := make([]volEntry, 0, len(results))
 	for _, r := range results {
 		if r.err != nil {
 			continue
 		}
-		entries = append(entries, volEntry{idx: r.index, num: r.volumeNumber, hasNum: r.hasVolumeNumber})
+		num, hasNum := r.volumeNumber, r.hasVolumeNumber
+		if version == RARVersion4 && !rar4Unnamed {
+			hasNum = false
+		}
+		entries = append(entries, volEntry{idx: r.index, num: num, hasNum: hasNum})
 	}
 	volumeOrder := p.resolveVolumeOrder(entries, len(results))
+	orderKnown := orderEstablished(entries, len(results))
 
 	// Sort results by index to maintain NZB/upload order and collect files.
 	// (Internal coordinate systems — baseSegments, volumeOffsetMap — are built
@@ -577,6 +630,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		EncryptionKey:     encryptionKey,
 		Files:             files,
 		VolumeOrder:       volumeOrder,
+		VolumeOrderKnown:  orderKnown,
 	}
 	return archiveInfo, nil
 }

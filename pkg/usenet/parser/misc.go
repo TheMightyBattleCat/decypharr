@@ -137,9 +137,26 @@ func dropOddSchemeVolumes(files []nzbparser.NzbFile) (kept []nzbparser.NzbFile, 
 // getRARVolumeOrder, so the volume sort did not have to fall back to subject
 // numbers or NZB order. A single file needs no order.
 func namesOrderVolumes(files []nzbparser.NzbFile) bool {
-	seen := make(map[int]bool, len(files))
-	for _, f := range files {
-		o := getRARVolumeOrder(f.Filename)
+	names := make([]string, len(files))
+	for i, f := range files {
+		names[i] = f.Filename
+	}
+	return namesGiveDistinctOrder(names)
+}
+
+// volumeNamesOrder is namesOrderVolumes for built archive volumes.
+func volumeNamesOrder(volumes []*types.Volume) bool {
+	names := make([]string, len(volumes))
+	for i, v := range volumes {
+		names[i] = v.Name
+	}
+	return namesGiveDistinctOrder(names)
+}
+
+func namesGiveDistinctOrder(names []string) bool {
+	seen := make(map[int]bool, len(names))
+	for _, name := range names {
+		o := getRARVolumeOrder(name)
 		if seen[o] {
 			return false
 		}
