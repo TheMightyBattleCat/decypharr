@@ -206,3 +206,70 @@ func TestMeasureUnsizedVolumes_FinalFirstThenShortestWithinTheCap(t *testing.T) 
 		t.Fatalf("got n=%d err=%q, want one single-line error counting all 4 failures", n, err)
 	}
 }
+
+const (
+	gretaFinalLast  = 11161
+	gretaFinalBytes = 45*article + gretaFinalLast
+)
+
+// greta replays Greta S03E03 on a production install: its NZB's [n/m] subject counters
+// are scrambled, so the final volume (46 articles, last 11,161 bytes) shares
+// its file number with the 68-article reference volume
+// enrichGroupWithFileInfo measured. Two full volumes stand in for 47.
+func greta() *FileGroup {
+	full := int64(68 * article)
+	ref := postedVolume(3, "h.part01.rar", 68, article)
+	lastByNumber := postedVolume(9, "h.part02.rar", 68, article)
+	final := postedVolume(3, "h.part48.rar", 46, gretaFinalLast)
+	group := &FileGroup{BaseName: "h", Files: []nzbparser.NzbFile{ref, lastByNumber, final}}
+	group.metadata = &fileAnalysisResult{fileSize: full, lastFileSize: full, segmentSize: article}
+	group.metadata.measure(ref, full)
+	group.metadata.measure(lastByNumber, full)
+	return group
+}
+
+func TestFileMetaKey_NamesOneFileWhateverItsNumberOrSegmentOrder(t *testing.T) {
+	group := greta()
+	ref, final := group.Files[0], group.Files[2]
+	if fileMetaKey(ref) == fileMetaKey(final) {
+		t.Fatalf("volumes sharing subject number %d share key %q", ref.Number, fileMetaKey(ref))
+	}
+	key := fileMetaKey(final)
+	shuffled := final
+	shuffled.Segments = slices.Clone(final.Segments)
+	slices.Reverse(shuffled.Segments)
+	if got := fileMetaKey(shuffled); got != key {
+		t.Fatalf("key changed with segment order: %q, want %q", got, key)
+	}
+	if got := fileMetaKey(nzbparser.NzbFile{Number: 4, Subject: "s"}); got != "s:s" {
+		t.Fatalf("no segments: key %q, want the subject", got)
+	}
+}
+
+func TestMeasureUnsizedVolumes_FinalVolumeSharingAMeasuredFilesNumber(t *testing.T) {
+	group := greta()
+	final := group.Files[2]
+	if got := group.metadata.measuredSize(final); got != 0 {
+		t.Fatalf("final volume reads as measured (%d bytes) before its header was fetched", got)
+	}
+
+	var calls atomic.Int32
+	fetch := countingFetch(fakeYencFetch(map[string]*nntp.YencMetadata{
+		"<h.part48.rar-1>": {Size: gretaFinalBytes, Begin: 1, End: article},
+	}), &calls)
+	n, err := measureUnsizedVolumes(context.Background(), group, fetch)
+	if n != 1 || err != nil || calls.Load() != 1 {
+		t.Fatalf("measureUnsizedVolumes = %d, %v after %d fetches; want the final volume measured", n, err, calls.Load())
+	}
+	size, segs := getNZBSegments(2, final, group)
+	if size != gretaFinalBytes {
+		t.Fatalf("final volume = %d bytes, want %d", size, gretaFinalBytes)
+	}
+	if got := segs[len(segs)-1].Bytes; got != gretaFinalLast {
+		t.Fatalf("last article = %d, want %d (the estimate is %d)", got, gretaFinalLast, estimate(gretaFinalLast))
+	}
+	// The reference keeps its own size.
+	if size, _ := getNZBSegments(0, group.Files[0], group); size != 68*article {
+		t.Fatalf("reference volume = %d bytes, want %d", size, 68*article)
+	}
+}

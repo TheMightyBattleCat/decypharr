@@ -193,6 +193,38 @@ func TestMeasureCrossedVolumes_DearJudge(t *testing.T) {
 	}
 }
 
+// The measured final volume shares its subject file number with the inner
+// volumes' probe: the probe must still be fetched, not take the final
+// volume's size and hand it to every crossed volume.
+func TestMeasureCrossedVolumes_ProbeSharingTheFinalVolumesNumber(t *testing.T) {
+	group, file := dearJudge()
+	group.metadata.measured = nil
+	group.Files[3].Number = group.Files[0].Number
+	group.metadata.measure(group.Files[3], yhFinal)
+	_, vols, _ := buildBaseSegments(group)
+
+	var calls atomic.Int32
+	fetch := countingFetch(fakeYencFetch(map[string]*nntp.YencMetadata{
+		"<yh.part1.rar-1>": {Size: fullVolume, Begin: 1, End: article},
+	}), &calls)
+	resized, err := measureCrossedVolumes(context.Background(), group, []*RARFileEntry{file}, vols, fetch)
+	if !resized || err != nil || calls.Load() != 1 {
+		t.Fatalf("got resized=%v err=%v fetches=%d, want the probe fetched", resized, err, calls.Load())
+	}
+	for i := 0; i < 3; i++ {
+		if got := group.metadata.measuredSize(group.Files[i]); got != fullVolume {
+			t.Fatalf("volume %d measured %d bytes, want %d", i+1, got, fullVolume)
+		}
+	}
+	if got := group.metadata.measuredSize(group.Files[3]); got != yhFinal {
+		t.Fatalf("final volume measured %d bytes, want %d", got, yhFinal)
+	}
+	_, vols, _ = buildBaseSegments(group)
+	if err := checkPartsInsideVolumes(file, vols); err != nil {
+		t.Fatalf("after measuring: %v", err)
+	}
+}
+
 func TestMeasureCrossedVolumes_FetchFailsLeavesGeometry(t *testing.T) {
 	group, file := dearJudge()
 	_, vols, _ := buildBaseSegments(group)

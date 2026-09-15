@@ -69,16 +69,35 @@ func wrapNZBFile(f *storage.NZBFile) ([]*storage.NZBFile, error) {
 	return []*storage.NZBFile{f}, nil
 }
 
-// fileMetaKey returns a stable key for associating per-file metadata.
+// fileMetaKey returns a key naming one posted file, for per-file metadata
+// such as a measured size.
+//
+// It is the message ID of the file's lowest-numbered article: unique per
+// file, and the same whatever order the segments are in (getNZBSegments sorts
+// them in place). The subject's file number is not unique - some posters
+// scramble the [n/m] counter, so a season's volumes share numbers - and keying
+// by it gave a final volume another volume's measured size. That size did not
+// fit its article count, so its last article fell back to the 0.97 estimate
+// and the served file ended 3% of an article short, cutting the Matroska index
+// (Greta S03E03 and most of the tail-truncated re-grabs on a production install,
+// 2026-09-14).
 func fileMetaKey(file nzbparser.NzbFile) string {
-	if file.Number > 0 {
-		return fmt.Sprintf("n:%d", file.Number)
+	if len(file.Segments) > 0 {
+		first := file.Segments[0]
+		for _, seg := range file.Segments[1:] {
+			if seg.Number < first.Number {
+				first = seg
+			}
+		}
+		if first.Id != "" {
+			return "m:" + first.Id
+		}
 	}
 	if file.Subject != "" {
 		return "s:" + file.Subject
 	}
-	if len(file.Segments) > 0 {
-		return "m:" + file.Segments[0].Id
+	if file.Number > 0 {
+		return fmt.Sprintf("n:%d", file.Number)
 	}
 	return ""
 }
