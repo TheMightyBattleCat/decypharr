@@ -123,7 +123,7 @@ func TestParseArchive_OrdersUnnamedRAR4VolumesByEndHeader(t *testing.T) {
 		posted.volume("c094d114.rar", rarFixture(t, "rar4set.r00"), 1000),
 	}
 	p := &RARParser{logger: zerolog.Nop(), maxConcurrent: 2, fetchBody: posted.fetch}
-	info, err := p.parseArchive(context.Background(), volumes, "")
+	info, err := p.parseArchive(context.Background(), volumes, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestParseArchive_UnnamedRAR4OrderFromTailsWhenSizesAreEstimates(t *testing.
 			t.Fatalf("%s: the header walk reached the end header; the test no longer covers the tail read", v.Name)
 		}
 	}
-	info, err := p.parseArchive(context.Background(), volumes, "")
+	info, err := p.parseArchive(context.Background(), volumes, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestParseArchive_UnnamedRAR4VolumesInOrder(t *testing.T) {
 		posted.volume("c.rar", rarFixture(t, "rar4set.r01"), 1000),
 	}
 	p := &RARParser{logger: zerolog.Nop(), maxConcurrent: 2, fetchBody: posted.fetch}
-	info, err := p.parseArchive(context.Background(), volumes, "")
+	info, err := p.parseArchive(context.Background(), volumes, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestParseArchive_UnnamedRAR4TailFetchFails(t *testing.T) {
 		posted.fail[v.Segments[len(v.Segments)-1].MessageID] = true
 	}
 	p := &RARParser{logger: zerolog.Nop(), maxConcurrent: 2, fetchBody: posted.fetch}
-	info, err := p.parseArchive(context.Background(), volumes, "")
+	info, err := p.parseArchive(context.Background(), volumes, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestParseArchive_NamedRAR4VolumesReadNoTails(t *testing.T) {
 		posted.volume("x.r01", rarFixture(t, "rar4set.r01"), 1000),
 	}
 	p := &RARParser{logger: zerolog.Nop(), maxConcurrent: 2, fetchBody: posted.fetch}
-	info, err := p.parseArchive(context.Background(), volumes, "")
+	info, err := p.parseArchive(context.Background(), volumes, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}

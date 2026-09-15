@@ -210,7 +210,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	}
 
 	// Parse RAR archive to get file entries with volume parts
-	archiveInfo, err := p.parseArchive(ctx, volumes, password)
+	namesOrder := namesOrderVolumes(group.Files)
+	archiveInfo, err := p.parseArchive(ctx, volumes, password, namesOrder)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RAR archive: %w", err)
 	}
@@ -256,7 +257,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 	}
 
-	if archiveInfo.Version == RARVersion4 && !archiveInfo.VolumeOrderKnown && !namesOrderVolumes(group.Files) {
+	if archiveInfo.Version == RARVersion4 && !archiveInfo.VolumeOrderKnown && !namesOrder {
 		// parseArchive reads RAR4 volume numbers from end-of-archive headers;
 		// some volumes had none it could read (an old RAR without the field, or
 		// a tail that would not fetch). If the upload order is wrong, the file
@@ -429,7 +430,12 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 }
 
 // ParseArchive parses all volumes and extracts file information
-func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, password string) (*RARArchiveInfo, error) {
+//
+// namesOrder reports whether the posted filenames give the volumes a distinct
+// order (namesOrderVolumes on the group's files). It is decided from the NZB
+// names, not volumes[i].Name: buildArchiveVolumeDescriptors gives a file with
+// no name a distinct synthetic .partNNN name.
+func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, password string, namesOrder bool) (*RARArchiveInfo, error) {
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no volumes provided")
 	}
@@ -534,7 +540,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	// its end-of-archive header. The header walk above reads that header when
 	// it reaches the volume's end; for the rest, read the volume's last
 	// article. Named RAR4 sets keep their name order, as before.
-	rar4Unnamed := version == RARVersion4 && len(volumes) > 1 && !volumeNamesOrder(volumes)
+	rar4Unnamed := version == RARVersion4 && len(volumes) > 1 && !namesOrder
 	if rar4Unnamed {
 		var want []int
 		for i, r := range results {

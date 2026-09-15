@@ -144,15 +144,6 @@ func namesOrderVolumes(files []nzbparser.NzbFile) bool {
 	return namesGiveDistinctOrder(names)
 }
 
-// volumeNamesOrder is namesOrderVolumes for built archive volumes.
-func volumeNamesOrder(volumes []*types.Volume) bool {
-	names := make([]string, len(volumes))
-	for i, v := range volumes {
-		names[i] = v.Name
-	}
-	return namesGiveDistinctOrder(names)
-}
-
 func namesGiveDistinctOrder(names []string) bool {
 	seen := make(map[int]bool, len(names))
 	for _, name := range names {
