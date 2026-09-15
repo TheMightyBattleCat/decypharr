@@ -156,7 +156,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	// Sort RAR files by volume order (.rar first, then .r00, .r01, etc.)
 	// For obfuscated filenames that all get the same sort key, fall back to
 	// NZB file Number (upload order) which preserves the original volume sequence.
-	sort.Slice(group.Files, func(i, j int) bool {
+	// Stable, so volumes tied on both keep the NZB order they arrive in.
+	sort.SliceStable(group.Files, func(i, j int) bool {
 		oi := getRARVolumeOrder(group.Files[i].Filename)
 		oj := getRARVolumeOrder(group.Files[j].Filename)
 		if oi != oj {
@@ -234,6 +235,14 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 				Int("volumes", len(group.Files)).
 				Msg("RAR volumes reordered to true volume sequence for assembly")
 		}
+	}
+
+	if archiveInfo.Version == RARVersion4 && archiveInfo.VolumeOrder == nil && !namesOrderVolumes(group.Files) {
+		// RAR5 main headers number their volumes (resolveVolumeOrder); RAR4
+		// headers carry nothing this parser reads. If the upload order is wrong,
+		// the file is assembled with its volumes out of order.
+		p.logger.Warn().Str("group", group.BaseName).Int("volumes", len(group.Files)).
+			Msg("RAR4 volumes carry no order in their names; assembled in the order the NZB lists them")
 	}
 
 	if p.manager != nil {

@@ -182,9 +182,13 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	}()
 
 	// Parse raw XML
-	raw, err := nzbparser.Parse(bytes.NewReader(content))
+	raw, oneCopy, err := parseNZB(bytes.NewReader(content))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse NZB content: %w", err)
+	}
+	if len(oneCopy) > 0 {
+		p.logger.Warn().Str("filename", filename).Int("files", len(oneCopy)).Strs("subjects", oneCopy[:min(len(oneCopy), 5)]).
+			Msg("NZB lists files posted more than once; kept the first complete copy of each")
 	}
 
 	// Create base NZB structure
@@ -820,6 +824,20 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 	if len(singleFileRarGroups) <= 1 {
 		return groups
 	}
+	// groups is a map: put its volumes back in the order the NZB lists them, so
+	// the merge below breaks subject-number ties by upload order rather than
+	// differently on every run.
+	docIndex := make(map[string]int, len(rawFiles))
+	for i, f := range rawFiles {
+		if k := fileMetaKey(f); k != "" {
+			if _, ok := docIndex[k]; !ok {
+				docIndex[k] = i
+			}
+		}
+	}
+	sort.SliceStable(singleFileRarGroups, func(i, j int) bool {
+		return docIndex[fileMetaKey(singleFileRarGroups[i].Files[0])] < docIndex[fileMetaKey(singleFileRarGroups[j].Files[0])]
+	})
 
 	p.logger.Debug().
 		Int("single_file_rar_groups", len(singleFileRarGroups)).
@@ -846,7 +864,7 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 		}
 	}
 
-	sort.Slice(mergedGroup.Files, func(i, j int) bool {
+	sort.SliceStable(mergedGroup.Files, func(i, j int) bool {
 		return mergedGroup.Files[i].Number < mergedGroup.Files[j].Number
 	})
 
@@ -1332,11 +1350,12 @@ func (p *NZBParser) processFileGroup(ctx context.Context, group *FileGroup, pass
 }
 
 func (p *NZBParser) enrichGroupWithFileInfo(ctx context.Context, group *FileGroup) error {
-	sort.Slice(group.Files, func(i, j int) bool {
-		if group.Files[i].Number != group.Files[j].Number {
-			return group.Files[i].Number < group.Files[j].Number
-		}
-		return group.Files[i].Filename < group.Files[j].Filename
+	// Stable: files sharing a subject number stay in NZB order. A filename
+	// tie-break sorted an obfuscated merge's random names over the upload
+	// order mergeObfuscatedRarGroups had put them in; named volumes are ordered
+	// by name by their archive processor anyway.
+	sort.SliceStable(group.Files, func(i, j int) bool {
+		return group.Files[i].Number < group.Files[j].Number
 	})
 
 	firstFile := group.Files[0]
@@ -1455,7 +1474,7 @@ func (p *NZBParser) processMediaFile(group *FileGroup, password string) *storage
 	}
 
 	// Sort files for consistent ordering
-	sort.Slice(group.Files, func(i, j int) bool {
+	sort.SliceStable(group.Files, func(i, j int) bool {
 		return group.Files[i].Number < group.Files[j].Number
 	})
 

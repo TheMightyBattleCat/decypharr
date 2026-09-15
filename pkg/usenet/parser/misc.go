@@ -133,6 +133,21 @@ func dropOddSchemeVolumes(files []nzbparser.NzbFile) (kept []nzbparser.NzbFile, 
 	return kept, dropped
 }
 
+// namesOrderVolumes reports whether files' names give each a distinct
+// getRARVolumeOrder, so the volume sort did not have to fall back to subject
+// numbers or NZB order. A single file needs no order.
+func namesOrderVolumes(files []nzbparser.NzbFile) bool {
+	seen := make(map[int]bool, len(files))
+	for _, f := range files {
+		o := getRARVolumeOrder(f.Filename)
+		if seen[o] {
+			return false
+		}
+		seen[o] = true
+	}
+	return true
+}
+
 func wrapNZBFile(f *storage.NZBFile) ([]*storage.NZBFile, error) {
 	if f == nil {
 		return nil, fmt.Errorf("nzb file is nil")

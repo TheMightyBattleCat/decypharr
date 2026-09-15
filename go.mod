@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/Tensai75/nzbparser v0.1.0
 	github.com/Tensai75/rapidyenc v0.0.1
+	github.com/Tensai75/subjectparser v0.1.0
 	github.com/anacrolix/torrent v1.55.0
 	github.com/bytedance/sonic v1.15.0
 	github.com/cavaliergopher/grab/v3 v3.0.1
@@ -34,7 +35,6 @@ require (
 )
 
 require (
-	github.com/Tensai75/subjectparser v0.1.0 // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
 	github.com/anacrolix/missinggo/v2 v2.7.3 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
