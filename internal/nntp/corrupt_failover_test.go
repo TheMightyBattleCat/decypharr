@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
@@ -88,15 +89,30 @@ func TestExecuteWithFailoverCorruptArticleTriesNextProvider(t *testing.T) {
 	pa, pb := twoLocalProviders(t, bad, good)
 	c := newStatTestClient(t, []config.UsenetProvider{pa, pb}, 100)
 
-	var out bytes.Buffer
-	if err := fetchBody(c, "seg@test", &out); err != nil {
-		t.Fatalf("fetch with an intact copy on the second provider: %v", err)
+	// More fetches than the bad provider has connection slots: a slot the
+	// corrupt branch failed to give back would stall the later ones.
+	const fetches = 3 * 4
+	for i := range fetches {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var out bytes.Buffer
+		err := c.ExecuteWithFailover(ctx, func(conn *Connection) error {
+			out.Reset()
+			_, _, err := conn.StreamBodyMeta("seg@test", &out)
+			return err
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("fetch %d with an intact copy on the second provider: %v", i, err)
+		}
+		if !bytes.Equal(out.Bytes(), data) {
+			t.Fatalf("fetch %d: got %d bytes, want the intact %d", i, out.Len(), len(data))
+		}
 	}
-	if !bytes.Equal(out.Bytes(), data) {
-		t.Fatalf("got %d bytes, want the intact %d", out.Len(), len(data))
+	if bad.bodyReqs.Load() != fetches || good.bodyReqs.Load() != fetches {
+		t.Fatalf("BODY requests bad=%d good=%d, want %d each", bad.bodyReqs.Load(), good.bodyReqs.Load(), fetches)
 	}
-	if bad.bodyReqs.Load() != 1 || good.bodyReqs.Load() != 1 {
-		t.Fatalf("BODY requests bad=%d good=%d, want 1 each", bad.bodyReqs.Load(), good.bodyReqs.Load())
+	if n := len(c.pools[pa.Host].slots); n != 0 {
+		t.Fatalf("bad provider holds %d connection slots after the fetches, want 0", n)
 	}
 }
 
