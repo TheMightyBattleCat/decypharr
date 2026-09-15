@@ -1412,7 +1412,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// "Unavailable" version they leave behind.
 	for _, f := range files {
 		if f.Path != "" {
-			r.manager.plexReaper.Enqueue(PlexReapNotice{
+			r.manager.PlexReaper().Enqueue(PlexReapNotice{
 				Source: ReapSourceRepair, StalePaths: []string{f.Path}, ArrName: a.Name, MediaID: f.Id,
 			})
 		}

@@ -31,6 +31,9 @@ type fakePlex struct {
 	deletes   []string
 	refresh   []string
 	playing   bool
+	// shared adds a second section over the same folder that holds no
+	// matching item (live: TEST Movies over the Movie Archive folder).
+	shared bool
 }
 
 func (p *fakePlex) itemJSON() map[string]any {
@@ -67,11 +70,17 @@ func (p *fakePlex) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodGet && path == "/library/sections":
-		write(map[string]any{"MediaContainer": map[string]any{"Directory": []map[string]any{
+		dirs := []map[string]any{
 			{"key": "36", "type": "movie", "title": "Movies HD", "Location": []map[string]any{{"id": 67, "path": p.dir}}},
-		}}})
-	case r.Method == http.MethodGet && path == "/library/sections/36/refresh":
+		}
+		if p.shared {
+			dirs = append(dirs, map[string]any{"key": "42", "type": "movie", "title": "TEST Movies", "Location": []map[string]any{{"id": 70, "path": p.dir}}})
+		}
+		write(map[string]any{"MediaContainer": map[string]any{"Directory": dirs}})
+	case r.Method == http.MethodGet && (path == "/library/sections/36/refresh" || path == "/library/sections/42/refresh"):
 		p.refresh = append(p.refresh, r.URL.Query().Get("path"))
+	case r.Method == http.MethodGet && path == "/library/sections/42/all":
+		write(map[string]any{"MediaContainer": map[string]any{"size": 0, "totalSize": 0}})
 	case r.Method == http.MethodGet && path == "/library/sections/36/all":
 		write(map[string]any{"MediaContainer": map[string]any{"size": 1, "totalSize": 1, "Metadata": []any{p.itemJSON()}}})
 	case r.Method == http.MethodGet && path == "/library/metadata/100":
@@ -295,6 +304,31 @@ func TestPlexReaper_RepairJobWaitsAndNudge(t *testing.T) {
 	}
 	if d := lastDecision(t, h.reaper); d.Source != ReapSourceRepair || d.Status != "reaped" {
 		t.Fatalf("decision = %+v", d)
+	}
+}
+
+// A keep-release re-grab lands at the same path: Plex never shows a stale
+// version, the Arr holds the old path again, and the job must finish rather
+// than wait out its 72 h - also when a second section shares the folder.
+func TestPlexReaper_RepairSamePathFinishesAcrossSharedSections(t *testing.T) {
+	h := newReapHarness(t)
+	h.plex.shared = true
+	h.plex.gone = true // only the live version exists
+	h.reaper.Enqueue(PlexReapNotice{Source: ReapSourceRepair, StalePaths: []string{h.plex.live}, ArrName: "radarr", MediaID: 7})
+	h.tick(plexReapRepairFirstGap) // scan both sections
+	if len(h.plex.refresh) != 2 {
+		t.Fatalf("refresh = %v, want both sections", h.plex.refresh)
+	}
+	h.tick(plexReapScanSettle)
+	if n := len(h.reaper.Status().Pending); n != 0 {
+		t.Fatalf("pending = %d, want the job finished", n)
+	}
+	d := lastDecision(t, h.reaper)
+	if d.Status != reapSkipped || d.Reason != reasonSamePath {
+		t.Fatalf("decision = %+v, want skipped/%s", d, reasonSamePath)
+	}
+	if len(h.plex.deletes) != 0 {
+		t.Fatalf("deleted %v", h.plex.deletes)
 	}
 }
 
