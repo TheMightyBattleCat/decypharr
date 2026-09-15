@@ -350,13 +350,16 @@ type builtPar2File struct {
 // buildPar2RefsWithFetch is buildPar2Refs with its yEnc header fetch and file
 // type classification injected, so it can be exercised with fakes in tests.
 //
-// A real header fetch (see realPar2SegmentRefs) is only ever attempted for
-// one file per release: upload tooling always encodes same-posting volumes
-// to a uniform segment byte budget, so once that shared article size is
-// known from a single probe, every other file's geometry is checked against
-// it (segmentsConsistentWithPostingSize) and, if consistent, its refs are
-// built for free (par2SegmentRefsFromPostingSize) - no network round trip.
-// Only a file whose geometry doesn't match gets its own real probe. Past
+// Every posted (non-PAR2) file gets its own real header fetch (see
+// realPar2SegmentRefs): par2.MatchFiles pairs a posted file with its FileDesc
+// by exact length first, and only the file's own yEnc header gives its final
+// article's size. An estimated length misses its FileDesc, which sends the
+// file to an MD5-16k fetch of its first article - and a file whose first
+// article is dead can then never be matched or repaired. A PAR2 file is never
+// matched by length, so the seed's shared article size (from the one seed
+// probe) builds its refs for free when its geometry is consistent with it
+// (segmentsConsistentWithPostingSize, par2SegmentRefsFromPostingSize); the
+// same refs stand in for a posted file whose own probe fails. Past
 // par2ProbeMaxFailedFetches genuinely not-found fetches (nntp.
 // IsArticleNotFoundError - see realPar2SegmentRefs) in one release, probing
 // stops entirely (aborted=true) and every remaining file falls back to the
@@ -463,13 +466,22 @@ func buildPar2RefsWithFetch(
 	mapper := iter.Mapper[par2ProbeCandidate, *builtPar2File]{MaxGoroutines: maxConcurrent}
 	mapped := mapper.Map(candidates, func(c *par2ProbeCandidate) *builtPar2File {
 		isPar2 := detectFileType(c.file.Filename) == storage.NZBFileTypePar2
+		consistent := segmentsConsistentWithPostingSize(c.segs, postingSegmentSize)
 
-		if segmentsConsistentWithPostingSize(c.segs, postingSegmentSize) {
+		// A PAR2 file's own size is never matched against a FileDesc, so the
+		// shared article size is enough for it. A posted file is matched to its
+		// FileDesc by exact length, and only its own header gives its final
+		// article's size.
+		if consistent && isPar2 {
 			refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
 			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
 		}
 
 		if atomic.LoadInt32(&abortedFlag) != 0 {
+			if consistent {
+				refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
+				return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+			}
 			atomic.AddInt32(&fellBack, 1)
 			refs, total := par2SegmentRefsFallback(c.segs)
 			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
@@ -484,6 +496,12 @@ func buildPar2RefsWithFetch(
 			}
 		}
 		if !real {
+			if consistent {
+				// Interior articles still take the shared size; only the final
+				// article stays an estimate.
+				refs, total = par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
+				return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+			}
 			atomic.AddInt32(&fellBack, 1)
 			if !notFound {
 				atomic.AddInt32(&filesTransient, 1)
@@ -555,6 +573,16 @@ func segmentsConsistentWithPostingSize(segs nzbparser.NzbSegments, postingSegmen
 // final (possibly partial) segment uses the same XML-bytes estimate
 // par2SegmentRefsFallback does, since a real per-file fetch is the only way
 // to learn that exactly.
+//
+// The final segment is never marked Real. Neither branch measures it: the
+// seed's final article only matches when the two files happen to be the same
+// size, and the residual branch scales this file's NZB bytes. Both were marked
+// Real, so a posted file's Size read as exact while its final article was off
+// by up to a few KB: Nora S01E06 ETHEL .r16 read 13,164,355 B though its RAR
+// header and data alone take 13,172,207 B, and its .rar-.r15 volumes, which
+// all hold the same 199,999,980 B of header and data, read as 17 different
+// sizes. 135 of 396 imports on a production install (2026-09-15) carried such a size. buildPar2RefsWithFetch probes every posted file for its own total, so
+// this is only used for PAR2 files and for posted files whose probe failed.
 func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSize int64, seedLastSegBytes int64, seedSegCount int) ([]storage.Par2SegmentRef, int64) {
 	n := len(segs)
 	// residualOverhead is the decoded/wire ratio implied by this file's own
@@ -577,15 +605,16 @@ func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSi
 	refs := make([]storage.Par2SegmentRef, n)
 	var total int64
 	for i, seg := range segs {
-		b := postingSegmentSize
+		b, real := postingSegmentSize, true
 		if i == n-1 {
+			real = false
 			if n == seedSegCount && seedLastSegBytes > 0 {
-				b = seedLastSegBytes // exact: identical geometry to the real-fetched seed
+				b = seedLastSegBytes // the seed's final article: right only for a file the seed's size
 			} else {
 				b = int64(float64(seg.Bytes) * residualOverhead) // residual: consistent-but-different-count geometry
 			}
 		}
-		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b, Real: true}
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b, Real: real}
 		total += b
 	}
 	return refs, total
@@ -642,8 +671,8 @@ func (p *NZBParser) fetchYencHeaderFast(ctx context.Context, messageID string) (
 // file's true decoded size ("size="), and this segment's own decoded length
 // ("end"-"begin"+1) stands in for every other non-final segment's length -
 // upload tooling always encodes same-file segments to a uniform byte budget.
-// On fetch failure (or any inconsistency the same threshold check
-// processFileGroup's last-segment fallback uses), falls back to the
+// On fetch failure (or a declared total that leaves the final article empty
+// or larger than a full one), falls back to the
 // XML-declared bytes scaled by the same yEnc-overhead estimate used there -
 // approximate, but PAR2 support for this one file is best-effort
 // bookkeeping, not something worth failing the whole NZB parse over.
@@ -679,15 +708,11 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 
 	n := len(segs)
 	fullSegsSize := segmentSize * int64(n-1)
-	expectedTotal := fullSegsSize + segmentSize
-	diff := fileSize - expectedTotal
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > (segmentSize*3)/2 {
-		// The header's declared total is inconsistent with this segment
-		// count/size (e.g. a mixed-subject group false match) - don't trust
-		// derived per-segment math against it.
+	if last := fileSize - fullSegsSize; last <= 0 || last > segmentSize {
+		// The header's declared total does not fit this many articles of this
+		// size: the final article would be empty, negative or larger than a
+		// full one (e.g. a mixed-subject group false match, or articles that
+		// are not uniform). Don't trust derived per-segment math against it.
 		refs, total = par2SegmentRefsFallback(segs)
 		return refs, total, false, false
 	}

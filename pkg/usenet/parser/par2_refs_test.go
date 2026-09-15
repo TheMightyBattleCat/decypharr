@@ -263,17 +263,24 @@ func TestRealPar2SegmentRefsFallsBackOnSizeMismatch(t *testing.T) {
 	}
 }
 
-// TestBuildPar2RefsReusesPostingSizeAcrossFiles proves the per-posting-size
-// optimization: only the seed file (the first eligible file with more than
-// one segment) gets a real yEnc fetch. Every other file whose own segment
-// geometry is consistent with the seed's derived article size reuses it
-// with zero network round trips.
-func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
+func segBytesOf(f storage.PostedFileRef) []int64 {
+	out := make([]int64, len(f.Segments))
+	for i, s := range f.Segments {
+		out[i] = s.Bytes
+	}
+	return out
+}
+
+// TestBuildPar2RefsReusesPostingSizeForPar2Files proves the per-posting-size
+// optimization still covers PAR2 files: once the seed file (the first
+// eligible file with more than one segment) is probed, a PAR2 file whose own
+// segment geometry is consistent with the seed's article size reuses it with
+// no network round trip, and its estimated final segment is not marked Real.
+func TestBuildPar2RefsReusesPostingSizeForPar2Files(t *testing.T) {
 	files := nzbparser.NzbFiles{
 		{
 			// Seed: 3 full segments, real per-segment size (from the fetch
-			// below) = 970, matching its own XML-declared Bytes of 1000
-			// scaled by yencOverheadEstimate exactly - a clean baseline.
+			// below) = 970.
 			Filename: "a.rar",
 			Segments: nzbparser.NzbSegments{
 				{Number: 1, Bytes: 1000, Id: "<a-seg1>"},
@@ -282,9 +289,8 @@ func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
 			},
 		},
 		{
-			// Consistent geometry (non-final segment Bytes == seed's) - must
-			// reuse the seed's derived size with no fetch.
-			Filename: "b.rar",
+			// Consistent geometry (non-final segment Bytes == seed's).
+			Filename: "a.vol00+01.par2",
 			Segments: nzbparser.NzbSegments{
 				{Number: 1, Bytes: 1000, Id: "<b-seg1>"},
 				{Number: 2, Bytes: 1000, Id: "<b-seg2>"},
@@ -292,8 +298,8 @@ func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
 		},
 		{
 			// Still within postingSizeToleranceFrac (8% high on the
-			// non-final segment) - must also reuse, not probe.
-			Filename: "c.rar",
+			// non-final segment).
+			Filename: "a.vol01+02.par2",
 			Segments: nzbparser.NzbSegments{
 				{Number: 1, Bytes: 1080, Id: "<c-seg1>"},
 				{Number: 2, Bytes: 900, Id: "<c-seg2>"},
@@ -315,44 +321,127 @@ func TestBuildPar2RefsReusesPostingSizeAcrossFiles(t *testing.T) {
 	if aborted {
 		t.Fatal("aborted = true, want false")
 	}
-	if len(par2Files) != 0 {
-		t.Fatalf("par2Files = %+v, want empty (all files are .rar)", par2Files)
-	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("fetch called %d times, want exactly 1 (only the seed file)", got)
 	}
+	if len(source) != 1 || source[0].Size != 2910 || !equalInt64(segBytesOf(source[0]), []int64{970, 970, 970}) {
+		t.Fatalf("source = %+v, want a.rar size=2910 segBytes=[970 970 970]", source)
+	}
 
+	byName := make(map[string]storage.Par2FileRef)
+	for _, f := range par2Files {
+		byName[f.Name] = f
+	}
+	b := byName["a.vol00+01.par2"]
+	wantBLast := int64(float64(1000) * yencOverheadEstimate)
+	if b.Size != 970+wantBLast || len(b.Segments) != 2 || b.Segments[0].Bytes != 970 || b.Segments[1].Bytes != wantBLast {
+		t.Errorf("a.vol00+01.par2 = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", b, wantBLast)
+	}
+	c := byName["a.vol01+02.par2"]
+	// c's own first segment (1080) differs from the seed's (1000), so its
+	// residual overhead ratio is derived per-file - postingSegmentSize (970)
+	// over c's OWN segs[0].Bytes (1080) - not the global 0.97 constant.
+	postingSize, cFirstSegBytes := int64(970), int64(1080)
+	wantCLast := int64(float64(900) * (float64(postingSize) / float64(cFirstSegBytes)))
+	if c.Size != 970+wantCLast || len(c.Segments) != 2 || c.Segments[1].Bytes != wantCLast {
+		t.Errorf("a.vol01+02.par2 = %+v, want segBytes=[970 %d] (shared size + per-file-ratio-estimated last segment)", c, wantCLast)
+	}
+	for _, f := range []storage.Par2FileRef{b, c} {
+		if !f.Segments[0].Real || f.Segments[len(f.Segments)-1].Real {
+			t.Errorf("%s Real flags = %+v, want interior Real and the estimated final segment not", f.Name, f.Segments)
+		}
+	}
+}
+
+// TestBuildPar2RefsProbesEveryPostedFile replays Nora S01E06 ETHEL's shape:
+// the seed has another article count than the release's volumes, and the
+// final volume (.r16) has a short tail. Its NZB bytes put the old residual
+// estimate 7,852 B under the size in its own yEnc header, and the estimate was
+// marked Real. Every posted file must be sized from its own header, exactly,
+// and marked Real.
+func TestBuildPar2RefsProbesEveryPostedFile(t *testing.T) {
+	const article = 714286
+	mk := func(name, prefix string, n int, lastBytes int) nzbparser.NzbFile {
+		f := nzbparser.NzbFile{Filename: name}
+		for i := 1; i <= n; i++ {
+			b := 736400
+			if i == n {
+				b = lastBytes
+			}
+			f.Segments = append(f.Segments, nzbparser.NzbSegment{Number: i, Bytes: b, Id: fmt.Sprintf("<%s-%d>", prefix, i)})
+		}
+		return f
+	}
+	files := nzbparser.NzbFiles{
+		mk("nora.nfo.rar", "seed", 3, 736400), // seed: 3 articles
+		mk("nora.r15", "r15", 280, 736400),
+		mk("nora.r16", "r16", 19, 278000),
+	}
+	sizes := map[string]int64{
+		"<seed-1>": 3 * article,
+		"<r15-1>":  200000000,
+		"<r16-1>":  13172227,
+	}
+	var calls int32
+	fetch := func(_ context.Context, id string) (*nntp.YencMetadata, error) {
+		atomic.AddInt32(&calls, 1)
+		size, ok := sizes[id]
+		if !ok {
+			return nil, errors.New("unexpected fetch for " + id)
+		}
+		return &nntp.YencMetadata{Size: size, Begin: 1, End: article}, nil
+	}
+
+	p := &NZBParser{logger: zerolog.Nop()}
+	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("fetch called %d times, want 3 (one per posted file)", got)
+	}
 	byName := make(map[string]storage.PostedFileRef)
 	for _, f := range source {
 		byName[f.Name] = f
 	}
-
-	segBytesOf := func(f storage.PostedFileRef) []int64 {
-		out := make([]int64, len(f.Segments))
-		for i, s := range f.Segments {
-			out[i] = s.Bytes
+	for name, want := range map[string]int64{"nora.r15": 200000000, "nora.r16": 13172227} {
+		f := byName[name]
+		if f.Size != want {
+			t.Errorf("%s Size = %d, want %d from its own yEnc header", name, f.Size, want)
 		}
-		return out
+		last := f.Segments[len(f.Segments)-1]
+		if wantLast := want - int64(len(f.Segments)-1)*article; last.Bytes != wantLast || !last.Real {
+			t.Errorf("%s final segment = %+v, want %d bytes, Real", name, last, wantLast)
+		}
 	}
+}
 
-	a := byName["a.rar"]
-	if a.Size != 2910 || !equalInt64(segBytesOf(a), []int64{970, 970, 970}) {
-		t.Errorf("a.rar = %+v, want size=2910 segBytes=[970 970 970]", a)
+// TestBuildPar2RefsFailedPostedProbeKeepsEstimateUnreal proves a posted file
+// whose own probe fails keeps the shared article size for its interior
+// articles, and that its estimated final article is not marked Real.
+func TestBuildPar2RefsFailedPostedProbeKeepsEstimateUnreal(t *testing.T) {
+	files := nzbparser.NzbFiles{
+		{Filename: "a.rar", Segments: nzbparser.NzbSegments{
+			{Number: 1, Bytes: 1000, Id: "<a-1>"}, {Number: 2, Bytes: 1000, Id: "<a-2>"}, {Number: 3, Bytes: 1000, Id: "<a-3>"},
+		}},
+		{Filename: "a.r00", Segments: nzbparser.NzbSegments{
+			{Number: 1, Bytes: 1000, Id: "<b-1>"}, {Number: 2, Bytes: 600, Id: "<b-2>"},
+		}},
 	}
-	b := byName["b.rar"]
-	wantBLast := int64(float64(1000) * yencOverheadEstimate)
-	if b.Size != 970+wantBLast || !equalInt64(segBytesOf(b), []int64{970, wantBLast}) {
-		t.Errorf("b.rar = %+v, want segBytes=[970 %d] (shared size + XML-estimated last segment)", b, wantBLast)
+	fetch := func(_ context.Context, id string) (*nntp.YencMetadata, error) {
+		if id == "<a-1>" {
+			return &nntp.YencMetadata{Size: 2910, Begin: 0, End: 969}, nil
+		}
+		return nil, nntp.NewConnectionError(errors.New("simulated dropped connection"))
 	}
-	c := byName["c.rar"]
-	// c.rar's own first segment (1080) differs from the seed's (1000), so its
-	// residual overhead ratio is now derived per-file - postingSegmentSize
-	// (970) over c.rar's OWN segs[0].Bytes (1080) - not the global 0.97
-	// constant.
-	postingSize, cFirstSegBytes := int64(970), int64(1080)
-	wantCLast := int64(float64(900) * (float64(postingSize) / float64(cFirstSegBytes)))
-	if c.Size != 970+wantCLast || !equalInt64(segBytesOf(c), []int64{970, wantCLast}) {
-		t.Errorf("c.rar = %+v, want segBytes=[970 %d] (shared size + per-file-ratio-estimated last segment)", c, wantCLast)
+	p := &NZBParser{logger: zerolog.Nop()}
+	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	var b storage.PostedFileRef
+	for _, f := range source {
+		if f.Name == "a.r00" {
+			b = f
+		}
+	}
+	wantLast := int64(float64(600) * 0.97)
+	if len(b.Segments) != 2 || b.Segments[0].Bytes != 970 || !b.Segments[0].Real || b.Segments[1].Bytes != wantLast || b.Segments[1].Real {
+		t.Fatalf("a.r00 = %+v, want [970 Real, %d not Real]", b, wantLast)
 	}
 }
 
@@ -540,6 +629,28 @@ func TestPostingSizeTailFallsBackWhenRatioInvalid(t *testing.T) {
 				t.Errorf("tail segment Bytes = %d, want fallback %d (yencOverheadEstimate)", refs[1].Bytes, want)
 			}
 		})
+	}
+}
+
+// TestRealPar2SegmentRefsRejectsImpossibleFinalArticle proves a declared
+// total that would make the final article larger than a full one, or empty,
+// falls back to the estimate instead of being marked Real. The old check let
+// the final article reach 2.5 articles.
+func TestRealPar2SegmentRefsRejectsImpossibleFinalArticle(t *testing.T) {
+	segs := nzbparser.NzbSegments{
+		{Number: 1, Bytes: 1000, Id: "<s1>"},
+		{Number: 2, Bytes: 1000, Id: "<s2>"},
+	}
+	for _, size := range []int64{2000 + 1, 1000} {
+		fetch := fakeYencFetch(map[string]*nntp.YencMetadata{"<s1>": {Size: size, Begin: 1, End: 1000}})
+		refs, _, _, real := realPar2SegmentRefs(context.Background(), zerolog.Nop(), "f.rar", segs, fetch)
+		if real || refs[1].Real {
+			t.Errorf("size %d: real = %v, refs = %+v; want the estimate, not Real", size, real, refs)
+		}
+	}
+	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{"<s1>": {Size: 2000, Begin: 1, End: 1000}})
+	if refs, total, _, real := realPar2SegmentRefs(context.Background(), zerolog.Nop(), "f.rar", segs, fetch); !real || total != 2000 || refs[1].Bytes != 1000 {
+		t.Errorf("size 2000: real=%v total=%d refs=%+v, want two full Real articles", real, total, refs)
 	}
 }
 

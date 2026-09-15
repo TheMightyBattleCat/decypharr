@@ -2593,11 +2593,13 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerol
 	// the uniform-interior assumption this branch rests on does not hold, and
 	// committing to it would put every interior boundary in the wrong place.
 	//
-	// This is reachable, not theoretical: realPar2SegmentRefs accepts the yEnc
-	// header's declared total whenever it is within +/-1.5 x segmentSize of
-	// n x segmentSize and then marks every ref Real, which permits a final
-	// segment up to 2.5x the seed. trueLen arrives from a different authority
-	// (FileDesc.Length) and nothing previously cross-checked the two.
+	// This was reachable, not theoretical: realPar2SegmentRefs used to accept
+	// the yEnc header's declared total whenever it was within +/-1.5 x
+	// segmentSize of n x segmentSize and then marked every ref Real, which
+	// permitted a final segment up to 2.5x the seed. It now requires a final
+	// article no larger than a full one, but records written before that keep
+	// their refs, and trueLen arrives from a different authority
+	// (FileDesc.Length) that nothing else cross-checks.
 	//
 	// The cost of getting this wrong is not a clean failure: an overstated
 	// final segment makes readRange demand more bytes than the article holds,
