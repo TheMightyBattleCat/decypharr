@@ -69,6 +69,11 @@ type VerifyBudget struct {
 	reads   atomic.Int64 // metered reads that delivered >0 bytes
 	waitNs  atomic.Int64 // cumulative time blocked in the underlying reader
 	firstAt atomic.Int64 // UnixNano of the first delivered byte, set once
+
+	// requests and written are per range request, from ObserveRequest: what
+	// the probe was sent, against used, what it was charged.
+	requests atomic.Int64
+	written  atomic.Int64
 }
 
 // NewVerifyBudget returns a budget of limit bytes, or nil when limit <= 0
@@ -119,6 +124,38 @@ func (b *VerifyBudget) Observe(n int64, waited time.Duration) {
 	b.reads.Add(1)
 	b.waitNs.Add(int64(waited))
 	b.firstAt.CompareAndSwap(0, time.Now().UnixNano())
+}
+
+// ObserveRequest records that one range request metered against b ended
+// having handed written bytes to the client. Charged bytes (Used) run ahead
+// of written ones by whatever a request read and never sent - ffprobe
+// abandons most range requests after its first megabyte - so the two side by
+// side show how closely the budget tracks what the probe consumed. Safe on
+// nil.
+func (b *VerifyBudget) ObserveRequest(written int64) {
+	if b == nil {
+		return
+	}
+	b.requests.Add(1)
+	if written > 0 {
+		b.written.Add(written)
+	}
+}
+
+// Requests returns the range requests ObserveRequest recorded. 0 on nil.
+func (b *VerifyBudget) Requests() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.requests.Load()
+}
+
+// Written returns the bytes those requests handed to the client. 0 on nil.
+func (b *VerifyBudget) Written() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.written.Load()
 }
 
 // Exceeded reports whether the budget may no longer be read against: its byte

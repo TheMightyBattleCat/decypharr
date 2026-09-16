@@ -240,6 +240,9 @@ func TestBudgetStats_TellsAnExhaustFromACut(t *testing.T) {
 			if got := strings.Contains(out.String(), `"budget_exhausted":true`); got != tc.wantExhausted {
 				t.Fatalf("budget_exhausted=true present: %v, want %v in %s", got, tc.wantExhausted, out.String())
 			}
+			if !strings.Contains(out.String(), `"written_mb":0`) || !strings.Contains(out.String(), `"requests":0`) {
+				t.Fatalf("charged-vs-sent fields missing: %s", out.String())
+			}
 		})
 	}
 }

@@ -29,11 +29,12 @@ const (
 	// (a retry after a 400 MiB pass is still cut, which ends inconclusive,
 	// never broken). It still cuts a runaway read of a file over ~0.5 GB.
 	//
-	// This raises the cliff rather than removing its cause: a read is charged
-	// a whole buffer however little of it ffprobe consumes (the 253 MB episode
-	// above: ~70 MB consumed, ~260 MiB charged), so a file needing ~130 range
-	// requests is still cut. Charging closer to what ffprobe pulls (a smaller
-	// first read per request, ramping to the buffer size) is not done.
+	// The cliff's cause was a read charged a whole buffer however little of it
+	// ffprobe consumed (the 253 MB episode above: ~70 MB consumed, ~260 MiB
+	// charged). Each range request's reads now ramp from 256 KiB
+	// (usenet.verifyFirstRead); the floor stays at 512 MiB until the
+	// verification lines' served_mb against written_mb show what a healthy
+	// spread costs under the ramp.
 	verifyBudgetFloor = 512 * 1024 * 1024
 
 	// verifyBudgetDivisor sets the cap at fileBytes/8 (12.5%) once that

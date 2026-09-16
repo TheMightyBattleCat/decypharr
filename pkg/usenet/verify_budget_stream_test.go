@@ -76,6 +76,38 @@ func TestMeteredReader_RefusesASpentBudgetBeforeReading(t *testing.T) {
 	}
 }
 
+// A range request's reads start small and double to the verification buffer,
+// so a request ffprobe abandons after its first megabyte is charged (and
+// fetches) about that much, not a whole 4 MiB buffer.
+func TestMeteredReader_RampsEachRequestsReads(t *testing.T) {
+	b := reader.NewVerifyBudget(1 << 30)
+	m := &meteredReader{inner: strings.NewReader(strings.Repeat("x", 32<<20)), budget: b}
+	buf := make([]byte, verifyBufferSize)
+	var sizes []int
+	for range 7 {
+		n, err := m.Read(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes = append(sizes, n)
+	}
+	want := []int{256 << 10, 512 << 10, 1 << 20, 2 << 20, 4 << 20, 4 << 20, 4 << 20}
+	for i := range want {
+		if sizes[i] != want[i] {
+			t.Fatalf("read sizes %v, want %v", sizes, want)
+		}
+	}
+	if got, sum := b.Used(), int64(256<<10+512<<10+1<<20+2<<20+3*(4<<20)); got != sum {
+		t.Fatalf("charged %d, want %d", got, sum)
+	}
+
+	// A new request (a new meter on the same budget) starts small again.
+	m2 := &meteredReader{inner: strings.NewReader(strings.Repeat("x", 8<<20)), budget: b}
+	if n, _ := m2.Read(buf); n != verifyFirstRead {
+		t.Fatalf("second request's first read %d, want %d", n, verifyFirstRead)
+	}
+}
+
 // A nil budget must leave the read path exactly as it was before the cap
 // existed: read to EOF, no sentinel.
 func TestMeteredReader_NilBudgetReadsToEOF(t *testing.T) {

@@ -84,8 +84,25 @@ func TestVerifyBudget_ObserveAccounting(t *testing.T) {
 	}
 }
 
+func TestVerifyBudget_RequestAccounting(t *testing.T) {
+	b := NewVerifyBudget(1 << 30)
+	b.ObserveRequest(1 << 20)
+	b.ObserveRequest(0) // refused before a byte: a request, nothing written
+	b.ObserveRequest(3 << 20)
+	if b.Requests() != 3 || b.Written() != 4<<20 {
+		t.Fatalf("requests=%d written=%d, want 3 and 4 MiB", b.Requests(), b.Written())
+	}
+	if b.Used() != 0 {
+		t.Fatal("ObserveRequest must not charge the budget")
+	}
+}
+
 func TestVerifyBudget_NilObserveIsSafe(t *testing.T) {
 	var b *VerifyBudget
+	b.ObserveRequest(1 << 20)
+	if b.Requests() != 0 || b.Written() != 0 {
+		t.Fatal("nil budget request accounting must be zero")
+	}
 	b.Observe(1<<20, time.Second) // must not panic
 	if b.Reads() != 0 || b.Wait() != 0 || b.Elapsed() != 0 || b.MiBPerSec() != 0 {
 		t.Fatal("nil budget accounting accessors must all be zero")

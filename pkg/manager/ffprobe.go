@@ -394,7 +394,11 @@ func budgetStats(ev *zerolog.Event, b *VerifyBudget) *zerolog.Event {
 	if b == nil {
 		return ev
 	}
+	// served_mb is what the budget charged; written_mb what the range
+	// requests handed to ffprobe. See reader.VerifyBudget.ObserveRequest.
 	ev = ev.Int64("served_mb", b.Used()>>20).
+		Int64("written_mb", b.Written()>>20).
+		Int64("requests", b.Requests()).
 		Int64("range_gets", b.Reads()).
 		Int64("read_wait_ms", b.Wait().Milliseconds())
 	if b.Limit() > 0 {

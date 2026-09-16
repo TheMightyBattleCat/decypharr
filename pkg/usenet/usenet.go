@@ -44,6 +44,19 @@ const (
 	// tried at 24MB with no gain when the fetch was still synchronous.
 	verifyBufferSize = 4 * 1024 * 1024 // 4MB
 
+	// verifyFirstRead is the most a verification range request's first read
+	// asks the source for; each later read asks for twice the one before, up
+	// to verifyBufferSize. A read fills what it asks for (fetching those
+	// articles) and is charged to the probe's budget before a byte is sent,
+	// but ffprobe abandons most range requests after about a megabyte: at
+	// 4 MiB per first read, a 15-window spread of a 253 MB episode was
+	// charged ~260 MiB for ~70 MB consumed (a production install, 2026-09-16). Ramping
+	// reaches the full buffer after ~7.8 MiB, before the rolling prefetch
+	// starts (verificationPrefetchRamp), so a long forward read is unchanged.
+	// Measured locally against a 265 MB file with a 40 ms/MiB fetch: charged
+	// 68.0 -> 28.5 MiB, spread 3.4 -> 0.8 s, frames and errors identical.
+	verifyFirstRead = 256 * 1024
+
 	// verificationPrefetchAhead is how far ahead of a verification read's
 	// position Usenet.verificationPrefetch keeps segments fetched. Deep enough
 	// (~3-4s of lead at observed REMUX scan rates) that a multi-second
@@ -306,6 +319,9 @@ type meteredReader struct {
 	// range request it issues for the file (see reader.VerifyBudget). Once
 	// blown, Read stops feeding the probe.
 	budget *reader.VerifyBudget
+	// next is the most the next read asks the source for (verifyFirstRead,
+	// doubling); 0 before the first read.
+	next int
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
@@ -316,6 +332,13 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 	if m.budget.Exceeded() {
 		return 0, reader.ErrVerifyBudgetExhausted
 	}
+	if m.next == 0 {
+		m.next = verifyFirstRead
+	}
+	if len(p) > m.next {
+		p = p[:m.next]
+	}
+	m.next = min(m.next*2, verifyBufferSize)
 	t := time.Now()
 	n, err := m.inner.Read(p)
 	waited := time.Since(t)
@@ -1768,7 +1791,10 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	copyStart := time.Now()
 
 	// Use a safe copy loop that checks context and validates read counts
-	_, err = safeCopyBuffer(ctx, writer, copySrc, buf)
+	written, err := safeCopyBuffer(ctx, writer, copySrc, buf)
+	if meter != nil {
+		meter.budget.ObserveRequest(written)
+	}
 
 	// A blown verification budget ends the body early on purpose. It is not a
 	// stream failure and must not reach the article-not-found / failedFiles
