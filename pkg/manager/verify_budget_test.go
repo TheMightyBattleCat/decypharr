@@ -22,6 +22,7 @@ func TestVerifyBudgetFor_Sizing(t *testing.T) {
 		{"negative size is unbounded", -1, 0},
 		{"small file gets the floor", 300 * 1024 * 1024, verifyBudgetFloor},
 		{"1GB still under the floor", gb, verifyBudgetFloor},
+		{"2GB episode gets 512 MiB, not a quarter of that", 2 * gb, 512 * 1024 * 1024},
 		{"4GB scales to an eighth", 4 * gb, 4 * gb / 8},
 		{"40GB REMUX scales too", 40 * gb, 40 * gb / 8},
 	}
@@ -41,6 +42,22 @@ func TestVerifyBudgetFor_Sizing(t *testing.T) {
 				t.Fatalf("verifyBudgetFor(%d) limit = %d, want %d", tc.bytes, got.Limit(), tc.want)
 			}
 		})
+	}
+}
+
+// Fear Light & Clocks S04E02 (253 MB) was cut on every recheck: its 15-window
+// spread took 68 reads of the 4 MiB verification buffer. A spread of that shape,
+// and one checkConfirmed retry of the largest healthy pass (416 MiB), must fit.
+func TestVerifyBudgetFor_ManySeekSpreadFits(t *testing.T) {
+	const mib = int64(1024 * 1024)
+	b := verifyBudgetFor(253_210_039)
+	for i := 0; i < 70; i++ {
+		if !b.Add(4 * mib) {
+			t.Fatalf("budget cut after %d 4 MiB reads (%d MiB), limit %d MiB", i+1, (int64(i)+1)*4, b.Limit()/mib)
+		}
+	}
+	if b.Limit() < 416*mib {
+		t.Fatalf("limit %d MiB is below the largest healthy spread (416 MiB)", b.Limit()/mib)
 	}
 }
 

@@ -15,11 +15,26 @@ type VerifyBudget = usenet.VerifyBudget
 func NewVerifyBudget(limit int64) *VerifyBudget { return usenet.NewVerifyBudget(limit) }
 
 const (
-	// verifyBudgetFloor is the smallest cap handed to any probe. A healthy
-	// decode pass over a 3-4 GB episode consumes 45-75 MB, so this leaves
-	// roughly 3-5x headroom before a well-behaved read could ever trip, and
-	// keeps small files effectively unbounded.
-	verifyBudgetFloor = 256 * 1024 * 1024
+	// verifyBudgetFloor is the smallest cap handed to any probe. The budget
+	// is charged per read of the verification path's 4 MiB copy buffer, and
+	// every range request ffprobe opens costs at least one such read, fetched
+	// by the prefetch whether or not ffprobe consumes it. Measured on
+	// a production install (1,513 healthy 15-window spreads, 2026-09-14..16): 3.7 MiB per
+	// read, p50 38 reads / 140 MiB, p99 57 / 208 MiB, max 416 MiB. At the old
+	// 256 MiB floor 40 spreads were cut, every one a file of 2.2 GB or less;
+	// an episode whose windows need ~65 range requests (Fear Light & Clocks
+	// S04E02, 253 MB, measured 46 requests reading 70 MB) could never pass.
+	// 512 MiB clears the largest healthy pass, and a typical pass plus the
+	// one retry checkConfirmed runs on the same budget after a broken verdict
+	// (a retry after a 400 MiB pass is still cut, which ends inconclusive,
+	// never broken). It still cuts a runaway read of a file over ~0.5 GB.
+	//
+	// This raises the cliff rather than removing its cause: a read is charged
+	// a whole buffer however little of it ffprobe consumes (the 253 MB episode
+	// above: ~70 MB consumed, ~260 MiB charged), so a file needing ~130 range
+	// requests is still cut. Charging closer to what ffprobe pulls (a smaller
+	// first read per request, ramping to the buffer size) is not done.
+	verifyBudgetFloor = 512 * 1024 * 1024
 
 	// verifyBudgetDivisor sets the cap at fileBytes/8 (12.5%) once that
 	// exceeds the floor. Measured healthy probes land at 1.4-2.3% of the
