@@ -24,13 +24,24 @@ const (
 	// not seek. The sweep leaves it healthy and unverified; only a manual
 	// Replace re-grabs it (ReplaceUnverified).
 	reasonTailTruncated = "import_tail_truncated"
+	// reasonVolumeOrder: the file's archive volumes are stored in another
+	// order than the volumes' own numbers give (legacy imports that kept the
+	// upload order), so the file serves the right bytes at the wrong places.
+	// Flagged Unverified like reasonTailTruncated; Replace re-grabs it.
+	reasonVolumeOrder = "import_volume_order"
 )
 
 // keepReleaseReason reports whether a broken file's reason is an import
 // fault rather than damage in the posting, so its re-grab must not blocklist
 // the release.
 func keepReleaseReason(reason string) bool {
-	return reason == reasonSplicedVolumes || reason == reasonMissingVolume || reason == reasonTailTruncated
+	return reason == reasonSplicedVolumes || reason == reasonMissingVolume || replaceableReason(reason)
+}
+
+// replaceableReason reports whether an unverified file's reason is one Replace
+// acts on: an import fault in a file that still plays.
+func replaceableReason(reason string) bool {
+	return reason == reasonTailTruncated || reason == reasonVolumeOrder
 }
 
 // geometryVerdict is what checkImportGeometry found for one file.
@@ -38,6 +49,7 @@ type geometryVerdict struct {
 	reason        string // reasonSplicedVolumes or reasonMissingVolume: broken
 	tailTruncated bool   // short by less than an article: flagged, not broken
 	singleSplice  bool   // one duplicate boundary: flagged, not broken
+	shortVolume   bool   // a short volume before a full one: volume order worth checking
 	splices       int
 	shortBytes    int64
 }
@@ -137,6 +149,7 @@ func classifyGeometry(f *storage.NZBFile, head []byte) geometryVerdict {
 	if f == nil || len(f.Segments) == 0 {
 		return v
 	}
+	v.shortVolume = f.FileType == storage.NZBFileTypeRar && shortVolumeBeforeFull(layoutVolumes(f.Segments))
 	// Several boundaries is unambiguous (Dear Judge: 101). A single one is
 	// often the last volume swallowing a small trailing group file (Man of
 	// Sun Dao, Netfall): wrong bytes too, but near the end and the least

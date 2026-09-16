@@ -718,6 +718,15 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 					r.logger.Warn().Str("entry", c.name).Str("file", name).
 						Msg("Repair: one volume boundary serves another volume's article (assembled wrong at import); not re-grabbed automatically, re-grab by hand")
 				}
+				// A short volume before a full one, or a splice, is how a file
+				// stored out of volume order shows in its meta. Reading the
+				// volumes' headers settles it before a decode check spends its
+				// budget on the jumps.
+				if geo.singleSplice || geo.shortVolume {
+					if vo, checked := r.checkVolumeOrder(ctx, res.infoHash, name); checked && vo.misordered {
+						return r.markVolumeOrder(c.name, name, vo, res)
+					}
+				}
 			}
 
 			exp := expectedRuntimeFor(c, name)
@@ -739,6 +748,13 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			if ok && !conclusive && !skipDecode {
 				res.unverifiedReason = cause.get()
 				res.unverifiedCause, res.unverifiedDetail = cause.decodeCause, cause.detail
+				// Misordered volumes decode through as valid Matroska from
+				// elsewhere in the file, which lands here rather than broken.
+				if entry.IsNZB() && (res.unverifiedReason == unverifiedDecodeErrors || res.unverifiedReason == unverifiedReadBudget) {
+					if vo, checked := r.checkVolumeOrder(ctx, res.infoHash, name); checked && vo.misordered {
+						res = r.markVolumeOrder(c.name, name, vo, res)
+					}
+				}
 			}
 
 			if !ok {
@@ -768,6 +784,20 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			r.logFileVerdict(c.name, name, expectedRuntimeFor(c, name).Bytes, nil, 0, res, false)
 		}
 	}
+	return res
+}
+
+// markVolumeOrder leaves a file whose volumes are stored out of order healthy
+// but unverified with reasonVolumeOrder: it plays, with jumps, and Replace
+// re-grabs it keeping the release.
+func (r *Repair) markVolumeOrder(entryName, name string, vo volumeOrderVerdict, res fileResult) fileResult {
+	r.logger.Warn().Str("entry", entryName).Str("file", name).Int("volumes", vo.volumes).Int("out_of_place", vo.outOfPlace).
+		Int("position", vo.position).Int("volume_number", vo.number).Str("source", vo.source).
+		Msg("Repair: archive volumes are stored out of order (assembled wrong at import); replace it from Unverified")
+	res.decodeConclusive = false
+	res.unverifiedReason = reasonVolumeOrder
+	res.unverifiedCause = ""
+	res.unverifiedDetail = vo.detail()
 	return res
 }
 
@@ -1500,10 +1530,10 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 		if len(hashes) == 0 {
 			shouldDelete = false
 		}
-		// A tail-truncated file still played when it was replaced. Keep its
-		// entry so a re-grab that never lands leaves a copy to import by hand;
-		// the replacement supersedes it when it does.
-		if !slices.ContainsFunc(h.BrokenFiles, func(bf storage.BrokenFile) bool { return bf.Reason != reasonTailTruncated }) {
+		// A replaced file (tail truncated, volumes out of order) still played.
+		// Keep its entry so a re-grab that never lands leaves a copy to import
+		// by hand; the replacement supersedes it when it does.
+		if !slices.ContainsFunc(h.BrokenFiles, func(bf storage.BrokenFile) bool { return !replaceableReason(bf.Reason) }) {
 			shouldDelete = false
 		}
 	}

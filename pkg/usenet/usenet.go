@@ -1142,6 +1142,30 @@ func (u *Usenet) FetchArticlePrefix(ctx context.Context, messageID string, n int
 	return prefix, nil
 }
 
+// ArticleHead is an article's first decoded bytes and the posted file its
+// yEnc header names.
+type ArticleHead struct {
+	Prefix []byte
+	Name   string // yEnc name= of the posted file
+	Part   int    // yEnc part= (1 for a posted file's first article)
+}
+
+// FetchArticleHead is FetchArticlePrefix plus the article's yEnc name and part
+// number, which say which posted file the article belongs to - a check that
+// a stored message ID still serves its own upload.
+func (u *Usenet) FetchArticleHead(ctx context.Context, messageID string, n int) (ArticleHead, error) {
+	var head ArticleHead
+	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+		meta, err := conn.GetHeaderPrefix(messageID, n)
+		if err != nil {
+			return err
+		}
+		head = ArticleHead{Prefix: meta.Snippet, Name: meta.Name, Part: int(meta.Part)}
+		return nil
+	})
+	return head, err
+}
+
 // MissingSegment identifies one confirmed-missing article found during a
 // CheckFileDetailed probe, in enough detail to record against the overlay
 // store (pkg/usenet/overlay.Store.RecordDead).

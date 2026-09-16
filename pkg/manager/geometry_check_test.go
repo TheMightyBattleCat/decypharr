@@ -97,7 +97,7 @@ func TestClassifyGeometry(t *testing.T) {
 }
 
 func TestKeepReleaseReason(t *testing.T) {
-	for _, r := range []string{reasonSplicedVolumes, reasonMissingVolume, reasonTailTruncated} {
+	for _, r := range []string{reasonSplicedVolumes, reasonMissingVolume, reasonTailTruncated, reasonVolumeOrder} {
 		if !keepReleaseReason(r) {
 			t.Errorf("%s should keep the release", r)
 		}
