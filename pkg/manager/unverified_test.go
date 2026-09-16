@@ -239,6 +239,46 @@ func TestReplaceUnverifiedBatchesAndNames(t *testing.T) {
 	}
 }
 
+// A file stored out of volume order is replaced like a tail-truncated one,
+// under its own reason, keeping the release and the entry.
+func TestReplaceUnverifiedVolumeOrder(t *testing.T) {
+	repair := newTestRepairForFix(t)
+	saveUnverified(t, repair, "h1", "Kivi", reasonVolumeOrder)
+	saveUnverified(t, repair, "h2", "Halvard", unverifiedDecodeErrors)
+
+	res, err := repair.ReplaceUnverified(context.Background(), nil, 0)
+	if err != nil {
+		t.Fatalf("ReplaceUnverified: %v", err)
+	}
+	repair.runWG.Wait()
+	if res.Eligible != 1 || !slices.Equal(res.Queued, []string{"Kivi"}) {
+		t.Fatalf("result %+v, want Kivi queued", res)
+	}
+	h := health(t, repair, "Kivi")
+	if h.Status != storage.HealthBroken || h.FailureReason != reasonVolumeOrder || len(h.BrokenFiles) != 1 || h.BrokenFiles[0].Reason != reasonVolumeOrder {
+		t.Fatalf("Kivi health %+v, want its misordered file broken under %s", h, reasonVolumeOrder)
+	}
+	if !keepReleaseReason(h.BrokenFiles[0].Reason) {
+		t.Fatal("a replaced misordered file would blocklist its release")
+	}
+	if g := health(t, repair, "Halvard"); g.Status != storage.HealthHealthy || len(g.UnverifiedFiles) != 1 {
+		t.Fatalf("a decoded-with-errors file was touched: %+v", g)
+	}
+
+	e := torrentEntry("h3", "Lamplight", "realdebrid", "realdebrid")
+	if err := repair.manager.storage.AddOrUpdate(e); err != nil {
+		t.Fatal(err)
+	}
+	broken := &storage.EntryHealth{
+		EntryName: "Lamplight", Status: storage.HealthBroken, FileCount: 1, BrokenCount: 1,
+		BrokenFiles: []storage.BrokenFile{{EntryName: "Lamplight", FileName: "Lamplight.mkv", InfoHash: "h3", Reason: reasonVolumeOrder, ArrName: "radarr", MediaID: 1, ArrFileID: 101}},
+	}
+	repair.finalizeEntryRepair("Lamplight", broken, map[string]struct{}{"radarr": {}})
+	if got, err := repair.manager.storage.Get("h3"); err != nil || got == nil {
+		t.Fatalf("entry deleted after replacing a misordered file (%v)", err)
+	}
+}
+
 // While a run is active Replace changes nothing.
 func TestReplaceUnverifiedDuringARun(t *testing.T) {
 	repair := newTestRepairForFix(t)

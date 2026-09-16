@@ -924,7 +924,7 @@
                     <option value="all">All reasons</option>
                 </select>
                 <button id="replaceUnverifiedBtn" class="btn btn-warning btn-outline btn-sm" disabled
-                        title="Pick the Tail truncated reason to replace those files">
+                        title="Pick Tail truncated or Volumes out of order to replace those files">
                     <i class="bi bi-arrow-repeat mr-1"></i><span id="replaceUnverifiedLabel">Replace all</span>
                 </button>
                 <button id="refreshUnverifiedBtn" class="btn btn-outline btn-sm">
@@ -933,9 +933,11 @@
             </div>
         </div>
         <p class="text-xs opacity-70 mb-2">
-            Healthy entries with a file the last check could not verify. Only a tail-truncated file
-            (it ends before its Matroska index, so it plays but does not seek) can be replaced; the
-            other reasons say nothing about the file, so recheck those instead.
+            Healthy entries with a file the last check could not verify. Only a file assembled wrong at
+            import can be replaced: tail truncated (it ends before its Matroska index, so it plays but
+            does not seek) or volumes out of order (its archive volumes are stored in another order than
+            their own numbers, so playback jumps). The other reasons say nothing about the file, so
+            recheck those instead.
         </p>
         <div id="unverifiedReplaceWarning" class="alert alert-warning text-sm py-2 mb-2 hidden">
             <i class="bi bi-exclamation-triangle"></i>

@@ -9,12 +9,13 @@ const PRECACHE_GIB = 1024 * 1024 * 1024;
 // TTL" input is in seconds for a human to read.
 const NS_PER_SECOND = 1e9;
 const PLEX_TOKEN_PLACEHOLDER = '********';
-// The only unverified reason Replace acts on, and how many entries one Replace
-// re-grabs (manager.reasonTailTruncated, defaultReplaceUnverifiedLimit).
-const REASON_TAIL_TRUNCATED = 'import_tail_truncated';
+// The unverified reasons Replace acts on, and how many entries one Replace
+// re-grabs (manager.replaceableReason, defaultReplaceUnverifiedLimit).
+const REPLACEABLE_REASONS = new Set(['import_tail_truncated', 'import_volume_order']);
 const REPLACE_UNVERIFIED_BATCH = 25;
 const UNVERIFIED_REASON_LABELS = {
     import_tail_truncated: 'Tail truncated',
+    import_volume_order: 'Volumes out of order',
     no_seek_index: 'No seek index',
     decode_timeout: 'Timed out',
     read_budget_spent: 'Read budget spent',
@@ -1013,12 +1014,12 @@ class RepairManager {
         return items.filter((h) => (h.unverified_files || []).some((f) => this.unverifiedKey(f) === reason));
     }
 
-    // sortReasons puts the reason Replace acts on first, then the rest by
+    // sortReasons puts the reasons Replace acts on first, then the rest by
     // count (most first) when counts are given.
     sortReasons(reasons, counts = {}) {
         return reasons.sort((a, b) => {
-            if (a === REASON_TAIL_TRUNCATED) return -1;
-            if (b === REASON_TAIL_TRUNCATED) return 1;
+            const ra = REPLACEABLE_REASONS.has(a), rb = REPLACEABLE_REASONS.has(b);
+            if (ra !== rb) return ra ? -1 : 1;
             return (counts[b] || 0) - (counts[a] || 0);
         });
     }
@@ -1066,7 +1067,7 @@ class RepairManager {
         const items = this.filteredUnverified();
         const count = document.getElementById('unverifiedModalCount');
         if (count) count.textContent = items.length;
-        document.getElementById('unverifiedReplaceWarning')?.classList.toggle('hidden', st.reason !== REASON_TAIL_TRUNCATED);
+        document.getElementById('unverifiedReplaceWarning')?.classList.toggle('hidden', !REPLACEABLE_REASONS.has(st.reason));
         this.updateReplaceUnverifiedButton();
 
         const totalPages = Math.max(1, Math.ceil(items.length / st.pageSize));
@@ -1084,7 +1085,7 @@ class RepairManager {
         for (const h of items.slice(start, start + st.pageSize)) {
             const files = h.unverified_files || [];
             const rowId = `unverified-row-${this.slug(h.entry_name)}`;
-            const replaceable = files.some((f) => f.reason === REASON_TAIL_TRUNCATED);
+            const replaceable = files.some((f) => REPLACEABLE_REASONS.has(f.reason));
             const reasons = this.sortReasons([...new Set(files.map((f) => this.unverifiedKey(f)))]);
             const reasonText = this.unverifiedReasonLabel(reasons[0]) + (reasons.length > 1 ? ` +${reasons.length - 1}` : '');
             const shortBy = Math.max(0, ...files.map((f) => f.short_bytes || 0));
@@ -1106,7 +1107,7 @@ class RepairManager {
                     <button class="btn btn-xs btn-outline" data-action="recheck" aria-label="Recheck ${this.escapeAttr(h.entry_name)}" title="Check this entry again">
                         <i class="bi bi-search-heart"></i>
                     </button>
-                    ${replaceable ? `<button class="btn btn-xs btn-warning btn-outline" data-action="replace" aria-label="Replace ${this.escapeAttr(h.entry_name)}" title="Delete and re-search the tail-truncated files, keeping the release">
+                    ${replaceable ? `<button class="btn btn-xs btn-warning btn-outline" data-action="replace" aria-label="Replace ${this.escapeAttr(h.entry_name)}" title="Delete and re-search the files assembled wrong at import (tail truncated, volumes out of order), keeping the release">
                         <i class="bi bi-arrow-repeat"></i>
                     </button>` : ''}
                 </td>
@@ -1215,25 +1216,25 @@ class RepairManager {
     }
 
     // replaceUnverifiedBatch is what the bulk Replace acts on: the first batch
-    // of listed entries with a tail-truncated file, in list order. Empty
-    // unless the Tail truncated reason is selected.
+    // of listed entries with a file of the selected replaceable reason, in
+    // list order. Empty unless a replaceable reason is selected.
     replaceUnverifiedBatch() {
-        if (this.unverifiedState.reason !== REASON_TAIL_TRUNCATED) return [];
+        if (!REPLACEABLE_REASONS.has(this.unverifiedState.reason)) return [];
         return this.filteredUnverified().slice(0, REPLACE_UNVERIFIED_BATCH).map((h) => h.entry_name);
     }
 
-    // updateReplaceUnverifiedButton enables the bulk Replace only for the Tail
-    // truncated reason with no run active, and never labels a capped batch
+    // updateReplaceUnverifiedButton enables the bulk Replace only for a
+    // replaceable reason with no run active, and never labels a capped batch
     // "all".
     updateReplaceUnverifiedButton() {
         const btn = document.getElementById('replaceUnverifiedBtn');
         const label = document.getElementById('replaceUnverifiedLabel');
         if (!btn || !label || btn.dataset.confirming === 'true') return;
-        const tail = this.unverifiedState.reason === REASON_TAIL_TRUNCATED;
-        const total = tail ? this.filteredUnverified().length : 0;
+        const replaceable = REPLACEABLE_REASONS.has(this.unverifiedState.reason);
+        const total = replaceable ? this.filteredUnverified().length : 0;
         const running = !!this.latestStatus?.active_run;
-        btn.disabled = !tail || total === 0 || running;
-        btn.title = !tail ? 'Pick the Tail truncated reason to replace those files'
+        btn.disabled = !replaceable || total === 0 || running;
+        btn.title = !replaceable ? 'Pick Tail truncated or Volumes out of order to replace those files'
             : running ? 'Wait for the current repair run to finish' : '';
         label.textContent = total > REPLACE_UNVERIFIED_BATCH
             ? `Replace next ${REPLACE_UNVERIFIED_BATCH} of ${total}`

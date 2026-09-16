@@ -203,11 +203,13 @@ func (r *Repair) ListUnverified() ([]*storage.EntryHealth, error) {
 	return out, err
 }
 
-func isTailTruncated(uf storage.UnverifiedFile) bool { return uf.Reason == reasonTailTruncated }
+// isReplaceable reports whether Replace acts on uf: a file that plays but was
+// assembled wrong at import (see replaceableReason).
+func isReplaceable(uf storage.UnverifiedFile) bool { return replaceableReason(uf.Reason) }
 
 // ReplaceUnverifiedResult is what ReplaceUnverified reports.
 type ReplaceUnverifiedResult struct {
-	// Eligible counts the unverified entries with a tail-truncated file among
+	// Eligible counts the unverified entries with a replaceable file among
 	// those asked for; Queued names the ones this call re-grabs and Remaining
 	// how many are left for another call.
 	Eligible  int                `json:"eligible"`
@@ -216,9 +218,10 @@ type ReplaceUnverifiedResult struct {
 	Run       *storage.RepairRun `json:"run,omitempty"`
 }
 
-// ReplaceUnverified re-grabs up to limit unverified entries' tail-truncated
-// files (names, or every such entry when empty): each is marked broken with
-// reasonTailTruncated and handed to FixBroken, which deletes and re-searches it
+// ReplaceUnverified re-grabs up to limit unverified entries' replaceable files,
+// tail truncated or volumes out of order (names, or every such entry when
+// empty): each is marked broken with its reason and handed to FixBroken, which
+// deletes and re-searches it
 // through its Arr without blocklisting the release. Files left unverified for
 // any other reason are not touched - a timed-out check says nothing about the
 // file. When FixBroken refuses (a run is active), the records are restored.
@@ -246,13 +249,13 @@ func (r *Repair) ReplaceUnverified(ctx context.Context, names []string, limit in
 	}
 	var eligible []*storage.EntryHealth
 	for _, h := range all {
-		if (len(wanted) == 0 || wanted[h.EntryName]) && slices.ContainsFunc(h.UnverifiedFiles, isTailTruncated) {
+		if (len(wanted) == 0 || wanted[h.EntryName]) && slices.ContainsFunc(h.UnverifiedFiles, isReplaceable) {
 			eligible = append(eligible, h)
 		}
 	}
 	res.Eligible = len(eligible)
 	if len(eligible) == 0 {
-		return res, errors.New("no tail-truncated entries to replace")
+		return res, errors.New("no tail-truncated or misordered entries to replace")
 	}
 	chosen := eligible[:min(limit, len(eligible))]
 	res.Remaining = len(eligible) - len(chosen)
@@ -263,7 +266,7 @@ func (r *Repair) ReplaceUnverified(ctx context.Context, names []string, limit in
 		orig.UnverifiedFiles = slices.Clone(h.UnverifiedFiles)
 		orig.BrokenFiles = slices.Clone(h.BrokenFiles)
 		originals = append(originals, orig)
-		markTailTruncatedBroken(h, time.Now())
+		markReplaceableBroken(h, time.Now())
 		r.saveHealth(h)
 		res.Queued = append(res.Queued, h.EntryName)
 	}
@@ -279,17 +282,17 @@ func (r *Repair) ReplaceUnverified(ctx context.Context, names []string, limit in
 	}
 	res.Run = run
 	r.logger.Info().Int("entries", len(res.Queued)).Int("remaining", res.Remaining).Str("run_id", run.ID).
-		Msg("Repair: replacing tail-truncated files, re-grabbing each release without blocklisting it")
+		Msg("Repair: replacing files assembled wrong at import, re-grabbing each release without blocklisting it")
 	return res, nil
 }
 
-// markTailTruncatedBroken turns h's tail-truncated files into broken files
-// with reasonTailTruncated, leaving its other unverified files listed.
-func markTailTruncatedBroken(h *storage.EntryHealth, now time.Time) {
+// markReplaceableBroken turns h's replaceable files into broken files with
+// their reason, leaving its other unverified files listed.
+func markReplaceableBroken(h *storage.EntryHealth, now time.Time) {
 	var keep []storage.UnverifiedFile
 	h.BrokenFiles = nil
 	for _, uf := range h.UnverifiedFiles {
-		if !isTailTruncated(uf) {
+		if !isReplaceable(uf) {
 			keep = append(keep, uf)
 			continue
 		}
@@ -298,14 +301,14 @@ func markTailTruncatedBroken(h *storage.EntryHealth, now time.Time) {
 			FileName:  uf.FileName,
 			InfoHash:  uf.InfoHash,
 			Protocol:  h.Protocol,
-			Reason:    reasonTailTruncated,
+			Reason:    uf.Reason,
 			Size:      uf.Size,
 		})
 	}
 	h.UnverifiedFiles = keep
 	h.Status = storage.HealthBroken
 	h.BrokenCount = len(h.BrokenFiles)
-	h.FailureReason = reasonTailTruncated
+	h.FailureReason = h.BrokenFiles[0].Reason
 	h.LastFailedAt = now
 	h.DecodeVerifiedAt = time.Time{}
 	h.DecodeVerifiedFingerprint = ""

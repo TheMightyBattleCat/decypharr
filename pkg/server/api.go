@@ -1287,7 +1287,8 @@ func (s *Server) handleListUnverified(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, list, http.StatusOK)
 }
 
-// handleReplaceUnverified re-grabs the tail-truncated files of unverified
+// handleReplaceUnverified re-grabs the replaceable files (tail truncated,
+// volumes out of order) of unverified
 // entries without blocklisting their releases. Body: {"names": [...],
 // "limit": N}; no names means every such entry, limit defaults to 25. 409
 // while another repair run is active.
