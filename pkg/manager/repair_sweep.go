@@ -388,6 +388,16 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		c.item = item
 	}
 
+	// Correct file sizes that disagree with the stored meta before anything
+	// reads them: a stale size cuts the served file short and would be probed
+	// (and fingerprinted) as such. The corrected item changes the fingerprint,
+	// so a decode verification stamped on the short file does not carry over.
+	if u := r.manager.usenet; u != nil && syncEntrySizesFromMeta(s, u, c.item, r.logger) {
+		if item, err := s.GetEntryItem(c.name); err == nil && item != nil && len(item.Files) > 0 {
+			c.item = item
+		}
+	}
+
 	// Mark every nzbID backing this entry as under a sweep probe for the
 	// duration of probeEntry. While marked, the fetcher refuses to pad the
 	// entry's dead segments (the real 430 propagates so this run's ffprobe
