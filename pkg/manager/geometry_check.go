@@ -233,5 +233,11 @@ func startsMidArchive(f *storage.NZBFile, prefix []byte) bool {
 		return false
 	}
 	hs, ok := parser.ReadFileHeaderStart(prefix)
+	// DataAt == SegmentDataStart is what makes this safe, not SplitBefore:
+	// the walk returns a volume's first file header, which is often another
+	// file's (Emberly's volume 1 starts with its cover .jpg; a season-set
+	// episode starts mid-volume after the previous episode's continued
+	// data). Only a header whose data begins exactly where this file's
+	// slice does describes this file.
 	return ok && hs.SplitBefore && hs.DataAt == first.SegmentDataStart
 }
