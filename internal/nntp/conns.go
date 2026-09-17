@@ -227,6 +227,11 @@ type Connection struct {
 	// and the janitor should skip it.
 	lastProgressNS atomic.Int64
 	idleNS         atomic.Int64
+
+	// onBody receives each successful article body's decoded size and how
+	// long it took from sending BODY to the end of the body, for the owning
+	// client's body routing (body_routing.go). Nil outside a client pool.
+	onBody func(n int64, d time.Duration)
 }
 
 func (c *Connection) Close() error {
@@ -581,6 +586,7 @@ func (c *Connection) GetDecodedBody(messageID string) ([]byte, error) {
 // returning the parsed yEnc metadata from the same pass.
 func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
+	start := time.Now()
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
 		return nil, nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
 	}
@@ -606,6 +612,7 @@ func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *Yenc
 		return nil, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
 	decoded := output.Bytes()
+	c.noteBody(int64(len(decoded)), time.Since(start))
 
 	return decoded, metadataFromDecoder(dec, nil), nil
 }
@@ -622,6 +629,7 @@ func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
 // number and size give it away. meta is nil when no body was read.
 func (c *Connection) StreamBodyMeta(messageID string, w io.Writer) (int64, *YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
+	start := time.Now()
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
 		return 0, nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
 	}
@@ -642,7 +650,16 @@ func (c *Connection) StreamBodyMeta(messageID string, w io.Writer) (int64, *Yenc
 	if err != nil {
 		return n, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
+	c.noteBody(n, time.Since(start))
 	return n, metadataFromDecoder(dec, nil), nil
+}
+
+// noteBody hands a completed body download to the owning client's body
+// routing.
+func (c *Connection) noteBody(n int64, d time.Duration) {
+	if c.onBody != nil {
+		c.onBody(n, d)
+	}
 }
 
 // readDotBytes reads dot-terminated NNTP data using textproto.DotReader

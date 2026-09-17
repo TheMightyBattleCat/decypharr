@@ -32,8 +32,9 @@ type ProviderPool struct {
 	slots       chan struct{}      // Semaphore: capacity = max connections
 	max         int
 	config      config.UsenetProvider
-	activeConns sync.Map    // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
-	stat        statLatency // measured STAT latency, for BatchStat routing (stat_routing.go)
+	activeConns sync.Map       // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
+	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
+	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
 }
 
 // Client manages a pool of NNTP connections.
@@ -617,9 +618,10 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	}
 
 	// Phase 1: Non-blocking scan - try to get a free slot from any provider
-	// within the target tier.
+	// within the target tier. Priority order, except that a primary measured
+	// far slower than the others is tried after them (body_routing.go).
 	eligibleCount := 0
-	for _, provider := range c.providers {
+	for _, provider := range c.bodyScanOrder(time.Now()) {
 		if c.providerTier(ctx, provider) != target || exclusions.excludes(provider) {
 			continue
 		}
@@ -940,6 +942,9 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		username: provider.Username,
 		password: provider.Password,
 		logger:   c.logger.With().Str("host", provider.Host).Logger(),
+		onBody: func(n int64, d time.Duration) {
+			c.recordBody(provider.Host, n, d)
+		},
 	}
 
 	// Set deadline for handshake (greeting + auth)
@@ -1062,6 +1067,11 @@ func (c *Client) Stats() map[string]any {
 			// Computed live (not cached) so a soft-threshold demotion or a
 			// calendar-aligned quota reset is reflected on the very next poll.
 			"tier": tierLabel(c.providerTier(context.Background(), p)),
+			// Body download rate the connection order judges by, and whether
+			// that order currently tries this provider after the other
+			// primaries (body_routing.go). 0 until measured.
+			"body_mib_s":    float64(pp.body.bytesPerSec.Load()) / (1 << 20),
+			"body_deferred": pp.body.slow.Load(),
 		}
 
 		// Add speed test result if available
