@@ -30,6 +30,13 @@ func setBody(c *Client, host string, mibs float64) {
 	b.sampledAt.Store(time.Now().UnixNano())
 }
 
+// freshScan takes new verdicts for this scan instead of reusing ones up to
+// bodyVerdictEvery old, so a test can change rates between scans.
+func freshScan(c *Client, now time.Time) []config.UsenetProvider {
+	c.bodyScan.Store(nil)
+	return c.bodyScanOrder(now)
+}
+
 func bodyHosts(ps []config.UsenetProvider) []string {
 	out := make([]string, len(ps))
 	for i, p := range ps {
@@ -91,7 +98,7 @@ func TestBodyScanOrderUnchangedWhenNothingSlow(t *testing.T) {
 	c := newBodyTestClient(t, providers)
 	same := func() {
 		t.Helper()
-		got := c.bodyScanOrder(time.Now())
+		got := freshScan(c, time.Now())
 		if len(got) != len(c.providers) || &got[0] != &c.providers[0] {
 			t.Fatalf("order = %v, want c.providers itself", bodyHosts(got))
 		}
@@ -122,7 +129,7 @@ func TestBodyScanOrderDefersSlowPrimary(t *testing.T) {
 	setBody(c, "newshosting", 28)
 	// eweka unmeasured: keeps its priority position.
 
-	wantOrder(t, c.bodyScanOrder(time.Now()), "newshosting", "eweka", "frugal", "backup")
+	wantOrder(t, freshScan(c, time.Now()), "newshosting", "eweka", "frugal", "backup")
 	if !c.pools["frugal"].body.slow.Load() {
 		t.Error("frugal's verdict not recorded as slow")
 	}
@@ -141,7 +148,7 @@ func TestBodyScanOrderSlowPrimariesFastestFirst(t *testing.T) {
 	setBody(c, "newshosting", 40)
 	setBody(c, "eunews", 1.2)
 	setBody(c, "bonus", 3)
-	wantOrder(t, c.bodyScanOrder(time.Now()), "newshosting", "bonus", "eunews", "backup")
+	wantOrder(t, freshScan(c, time.Now()), "newshosting", "bonus", "eunews", "backup")
 }
 
 // Backups never move, are never judged, and never set the rate primaries are
@@ -157,7 +164,7 @@ func TestBodyScanOrderBackupsKeepTheirPlaces(t *testing.T) {
 	setBody(c, "slow", 1)
 	setBody(c, "fast", 30)
 	setBody(c, "b1", 0.1) // a crawling backup is still not deferred
-	wantOrder(t, c.bodyScanOrder(time.Now()), "b1", "fast", "slow", "b2")
+	wantOrder(t, freshScan(c, time.Now()), "b1", "fast", "slow", "b2")
 	if c.pools["b1"].body.slow.Load() {
 		t.Error("a backup was judged slow")
 	}
@@ -165,7 +172,7 @@ func TestBodyScanOrderBackupsKeepTheirPlaces(t *testing.T) {
 	// Only a backup is fast: the primaries are judged against each other.
 	setBody(c, "fast", 1.5)
 	setBody(c, "b2", 100)
-	got := c.bodyScanOrder(time.Now())
+	got := freshScan(c, time.Now())
 	if &got[0] != &c.providers[0] {
 		t.Fatalf("order = %v: a backup's rate made a primary slow", bodyHosts(got))
 	}
@@ -185,13 +192,13 @@ func TestBodyScanOrderHardQuota(t *testing.T) {
 	setBody(c, "slowest", 1)
 
 	c.bw = quotaTracker("capped", 95, 100, 10) // reserve band
-	wantOrder(t, c.bodyScanOrder(time.Now()), "capped", "slower", "slowest")
+	wantOrder(t, freshScan(c, time.Now()), "capped", "slower", "slowest")
 	if !c.pools["slower"].body.slow.Load() {
 		t.Error("slower not judged against a reserve-band primary")
 	}
 
 	c.bw = quotaTracker("capped", 100, 100, 10) // hard quota
-	got := c.bodyScanOrder(time.Now())
+	got := freshScan(c, time.Now())
 	wantOrder(t, got, "capped", "slower", "slowest")
 	if c.pools["slowest"].body.slow.Load() {
 		t.Error("slowest (1 MiB/s) judged slow against slower (3): only a hard-quota provider was 4x faster")
@@ -209,13 +216,13 @@ func TestBodyScanOrderRecoveryMargin(t *testing.T) {
 	setBody(c, "p2", 40) // cut = min(4, 40/4) = 4 MiB/s
 
 	setBody(c, "p1", 2)
-	wantOrder(t, c.bodyScanOrder(time.Now()), "p2", "p1")
+	wantOrder(t, freshScan(c, time.Now()), "p2", "p1")
 	setBody(c, "p1", 4.5) // over the cut, under cut x 1.25
-	wantOrder(t, c.bodyScanOrder(time.Now()), "p2", "p1")
+	wantOrder(t, freshScan(c, time.Now()), "p2", "p1")
 	setBody(c, "p1", 5.5)
-	wantOrder(t, c.bodyScanOrder(time.Now()), "p1", "p2")
+	wantOrder(t, freshScan(c, time.Now()), "p1", "p2")
 	setBody(c, "p1", 4.5) // back under 5, but not under the cut itself
-	wantOrder(t, c.bodyScanOrder(time.Now()), "p1", "p2")
+	wantOrder(t, freshScan(c, time.Now()), "p1", "p2")
 }
 
 // A deferred primary with a stale sample stays behind the others, except for
@@ -229,20 +236,20 @@ func TestBodyScanOrderStaleSampleExplorer(t *testing.T) {
 	now := time.Now()
 	setBody(c, "p2", 40)
 	setBody(c, "p1", 1)
-	wantOrder(t, c.bodyScanOrder(now), "p2", "p1")
+	wantOrder(t, freshScan(c, now), "p2", "p1")
 
 	stale := now.Add(-bodyExploreAfter).UnixNano()
 	c.pools["p1"].body.sampledAt.Store(stale)
-	wantOrder(t, c.bodyScanOrder(now), "p1", "p2") // the explorer
-	wantOrder(t, c.bodyScanOrder(now), "p2", "p1")
-	wantOrder(t, c.bodyScanOrder(now.Add(time.Minute)), "p2", "p1")
+	wantOrder(t, freshScan(c, now), "p1", "p2") // the explorer
+	wantOrder(t, freshScan(c, now), "p2", "p1")
+	wantOrder(t, freshScan(c, now.Add(time.Minute)), "p2", "p1")
 	later := now.Add(bodyExploreAfter)
 	c.pools["p2"].body.sampledAt.Store(later.UnixNano())
-	wantOrder(t, c.bodyScanOrder(later), "p1", "p2") // the next explorer
+	wantOrder(t, freshScan(c, later), "p1", "p2") // the next explorer
 
 	// Stale but never slow: nothing to hold back.
 	c.pools["p1"].body.slow.Store(false)
-	wantOrder(t, c.bodyScanOrder(later.Add(time.Second)), "p1", "p2")
+	wantOrder(t, freshScan(c, later.Add(time.Second)), "p1", "p2")
 }
 
 // Every primary last seen slow, every sample stale: no primary is faster to
@@ -260,7 +267,7 @@ func TestBodyScanOrderEveryPrimaryDeferred(t *testing.T) {
 		b.slow.Store(true)
 		b.exploredAt.Store(now.UnixNano())
 	}
-	got := c.bodyScanOrder(now)
+	got := freshScan(c, now)
 	if &got[0] != &c.providers[0] {
 		t.Fatalf("order = %v, want c.providers itself", bodyHosts(got))
 	}
@@ -305,6 +312,7 @@ func TestBodyRoutingOverConnections(t *testing.T) {
 
 	setBody(c, ps.Host, 1)
 	setBody(c, pf.Host, 40)
+	c.bodyScan.Store(nil) // the fetches above took verdicts under a second ago
 	var out bytes.Buffer
 	if err := fetchBody(c, "seg@test", &out); err != nil {
 		t.Fatalf("fetch after routing: %v", err)
@@ -314,5 +322,38 @@ func TestBodyRoutingOverConnections(t *testing.T) {
 	}
 	if slow.bodyReqs.Load() != 2 || fast.bodyReqs.Load() != 2 {
 		t.Fatalf("BODY requests slow=%d fast=%d, want the fetch on the fast provider (2 and 2)", slow.bodyReqs.Load(), fast.bodyReqs.Load())
+	}
+}
+
+// Verdicts are shared for bodyVerdictEvery; the explorer is still decided per
+// acquisition, so a stale deferred primary gets one fetch, not a second's worth.
+func TestBodyScanOrderVerdictsShared(t *testing.T) {
+	providers := []config.UsenetProvider{
+		{Host: "p1", Priority: 1, MaxConnections: 4},
+		{Host: "p2", Priority: 2, MaxConnections: 4},
+	}
+	c := newBodyTestClient(t, providers)
+	now := time.Now()
+	setBody(c, "p2", 40)
+	setBody(c, "p1", 1)
+	first := c.bodyScanOrder(now)
+	wantOrder(t, first, "p2", "p1")
+
+	setBody(c, "p1", 30) // recovered, but the verdicts are still current
+	again := c.bodyScanOrder(now.Add(bodyVerdictEvery / 2))
+	wantOrder(t, again, "p2", "p1")
+	if &again[0] != &first[0] {
+		t.Error("scan order rebuilt within bodyVerdictEvery")
+	}
+	wantOrder(t, c.bodyScanOrder(now.Add(bodyVerdictEvery)), "p1", "p2")
+
+	// Deferred again, then its sample goes stale inside one verdict period.
+	setBody(c, "p1", 1)
+	later := now.Add(2 * bodyVerdictEvery)
+	wantOrder(t, c.bodyScanOrder(later), "p2", "p1")
+	c.pools["p1"].body.sampledAt.Store(later.Add(-bodyExploreAfter).UnixNano())
+	wantOrder(t, c.bodyScanOrder(later), "p1", "p2") // the one explorer
+	for range 10 {
+		wantOrder(t, c.bodyScanOrder(later), "p2", "p1")
 	}
 }

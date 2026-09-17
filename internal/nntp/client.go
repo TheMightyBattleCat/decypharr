@@ -57,6 +57,9 @@ type Client struct {
 	// sized its own pool to the entire bank capacity. The shared pool
 	// caps total worker goroutines to exactly pool.Capacity().
 	repairPool *RepairPool
+	// bodyScan is the latest set of body-routing verdicts and the connection
+	// scan order they give (body_routing.go).
+	bodyScan atomic.Pointer[bodyScan]
 	// statHomes are the pools repair-pool workers are homed on (see
 	// statHomePools); fixed at construction.
 	statHomes []*ProviderPool

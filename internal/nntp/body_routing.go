@@ -20,11 +20,17 @@ import (
 // ~2.5 MiB/s; a minute after newshosting took priority 1 the same read-ahead
 // ran at ~44 MiB/s.
 //
-// Every body download of at least bodySampleMinBytes records its throughput
-// against its provider. When a primary is measurably slow - under
-// bodyFastEnough AND more than bodySlowFactor below the fastest measured
-// primary - the connection scan tries it after the other primaries instead of
-// at its priority position. While every primary is fast the scan order is
+// Every body download of at least bodySampleMinBytes records its throughput -
+// one article on one connection - against its provider. Per-article time holds
+// up under load: the same 60 articles at 1, 4 and 15 connections took a median
+// 71/71/80 ms on newshosting, 51/51/85 ms on eweka and 1019/1005/1283 ms on
+// frugal, so a provider's rate doesn't collapse just because it carries the
+// traffic. The time runs to the end of the caller's write, so a stalled disk
+// cache is charged to whichever provider was writing into it.
+//
+// When a primary is measurably slow - under bodyFastEnough AND more than
+// bodySlowFactor below the fastest measured primary - the connection scan
+// tries it after the other primaries instead of at its priority position. While every primary is fast the scan order is
 // exactly priority order. Configured backups are never measured against and
 // never move: they are still only reached when no primary can provide the
 // article. A primary its quota has demoted to the fill tier is still a
@@ -34,6 +40,10 @@ import (
 // that sample is bodyExploreAfter old, one fetch is let through at its
 // priority position to measure it again; the rest keep going to the faster
 // primaries until that sample lands.
+//
+// Connection acquisition runs hundreds of times a second, so the verdicts and
+// the order they give are taken at most once per bodyVerdictEvery and shared.
+// Only the explorer check runs on every acquisition.
 const (
 	// bodySampleMinBytes: smaller bodies (header probes, a file's short final
 	// article) are mostly round-trip time and say little about throughput.
@@ -41,8 +51,11 @@ const (
 	// bodySlowFactor: a primary is slow only when the fastest measured primary
 	// is more than this many times faster.
 	bodySlowFactor = 4
-	// bodyFastEnough (bytes/s per article): a primary at or above this is never
-	// slow, however much faster another is - a ~700 KB article in ~175 ms.
+	// bodyFastEnough (bytes/s per article, i.e. per connection): a primary at or
+	// above this is never slow, however much faster another is - a ~700 KB
+	// article in ~175 ms. Healthy providers run 10-13 MiB/s per connection, so
+	// bodySlowFactor usually sets the cut; this guards a merely good provider
+	// against an exceptionally fast one.
 	bodyFastEnough = 4 << 20
 	// bodyRecoverPercent: a slow primary gets its position back only once it
 	// clears the slow cut by this much, so a rate hovering at the cut doesn't
@@ -57,7 +70,17 @@ const (
 	// bodyEWMADivisor: each sample moves the average 1/bodyEWMADivisor of the
 	// way towards itself.
 	bodyEWMADivisor = 5
+	// bodyVerdictEvery: how long one set of verdicts, and the scan order they
+	// give, serves connection acquisitions before being taken again.
+	bodyVerdictEvery = time.Second
 )
+
+// bodyScan is one set of verdicts and the scan order it gives.
+type bodyScan struct {
+	at       int64                   // unix nanoseconds the verdicts were taken
+	deferred uint64                  // bit i set: c.providers[i] is deferred
+	order    []config.UsenetProvider // c.providers itself when deferred is 0
+}
 
 // bodyThroughput is one provider's measured body download rate.
 type bodyThroughput struct {
@@ -133,23 +156,22 @@ func (c *Client) fastestBody(now time.Time) int64 {
 	return best
 }
 
-// bodyDeferred decides whether primary pp goes behind the other primaries in
-// this scan, logging a change of verdict.
-func (c *Client) bodyDeferred(pp *ProviderPool, fastest int64, now time.Time) bool {
+// bodyVerdict decides whether primary pp goes behind the other primaries,
+// logging a change of verdict. A primary without a usable sample keeps its
+// last verdict.
+func (c *Client) bodyVerdict(pp *ProviderPool, fastest int64, now time.Time) bool {
 	b := &pp.body
+	wasSlow := b.slow.Load()
 	rate := b.usable(now)
 	if rate == 0 {
-		// No usable sample. A primary last seen slow stays behind the others,
-		// except for one explorer per bodyExploreAfter to measure it again.
-		return b.slow.Load() && !b.tryExplore(now)
+		return wasSlow
 	}
-	wasSlow := b.slow.Load()
 	cut := min(int64(bodyFastEnough), fastest/bodySlowFactor)
 	slow := rate < cut
 	if wasSlow && !slow {
 		slow = rate*100 < cut*bodyRecoverPercent
 	}
-	if b.slow.CompareAndSwap(wasSlow, slow) && wasSlow != slow {
+	if slow != wasSlow && b.slow.CompareAndSwap(wasSlow, slow) {
 		msg := "Body routing: provider is fast enough again, back at its priority position"
 		if slow {
 			msg = "Body routing: provider is too slow, trying the other primaries first"
@@ -162,31 +184,62 @@ func (c *Client) bodyDeferred(pp *ProviderPool, fastest int64, now time.Time) bo
 	return slow
 }
 
+// takeBodyVerdicts judges every primary and builds the scan order.
+func (c *Client) takeBodyVerdicts(now time.Time) *bodyScan {
+	fastest := c.fastestBody(now)
+	var deferred uint64
+	for i, p := range c.providers {
+		pp, ok := c.pools[p.Host]
+		if !ok || p.Backup || i >= 64 {
+			continue
+		}
+		if c.bodyVerdict(pp, fastest, now) {
+			deferred |= 1 << i
+		}
+	}
+	return &bodyScan{at: now.UnixNano(), deferred: deferred, order: c.orderDeferring(deferred)}
+}
+
 // bodyScanOrder is the order getAnyAvailableConnection's non-blocking scan
 // tries providers in: priority order, except that deferred primaries move to
 // just after the last remaining primary, fastest of them first. Backups keep
-// their places. Returns c.providers itself when nothing is deferred, which is
-// the common case and allocates nothing.
+// their places. Returns c.providers itself when nothing is deferred.
 func (c *Client) bodyScanOrder(now time.Time) []config.UsenetProvider {
-	fastest := c.fastestBody(now)
-	var deferred []config.UsenetProvider
-	for _, p := range c.providers {
-		pp, ok := c.pools[p.Host]
-		if !ok || p.Backup {
+	s := c.bodyScan.Load()
+	if s == nil || now.UnixNano()-s.at >= int64(bodyVerdictEvery) || now.UnixNano() < s.at {
+		s = c.takeBodyVerdicts(now)
+		c.bodyScan.Store(s)
+	}
+	if s.deferred == 0 {
+		return s.order
+	}
+	for i, p := range c.providers {
+		if i >= 64 || s.deferred&(1<<i) == 0 {
 			continue
 		}
-		if c.bodyDeferred(pp, fastest, now) {
-			deferred = append(deferred, p)
+		b := &c.pools[p.Host].body
+		if b.usable(now) == 0 && b.tryExplore(now) {
+			// This one acquisition measures the stale primary again.
+			return c.orderDeferring(s.deferred &^ (1 << i))
 		}
 	}
-	if len(deferred) == 0 {
+	return s.order
+}
+
+// orderDeferring is c.providers with the primaries in deferred moved to just
+// after the last primary not in it, fastest first. c.providers itself when
+// nothing is deferred, or when every primary is: then nothing is faster to
+// prefer.
+func (c *Client) orderDeferring(deferred uint64) []config.UsenetProvider {
+	if deferred == 0 {
 		return c.providers
 	}
-
 	order := make([]config.UsenetProvider, 0, len(c.providers))
+	var moved []config.UsenetProvider
 	lastPrimary := -1
-	for _, p := range c.providers {
-		if !p.Backup && isDeferred(deferred, p.Host) {
+	for i, p := range c.providers {
+		if i < 64 && deferred&(1<<i) != 0 {
+			moved = append(moved, p)
 			continue
 		}
 		if !p.Backup {
@@ -195,21 +248,10 @@ func (c *Client) bodyScanOrder(now time.Time) []config.UsenetProvider {
 		order = append(order, p)
 	}
 	if lastPrimary < 0 {
-		// Every primary is deferred (all last seen slow, samples stale): there
-		// is nothing faster to prefer.
 		return c.providers
 	}
 	rate := func(p config.UsenetProvider) int64 { return c.pools[p.Host].body.bytesPerSec.Load() }
-	sort.SliceStable(deferred, func(i, j int) bool { return rate(deferred[i]) > rate(deferred[j]) })
-	tail := append(deferred, order[lastPrimary+1:]...)
+	sort.SliceStable(moved, func(i, j int) bool { return rate(moved[i]) > rate(moved[j]) })
+	tail := append(moved, order[lastPrimary+1:]...)
 	return append(order[:lastPrimary+1], tail...)
-}
-
-func isDeferred(deferred []config.UsenetProvider, host string) bool {
-	for _, p := range deferred {
-		if p.Host == host {
-			return true
-		}
-	}
-	return false
 }
