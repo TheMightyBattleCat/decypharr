@@ -1447,14 +1447,13 @@
                             <label class="label cursor-pointer justify-start gap-3">
                                 <input type="checkbox" class="checkbox checkbox-lg checkbox-primary"
                                        id="repair.enabled" name="repair.enabled">
-                                <div>
-                                    <span class="label-text font-medium text-lg">Enable Repair</span>
-                                    <div class="label-text-alt">When off, the scheduled sweep is unregistered. Per-entry
-                                        rechecks from the Browse
-                                        page still work.
-                                    </div>
-                                </div>
+                                <span class="label-text font-medium text-lg">Enable Repair</span>
                             </label>
+                            <!-- Outside the label: a click on the description must not toggle Repair. -->
+                            <div class="label-text-alt">When off, the scheduled sweep is unregistered. Per-entry
+                                rechecks from the Browse
+                                page still work.
+                            </div>
                         </div>
 
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">

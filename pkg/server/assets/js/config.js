@@ -162,6 +162,9 @@ class ConfigManager {
         if (!repair) return;
         const $ = (id) => document.getElementById(id);
         if ($('repair.enabled')) $('repair.enabled').checked = !!repair.enabled;
+        // What Repair was when the page loaded, so a save that turns it off
+        // can ask first (see saveConfiguration).
+        this.loadedRepairEnabled = !!repair.enabled;
         if ($('repair.source')) $('repair.source').value = repair.source || 'arr';
         if ($('repair.schedule')) $('repair.schedule').value = repair.schedule || '';
         if ($('repair.recheck_interval')) $('repair.recheck_interval').value = repair.recheck_interval || '';
@@ -1104,6 +1107,14 @@ class ConfigManager {
                 throw new Error(validation.errors.join('\n'));
             }
 
+            // Repair was switched off by a settings save on 2026-09-16 without
+            // anyone meaning to: ask before a save turns it off.
+            if (this.loadedRepairEnabled && !config.repair?.enabled &&
+                !confirm('This save turns Repair off: no scheduled sweep and no repair on playback failure until it is enabled again. Save anyway?')) {
+                this.refs.loadingOverlay.classList.add('hidden');
+                return;
+            }
+
             const response = await window.decypharrUtils.fetcher('/api/config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1131,6 +1142,7 @@ class ConfigManager {
                 }, 2000);
             } else {
                 // Applied live — no restart, no disruptive reload.
+                this.loadedRepairEnabled = !!config.repair?.enabled;
                 window.decypharrUtils.createToast('Configuration saved and applied.', 'success');
                 this.refs.loadingOverlay.classList.add('hidden');
             }

@@ -2449,8 +2449,11 @@ class RepairManager {
         const btn = $('overlayConfigSaveBtn');
         if (btn) btn.disabled = true;
         try {
+            // Only this form's fields: the server keeps every other repair
+            // setting as it is now. Spreading the copy loaded with the page
+            // would put back anything changed elsewhere since (e.g. Repair
+            // switched on in Settings in another tab).
             const payload = {
-                ...this.repairConfig,
                 playback_padding: !!$('overlayPlaybackPadding')?.checked,
                 par2_repair: !!$('overlayPar2Repair')?.checked,
                 pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
@@ -2504,8 +2507,9 @@ class RepairManager {
             // "unset" - matches the min="0" on the input.
             const maxBytes = Number.isFinite(giB) && giB > 0 ? Math.round(giB * PRECACHE_GIB) : 0;
 
+            // Only this form's repair field; the server keeps the rest (see
+            // saveOverlayConfig).
             const repairPayload = {
-                ...this.repairConfig,
                 precache_read_ahead_enabled: !!$('precacheReadAhead')?.checked,
             };
             const precachePayload = {

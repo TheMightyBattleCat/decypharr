@@ -5,6 +5,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -501,9 +502,27 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	// Decode the incoming config update
+	currentConfig := config.Get()
+	before, err := json.Marshal(currentConfig)
+	if err != nil {
+		http.Error(w, "Failed to read current config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigBodyBytes))
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The form sends only the settings it has inputs for. Lay it over the live
+	// config so every other setting keeps its value instead of resetting.
+	merged, err := config.MergeJSON(before, body)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to decode config update request")
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var newConfig config.Config
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+	if err := json.Unmarshal(merged, &newConfig); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to decode config update request")
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
@@ -518,7 +537,6 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Preserve fields that shouldn't be overwritten by frontend
-	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
 	// The frontend config form doesn't include use_auth or enable_webdav_auth,
 	// so they would be zero-valued (false) in the decoded payload. Preserve
@@ -576,6 +594,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error saving config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.logConfigChanges("settings", before, &newConfig)
 
 	// Only restart when a field that needs it actually changed (HTTP bind,
 	// debrid/usenet clients, or the mount). For everything else, apply the new
@@ -596,6 +615,28 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": restarted}, http.StatusOK)
 }
 
+// maxConfigBodyBytes bounds a settings save's request body.
+const maxConfigBodyBytes = 4 << 20
+
+// logConfigChanges logs which config keys a save changed - names only, never
+// values (the config holds tokens and passwords). On a production install Repair was
+// switched off by a save on 2026-09-16 and nothing recorded which save or
+// which field.
+func (s *Server) logConfigChanges(source string, before []byte, after *config.Config) {
+	now, err := json.Marshal(after)
+	if err != nil {
+		return
+	}
+	changed, err := config.ChangedJSONKeys(before, now)
+	if err != nil || len(changed) == 0 {
+		return
+	}
+	s.logger.Info().Str("source", source).Strs("changed_keys", changed).Msg("Settings saved")
+	if slices.Contains(changed, "repair.enabled") && !after.Repair.Enabled {
+		s.logger.Warn().Str("source", source).Msg("Settings save turned Repair off: no scheduled sweep until it is enabled again")
+	}
+}
+
 func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, map[string]any{
 		"repair":   config.Get().Repair,
@@ -604,8 +645,31 @@ func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	before, err := json.Marshal(cfg)
+	if err != nil {
+		http.Error(w, "Failed to read current config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	current, err := json.Marshal(cfg.Repair)
+	if err != nil {
+		http.Error(w, "Failed to read current repair config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigBodyBytes))
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The Repair page's forms each send their own fields; the rest of the
+	// repair settings keep their live values (see config.MergeJSON).
+	merged, err := config.MergeJSON(current, body)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var req config.RepairConfig
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(merged, &req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -658,13 +722,13 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cfg := config.Get()
 	cfg.Repair = req
 	if err := cfg.Save(); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save repair config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.logConfigChanges("repair", before, cfg)
 
 	if svc := s.manager.Repair(); svc != nil {
 		if err := svc.ApplyConfig(); err != nil {
