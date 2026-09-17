@@ -1,0 +1,140 @@
+package reader
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Read-ahead bursts yield to stalled playback on other files.
+//
+// A read-ahead burst (FetchRange: next-episode precache, read-ahead of a file
+// nobody is watching yet) runs a dozen fetches wide on its own reader. Each
+// reader has its own connection semaphore, so nothing stops a burst from
+// competing with playback of a different file for the same providers. On
+// 2026-09-16 a 34 Mbit/s Remux buffered for two hours on ~2.5 MiB/s while three
+// ~4 GB next-episode bursts for another series ran back to back against the
+// same slow provider at ~2-3 MiB/s.
+//
+// A playback read that waits playbackStallAfter or longer for its segments
+// marks its reader stalled. While a reader other than its own stalled within
+// readAheadYieldFor, a burst starts no new segment (fetches already running
+// finish), and carries on once playback has gone that long without a stall. A
+// reader that is itself being played never yields: its read-ahead fills the
+// cache that playback reads next.
+const (
+	// playbackStallAfter: how long a playback read must wait for its segments
+	// to count as stalled - about the point a player starts to buffer.
+	playbackStallAfter = 2 * time.Second
+	// readAheadYieldFor: how long a stall keeps other files' bursts paused, and
+	// how recent a playback read must be for a reader to count as being played.
+	readAheadYieldFor = 30 * time.Second
+	// readAheadYieldPoll: how often a paused burst looks again.
+	readAheadYieldPoll = 500 * time.Millisecond
+)
+
+// stallBoard records each reader's latest playback stall.
+type stallBoard struct {
+	yieldFor time.Duration
+	poll     time.Duration
+
+	lastAny atomic.Int64 // unix nanoseconds of the latest stall on any reader
+	mu      sync.Mutex
+	last    map[*StreamingReader]int64
+}
+
+func newStallBoard(yieldFor, poll time.Duration) *stallBoard {
+	return &stallBoard{yieldFor: yieldFor, poll: poll, last: map[*StreamingReader]int64{}}
+}
+
+// playbackStalls is shared by every reader in the process: a burst on one file
+// yields to playback of any other.
+var playbackStalls = newStallBoard(readAheadYieldFor, readAheadYieldPoll)
+
+func (b *stallBoard) note(sr *StreamingReader, now time.Time) {
+	ns := now.UnixNano()
+	b.mu.Lock()
+	b.last[sr] = ns
+	b.mu.Unlock()
+	for {
+		old := b.lastAny.Load()
+		if old >= ns || b.lastAny.CompareAndSwap(old, ns) {
+			return
+		}
+	}
+}
+
+func (b *stallBoard) forget(sr *StreamingReader) {
+	b.mu.Lock()
+	delete(b.last, sr)
+	b.mu.Unlock()
+}
+
+// stalledOther reports whether a reader other than self stalled within yieldFor
+// of now, dropping stalls older than that.
+func (b *stallBoard) stalledOther(self *StreamingReader, now time.Time) bool {
+	since := now.Add(-b.yieldFor).UnixNano()
+	if b.lastAny.Load() <= since {
+		return false
+	}
+	found := false
+	b.mu.Lock()
+	for r, ns := range b.last {
+		switch {
+		case ns <= since:
+			delete(b.last, r)
+		case r != self:
+			found = true
+		}
+	}
+	b.mu.Unlock()
+	return found
+}
+
+// notePlaybackRead records a playback read that waited d for its segments.
+func (sr *StreamingReader) notePlaybackRead(d time.Duration, now time.Time) {
+	sr.lastPlaybackRead.Store(now.UnixNano())
+	if d >= playbackStallAfter && sr.stalls != nil {
+		sr.stalls.note(sr, now)
+	}
+}
+
+// beingPlayed reports whether this reader served a playback read within the
+// yield window.
+func (sr *StreamingReader) beingPlayed(now time.Time) bool {
+	last := sr.lastPlaybackRead.Load()
+	return last != 0 && now.UnixNano()-last < int64(sr.stalls.yieldFor)
+}
+
+// yieldToPlayback blocks a read-ahead burst while playback of another file is
+// stalling, returning early only when ctx or the reader ends.
+func (sr *StreamingReader) yieldToPlayback(ctx context.Context, nextSeg int) error {
+	b := sr.stalls
+	if b == nil {
+		return nil
+	}
+	start := time.Now()
+	if sr.beingPlayed(start) || !b.stalledOther(sr, start) {
+		return nil
+	}
+	sr.logger.Debug().Int("next_seg", nextSeg).
+		Msg("read-ahead paused: playback of another file is waiting on the network")
+	tick := time.NewTicker(b.poll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sr.ctx.Done():
+			return sr.ctx.Err()
+		case <-tick.C:
+		}
+		now := time.Now()
+		if sr.beingPlayed(now) || !b.stalledOther(sr, now) {
+			sr.logger.Debug().Int("next_seg", nextSeg).Dur("paused", now.Sub(start)).
+				Msg("read-ahead resumed: no playback stalls for the yield window")
+			return nil
+		}
+	}
+}

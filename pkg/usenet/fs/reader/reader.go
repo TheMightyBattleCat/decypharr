@@ -80,6 +80,11 @@ type StreamingReader struct {
 
 	// Stats
 	stats *ReaderStats
+
+	// Playback stall tracking, so read-ahead bursts on other files yield to
+	// this one's playback (playback_yield.go).
+	stalls           *stallBoard
+	lastPlaybackRead atomic.Int64 // unix nanoseconds of the latest playback read
 }
 
 // NewStreamingReader creates a new streaming reader for NNTP segments.
@@ -127,6 +132,7 @@ func NewStreamingReader(
 		cancel:    cancel,
 		logger:    logger,
 		stats:     stats,
+		stalls:    playbackStalls,
 	}
 
 	return sr, nil
@@ -237,8 +243,8 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// Playback prefetch (queued just above) already covers the warm case; this
 	// only changes the cold-span read that would otherwise serialize.
 	var ensureErr error
+	fetchStart := time.Now()
 	if endSeg > startSeg {
-		fetchStart := time.Now()
 		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
 		// Only log the slow ones. With prefetch pipelining ahead the common
 		// case is an instant cache hit, one line per readAtPlain call - pure
@@ -257,6 +263,13 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 		}
 	} else {
 		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
+	}
+	// A playback read that waited long for its segments pauses read-ahead
+	// bursts on other files (playback_yield.go). A caller that walked away
+	// says nothing about the network.
+	if !paddingDisabled(ctx) && ctx.Err() == nil {
+		now := time.Now()
+		sr.notePlaybackRead(now.Sub(fetchStart), now)
 	}
 	if ensureErr != nil {
 		sr.stats.ReadErrors.Add(1)
@@ -550,6 +563,14 @@ func (sr *StreamingReader) FetchRange(ctx context.Context, off, length int64, co
 
 sendLoop:
 	for segIdx := startSeg; segIdx <= endSeg; segIdx++ {
+		if err := sr.yieldToPlayback(ctx, segIdx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+			break sendLoop
+		}
 		select {
 		case segCh <- segIdx:
 		case <-ctx.Done():
@@ -748,6 +769,9 @@ func (sr *StreamingReader) Close() error {
 	}
 
 	sr.cancel()
+	if sr.stalls != nil {
+		sr.stalls.forget(sr)
+	}
 
 	// Close fetcher first (stops downloads)
 	sr.fetcher.Close()
