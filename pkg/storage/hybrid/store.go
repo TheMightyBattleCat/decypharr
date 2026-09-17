@@ -305,6 +305,10 @@ func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
 	return nil
 }
 
+// testHookBeforeCachePut, when set by a test, runs in Get between reading a
+// value from the log and caching it.
+var testHookBeforeCachePut func()
+
 // Get retrieves a value by key
 func (s *Store) Get(key string) ([]byte, error) {
 	if s.closed.Load() {
@@ -332,12 +336,17 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read from log: %w", err)
 	}
 
-	// Populate cache (upgrade to write lock)
-	s.mu.RUnlock()
-	s.mu.Lock()
+	if testHookBeforeCachePut != nil {
+		testHookBeforeCachePut()
+	}
+	// Populate the cache while still holding the read lock. The LRU has its
+	// own mutex, and every writer (Put, Delete, Compact) takes s.mu for
+	// writing, so none can land between the read above and this Put. Dropping
+	// the read lock to take the write lock here let a Put or Delete run in
+	// between, and this then cached the old value: stale data after a Put, and
+	// a deleted key still returned after a Delete (the cache is checked before
+	// the index).
 	s.cache.Put(key, value)
-	s.mu.Unlock()
-	s.mu.RLock()
 
 	s.stats.CacheMisses.Add(1)
 	s.stats.Reads.Add(1)
