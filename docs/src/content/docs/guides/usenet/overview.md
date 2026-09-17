@@ -73,6 +73,27 @@ Lower `priority` = higher preference.
 
 `backbone` is optional. Set it when two providers share the same article spool so Decypharr can skip same-backbone providers after `423/430 article not found` responses.
 
+### Prefer Faster Servers
+
+Every stream fits inside the priority-1 provider's connection pool, so without help all playback goes to that provider however slowly it serves. **Settings → Providers → Usenet → Prefer Faster Servers** (on by default) measures how fast each provider delivers articles and tries a primary that is far slower than the others after them:
+
+- A primary counts as slow only when it serves under 4 MiB/s per connection **and** the fastest primary is more than 4× faster. While no primary is that slow, providers are used in exact priority order.
+- Slow primaries go after the faster primaries, the least slow first. An article the fast providers don't have comes from the least slow provider that has it.
+- Backup providers (`"backup": true`) are never reordered and are still only used for articles the primaries can't provide. A primary that has reached its quota reserve still counts as a primary.
+- A slow provider gets one article every 5 minutes to measure it again, and gets its position back once it is 25% above the cut.
+
+Turn it off to always use providers in priority order. The setting applies within a second of saving, without a restart:
+
+```json
+{
+  "usenet": {
+    "prefer_faster_servers": false
+  }
+}
+```
+
+The provider stats show each provider's measured rate (`body_mib_s`) and whether it is currently tried after the others (`body_deferred`). Debug logs record each change: `Body routing: provider is too slow, trying the other primaries first` and `... fast enough again, back at its priority position`.
+
 ## Performance Tuning
 
 ### Connection Limits
@@ -97,6 +118,22 @@ Lower `priority` = higher preference.
 - Provider B: `10`
 
 → Up to 15 connections per file, split between providers based on priority
+
+### Read-Ahead Bursts Yield to Playback
+
+Read-ahead bursts (next-episode pre-caching, read-ahead of a file nobody is watching yet) compete with playback for the same providers. When a client's stream waits 2 seconds or more for its data, bursts on **other** files stop starting new downloads until playback has gone 30 seconds without such a wait. The file being played keeps its own read-ahead running, since that fills the cache it reads next. A burst paused through a long buffering session can end incomplete; the next trigger fills the gaps.
+
+This is on by default. To turn it off (no UI setting):
+
+```json
+{
+  "precache": {
+    "precache_yield_to_playback": false
+  }
+}
+```
+
+Pauses and resumes are logged at debug: `read-ahead paused: playback of another file is waiting on the network` / `read-ahead resumed`.
 
 ### Read-Ahead Buffer
 

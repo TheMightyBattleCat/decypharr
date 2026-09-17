@@ -119,7 +119,8 @@ Array of Debrid services:
     "processing_timeout": "10m",
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
-    "disk_buffer_path": "/cache/usenet/streams"
+    "disk_buffer_path": "/cache/usenet/streams",
+    "prefer_faster_servers": true
   }
 }
 ```
@@ -136,6 +137,7 @@ Array of Debrid services:
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
 | `disk_buffer_path`            | string | Disk buffer location            | `{main_path}/usenet/streams` |
+| `prefer_faster_servers`       | bool   | Try a primary provider that is far slower than the others after them; off = strict priority order. Backups are never reordered. Applies without a restart ([details](../usenet/overview/#prefer-faster-servers)) | `true` |
 
 ### Provider Fields
 
