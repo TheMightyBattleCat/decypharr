@@ -60,6 +60,9 @@ type Client struct {
 	// bodyScan is the latest set of body-routing verdicts and the connection
 	// scan order they give (body_routing.go).
 	bodyScan atomic.Pointer[bodyScan]
+	// preferFaster reports the live Prefer Faster Servers setting; nil (a
+	// client built outside NewClient) means on.
+	preferFaster func() bool
 	// statHomes are the pools repair-pool workers are homed on (see
 	// statHomePools); fixed at construction.
 	statHomes []*ProviderPool
@@ -232,6 +235,7 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		sockReadBuf:      parseSockBuf(cfg.Usenet.SocketReadBuffer),
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
 	}
+	cm.preferFaster = func() bool { return config.Get().Usenet.PreferFasterServersEnabled() }
 	// bw first: repair-pool workers read it (statHomeBlocked) from the moment
 	// they start.
 	cm.bw = newBandwidthTracker(providers, cm.logger)
@@ -1074,7 +1078,7 @@ func (c *Client) Stats() map[string]any {
 			// that order currently tries this provider after the other
 			// primaries (body_routing.go). 0 until measured.
 			"body_mib_s":    float64(pp.body.bytesPerSec.Load()) / (1 << 20),
-			"body_deferred": pp.body.slow.Load(),
+			"body_deferred": c.bodyRoutingOn() && pp.body.slow.Load(),
 		}
 
 		// Add speed test result if available

@@ -357,3 +357,28 @@ func TestBodyScanOrderVerdictsShared(t *testing.T) {
 		wantOrder(t, c.bodyScanOrder(later), "p2", "p1")
 	}
 }
+
+// Prefer Faster Servers off: the scan is plain priority order whatever the
+// rates, and turning it back on acts on the rates recorded meanwhile.
+func TestBodyScanOrderPreferFasterServersOff(t *testing.T) {
+	providers := []config.UsenetProvider{
+		{Host: "frugal", Priority: 1, MaxConnections: 4},
+		{Host: "newshosting", Priority: 2, MaxConnections: 4},
+	}
+	c := newBodyTestClient(t, providers)
+	on := false
+	c.preferFaster = func() bool { return on }
+	setBody(c, "frugal", 1)
+	setBody(c, "newshosting", 40)
+
+	got := freshScan(c, time.Now())
+	if &got[0] != &c.providers[0] {
+		t.Fatalf("switched off: order = %v, want c.providers itself", bodyHosts(got))
+	}
+	if c.pools["frugal"].body.slow.Load() {
+		t.Error("switched off: a verdict was still taken")
+	}
+
+	on = true
+	wantOrder(t, freshScan(c, time.Now()), "newshosting", "frugal")
+}

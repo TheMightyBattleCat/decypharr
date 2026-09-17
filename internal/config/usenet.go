@@ -79,6 +79,19 @@ type Usenet struct {
 	// smooth playback; this bounds the aggregate so many concurrent streams
 	// can't OOM. Empty = default (512MB); "0" disables the cap.
 	BufferMemory string `json:"buffer_memory,omitempty"`
+
+	// PreferFasterServers lets connection order move a primary server that is
+	// measurably far slower than the others behind them (internal/nntp
+	// body_routing.go). Off, servers are always tried in priority order.
+	// Backup servers are never reordered either way. *bool so unset means on.
+	// Read live, so a change applies without a restart.
+	PreferFasterServers *bool `json:"prefer_faster_servers,omitempty"`
+}
+
+// PreferFasterServersEnabled reports whether slow primaries may be tried after
+// faster ones, defaulting to true when unset.
+func (u Usenet) PreferFasterServersEnabled() bool {
+	return u.PreferFasterServers == nil || *u.PreferFasterServers
 }
 
 // BufferMemoryBytes resolves the usenet streaming-buffer RAM cap. Empty ->

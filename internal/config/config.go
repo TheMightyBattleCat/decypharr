@@ -1115,6 +1115,8 @@ func clearHotFields(c *Config) {
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
 	c.Precache = PrecacheConfig{}
+	// Read live by the NNTP client when it takes its body-routing verdicts.
+	c.Usenet.PreferFasterServers = nil
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.

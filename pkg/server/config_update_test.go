@@ -136,3 +136,61 @@ func TestHandleUpdateRepairConfig_PartialBodyKeepsOtherRepairSettings(t *testing
 		t.Errorf("sent fields not applied: %+v", r)
 	}
 }
+
+// Settings > Providers > Usenet > Prefer Faster Servers saves through the
+// general form and applies live: switching it must not restart the service
+// (a restart unmounts the DFS mount under anyone watching).
+func TestHandleUpdateConfig_PreferFasterServersAppliesWithoutRestart(t *testing.T) {
+	live := config.Get()
+	saved, savedBind := live.Usenet.PreferFasterServers, live.BindAddress
+	t.Cleanup(func() {
+		config.Get().Usenet.PreferFasterServers = saved
+		config.Get().BindAddress = savedBind
+	})
+	// A running service's live config has its defaults applied and a bind
+	// address; the test singleton has neither until set and saved, and every
+	// save would differ from it on those (the handler fills in 0.0.0.0).
+	live.BindAddress = "0.0.0.0"
+	if err := live.Save(); err != nil {
+		t.Fatalf("normalizing the live config: %v", err)
+	}
+
+	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	for _, on := range []bool{false, true} {
+		body := `{"usenet":{"prefer_faster_servers":false}}`
+		if on {
+			body = `{"usenet":{"prefer_faster_servers":true}}`
+		}
+		rec := httptest.NewRecorder()
+		s.handleUpdateConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Restarted bool `json:"restarted"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decoding response: %v", err)
+		}
+		if resp.Restarted {
+			t.Errorf("saving prefer_faster_servers=%v restarted the service", on)
+		}
+		if got := config.Get().Usenet.PreferFasterServersEnabled(); got != on {
+			t.Errorf("live setting = %v after saving %v", got, on)
+		}
+
+		raw, err := os.ReadFile(config.Get().JsonFile())
+		if err != nil {
+			t.Fatalf("reading persisted config.json: %v", err)
+		}
+		var persisted struct {
+			Usenet config.Usenet `json:"usenet"`
+		}
+		if err := json.Unmarshal(raw, &persisted); err != nil {
+			t.Fatalf("unmarshaling persisted config.json: %v", err)
+		}
+		if got := persisted.Usenet.PreferFasterServersEnabled(); got != on {
+			t.Errorf("persisted setting = %v after saving %v", got, on)
+		}
+	}
+}

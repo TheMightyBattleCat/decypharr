@@ -1337,7 +1337,9 @@ class ConfigManager {
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,
             import_availability_sample_percent: parseInt(document.querySelector('[name="usenet.import_availability_sample_percent"]')?.value) || 1,
             disk_buffer_path: document.querySelector('[name="usenet.disk_buffer_path"]')?.value || "",
-            buffer_memory: document.querySelector('[name="usenet.buffer_memory"]')?.value || ""
+            buffer_memory: document.querySelector('[name="usenet.buffer_memory"]')?.value || "",
+            // Unset on the server means on, and the box starts checked.
+            prefer_faster_servers: document.querySelector('[name="usenet.prefer_faster_servers"]')?.checked ?? true
         };
     }
 
@@ -1882,6 +1884,12 @@ class ConfigManager {
                 input.value = value;
             }
         });
+
+        // Unset means on; only an explicit false unticks it.
+        const preferFaster = document.getElementsByName('usenet.prefer_faster_servers')[0];
+        if (preferFaster) {
+            preferFaster.checked = usenet.prefer_faster_servers !== false;
+        }
     }
 
     addUsenetProvider(data = {}) {

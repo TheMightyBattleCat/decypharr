@@ -44,6 +44,12 @@ import (
 // Connection acquisition runs hundreds of times a second, so the verdicts and
 // the order they give are taken at most once per bodyVerdictEvery and shared.
 // Only the explorer check runs on every acquisition.
+//
+// Settings > Providers > Usenet > Prefer Faster Servers (usenet
+// prefer_faster_servers) turns the reordering off: the scan is then plain
+// priority order. Rates are still recorded, so turning it back on acts on
+// current measurements. It is read with each set of verdicts, so a change
+// applies within bodyVerdictEvery.
 const (
 	// bodySampleMinBytes: smaller bodies (header probes, a file's short final
 	// article) are mostly round-trip time and say little about throughput.
@@ -184,8 +190,17 @@ func (c *Client) bodyVerdict(pp *ProviderPool, fastest int64, now time.Time) boo
 	return slow
 }
 
-// takeBodyVerdicts judges every primary and builds the scan order.
+// bodyRoutingOn reports whether Prefer Faster Servers is on.
+func (c *Client) bodyRoutingOn() bool {
+	return c.preferFaster == nil || c.preferFaster()
+}
+
+// takeBodyVerdicts judges every primary and builds the scan order - plain
+// priority order while Prefer Faster Servers is off.
 func (c *Client) takeBodyVerdicts(now time.Time) *bodyScan {
+	if !c.bodyRoutingOn() {
+		return &bodyScan{at: now.UnixNano(), order: c.providers}
+	}
 	fastest := c.fastestBody(now)
 	var deferred uint64
 	for i, p := range c.providers {
