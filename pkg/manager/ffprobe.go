@@ -845,11 +845,32 @@ const (
 	decodePhaseSpread = "spread"
 	decodePhaseDetect = "detect"
 	decodePhaseHead   = "head"
+	// decodePhaseSpreadLead re-decodes a spread's windows from
+	// decodeSpreadLead earlier, after codec errors - see decodeWindows.
+	decodePhaseSpreadLead = "spread_lead"
 )
+
+// decodeSpreadLead is how far before each window a codec-errors spread is
+// decoded again. An H.264 Blu-ray window that starts on an I-frame whose
+// slices need the frames before it prints "top block unavailable" / "error
+// while decoding MB 0 0" for its first frames, though the same frames decode
+// cleanly when the decoder arrives from earlier. Measured on a production install
+// 2026-09-17 on the five codec-error windows that did this (Halvard, Bold Q,
+// Red Fox 2, Evening Walk, Barnaby & Quill; 12-123 error lines each): a 1 s
+// lead-in cleared four and left Halvard's 74 lines, 3 s and 6 s cleared all
+// five. Errors that stay (La Belle Odette's "PPS changed between slices", an
+// SEI truncated at byte 0) are left unverified as before.
+const decodeSpreadLead = 5 * time.Second
 
 // spreadIntervals builds the evenly-spaced -read_intervals list that samples
 // the whole duration - the normal decode check.
 func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64, fps float64) []string {
+	return f.spreadIntervalsLead(duration, fileBytes, fps, 0)
+}
+
+// spreadIntervalsLead is spreadIntervals with each window starting lead
+// earlier (not before 0) and running through the same frames.
+func (f *ffprobeChecker) spreadIntervalsLead(duration time.Duration, fileBytes int64, fps float64, lead time.Duration) []string {
 	// Adaptive window count: a large file (REMUX) gets fewer windows so the
 	// probe pulls ~120-150 MB of cold random I/O over WebDAV instead of
 	// ~300-450 MB. Still spans the whole duration.
@@ -866,9 +887,19 @@ func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64
 	intervals := make([]string, n)
 	for i := range n {
 		startSec := duration * time.Duration(i) / time.Duration(n)
-		intervals[i] = decodeInterval(startSec, ffprobeDecodeWindowSpan, fps)
+		from := max(0, startSec-lead)
+		intervals[i] = decodeInterval(from, ffprobeDecodeWindowSpan+(startSec-from), fps)
 	}
 	return intervals
+}
+
+// recordedDecodeCause returns the decode-error cause a probe noted on ctx
+// (noteDecodeErrors), or "" when none was.
+func recordedDecodeCause(ctx context.Context) string {
+	if c, _ := ctx.Value(unverifiedCauseCtxKey{}).(*unverifiedCause); c != nil {
+		return c.decodeCause
+	}
+	return ""
 }
 
 // decodeProbeFlags is the ffprobe flag list for one frame-decode probe over
@@ -1115,6 +1146,29 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		// wastes time on the small ones.
 		timeout := f.scaledTimeout(fileBytes, ffprobeDecodeTimeoutPerGB, ffprobeDecodeTimeoutCap)
 		ok, reason, conclusive := run(ctx, entryFolder, fileName, decodePhaseSpread, intervals, timeout, fileBytes, budget)
+		if ok && reason == ffprobeReasonDecodedThrough && recordedDecodeCause(ctx) == decodeCauseCodec {
+			// Codec errors at a window's start can be the decoder starting on
+			// a frame that needs the ones before it (decodeSpreadLead). Decode
+			// the same frames from earlier, on the same budget: clean means the
+			// file decodes and the check passes.
+			lead := f.spreadIntervalsLead(duration, fileBytes, fps, decodeSpreadLead)
+			ok2, reason2, conclusive2 := run(ctx, entryFolder, fileName, decodePhaseSpreadLead, lead, timeout, fileBytes, budget)
+			if ok2 && reason2 == "" && conclusive2 {
+				budgetStats(f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Int("windows", len(lead)), budget).
+					Msg("Repair: codec errors at the decode windows' starts were not there when decoding from earlier; counting the check as passed")
+				return true, "", true, decodeCoverageFull
+			}
+			ok, reason, conclusive = ok2, reason2, conclusive2
+			if !ok {
+				// A lead-in pass stopped by a decode error is still judged
+				// by checkConfirmed's retry, like any spread.
+				return ok, reason, conclusive, decodeCoverageFull
+			}
+			if reason != ffprobeReasonDecodedThrough {
+				// Cut or timed out: its own noteUnverified stands.
+				return ok, reason, conclusive, decodeCoverageFull
+			}
+		}
 		if ok && reason == ffprobeReasonDecodedThrough {
 			// A retry would print the same errors over the same frames.
 			budget.Exhaust()
