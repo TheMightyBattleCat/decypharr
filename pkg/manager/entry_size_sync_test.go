@@ -101,6 +101,36 @@ func TestSyncEntrySizesFromMetaCorrectsOneVolumeSize(t *testing.T) {
 	}
 }
 
+// With a stale one-volume record first under the same name, the header decode
+// (no segments) matches the entry's stale size; the sync must still read the
+// full meta and take the record streaming serves.
+func TestSyncEntrySizesFromMetaSameNameRecords(t *testing.T) {
+	s := newEntrySizeSyncStorage(t)
+	const hash = "9a78d2cf"
+	oneVolume := metaFile("e01.mkv", 1, 1000)
+	full := metaFile("e01.mkv", 85, 1000)
+	src := fakeMetaSource{hash: {ID: hash, Files: []storage.NZBFile{oneVolume, full}}}
+	item := addNZBEntry(t, s, hash, "Tide.On.Sark.S02", config.ProtocolNZB, map[string]int64{"e01.mkv": oneVolume.Size})
+
+	if !syncEntrySizesFromMeta(s, src, item, zerolog.Nop()) {
+		t.Fatal("sync left the stale size: the header's first record matched it")
+	}
+	entry, err := s.Get(hash)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := entry.Files["e01.mkv"].Size; got != full.Size {
+		t.Fatalf("entry size = %d, want %d", got, full.Size)
+	}
+	got, err := s.GetEntryItem(item.Name)
+	if err != nil {
+		t.Fatalf("GetEntryItem: %v", err)
+	}
+	if syncEntrySizesFromMeta(s, src, got, zerolog.Nop()) {
+		t.Error("second sync reported a change")
+	}
+}
+
 // The meta size is only trusted when its articles cover exactly that size.
 func TestSyncEntrySizesFromMetaLeavesUncoveredLayout(t *testing.T) {
 	cases := map[string]func(f *storage.NZBFile){

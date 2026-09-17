@@ -3,6 +3,7 @@ package usenet
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -181,6 +182,43 @@ func TestParseWithIDRejectsKnownDeadPosting(t *testing.T) {
 	}
 	if !errors.Is(err, parser.ErrReleaseUnavailable) {
 		t.Errorf("error = %v, want it to wrap parser.ErrReleaseUnavailable", err)
+	}
+}
+
+// Streaming must serve the record every check reads. Tide on Sark S02 on
+// a production install held each episode whole and, after it, as one RAR volume; the
+// stream took the last record and served 49,999,892 of 4.21 GB.
+func TestGetFileServesTheCheckedRecord(t *testing.T) {
+	store := &NZBStorage{metaDir: t.TempDir(), logger: zerolog.Nop()}
+	u := &Usenet{logger: zerolog.Nop(), nzbStorage: store}
+
+	record := func(n int) storage.NZBFile {
+		f := storage.NZBFile{Name: "e01.mkv", Size: int64(n) * 1000}
+		for i := 0; i < n; i++ {
+			start := int64(i) * 1000
+			f.Segments = append(f.Segments, storage.NZBSegment{Number: i + 1, MessageID: fmt.Sprintf("m%d@x", i), Bytes: 1000, StartOffset: start, EndOffset: start + 999})
+		}
+		return f
+	}
+	nzb := &storage.NZB{ID: "tos", Name: "Tide.On.Sark.S02", Files: []storage.NZBFile{record(85), record(1)}}
+	if err := store.AddNZB(nzb); err != nil {
+		t.Fatalf("AddNZB: %v", err)
+	}
+	stored, err := store.GetNZB("tos")
+	if err != nil {
+		t.Fatalf("GetNZB: %v", err)
+	}
+	want := stored.GetFileByName("e01.mkv")
+
+	got, err := u.getFile("tos", "e01.mkv")
+	if err != nil {
+		t.Fatalf("getFile: %v", err)
+	}
+	if got.Size != want.Size || len(got.Segments) != len(want.Segments) || got.Size != 85_000 {
+		t.Fatalf("stream record %d B / %d segments, checks read %d B / %d segments", got.Size, len(got.Segments), want.Size, len(want.Segments))
+	}
+	if got.NzbID != "tos" {
+		t.Fatalf("NzbID = %q, want it filled from the lookup", got.NzbID)
 	}
 }
 

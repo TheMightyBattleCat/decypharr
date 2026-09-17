@@ -1515,21 +1515,15 @@ func (u *Usenet) getFiles(nzoID string, filenames []string) (map[string]*storage
 		return nil, fmt.Errorf("%w: metadata load failed: %w", ErrEntryGone, err)
 	}
 
-	requested := make(map[string]struct{}, len(filenames))
+	// GetFileByName picks among same-name records the way every check does,
+	// so what streams is what was checked.
+	files := make(map[string]*storage.NZBFile, len(filenames))
 	for _, filename := range filenames {
-		requested[filename] = struct{}{}
-	}
-
-	files := make(map[string]*storage.NZBFile, len(requested))
-	for i := range nzb.Files {
-		source := nzb.Files[i]
-		if source.IsDeleted {
+		source := nzb.GetFileByName(filename)
+		if source == nil {
 			continue
 		}
-		if _, ok := requested[source.Name]; !ok {
-			continue
-		}
-		file := source
+		file := *source
 		if file.NzbID == "" {
 			file.NzbID = nzoID
 		}

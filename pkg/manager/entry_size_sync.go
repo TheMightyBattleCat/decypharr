@@ -48,6 +48,12 @@ func syncEntrySizesFromMeta(s *storage.Storage, src entrySizeMetaSource, item *s
 		}
 		var stale []string
 		for _, name := range names {
+			// A header decode has no segments, so among same-name records it
+			// cannot pick the one streaming serves; check those in full.
+			if hdr.FileNameCount(name) > 1 {
+				stale = append(stale, name)
+				continue
+			}
 			if mf := hdr.GetFileByName(name); mf != nil && mf.Size > 0 && mf.Size != item.Files[name].Size {
 				stale = append(stale, name)
 			}
@@ -68,10 +74,10 @@ func syncEntrySizesFromMeta(s *storage.Storage, src entrySizeMetaSource, item *s
 		for _, name := range stale {
 			mf := nzb.GetFileByName(name)
 			ef := entry.Files[name]
-			if mf == nil || ef == nil || ef.Deleted {
+			if mf == nil || ef == nil || ef.Deleted || (mf.Size == ef.Size && mf.Size == item.Files[name].Size) {
 				continue
 			}
-			if !layoutCoversExactly(mf) {
+			if !mf.LayoutCoversSize() {
 				log.Debug().Str("entry", item.Name).Str("file", name).Int64("entry_bytes", ef.Size).Int64("meta_bytes", mf.Size).
 					Msg("Repair: entry size differs from its meta, but the meta's articles do not cover its size; leaving it")
 				continue
@@ -92,19 +98,4 @@ func syncEntrySizesFromMeta(s *storage.Storage, src entrySizeMetaSource, item *s
 		changed = true
 	}
 	return changed
-}
-
-// layoutCoversExactly reports whether f's articles run without gap or overlap
-// from byte 0 to exactly f.Size.
-func layoutCoversExactly(f *storage.NZBFile) bool {
-	segs := f.Segments
-	if len(segs) == 0 || segs[0].StartOffset != 0 {
-		return false
-	}
-	for i := 1; i < len(segs); i++ {
-		if segs[i].StartOffset != segs[i-1].EndOffset+1 {
-			return false
-		}
-	}
-	return segs[len(segs)-1].EndOffset+1 == f.Size
 }

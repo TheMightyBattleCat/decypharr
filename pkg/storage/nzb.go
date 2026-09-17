@@ -144,17 +144,61 @@ type NZBFile struct {
 	IsEncrypted   bool         `json:"is_encrypted,omitempty" msgpack:"is_encrypted,omitempty"`     // True if file data is encrypted
 }
 
+// GetFileByName returns the live file record named name.
+//
+// A meta can hold more than one live record under one name: on a production install
+// (2026-09-16) every Tide on Sark S02 episode was stored whole (4.21 GB) and
+// again as its first RAR volume (49,999,892 B), and Fear Light & Clocks
+// S04E02 as a media file and as a "rar" record laid out to twice its size.
+// Streaming took the last such record and every check the first, so a check
+// read one copy and playback served another. Both now take the same one: the
+// last record, as streaming always did, unless another record's articles run
+// contiguously from byte 0 to exactly its size and the last one's do not, or
+// that record is larger. Of 42 such names on a production install that changes what
+// streams for 10 (Tide on Sark ×8, Isles and Shoals, Fear Light & Clocks
+// S04E02); the rest (same size, a segment apart) keep the record they play.
 func (nzb *NZB) GetFileByName(name string) *NZBFile {
+	var last, best *NZBFile
 	for i := range nzb.Files {
-		f := nzb.Files[i]
-		if f.IsDeleted {
+		f := &nzb.Files[i]
+		if f.IsDeleted || f.Name != name {
 			continue
 		}
-		if nzb.Files[i].Name == name {
-			return &nzb.Files[i]
+		last = f
+		if f.LayoutCoversSize() && (best == nil || f.Size >= best.Size) {
+			best = f
 		}
 	}
-	return nil
+	if best != nil && best != last && (!last.LayoutCoversSize() || best.Size > last.Size) {
+		return best
+	}
+	return last
+}
+
+// FileNameCount returns how many live file records are named name.
+func (nzb *NZB) FileNameCount(name string) int {
+	n := 0
+	for i := range nzb.Files {
+		if !nzb.Files[i].IsDeleted && nzb.Files[i].Name == name {
+			n++
+		}
+	}
+	return n
+}
+
+// LayoutCoversSize reports whether f's articles run without gap or overlap
+// from byte 0 to exactly f.Size.
+func (f *NZBFile) LayoutCoversSize() bool {
+	segs := f.Segments
+	if f.Size <= 0 || len(segs) == 0 || segs[0].StartOffset != 0 {
+		return false
+	}
+	for i := 1; i < len(segs); i++ {
+		if segs[i].StartOffset != segs[i-1].EndOffset+1 {
+			return false
+		}
+	}
+	return segs[len(segs)-1].EndOffset+1 == f.Size
 }
 
 func (nzb *NZB) MarkFileAsRemoved(fileName string) error {
