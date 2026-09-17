@@ -267,7 +267,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// A playback read that waited long for its segments pauses read-ahead
 	// bursts on other files (playback_yield.go). A caller that walked away
 	// says nothing about the network.
-	if !paddingDisabled(ctx) && ctx.Err() == nil {
+	if isPlaybackRead(ctx) && ctx.Err() == nil {
 		now := time.Now()
 		sr.notePlaybackRead(now.Sub(fetchStart), now)
 	}

@@ -330,6 +330,24 @@ func paddingDisabled(ctx context.Context) bool {
 	return v
 }
 
+type playbackCtxKey struct{}
+
+// ContextForPlayback marks ctx as serving a client's stream (WebDAV or the DFS
+// mount, via pkg/usenet.Stream), as opposed to the process's own background
+// reads (durable cache persist, precache). Only a marked read that isn't a
+// verification read counts as playback for read-ahead yielding - see
+// playback_yield.go.
+func ContextForPlayback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, playbackCtxKey{}, true)
+}
+
+// isPlaybackRead reports whether ctx serves a client stream and isn't a
+// verification read.
+func isPlaybackRead(ctx context.Context) bool {
+	v, _ := ctx.Value(playbackCtxKey{}).(bool)
+	return v && !paddingDisabled(ctx)
+}
+
 // PaddingDisabled is the exported form of paddingDisabled, for callers
 // outside this package (pkg/usenet.Stream) that need to know a read was
 // marked as verification-only before deciding whether a resulting failure

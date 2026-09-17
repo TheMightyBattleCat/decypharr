@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/config"
 )
 
 // Read-ahead bursts yield to stalled playback on other files.
@@ -17,12 +19,17 @@ import (
 // ~4 GB next-episode bursts for another series ran back to back against the
 // same slow provider at ~2-3 MiB/s.
 //
-// A playback read that waits playbackStallAfter or longer for its segments
-// marks its reader stalled. While a reader other than its own stalled within
-// readAheadYieldFor, a burst starts no new segment (fetches already running
-// finish), and carries on once playback has gone that long without a stall. A
-// reader that is itself being played never yields: its read-ahead fills the
-// cache that playback reads next.
+// A playback read - one serving a client stream, marked by ContextForPlayback -
+// that waits playbackStallAfter or longer for its segments marks its reader
+// stalled. While a reader other than its own stalled within readAheadYieldFor,
+// a burst starts no new segment (fetches already running finish), and carries
+// on once playback has gone that long without a stall. A reader that is itself
+// being played never yields: its read-ahead fills the cache that playback
+// reads next.
+//
+// Paused time counts against the burst's own deadline, so a burst paused for a
+// long buffering session ends incomplete; the next trigger fills the gaps.
+// config.Precache.PrecacheYieldToPlayback turns the pause off.
 const (
 	// playbackStallAfter: how long a playback read must wait for its segments
 	// to count as stalled - about the point a player starts to buffer.
@@ -115,7 +122,7 @@ func (sr *StreamingReader) yieldToPlayback(ctx context.Context, nextSeg int) err
 		return nil
 	}
 	start := time.Now()
-	if sr.beingPlayed(start) || !b.stalledOther(sr, start) {
+	if sr.beingPlayed(start) || !b.stalledOther(sr, start) || !yieldEnabled() {
 		return nil
 	}
 	sr.logger.Debug().Int("next_seg", nextSeg).
@@ -131,10 +138,15 @@ func (sr *StreamingReader) yieldToPlayback(ctx context.Context, nextSeg int) err
 		case <-tick.C:
 		}
 		now := time.Now()
-		if sr.beingPlayed(now) || !b.stalledOther(sr, now) {
+		if sr.beingPlayed(now) || !b.stalledOther(sr, now) || !yieldEnabled() {
 			sr.logger.Debug().Int("next_seg", nextSeg).Dur("paused", now.Sub(start)).
 				Msg("read-ahead resumed: no playback stalls for the yield window")
 			return nil
 		}
 	}
+}
+
+// yieldEnabled reports whether read-ahead bursts pause for stalled playback.
+func yieldEnabled() bool {
+	return config.Get().Precache.YieldToPlayback()
 }

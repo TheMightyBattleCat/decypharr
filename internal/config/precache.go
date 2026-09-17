@@ -54,6 +54,13 @@ type PrecacheConfig struct {
 	// those durable bytes were deleted, though; the DFS cache's own
 	// eviction (unrelated to this cap) is what eventually reclaims them.
 	PrecacheMaxBytes *int64 `json:"precache_max_bytes,omitempty"`
+
+	// PrecacheYieldToPlayback pauses read-ahead bursts on other files while a
+	// client's playback is stalling on the network (see
+	// pkg/usenet/fs/reader/playback_yield.go). *bool so unset means on; an
+	// explicit false turns the pause off. Read when a pause would start and on
+	// every poll while paused, so a change applies without a restart.
+	PrecacheYieldToPlayback *bool `json:"precache_yield_to_playback,omitempty"`
 }
 
 func (p PrecacheConfig) IsZero() bool {
@@ -61,7 +68,14 @@ func (p PrecacheConfig) IsZero() bool {
 		p.PrecacheReadAheadConcurrency == 0 &&
 		p.PrecacheNextEpisodes == nil &&
 		!p.PrecacheEvictAfterWatched &&
-		p.PrecacheMaxBytes == nil
+		p.PrecacheMaxBytes == nil &&
+		p.PrecacheYieldToPlayback == nil
+}
+
+// YieldToPlayback reports whether read-ahead bursts pause for stalled playback
+// on other files, defaulting to true when unset.
+func (p PrecacheConfig) YieldToPlayback() bool {
+	return p.PrecacheYieldToPlayback == nil || *p.PrecacheYieldToPlayback
 }
 
 // ThresholdPercent returns the configured threshold, clamped to a sane

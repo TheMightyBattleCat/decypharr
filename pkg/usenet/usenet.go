@@ -1672,6 +1672,11 @@ func ContextForBurstDownload(ctx context.Context) context.Context {
 
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
+	// Every client stream comes through here; background reads don't. A slow
+	// playback read pauses other files' read-ahead bursts - see
+	// reader.ContextForPlayback. Verification reads are excluded by the
+	// reader itself.
+	ctx = reader.ContextForPlayback(ctx)
 	if start < 0 {
 		start = 0
 	}

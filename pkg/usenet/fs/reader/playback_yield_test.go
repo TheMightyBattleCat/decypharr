@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/config"
 )
 
 // yieldTestReaders builds two readers over already-cached segments sharing a
@@ -92,27 +94,44 @@ func TestNotePlaybackReadThreshold(t *testing.T) {
 	}
 }
 
-// Playback reads mark the reader as being played; verification reads don't.
+// Only a client stream's read marks the reader as being played: not a
+// background read (durable persist, precache), and not a verification read
+// even when it came through the stream path.
 func TestReadAtMarksPlaybackOnly(t *testing.T) {
 	// The test readers have no bytes on disk: past the segment check a read
 	// fails and resets its segments, so each read gets a fresh reader.
-	buf := make([]byte, 4096)
-	verify := newWindowedTestReader(t, 4, 1<<16)
-	defer verify.Close()
-	verify.stalls = newStallBoard(time.Minute, time.Second)
-	_, _ = verify.ReadAtContext(ContextWithoutPadding(context.Background()), buf, 0)
-	if verify.lastPlaybackRead.Load() != 0 {
-		t.Error("a verification read marked the reader as being played")
+	for _, tc := range []struct {
+		name string
+		ctx  func(context.Context) context.Context
+		want bool
+	}{
+		{"background", func(ctx context.Context) context.Context { return ctx }, false},
+		{"verification", func(ctx context.Context) context.Context { return ContextForPlayback(ContextWithoutPadding(ctx)) }, false},
+		{"playback", ContextForPlayback, true},
+	} {
+		sr := newWindowedTestReader(t, 4, 1<<16)
+		sr.stalls = newStallBoard(time.Minute, time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, _ = sr.ReadAtContext(tc.ctx(ctx), make([]byte, 4096), 0)
+		cancel()
+		_ = sr.Close()
+		if got := sr.lastPlaybackRead.Load() != 0; got != tc.want {
+			t.Errorf("%s read marked the reader as being played = %v, want %v", tc.name, got, tc.want)
+		}
 	}
+}
 
-	sr := newWindowedTestReader(t, 4, 1<<16)
-	defer sr.Close()
-	sr.stalls = newStallBoard(time.Minute, time.Second)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	_, _ = sr.ReadAtContext(ctx, buf, 0)
-	if sr.lastPlaybackRead.Load() == 0 {
-		t.Error("a playback read did not mark the reader as being played")
+// PrecacheYieldToPlayback=false turns the pause off.
+func TestFetchRangeYieldSwitchedOff(t *testing.T) {
+	burst, played, board := yieldTestReaders(t, time.Minute)
+	board.note(played, time.Now())
+	off := false
+	cfg := config.Get()
+	cfg.Precache.PrecacheYieldToPlayback = &off
+	defer func() { cfg.Precache.PrecacheYieldToPlayback = nil }()
+
+	if took, err := fetchRangeTook(t, context.Background(), burst, 2*time.Second); err != nil || took > 200*time.Millisecond {
+		t.Fatalf("switched off: FetchRange took %v (err %v), want no pause", took, err)
 	}
 }
 
