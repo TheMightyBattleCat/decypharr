@@ -77,6 +77,15 @@ func TestMergeJSONKeepsLargeIntegersExact(t *testing.T) {
 	if string(merged) != want {
 		t.Errorf("got %s want %s", merged, want)
 	}
+	// And through the handler's decoder into the typed field: 2^53+1 is where a
+	// float64 detour would lose the last unit.
+	var cfg Config
+	if err := json.Unmarshal(merged, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Precache.PrecacheMaxBytes == nil || *cfg.Precache.PrecacheMaxBytes != 9007199254740993 || cfg.Precache.PrecacheThresholdPercent != 20 {
+		t.Errorf("decoded precache %+v", cfg.Precache)
+	}
 }
 
 func TestMergeJSONRejectsNonObjectPatch(t *testing.T) {

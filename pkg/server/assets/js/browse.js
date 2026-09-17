@@ -382,12 +382,15 @@ class FileBrowser {
         return html;
     }
 
-    async recheckEntry(name) {
+    // recheckEntry starts a recheck. With wait (a single row's menu) the reply
+    // is the finished record (200), or the in-progress one (202) if the check
+    // outlasts the wait; bulkRecheck starts each without waiting, so a
+    // selection is not checked one entry at a time.
+    async recheckEntry(name, {wait = true} = {}) {
         try {
             window.createToast?.(`Rechecking ${name}…`, 'info');
-            // wait: the reply is the finished record (200), or the in-progress
-            // one (202) if the check outlasts the wait.
-            const url = `${window.urlBase}api/repair/health/${encodeURIComponent(name)}/check?wait=300s`;
+            const query = wait ? '?wait=300s' : '';
+            const url = `${window.urlBase}api/repair/health/${encodeURIComponent(name)}/check${query}`;
             const res = await fetch(url, {method: 'POST'});
             if (!res.ok) {
                 const txt = await res.text();
@@ -396,7 +399,9 @@ class FileBrowser {
             const state = await res.json();
             this.state.health.set(name, state);
             this.refreshHealthBadges();
-            if (res.status === 202) {
+            if (!wait) {
+                window.createToast?.(`Recheck of ${name} started`, 'info');
+            } else if (res.status === 202) {
                 window.createToast?.(`Recheck of ${name} still running`, 'info');
             } else {
                 window.createToast?.(`Health: ${state.status}`, state.status === 'broken' ? 'warning' : 'success');
@@ -1175,7 +1180,7 @@ class FileBrowser {
             return;
         }
         for (const entry of selected) {
-            if (entry?.name) await this.recheckEntry(entry.name);
+            if (entry?.name) await this.recheckEntry(entry.name, {wait: false});
         }
     }
 }

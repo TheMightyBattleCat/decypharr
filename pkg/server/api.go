@@ -537,7 +537,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		newConfig.Port = "8282"
 	}
 
-	// Preserve fields that shouldn't be overwritten by frontend
+	// Preserve fields that shouldn't be overwritten by frontend. The merge
+	// above already keeps every key the form leaves out; the assignments below
+	// predate it and stay as a second guard (Auth is json:"-", so the merge
+	// cannot carry it). A regression in the merge shows in
+	// TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend, not here.
 	newConfig.Auth = currentConfig.GetAuth()
 	// The frontend config form doesn't include use_auth or enable_webdav_auth,
 	// so they would be zero-valued (false) in the decoded payload. Preserve
