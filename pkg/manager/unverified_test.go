@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -290,6 +291,50 @@ func TestReplaceUnverifiedDuringARun(t *testing.T) {
 	}
 	if h := health(t, repair, "Movie"); !h.IsUnverified() || len(h.BrokenFiles) != 0 {
 		t.Fatalf("record changed during a run: %+v", h)
+	}
+}
+
+// An entry whose broken files all have import-fault reasons (the release is
+// kept) survives the re-search; one broken in the posting is deleted, and so
+// is an entry mixing the two.
+func TestKeepEntryForReGrab(t *testing.T) {
+	for _, tc := range []struct {
+		reasons []string
+		keep    bool
+	}{
+		{[]string{reasonMissingVolume}, true},
+		{[]string{reasonSplicedVolumes}, true},
+		{[]string{reasonTailTruncated}, true},
+		{[]string{reasonVolumeOrder}, true},
+		{[]string{reasonMissingVolume, reasonSplicedVolumes}, true},
+		{[]string{"usenet_segment_missing"}, false},
+		{[]string{reasonMissingVolume, "usenet_segment_missing"}, false},
+		{nil, false},
+	} {
+		var files []storage.BrokenFile
+		for i, reason := range tc.reasons {
+			files = append(files, storage.BrokenFile{FileName: fmt.Sprintf("E%02d.mkv", i+1), Reason: reason})
+		}
+		if got := keepEntryForReGrab(files); got != tc.keep {
+			t.Errorf("reasons %v: keep=%v, want %v", tc.reasons, got, tc.keep)
+		}
+	}
+}
+
+// A file missing a volume at import (Tide on Sark on a production install) is re-grabbed
+// keeping its release; its entry stays until the re-import supersedes it.
+func TestFinalizeEntryRepairKeepsMissingVolumeEntry(t *testing.T) {
+	repair := newTestRepairForFix(t)
+	e := torrentEntry("h1", "Show", "")
+	if err := repair.manager.storage.AddOrUpdate(e); err != nil {
+		t.Fatal(err)
+	}
+	h := &storage.EntryHealth{EntryName: "Show", Status: storage.HealthBroken, FileCount: 1, BrokenCount: 1,
+		BrokenFiles: []storage.BrokenFile{{EntryName: "Show", FileName: "Show.mkv", InfoHash: "h1", Reason: reasonMissingVolume,
+			ArrName: "sonarr", MediaID: 1, ArrFileID: 101}}}
+	repair.finalizeEntryRepair("Show", h, map[string]struct{}{"sonarr": {}})
+	if got, err := repair.manager.storage.Get("h1"); err != nil || got == nil {
+		t.Fatalf("entry deleted after re-grabbing a file missing a volume at import (%v)", err)
 	}
 }
 

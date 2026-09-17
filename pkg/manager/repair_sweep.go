@@ -1505,6 +1505,16 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	return actioned, false
 }
 
+// keepEntryForReGrab reports whether a fully broken entry stays after its
+// files are re-searched: every broken file has an import-fault reason (tail
+// truncated, volumes out of order, a volume missing or spliced at import), so
+// its re-grab keeps the release. A re-grab that never lands then leaves the
+// entry to fix or import by hand; the replacement supersedes it when it lands.
+// A file broken in the posting itself lets the entry go.
+func keepEntryForReGrab(files []storage.BrokenFile) bool {
+	return len(files) > 0 && !slices.ContainsFunc(files, func(bf storage.BrokenFile) bool { return !keepReleaseReason(bf.Reason) })
+}
+
 // finalizeEntryRepair stamps LastRepairAt and, when the entry is fully broken
 // and every broken file was handled (Arr-deleted + re-searched), deletes it.
 // Partial-broken entries are left in place so their healthy files survive.
@@ -1530,10 +1540,7 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 		if len(hashes) == 0 {
 			shouldDelete = false
 		}
-		// A replaced file (tail truncated, volumes out of order) still played.
-		// Keep its entry so a re-grab that never lands leaves a copy to import
-		// by hand; the replacement supersedes it when it does.
-		if !slices.ContainsFunc(h.BrokenFiles, func(bf storage.BrokenFile) bool { return !replaceableReason(bf.Reason) }) {
+		if keepEntryForReGrab(h.BrokenFiles) {
 			shouldDelete = false
 		}
 	}
