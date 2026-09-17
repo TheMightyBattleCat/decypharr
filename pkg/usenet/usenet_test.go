@@ -185,22 +185,23 @@ func TestParseWithIDRejectsKnownDeadPosting(t *testing.T) {
 	}
 }
 
-// Streaming must serve the record every check reads. Tide on Sark S02 on
-// a production install held each episode whole and, after it, as one RAR volume; the
-// stream took the last record and served 49,999,892 of 4.21 GB.
+// Streaming must serve the record every check reads. Fear Light & Clocks
+// S04E02 on a production install was stored as a media record laid out to its size and,
+// after it, a record laid out to twice its size; the stream took the last one
+// while every check read the first.
 func TestGetFileServesTheCheckedRecord(t *testing.T) {
 	store := &NZBStorage{metaDir: t.TempDir(), logger: zerolog.Nop()}
 	u := &Usenet{logger: zerolog.Nop(), nzbStorage: store}
 
-	record := func(n int) storage.NZBFile {
-		f := storage.NZBFile{Name: "e01.mkv", Size: int64(n) * 1000}
+	record := func(n int, size int64) storage.NZBFile {
+		f := storage.NZBFile{Name: "e01.mkv", Size: size}
 		for i := 0; i < n; i++ {
 			start := int64(i) * 1000
 			f.Segments = append(f.Segments, storage.NZBSegment{Number: i + 1, MessageID: fmt.Sprintf("m%d@x", i), Bytes: 1000, StartOffset: start, EndOffset: start + 999})
 		}
 		return f
 	}
-	nzb := &storage.NZB{ID: "tos", Name: "Tide.On.Sark.S02", Files: []storage.NZBFile{record(85), record(1)}}
+	nzb := &storage.NZB{ID: "tos", Name: "Fear.Light.and.Clocks.S04E02", Files: []storage.NZBFile{record(354, 354_000), record(708, 354_000)}}
 	if err := store.AddNZB(nzb); err != nil {
 		t.Fatalf("AddNZB: %v", err)
 	}
@@ -214,7 +215,7 @@ func TestGetFileServesTheCheckedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getFile: %v", err)
 	}
-	if got.Size != want.Size || len(got.Segments) != len(want.Segments) || got.Size != 85_000 {
+	if got.Size != want.Size || len(got.Segments) != len(want.Segments) || len(got.Segments) != 354 {
 		t.Fatalf("stream record %d B / %d segments, checks read %d B / %d segments", got.Size, len(got.Segments), want.Size, len(want.Segments))
 	}
 	if got.NzbID != "tos" {

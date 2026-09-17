@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 // Reasons for a Usenet file assembled wrong at import. The posting itself is
@@ -50,6 +51,7 @@ type geometryVerdict struct {
 	tailTruncated bool   // short by less than an article: flagged, not broken
 	singleSplice  bool   // one duplicate boundary: flagged, not broken
 	shortVolume   bool   // a short volume before a full one: volume order worth checking
+	missingStart  bool   // the first stored volume continues the file: its start is missing
 	splices       int
 	shortBytes    int64
 }
@@ -206,8 +208,30 @@ func (r *Repair) checkImportGeometry(ctx context.Context, infoHash, name string,
 		want := first.SegmentDataStart + min(first.Bytes, matroskaHeadBytes)
 		prefix, err := u.FetchArticlePrefix(ctx, first.MessageID, int(want))
 		if err == nil && int64(len(prefix)) == want {
+			if startsMidArchive(f, prefix) {
+				return geometryVerdict{reason: reasonMissingVolume, missingStart: true}
+			}
 			head = prefix[first.SegmentDataStart:]
 		}
 	}
 	return classifyGeometry(f, head)
+}
+
+// startsMidArchive reports whether a stored RAR file's first slice is data
+// its archive continues from an earlier volume: the file header whose data
+// starts exactly where the stored file does has split-before set, so the
+// volume holding the file's first bytes was left out at import. prefix is
+// the first slice's article from its first byte. Tide on Sark S02 on
+// a production install stored each episode's .r00-.r83 volumes as a file without the
+// .rar volume, 49,999,892 B short and with no Matroska header.
+func startsMidArchive(f *storage.NZBFile, prefix []byte) bool {
+	if f == nil || f.FileType != storage.NZBFileTypeRar || len(f.Segments) == 0 {
+		return false
+	}
+	first := f.Segments[0]
+	if first.SegmentDataStart <= 0 {
+		return false
+	}
+	hs, ok := parser.ReadFileHeaderStart(prefix)
+	return ok && hs.SplitBefore && hs.DataAt == first.SegmentDataStart
 }

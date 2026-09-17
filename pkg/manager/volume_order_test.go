@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -105,6 +106,46 @@ func TestShortVolumeBeforeFull(t *testing.T) {
 			}
 			if got := classifyGeometry(f, nil).shortVolume; got != c.want {
 				t.Fatalf("classifyGeometry shortVolume %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// Tide on Sark S02E01's .r00 volume stored as a file of its own starts
+// mid-archive; its .rar volume, and a file whose header is not the one its
+// data follows, do not.
+func TestStartsMidArchive(t *testing.T) {
+	mustHex := func(s string) []byte {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	const tosRar = "526172211a0700b2ef7301010d00000000000000f8d974c291440014f0fa027db835fe02ee993c46864a89401430170020000000000000000000000074656e6569676874792d746f737330326530312e6d6b7600b01025761a45dfa3"
+	const tosR00 = "526172211a0700f1fb7301000d00000000000000564174c391440014f0fa027db835fe026f7fe593864a89401430170020000000000000000000000074656e6569676874792d746f737330326530312e6d6b7600b010257653868dc9"
+	file := func(sds int64) *storage.NZBFile {
+		return &storage.NZBFile{Name: "teneighty-toss02e01.mkv", FileType: storage.NZBFileTypeRar,
+			Segments: []storage.NZBSegment{{Number: 1, SegmentDataStart: sds, Bytes: 767912}}}
+	}
+	cases := []struct {
+		name   string
+		f      *storage.NZBFile
+		prefix string
+		want   bool
+	}{
+		{".r00 stored alone", file(88), tosR00, true},
+		{".rar volume", file(88), tosRar, false},
+		// A season-set episode starting mid-article after another file's
+		// continued data: that header's data is not where this file starts.
+		{"another file's header", file(500_000), tosR00, false},
+		{"no data start", file(0), tosR00, false},
+		{"not RAR", &storage.NZBFile{FileType: storage.NZBFileTypeMedia, Segments: []storage.NZBSegment{{SegmentDataStart: 88}}}, tosR00, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := startsMidArchive(c.f, mustHex(c.prefix)); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
 			}
 		})
 	}

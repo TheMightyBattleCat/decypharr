@@ -13,19 +13,21 @@ func contiguousFile(name string, n int, per int64) NZBFile {
 }
 
 func TestGetFileByNameSameNameRecords(t *testing.T) {
-	full := contiguousFile("e01.mkv", 85, 1000)
+	rest := contiguousFile("e01.mkv", 84, 1000)
 	oneVolume := contiguousFile("e01.mkv", 1, 1000)
 
-	// Tide on Sark S02: whole, then again as its first RAR volume - and the
-	// other order, so the choice does not hang on position.
+	// Tide on Sark S02: the .r00-.r83 volumes and the .rar volume stored as
+	// two records of one name. Both lay out to their size and neither is
+	// the episode; size must not pick the headless larger one. The last
+	// record, which streaming always served, stays - in either order.
 	for name, files := range map[string][]NZBFile{
-		"whole first": {full, oneVolume},
-		"whole last":  {oneVolume, full},
+		"rest first": {rest, oneVolume},
+		"rest last":  {oneVolume, rest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			n := &NZB{Files: files}
-			if got := n.GetFileByName("e01.mkv"); got == nil || got.Size != full.Size {
-				t.Fatalf("got %+v, want the whole record (%d B)", got, full.Size)
+			if got := n.GetFileByName("e01.mkv"); got == nil || got.Size != files[1].Size {
+				t.Fatalf("got %+v, want the last record (%d B)", got, files[1].Size)
 			}
 			if c := n.FileNameCount("e01.mkv"); c != 2 {
 				t.Fatalf("FileNameCount = %d, want 2", c)
@@ -42,9 +44,9 @@ func TestGetFileByNameSameNameRecords(t *testing.T) {
 		t.Fatalf("got %d segments, want the media record's 354", len(got.Segments))
 	}
 
-	deleted := full
+	deleted := rest
 	deleted.IsDeleted = true
-	if got := (&NZB{Files: []NZBFile{deleted, oneVolume}}).GetFileByName("e01.mkv"); got == nil || got.Size != oneVolume.Size {
+	if got := (&NZB{Files: []NZBFile{oneVolume, deleted}}).GetFileByName("e01.mkv"); got == nil || got.Size != oneVolume.Size {
 		t.Fatalf("a deleted record was chosen: %+v", got)
 	}
 
@@ -69,7 +71,7 @@ func TestGetFileByNameSameNameRecords(t *testing.T) {
 	if got := (&NZB{Files: []NZBFile{headerA, headerB}}).GetFileByName("e01.mkv"); got == nil || got.Size != 9 {
 		t.Fatalf("header-only lookup got %+v, want the last record", got)
 	}
-	if got := (&NZB{Files: []NZBFile{full}}).GetFileByName("other.mkv"); got != nil {
+	if got := (&NZB{Files: []NZBFile{rest}}).GetFileByName("other.mkv"); got != nil {
 		t.Fatalf("missing name returned %+v", got)
 	}
 }

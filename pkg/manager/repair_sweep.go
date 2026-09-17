@@ -698,7 +698,7 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				switch {
 				case geo.reason != "":
 					r.logger.Warn().Str("entry", c.name).Str("file", name).Str("reason", geo.reason).
-						Int("spliced_boundaries", geo.splices).Int64("short_bytes", geo.shortBytes).
+						Int("spliced_boundaries", geo.splices).Int64("short_bytes", geo.shortBytes).Bool("missing_start", geo.missingStart).
 						Msg("Repair: file was assembled wrong at import; the posting is fine, so a re-grab keeps the release")
 					res.healthy = false
 					res.broken = true

@@ -38,6 +38,35 @@ func TestReadVolumeHead(t *testing.T) {
 	}
 }
 
+// First article bytes read on a production install 2026-09-17: Tide on Sark S02E01's .rar
+// (first) and .r00 (second) volumes, both with data at 88; Emberly's RAR5
+// volume 2 (.mkv continued, data at 138).
+func TestReadFileHeaderStart(t *testing.T) {
+	const tosRar = "526172211a0700b2ef7301010d00000000000000f8d974c291440014f0fa027db835fe02ee993c46864a89401430170020000000000000000000000074656e6569676874792d746f737330326530312e6d6b7600b01025761a45dfa3"
+	const tosR00 = "526172211a0700f1fb7301000d00000000000000564174c391440014f0fa027db835fe026f7fe593864a89401430170020000000000000000000000074656e6569676874792d746f737330326530312e6d6b7600b010257653868dc9"
+	const emberly2 = "526172211a070100085054da1101050c03010b0101dffefff98180808000c708573467021b0bddfdfff981800004becdcec3d68000a083028b015d9c8000013f456d6265726c792e323031332e426c755261792e31303830702e4454532d48442e4d412e372e312e4156432e52454d55582d4672614d6553546f522e6d6b760a03130075f36831c3a53aa6ab46d91a6aea27391beef2"
+	cases := []struct {
+		name string
+		hex  string
+		want FileHeaderStart
+		ok   bool
+	}{
+		{"rar4 first volume", tosRar, FileHeaderStart{DataAt: 88}, true},
+		{"rar4 continued volume", tosR00, FileHeaderStart{DataAt: 88, SplitBefore: true}, true},
+		{"rar5 continued volume", emberly2, FileHeaderStart{DataAt: 138, SplitBefore: true}, true},
+		{"not a volume start", "b3fa5947243ca88903f53162bf162acaaa2b1a79a78d7e3da5ad2ed2e4273f43", FileHeaderStart{}, false},
+		{"rar4 cut inside the file header", tosRar[:80], FileHeaderStart{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ReadFileHeaderStart(mustHex(t, c.hex))
+			if ok != c.ok || got != c.want {
+				t.Fatalf("got %+v, %v; want %+v, %v", got, ok, c.want, c.ok)
+			}
+		})
+	}
+}
+
 func TestNameVolumeNumber(t *testing.T) {
 	cases := []struct {
 		name string

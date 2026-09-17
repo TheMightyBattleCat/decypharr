@@ -152,11 +152,12 @@ type NZBFile struct {
 // S04E02 as a media file and as a "rar" record laid out to twice its size.
 // Streaming took the last such record and every check the first, so a check
 // read one copy and playback served another. Both now take the same one: the
-// last record, as streaming always did, unless another record's articles run
-// contiguously from byte 0 to exactly its size and the last one's do not, or
-// that record is larger. Of 42 such names on a production install that changes what
-// streams for 10 (Tide on Sark ×8, Isles and Shoals, Fear Light & Clocks
-// S04E02); the rest (same size, a segment apart) keep the record they play.
+// last record, as streaming always did, unless its articles do not run
+// contiguously from byte 0 to exactly its size and another record's do (the
+// largest such). Size alone does not decide: Tide on Sark's larger record is
+// the set's .r00-.r83 volumes without the .rar volume the smaller one holds,
+// so neither is the episode (4,264,933,501 B) and the larger one serves no
+// Matroska header at all.
 func (nzb *NZB) GetFileByName(name string) *NZBFile {
 	var last, best *NZBFile
 	for i := range nzb.Files {
@@ -169,7 +170,7 @@ func (nzb *NZB) GetFileByName(name string) *NZBFile {
 			best = f
 		}
 	}
-	if best != nil && best != last && (!last.LayoutCoversSize() || best.Size > last.Size) {
+	if best != nil && last != nil && !last.LayoutCoversSize() {
 		return best
 	}
 	return last
