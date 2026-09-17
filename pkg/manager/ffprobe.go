@@ -848,6 +848,9 @@ const (
 	// decodePhaseSpreadLead re-decodes a spread's windows from
 	// decodeSpreadLead earlier, after codec errors - see decodeWindows.
 	decodePhaseSpreadLead = "spread_lead"
+	// decodePhaseDetectLead re-decodes the detect window from
+	// decodeSpreadLead earlier, after codec errors - see detectLead.
+	decodePhaseDetectLead = "detect_lead"
 )
 
 // decodeSpreadLead is how far before each window a codec-errors spread is
@@ -1242,6 +1245,21 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 			// file, and in particular not that it cannot seek. Errors that
 			// decoded through end the verification instead, since a retry
 			// would see them again.
+			if reason == ffprobeReasonDecodedThrough && recordedDecodeCause(ctx) == decodeCauseCodec {
+				// Codec errors at the detect window's start can be the decoder
+				// starting on a frame that needs earlier ones, as on the spread
+				// (decodeSpreadLead; Emberly and Constitution Day Reckonings
+				// on a production install listed codec errors from detect). Decode that
+				// window again from earlier; the window at offset 0 cannot
+				// start earlier.
+				switch r := f.detectLead(ctx, entryFolder, fileName, detectOffset, fps, runPhase, detectCap); {
+				case r.passed:
+					scope.rememberSeek(canSeek)
+					return spread()
+				case r.failed:
+					return false, r.reason, r.conclusive, ""
+				}
+			}
 			if reason == ffprobeReasonDecodedThrough {
 				budget.Exhaust()
 				noteUnverified(ctx, unverifiedDecodeErrors)
@@ -1289,6 +1307,47 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		return true, "", false, decodeCoveragePartial
 	}
 	return ok, reason, conclusive, decodeCoveragePartial
+}
+
+// detectLeadResult is how a detect lead-in pass ended: passed (clean, so the
+// file seeks and the check goes on to the spread), failed (a decode error: a
+// failed check, as for any detect probe), or neither (errors again, cut or
+// timed out: the first pass's finding stands).
+type detectLeadResult struct {
+	passed, failed bool
+	reason         string
+	conclusive     bool
+}
+
+// detectLead re-runs the detect phase with its second window starting
+// decodeSpreadLead earlier and running through the same frames, under a fresh
+// detect cap. When it neither passes nor fails, the decode cause the first pass
+// recorded is put back, so the file is listed exactly as it was before.
+func (f *ffprobeChecker) detectLead(ctx context.Context, entryFolder, fileName string, detectOffset time.Duration, fps float64,
+	runPhase func(phase string, intervals []string, limit int64) (*VerifyBudget, bool, string, bool), detectCap int64) detectLeadResult {
+	var saved unverifiedCause
+	c, _ := ctx.Value(unverifiedCauseCtxKey{}).(*unverifiedCause)
+	if c != nil {
+		saved = *c
+	}
+	from := max(0, detectOffset-decodeSpreadLead)
+	lead, ok, reason, conclusive := runPhase(decodePhaseDetectLead, []string{
+		decodeInterval(0, ffprobeDecodeWindowSpan, fps),
+		decodeInterval(from, ffprobeDecodeWindowSpan+(detectOffset-from), fps),
+	}, detectCap)
+	switch {
+	case !lead.Exceeded() && ok && reason == "" && conclusive:
+		budgetStats(f.logger.Info().Str("entry", entryFolder).Str("file", fileName), lead).
+			Msg("Repair: codec errors at the detect window's start were not there when decoding from earlier; continuing the check")
+		noteUnverified(ctx, "")
+		return detectLeadResult{passed: true}
+	case !lead.Exceeded() && !ok:
+		return detectLeadResult{failed: true, reason: reason, conclusive: conclusive}
+	}
+	if c != nil {
+		*c = saved
+	}
+	return detectLeadResult{}
 }
 
 // checkConfirmed retries once before declaring a file broken: a transient

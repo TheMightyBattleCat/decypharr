@@ -103,6 +103,124 @@ func TestDecodeWindows_CodecErrorsDecodedAgainFromEarlier(t *testing.T) {
 	}
 }
 
+// detectLeadOutcome is one faked detect-path probe: its result, what it
+// prints (noted as decode errors), a cut, or a reason it notes itself.
+type detectLeadOutcome struct {
+	probeOutcome
+	stderr string
+	note   string
+}
+
+func detectLeadChecker(outcomes map[string]detectLeadOutcome) (*ffprobeChecker, *[]probeCall) {
+	calls := &[]probeCall{}
+	f := &ffprobeChecker{timeout: 90 * time.Second, detectBytes: defaultDecodeDetectBytes, headBytes: defaultDecodeHeadBytes, logger: zerolog.Nop()}
+	f.runProbeFn = func(ctx context.Context, _, _, phase string, intervals []string, _ time.Duration, _ int64, budget *VerifyBudget) (bool, string, bool) {
+		*calls = append(*calls, probeCall{phase: phase, intervals: intervals, budget: budget})
+		o, found := outcomes[phase]
+		if !found {
+			return true, "", true
+		}
+		if o.cut {
+			budget.Add(budget.Limit() + 1)
+		}
+		if o.stderr != "" {
+			noteDecodeErrors(ctx, o.stderr, o.stderr)
+		}
+		if o.note != "" {
+			noteUnverified(ctx, o.note)
+		}
+		return o.ok, o.reason, o.conclusive
+	}
+	return f, calls
+}
+
+// Codec errors in the detect phase (Emberly, Constitution Day Reckonings) are
+// decoded again from earlier, like the spread's.
+func TestDecodeWindows_DetectCodecErrorsDecodedAgainFromEarlier(t *testing.T) {
+	codecThrough := detectLeadOutcome{probeOutcome: decodedThrough, stderr: codecStderr}
+	for _, tc := range []struct {
+		name           string
+		outcomes       map[string]detectLeadOutcome
+		wantPhases     []string
+		wantOK         bool
+		wantConclusive bool
+		wantReason     string // recorded unverified reason, "" for a verdict
+		wantCause      string
+	}{
+		{
+			name:       "clean from earlier goes on to the spread",
+			outcomes:   map[string]detectLeadOutcome{decodePhaseDetect: codecThrough},
+			wantPhases: []string{decodePhaseDetect, decodePhaseDetectLead, decodePhaseSpread}, wantOK: true, wantConclusive: true,
+		},
+		{
+			name:       "errors again stay unverified",
+			outcomes:   map[string]detectLeadOutcome{decodePhaseDetect: codecThrough, decodePhaseDetectLead: codecThrough},
+			wantPhases: []string{decodePhaseDetect, decodePhaseDetectLead}, wantOK: true,
+			wantReason: unverifiedDecodeErrors, wantCause: decodeCauseCodec,
+		},
+		{
+			name: "container errors are not re-decoded",
+			outcomes: map[string]detectLeadOutcome{
+				decodePhaseDetect: {probeOutcome: decodedThrough, stderr: containerStderr},
+			},
+			wantPhases: []string{decodePhaseDetect}, wantOK: true,
+			wantReason: unverifiedDecodeErrors, wantCause: decodeCauseContainer,
+		},
+		{
+			name: "a decode error from earlier is a failed check",
+			outcomes: map[string]detectLeadOutcome{
+				decodePhaseDetect:     codecThrough,
+				decodePhaseDetectLead: {probeOutcome: probeOutcome{ok: false, reason: ffprobeReasonDecodeError, conclusive: true}},
+			},
+			wantPhases: []string{decodePhaseDetect, decodePhaseDetectLead}, wantOK: false, wantConclusive: true,
+		},
+		{
+			name: "a cut lead-in keeps the first finding",
+			outcomes: map[string]detectLeadOutcome{
+				decodePhaseDetect:     codecThrough,
+				decodePhaseDetectLead: {probeOutcome: unseekable},
+			},
+			wantPhases: []string{decodePhaseDetect, decodePhaseDetectLead}, wantOK: true,
+			wantReason: unverifiedDecodeErrors, wantCause: decodeCauseCodec,
+		},
+		{
+			name: "a timed-out lead-in keeps the first finding",
+			outcomes: map[string]detectLeadOutcome{
+				decodePhaseDetect:     codecThrough,
+				decodePhaseDetectLead: {probeOutcome: probeOutcome{ok: true, conclusive: false}, note: unverifiedTimeout},
+			},
+			wantPhases: []string{decodePhaseDetect, decodePhaseDetectLead}, wantOK: true,
+			wantReason: unverifiedDecodeErrors, wantCause: decodeCauseCodec,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := verifyBudgetFor(testBigFile)
+			f, calls := detectLeadChecker(tc.outcomes)
+			cause := &unverifiedCause{}
+			ctx := contextWithUnverifiedCause(context.Background(), cause)
+			ok, _, conclusive, _ := f.decodeWindows(ctx, "E", "f.mkv", testDuration, testBigFile, budget)
+			if ok != tc.wantOK || conclusive != tc.wantConclusive {
+				t.Fatalf("got ok=%v conclusive=%v, want ok=%v conclusive=%v", ok, conclusive, tc.wantOK, tc.wantConclusive)
+			}
+			if got := phases(*calls); !slices.Equal(got, tc.wantPhases) {
+				t.Fatalf("phases %v, want %v", got, tc.wantPhases)
+			}
+			if tc.wantReason != "" && (cause.reason != tc.wantReason || cause.decodeCause != tc.wantCause) {
+				t.Fatalf("recorded %q/%q, want %q/%q", cause.reason, cause.decodeCause, tc.wantReason, tc.wantCause)
+			}
+			if ok && conclusive && cause.reason != "" {
+				t.Fatalf("a passed check still records %q", cause.reason)
+			}
+			if len(*calls) >= 2 {
+				detect, lead := (*calls)[0].intervals, (*calls)[1].intervals
+				if len(detect) != 2 || len(lead) != 2 || lead[0] != detect[0] || lead[1] == detect[1] {
+					t.Fatalf("detect %v, lead %v: want window 0 unchanged and window 1 moved earlier", detect, lead)
+				}
+			}
+		})
+	}
+}
+
 func TestSpreadIntervalsLead(t *testing.T) {
 	f := &ffprobeChecker{}
 	const fps = 23.976
