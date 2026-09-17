@@ -323,6 +323,13 @@ type EntryHealth struct {
 	ActiveRunID    string       `json:"active_run_id,omitempty"`
 	PreviousStatus HealthStatus `json:"previous_status,omitempty"`
 
+	// LastRecheckRunID and LastRecheckFinishedAt record the last single-entry
+	// recheck to end (Repair.RecheckEntry), on every exit including a recheck
+	// that cleared the entry as superseded without probing it. A caller holding
+	// the run ID from the recheck's reply knows it is done when these match.
+	LastRecheckRunID      string    `json:"last_recheck_run_id,omitempty"`
+	LastRecheckFinishedAt time.Time `json:"last_recheck_finished_at,omitempty"`
+
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

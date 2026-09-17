@@ -2692,13 +2692,18 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		return nil, fmt.Errorf("entry %q not found", entryName)
 	}
 
-	runID := "recheck-" + entryName
+	// One ID per recheck: with the entry name alone, two rechecks of the same
+	// entry could not be told apart by a caller polling for the result.
+	runID := fmt.Sprintf("recheck-%s-%d", entryName, time.Now().UnixNano())
 	c := &candidate{name: entryName, item: item}
+	done := make(chan struct{})
+	r.rechecks.Store(runID, done)
 
 	if ctx == nil {
 		ctx = r.parentCtx
 	}
 	r.runWG.Go(func() {
+		defer r.finishRecheck(entryName, runID, done)
 		runCtx := r.attachFFProbeChecker(ctx, r.logger)
 
 		// Build the Arr reference set once for this recheck and reuse it both
@@ -2774,6 +2779,47 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 	h.Status = storage.HealthRepairing
 	h.ActiveRunID = runID
 	return h, nil
+}
+
+// recheckDoneRetention is how long WaitRecheck can still see a recheck that
+// has ended.
+const recheckDoneRetention = 10 * time.Minute
+
+// finishRecheck runs when a RecheckEntry run ends, however it ends (probed,
+// fixed, or cleared as superseded without a probe): it stamps the entry's
+// health record with the run, when one still exists, and wakes WaitRecheck.
+// Before this a recheck that found the entry superseded returned without
+// touching last_checked_at, so a caller polling for it never saw an end.
+func (r *Repair) finishRecheck(entryName, runID string, done chan struct{}) {
+	if h, err := r.manager.storage.GetEntryHealth(entryName); err == nil && h != nil {
+		h.LastRecheckRunID = runID
+		h.LastRecheckFinishedAt = time.Now()
+		if h.ActiveRunID == runID {
+			h.ActiveRunID = ""
+		}
+		r.saveHealth(h)
+	}
+	close(done)
+	time.AfterFunc(recheckDoneRetention, func() { r.rechecks.Delete(runID) })
+}
+
+// WaitRecheck blocks until the recheck runID ends, timeout passes or ctx is
+// done, and reports whether the recheck ended. An unknown run ID (never
+// started here, or ended more than recheckDoneRetention ago) reports false.
+func (r *Repair) WaitRecheck(ctx context.Context, runID string, timeout time.Duration) bool {
+	v, ok := r.rechecks.Load(runID)
+	if !ok {
+		return false
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-v.(chan struct{}):
+		return true
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	return false
 }
 
 // RecheckMedia kicks off a recheck for every entry that an Arr's media-id

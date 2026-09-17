@@ -1265,15 +1265,19 @@ class RepairManager {
 
     async recheckOne(name) {
         try {
-            const res = await fetch(`${this.api}/repair/health/${encodeURIComponent(name)}/check`, {method: 'POST'});
-            if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
             this.toast(`Recheck started for ${name}`, 'success');
-            // Recheck flips the entry to repairing; refresh shortly so the row updates.
-            setTimeout(() => {
-                this.loadBroken();
-                if (this.isUnverifiedModalOpen()) this.loadUnverified();
-                this.loadStatus();
-            }, 800);
+            // wait: the reply comes when the check has ended (200), or with the
+            // in-progress record (202) if it outlasts the wait. Refresh then,
+            // so the rows show the result rather than "repairing".
+            const res = await fetch(`${this.api}/repair/health/${encodeURIComponent(name)}/check?wait=300s`, {method: 'POST'});
+            if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+            if (res.status === 200) {
+                const state = await res.json();
+                this.toast(`Recheck of ${name} done: ${state.status}`, state.status === 'broken' ? 'warning' : 'success');
+            }
+            this.loadBroken();
+            if (this.isUnverifiedModalOpen()) this.loadUnverified();
+            this.loadStatus();
         } catch (e) {
             this.toast(`Recheck failed: ${e.message}`, 'error');
         }

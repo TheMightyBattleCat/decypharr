@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	json "github.com/bytedance/sonic"
 
@@ -1236,13 +1237,42 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
+	var wait time.Duration
+	if raw := r.URL.Query().Get("wait"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			http.Error(w, "Invalid wait (a duration such as 90s)", http.StatusBadRequest)
+			return
+		}
+		wait = min(d, maxRecheckWait)
+	}
 	state, err := svc.RecheckEntry(s.manager.Context(), name, fix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if wait > 0 {
+		// ?wait=<duration>: answer with the finished record, or 202 with the
+		// in-progress reply (its active_run_id is the run to wait for) when the
+		// recheck is still going.
+		if svc.WaitRecheck(r.Context(), state.ActiveRunID, wait) {
+			final, err := s.manager.Storage().GetEntryHealth(name)
+			if err != nil || final == nil {
+				http.Error(w, "Entry health not found: the recheck removed it", http.StatusNotFound)
+				return
+			}
+			utils.JSONResponse(w, final, http.StatusOK)
+			return
+		}
+		utils.JSONResponse(w, state, http.StatusAccepted)
+		return
+	}
 	utils.JSONResponse(w, state, http.StatusOK)
 }
+
+// maxRecheckWait caps how long a recheck request with ?wait= holds the
+// connection.
+const maxRecheckWait = 10 * time.Minute
 
 // handleFixBroken kicks off the Arr delete + re-search pass on currently
 // broken entries. Body: {"names": ["...", ...]}. Empty/missing names ⇒ fix

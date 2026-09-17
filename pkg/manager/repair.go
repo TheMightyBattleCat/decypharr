@@ -152,6 +152,11 @@ type Repair struct {
 	// (BuildArrReferencedSet). Read only by the overlay path; see
 	// arr_refs_cache.go.
 	arrRefs *arrRefsCache
+
+	// rechecks holds, per RecheckEntry run ID, a channel closed when that
+	// recheck ends (see WaitRecheck). Entries are dropped
+	// recheckDoneRetention after the end.
+	rechecks sync.Map // map[string]chan struct{}
 }
 
 // NewRepair builds the repair service for the given manager. Call
