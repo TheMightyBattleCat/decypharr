@@ -255,10 +255,16 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 				Int("end_seg", endSeg).
 				Int("segments", endSeg-startSeg+1).
 				Dur("fetch_dur", d)
-			if paddingDisabled(ctx) {
+			// Labelled by the same test that marks a playback stall below,
+			// so a background read (a durable-cache persist walk, say) no
+			// longer logs as playback.
+			switch {
+			case paddingDisabled(ctx):
 				ev.Msg("verification read: concurrent segment fetch blocked")
-			} else {
+			case isPlaybackRead(ctx):
 				ev.Msg("playback read: concurrent segment fetch blocked")
+			default:
+				ev.Msg("background read: concurrent segment fetch blocked")
 			}
 		}
 	} else {
