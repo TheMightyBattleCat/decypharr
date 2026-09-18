@@ -11,6 +11,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
+	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs/ranges"
 )
 
 // Manager manages VFS lifecycle
@@ -239,6 +240,19 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 		return false
 	}
 	return item.ReadCachedRange(p, off)
+}
+
+// HasCachedRange reports whether [off, off+length) of filename's cache item
+// under entryName is already cached, without reading or fetching anything:
+// the live in-memory item if one is open, else its on-disk metadata sidecar.
+func (m *Manager) HasCachedRange(entryName, filename string, off, length int64) bool {
+	if m.cache == nil || length <= 0 {
+		return false
+	}
+	if item, ok := m.cache.PeekItem(entryName, filename); ok {
+		return item.HasRange(ranges.Range{Pos: off, Size: length})
+	}
+	return m.cache.DiskHasRange(entryName, filename, off, length)
 }
 
 // WriteCachedRange durably writes p at [off, off+len(p)) into filename's

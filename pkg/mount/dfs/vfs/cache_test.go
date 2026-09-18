@@ -360,3 +360,35 @@ func TestCleanupItems_ForceZeroOpenClosesRecentItems(t *testing.T) {
 		t.Fatalf("expected cache buffer to be closed after forced cleanup, got %v", err)
 	}
 }
+
+// DiskHasRange answers from a closed file's sidecar: inside a recorded range
+// is cached, anything reaching past one is not, and no sidecar is nothing.
+func TestDiskHasRange(t *testing.T) {
+	cacheDir := t.TempDir()
+	entryDir := filepath.Join(cacheDir, "entry")
+	if err := os.MkdirAll(entryDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(entryDir, "video.mkv.json")
+	if err := os.WriteFile(metaPath, []byte(`{"size":1024,"ranges":[{"Pos":100,"Size":400}]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCache(cacheDir)
+	for _, tc := range []struct {
+		off, length int64
+		want        bool
+	}{
+		{100, 400, true},
+		{200, 100, true},
+		{50, 100, false},
+		{400, 200, false},
+		{600, 10, false},
+	} {
+		if got := c.DiskHasRange("entry", "video.mkv", tc.off, tc.length); got != tc.want {
+			t.Errorf("DiskHasRange(%d, %d) = %v, want %v", tc.off, tc.length, got, tc.want)
+		}
+	}
+	if c.DiskHasRange("entry", "other.mkv", 100, 10) {
+		t.Error("a file with no sidecar reported cached")
+	}
+}

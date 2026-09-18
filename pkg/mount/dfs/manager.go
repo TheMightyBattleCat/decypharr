@@ -159,6 +159,16 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return m.vfs.PeekCachedRange(entryName, filename, p, off)
 }
 
+// HasCachedRange reports whether [off, off+length) of filename's cache item
+// under entryName is already cached - see vfs.Manager.HasCachedRange. False
+// when there is no VFS mount.
+func (m *Manager) HasCachedRange(entryName, filename string, off, length int64) bool {
+	if m.vfs == nil {
+		return false
+	}
+	return m.vfs.HasCachedRange(entryName, filename, off, length)
+}
+
 // WriteCachedRange durably writes p at [off, off+len(p)) into filename's
 // cache item under entryName, creating it (sized by fileSize) if needed -
 // see vfs.Manager.WriteCachedRange. The write-side mirror of

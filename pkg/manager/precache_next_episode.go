@@ -365,15 +365,22 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 		concurrency := p.cfg().ReadAheadConcurrency()
 		p.logger.Info().Str("entry", nextEntry.Name).Str("file", filename).Int64("size", next.Size).Int("concurrency", concurrency).Msg("burst-downloading next episode ahead of playback")
 
-		burstErr := p.manager.usenet.ReadAhead(burstCtx, nextEntry.InfoHash, filename, 0, concurrency)
+		// Fetch and durably persist chunk by chunk, before waiting on repair -
+		// see burstToDurable, and persistCleanRanges for why damaged segments
+		// are deliberately excluded rather than persisted as padding. Fetching
+		// the whole episode first and persisting after meant reading it back
+		// through a 256 MB scratch cache, which re-downloaded all but its last
+		// few hundred MB.
+		res, burstErr := p.burstToDurable(burstCtx, nextEntry, filename, 0, next.Size, concurrency)
 		if burstErr != nil {
 			p.logger.Debug().Err(burstErr).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
 		}
-
-		// Durably persist whatever came back CLEAN into the DFS cache now, before
-		// waiting on repair - see persistCleanRanges for why damaged segments are
-		// deliberately excluded rather than persisted as padding.
-		p.persistCleanRanges(burstCtx, nextEntry, filename, next.Size)
+		if res.segmentsTotal > 0 {
+			res.persist.log(p.logger, nextEntry.Name, filename, res.segmentsTotal, "durable persist complete")
+		}
+		p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
+			Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
+			Msg("next-episode burst-download finished")
 	}
 
 	p.recordReadiness(burstCtx, nextEntry, filename, next.Size)

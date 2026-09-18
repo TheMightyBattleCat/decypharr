@@ -2105,6 +2105,15 @@ func (u *Usenet) ReadCachedAt(ctx context.Context, nzoID, filename string, p []b
 // enabled) exactly as it would be for a live read - see
 // pkg/usenet/fs/reader.SegmentFetcher.handleConfirmedMissing.
 func (u *Usenet) ReadAhead(ctx context.Context, nzoID, filename string, from int64, concurrency int) error {
+	return u.ReadAheadRange(ctx, nzoID, filename, from, -1, concurrency)
+}
+
+// ReadAheadRange is ReadAhead over [off, off+length) instead of to EOF; a
+// negative length means to EOF. The fetched segments land in the reader's
+// scratch SegmentCache, which holds only a few hundred MB, so a caller that
+// wants them durably has to copy each range out before fetching much more -
+// see pkg/manager.Precache.burstToDurable.
+func (u *Usenet) ReadAheadRange(ctx context.Context, nzoID, filename string, off, length int64, concurrency int) error {
 	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get or create entry: %w", err)
@@ -2115,11 +2124,14 @@ func (u *Usenet) ReadAhead(ctx context.Context, nzoID, filename string, from int
 		return fmt.Errorf("no volumes available for file %s", filename)
 	}
 	fileSize := entry.volumes[0].Size
-	if from < 0 {
-		from = 0
+	if off < 0 {
+		off = 0
 	}
-	if from >= fileSize {
+	if off >= fileSize {
 		return nil
+	}
+	if length < 0 || length > fileSize-off {
+		length = fileSize - off
 	}
 
 	readerAt, _, err := entry.getOrCreateReader()
@@ -2127,7 +2139,7 @@ func (u *Usenet) ReadAhead(ctx context.Context, nzoID, filename string, from int
 		return fmt.Errorf("failed to get reader: %w", err)
 	}
 
-	return readerAt.FetchRange(ctx, from, fileSize-from, concurrency)
+	return readerAt.FetchRange(ctx, off, length, concurrency)
 }
 
 // Stats returns nntp statistics

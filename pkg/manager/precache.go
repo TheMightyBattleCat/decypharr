@@ -518,13 +518,27 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 			Int("concurrency", concurrency).
 			Msg("starting read-ahead precache")
 
-		if err := p.manager.usenet.ReadAhead(ctx, entry.InfoHash, filename, from, concurrency); err != nil {
+		// Chunk by chunk into the durable cache - see burstToDurable. Before,
+		// this fetched [from, EOF) into the reader's 256 MB scratch cache and
+		// persisted nothing, so playback fetched the same bytes again when
+		// it got there. This ctx keeps zero-fill on (unlike the next-episode
+		// burst's): the reader is shared with this file's playback, and a
+		// dead article left failed instead of padded would fail the viewer's
+		// read. A padded segment is held for repair in the overlay, and
+		// persisting skips those, so no fill bytes become durable.
+		res, err := p.burstToDurable(ctx, entry, filename, from, size, concurrency)
+		if err != nil {
 			p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("read-ahead precache ended early")
 			p.logger.Warn().Str("entry", entry.Name).Str("file", filename).Int64("from", from).Err(err).
+				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
 				Msg("read-ahead incomplete")
 		} else {
 			p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
+				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
 				Msg("read-ahead complete")
+		}
+		if res.segmentsTotal > 0 {
+			res.persist.log(p.logger, entry.Name, filename, res.segmentsTotal, "read-ahead: durable persist complete")
 		}
 	}
 

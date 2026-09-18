@@ -244,6 +244,19 @@ func (c *Cache) DiskCoverage(entryName, filename string) (cached, total int64, m
 	return info.Rs.Size(), info.Size, info.ModTime, true
 }
 
+// DiskHasRange reports whether filename's on-disk metadata sidecar under
+// entryName records [off, off+length) as cached - DiskCoverage's per-range
+// counterpart, for a file not open in this process. False when there is no
+// sidecar.
+func (c *Cache) DiskHasRange(entryName, filename string, off, length int64) bool {
+	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
+	var info ItemInfo
+	if err := decodeJSONFile(metaPath, &info); err != nil || info.Size == 0 {
+		return false
+	}
+	return info.Rs.Present(ranges.Range{Pos: off, Size: length})
+}
+
 func (c *Cache) scanDiskCandidates() diskScanResult {
 	var result diskScanResult
 	topEntries, err := os.ReadDir(c.config.CacheDir)
