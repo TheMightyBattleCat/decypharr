@@ -121,8 +121,13 @@ func (sr *StreamingReader) NotePlaybackWait(d time.Duration, now time.Time) {
 	sr.lastPlaybackRead.Store(now.UnixNano())
 	if d >= playbackStallAfter && sr.stalls != nil {
 		sr.stalls.note(sr, now)
+		sr.logger.Debug().Dur("wait", d).Msg("playback stall: a client read waited on the mount for the network")
 	}
 }
+
+// PlaybackStallAfter is how long a client read must wait to count as a
+// playback stall, for callers that log a wait they could not record.
+const PlaybackStallAfter = playbackStallAfter
 
 // beingPlayed reports whether this reader served a playback read within the
 // yield window.

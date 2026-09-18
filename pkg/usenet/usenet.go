@@ -1683,21 +1683,34 @@ func ContextForBufferedPlayback(ctx context.Context) context.Context {
 // long enough. No-op when the file has no open entry or its reader can't
 // track stalls (a multi-volume archive).
 func (u *Usenet) NotePlaybackWait(nzoID, filename string, d time.Duration) {
+	// A stall that can't be recorded is logged, so a signal that never
+	// reaches a reader shows up as such rather than as calm playback.
+	untracked := func(reason string) {
+		if d >= reader.PlaybackStallAfter {
+			u.logger.Debug().Str("nzb", nzoID).Str("file", filename).Dur("wait", d).Str("reason", reason).
+				Msg("playback stall not tracked")
+		}
+	}
 	key := fsKey(nzoID, filename)
 	entry, ok := u.fs.Load(key)
 	if !ok || !entry.acquire() {
+		untracked("no open entry")
 		return
 	}
 	defer u.releaseFS(key)
 	r, _, err := entry.getOrCreateReader()
 	if err != nil {
+		untracked("no reader")
 		return
 	}
-	if s, ok := r.(interface {
+	s, ok := r.(interface {
 		NotePlaybackWait(time.Duration, time.Time)
-	}); ok {
-		s.NotePlaybackWait(d, time.Now())
+	})
+	if !ok {
+		untracked("reader does not track stalls")
+		return
 	}
+	s.NotePlaybackWait(d, time.Now())
 }
 
 // Stream streams a file using the new streaming system with caching and worker limiting
