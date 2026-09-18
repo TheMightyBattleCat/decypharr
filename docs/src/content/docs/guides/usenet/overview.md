@@ -124,6 +124,8 @@ The provider stats show each provider's measured rate (`body_mib_s`) and whether
 
 Read-ahead bursts (next-episode pre-caching, read-ahead of a file nobody is watching yet) compete with playback for the same providers. When a client's stream waits 2 seconds or more for its data, bursts on **other** files stop starting new downloads until playback has gone 30 seconds without such a wait. The file being played keeps its own read-ahead running, since that fills the cache it reads next. A burst paused through a long buffering session can end incomplete; the next trigger fills the gaps.
 
+Through the DFS mount, the wait that counts is the player's own read waiting for data the mount doesn't have yet. The mount's downloaders read far ahead of the player, so a slow download there doesn't count as a stall on its own; the debug log shows those as `mount read-ahead: concurrent segment fetch blocked`.
+
 This is on by default. To turn it off (no UI setting):
 
 ```json
