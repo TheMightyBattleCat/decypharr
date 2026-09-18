@@ -341,6 +341,23 @@ func ContextForPlayback(ctx context.Context) context.Context {
 	return context.WithValue(ctx, playbackCtxKey{}, true)
 }
 
+type bufferedPlaybackCtxKey struct{}
+
+// ContextForBufferedPlayback marks a playback ctx whose reads fill a buffer
+// that sits in front of the client - the DFS mount's downloaders, running up
+// to read_ahead_size ahead of the player. Such a read still counts as the file
+// being played, but its wait says nothing about the player waiting, so it
+// never marks a stall; the buffer's own reader reports those with
+// StreamingReader.NotePlaybackWait.
+func ContextForBufferedPlayback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, bufferedPlaybackCtxKey{}, true)
+}
+
+func bufferedPlayback(ctx context.Context) bool {
+	v, _ := ctx.Value(bufferedPlaybackCtxKey{}).(bool)
+	return v
+}
+
 // isPlaybackRead reports whether ctx serves a client stream and isn't a
 // verification read.
 func isPlaybackRead(ctx context.Context) bool {

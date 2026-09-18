@@ -1286,8 +1286,16 @@ func (item *CacheItem) ReadAtContext(ctx context.Context, p []byte, off int64) (
 	// bulk prefetch, and retry transient failures a few times before surfacing
 	// EIO — ffprobe treats a single read error as fatal.
 	priority := isProbeRead(off, readSize, item.info.Size)
+	waitStart := time.Now()
 	if err := dls.DownloadWithRetry(ctx, r, priority); err != nil {
 		return 0, fmt.Errorf("download failed: %w", err)
+	}
+	// A read that found its bytes missing waited here for the downloaders:
+	// that is the client waiting on the network, the signal that pauses other
+	// files' read-ahead bursts (the downloaders' own reads run ahead of the
+	// client and don't count). A read the client abandoned says nothing.
+	if !alreadyCached && ctx.Err() == nil && dls.manager != nil {
+		dls.manager.NotePlaybackWait(item.entry, item.filename, time.Since(waitStart))
 	}
 
 	// Read via the buffer. It serves from its in-RAM block cache when hot

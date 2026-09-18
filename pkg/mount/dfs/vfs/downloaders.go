@@ -1343,8 +1343,10 @@ func (dl *downloader) streamChunk(start, end int64) (int64, error) {
 		lastProgressNanos.Store(time.Now().UnixNano())
 	}
 
+	// A downloader runs up to read_ahead_size ahead of the player, so its
+	// waits aren't the player's; CacheItem.ReadAtContext reports those.
 	err := dl.dls.manager.Stream(
-		attemptCtx,
+		manager.ContextForBufferedPlayback(attemptCtx),
 		dl.dls.item.entry,
 		dl.dls.item.filename,
 		missingRange.Pos,

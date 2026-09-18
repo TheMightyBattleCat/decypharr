@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/retry"
@@ -167,6 +168,23 @@ func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename str
 
 	// Default to HTTP streaming for torrents
 	return m.streamHTTP(ctx, entry, filename, start, end, writer, onReady)
+}
+
+// ContextForBufferedPlayback marks a Stream call that fills a buffer in front
+// of the client (the DFS mount's downloaders), so its waits aren't taken for
+// the player waiting - see usenet.ContextForBufferedPlayback.
+func ContextForBufferedPlayback(ctx context.Context) context.Context {
+	return usenet.ContextForBufferedPlayback(ctx)
+}
+
+// NotePlaybackWait records that a client read of entry's filename waited d
+// on the buffer in front of Stream - see usenet.Usenet.NotePlaybackWait. A
+// no-op for anything but a usenet entry.
+func (m *Manager) NotePlaybackWait(entry *storage.Entry, filename string, d time.Duration) {
+	if entry == nil || entry.Protocol != config.ProtocolNZB || m.usenet == nil {
+		return
+	}
+	m.usenet.NotePlaybackWait(entry.InfoHash, filename, d)
 }
 
 // TrackStream registers an active stream for observability and returns the stream ID.

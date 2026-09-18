@@ -261,6 +261,8 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 			switch {
 			case paddingDisabled(ctx):
 				ev.Msg("verification read: concurrent segment fetch blocked")
+			case isPlaybackRead(ctx) && bufferedPlayback(ctx):
+				ev.Msg("mount read-ahead: concurrent segment fetch blocked")
 			case isPlaybackRead(ctx):
 				ev.Msg("playback read: concurrent segment fetch blocked")
 			default:
@@ -275,7 +277,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// says nothing about the network.
 	if isPlaybackRead(ctx) && ctx.Err() == nil {
 		now := time.Now()
-		sr.notePlaybackRead(now.Sub(fetchStart), now)
+		sr.notePlaybackRead(ctx, now.Sub(fetchStart), now)
 	}
 	if ensureErr != nil {
 		sr.stats.ReadErrors.Add(1)

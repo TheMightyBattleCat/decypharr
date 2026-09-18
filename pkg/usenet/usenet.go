@@ -1670,6 +1670,36 @@ func ContextForBurstDownload(ctx context.Context) context.Context {
 	return reader.ContextForBurstDownload(ctx)
 }
 
+// ContextForBufferedPlayback marks a stream whose reads fill a buffer in front
+// of the client, so their waits don't count as playback stalls - see
+// reader.ContextForBufferedPlayback and NotePlaybackWait.
+func ContextForBufferedPlayback(ctx context.Context) context.Context {
+	return reader.ContextForBufferedPlayback(ctx)
+}
+
+// NotePlaybackWait records that a client read of nzoID/filename, served from
+// a buffer in front of this package (the DFS mount), waited d for its data -
+// the player waiting, which pauses other files' read-ahead bursts once d is
+// long enough. No-op when the file has no open entry or its reader can't
+// track stalls (a multi-volume archive).
+func (u *Usenet) NotePlaybackWait(nzoID, filename string, d time.Duration) {
+	key := fsKey(nzoID, filename)
+	entry, ok := u.fs.Load(key)
+	if !ok || !entry.acquire() {
+		return
+	}
+	defer u.releaseFS(key)
+	r, _, err := entry.getOrCreateReader()
+	if err != nil {
+		return
+	}
+	if s, ok := r.(interface {
+		NotePlaybackWait(time.Duration, time.Time)
+	}); ok {
+		s.NotePlaybackWait(d, time.Now())
+	}
+}
+
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
 	// Every client stream comes through here; background reads don't. A slow

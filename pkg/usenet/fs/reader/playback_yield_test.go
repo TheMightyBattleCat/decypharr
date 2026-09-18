@@ -81,14 +81,14 @@ func TestNotePlaybackReadThreshold(t *testing.T) {
 	other := &StreamingReader{stalls: b}
 	now := time.Now()
 
-	sr.notePlaybackRead(playbackStallAfter-time.Millisecond, now)
+	sr.notePlaybackRead(context.Background(), playbackStallAfter-time.Millisecond, now)
 	if sr.lastPlaybackRead.Load() != now.UnixNano() {
 		t.Error("a quick playback read did not mark the reader as being played")
 	}
 	if b.stalledOther(other, now) {
 		t.Error("a read under playbackStallAfter counted as a stall")
 	}
-	sr.notePlaybackRead(playbackStallAfter, now)
+	sr.notePlaybackRead(context.Background(), playbackStallAfter, now)
 	if !b.stalledOther(other, now) {
 		t.Error("a read of playbackStallAfter did not count as a stall")
 	}
@@ -189,5 +189,47 @@ func TestFetchRangeYieldHonoursContext(t *testing.T) {
 	}
 	if took > time.Second {
 		t.Fatalf("FetchRange took %v to notice its deadline while paused", took)
+	}
+}
+
+// A read filling a buffer in front of the client (the DFS mount's
+// downloaders) marks the file as being played, however long it waited, but
+// never a stall: the player is up to read_ahead_size behind it.
+func TestBufferedPlaybackReadNeverStalls(t *testing.T) {
+	b := newStallBoard(time.Minute, time.Second)
+	sr := &StreamingReader{stalls: b}
+	other := &StreamingReader{stalls: b}
+	now := time.Now()
+
+	sr.notePlaybackRead(ContextForBufferedPlayback(ContextForPlayback(context.Background())), 10*playbackStallAfter, now)
+	if sr.lastPlaybackRead.Load() != now.UnixNano() {
+		t.Error("a buffered read did not mark the reader as being played")
+	}
+	if b.stalledOther(other, now) {
+		t.Error("a buffered read's wait counted as a stall")
+	}
+}
+
+// NotePlaybackWait - the client's own wait on the buffer - marks the reader as
+// being played, and as stalled once the wait reaches playbackStallAfter.
+func TestNotePlaybackWaitThreshold(t *testing.T) {
+	b := newStallBoard(time.Minute, time.Second)
+	sr := &StreamingReader{stalls: b}
+	other := &StreamingReader{stalls: b}
+	now := time.Now()
+
+	sr.NotePlaybackWait(playbackStallAfter-time.Millisecond, now)
+	if sr.lastPlaybackRead.Load() != now.UnixNano() {
+		t.Error("a short client wait did not mark the reader as being played")
+	}
+	if b.stalledOther(other, now) {
+		t.Error("a client wait under playbackStallAfter counted as a stall")
+	}
+	sr.NotePlaybackWait(playbackStallAfter, now)
+	if !b.stalledOther(other, now) {
+		t.Error("a client wait of playbackStallAfter did not count as a stall")
+	}
+	if b.stalledOther(sr, now) {
+		t.Error("a reader's own stall paused its own burst")
 	}
 }

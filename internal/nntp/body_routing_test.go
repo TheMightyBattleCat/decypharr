@@ -258,7 +258,7 @@ func TestBodyScanOrderHardQuota(t *testing.T) {
 		t.Error("slower not judged against a reserve-band primary")
 	}
 
-	c.bw = quotaTracker("capped", 100, 100, 10) // hard quota
+	c.bw = quotaTracker("capped", 100, 100, 10)          // hard quota
 	got := freshScan(c, time.Now().Add(bodyVerdictHold)) // past slowest's hold
 	wantOrder(t, got, "capped", "slower", "slowest")
 	if c.pools["slowest"].body.slow.Load() {

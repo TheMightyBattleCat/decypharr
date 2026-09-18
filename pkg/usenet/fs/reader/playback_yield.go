@@ -21,7 +21,9 @@ import (
 //
 // A playback read - one serving a client stream, marked by ContextForPlayback -
 // that waits playbackStallAfter or longer for its segments marks its reader
-// stalled. While a reader other than its own stalled within readAheadYieldFor,
+// stalled. Through the DFS mount the wait that counts is the client's own read
+// waiting on the mount's downloaders (NotePlaybackWait); the downloaders' reads
+// run ahead of the player and don't (ContextForBufferedPlayback). While a reader other than its own stalled within readAheadYieldFor,
 // a burst starts no new segment (fetches already running finish), and carries
 // on once playback has gone that long without a stall. A reader that is itself
 // being played never yields: its read-ahead fills the cache that playback
@@ -99,8 +101,23 @@ func (b *stallBoard) stalledOther(self *StreamingReader, now time.Time) bool {
 	return found
 }
 
-// notePlaybackRead records a playback read that waited d for its segments.
-func (sr *StreamingReader) notePlaybackRead(d time.Duration, now time.Time) {
+// notePlaybackRead records a playback read that waited d for its segments. A
+// read filling a buffer in front of the client (ContextForBufferedPlayback)
+// counts only as the file being played: on 2026-09-18 every "stall" logged
+// during playback was a DFS downloader read 2-4.6 s long, up to 512 MB ahead
+// of a player that never waited, and each paused other files' bursts.
+func (sr *StreamingReader) notePlaybackRead(ctx context.Context, d time.Duration, now time.Time) {
+	sr.lastPlaybackRead.Store(now.UnixNano())
+	if !bufferedPlayback(ctx) && d >= playbackStallAfter && sr.stalls != nil {
+		sr.stalls.note(sr, now)
+	}
+}
+
+// NotePlaybackWait records that a client read of this reader's file waited d
+// for its data in a buffer in front of the reader - the DFS mount's read
+// waiting on its downloaders. That is the player waiting, so it marks a stall
+// once d reaches playbackStallAfter.
+func (sr *StreamingReader) NotePlaybackWait(d time.Duration, now time.Time) {
 	sr.lastPlaybackRead.Store(now.UnixNano())
 	if d >= playbackStallAfter && sr.stalls != nil {
 		sr.stalls.note(sr, now)
