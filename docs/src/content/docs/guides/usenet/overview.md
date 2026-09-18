@@ -80,7 +80,8 @@ Every stream fits inside the priority-1 provider's connection pool, so without h
 - A primary counts as slow only when it serves under 4 MiB/s per connection **and** the fastest primary is more than 4× faster. While no primary is that slow, providers are used in exact priority order.
 - Slow primaries go after the faster primaries, the least slow first. An article the fast providers don't have comes from the least slow provider that has it.
 - Backup providers (`"backup": true`) are never reordered and are still only used for articles the primaries can't provide. A primary that has reached its quota reserve still counts as a primary.
-- A slow provider gets one article every 5 minutes to measure it again, and gets its position back once it is 25% above the cut.
+- A provider's rate is measured over the last minute of downloads (bytes over download time), not article by article, and the time spent writing to local disk isn't counted against it.
+- A slow provider gets one article every 5 minutes to measure it again, and gets its position back once it is 25% above the cut, and not before it has been deferred for 30 seconds.
 
 Turn it off to always use providers in priority order. The setting applies within a second of saving, without a restart:
 
@@ -134,6 +135,10 @@ This is on by default. To turn it off (no UI setting):
 ```
 
 Pauses and resumes are logged at debug: `read-ahead paused: playback of another file is waiting on the network` / `read-ahead resumed`.
+
+### Read-Ahead Bursts Keep What They Fetch
+
+A read-ahead burst (the rest of the file being played, or the next episode) works through the file in 96 MB chunks. Each chunk is copied into the durable disk cache as soon as it arrives, and a chunk the disk cache already holds is skipped without being downloaded. Segments with a missing article waiting on repair are not copied, so zero-filled data never lands in the disk cache. The completion log carries `fetchedBytes` and `skippedBytes`, and a `durable persist complete` line counts what was written.
 
 ### Read-Ahead Buffer
 
