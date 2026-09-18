@@ -2,6 +2,7 @@ package nntp
 
 import (
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,8 +26,18 @@ import (
 // up under load: the same 60 articles at 1, 4 and 15 connections took a median
 // 71/71/80 ms on newshosting, 51/51/85 ms on eweka and 1019/1005/1283 ms on
 // frugal, so a provider's rate doesn't collapse just because it carries the
-// traffic. The time runs to the end of the caller's write, so a stalled disk
-// cache is charged to whichever provider was writing into it.
+// traffic. The time spent inside the caller's writes is left out: a disk cache
+// stalled by a sweep is not the provider's doing, and charging it once made a
+// fast provider look slow for as long as the sweep ran.
+//
+// A provider's rate is its bytes over its download time across the last
+// bodyRateWindow, not a per-article moving average. The per-article average
+// (each sample moving it a fifth of the way) followed a burst of articles
+// within a second; on 2026-09-18 that flipped verdicts 728 times in nine
+// hours, eweka - a fast provider - 196 of them, and in 550 of 596 logged
+// flips the fastest rate, which sets the cut, had moved too. Summing bytes
+// and time weights each article by its size, so one slow article moves the
+// rate by its share of the window rather than by a fixed fraction.
 //
 // When a primary is measurably slow - under bodyFastEnough AND more than
 // bodySlowFactor below the fastest measured primary - the connection scan
@@ -35,6 +46,11 @@ import (
 // never move: they are still only reached when no primary can provide the
 // article. A primary its quota has demoted to the fill tier is still a
 // primary here.
+//
+// A deferred primary stays deferred for at least bodyVerdictHold, so a rate
+// sitting at the cut can't flip the order every second. Only the way back is
+// held: handing a slow primary its position too early is what costs playback,
+// while deferring a fast one early only hands its fetches to the others.
 //
 // A deferred primary gets no traffic, so its sample would never refresh. Once
 // that sample is bodyExploreAfter old, one fetch is let through at its
@@ -73,9 +89,13 @@ const (
 	// bodyExploreAfter: how old a sample may get before it stops counting, and
 	// how often a deferred primary is let one fetch through to re-measure it.
 	bodyExploreAfter = 5 * time.Minute
-	// bodyEWMADivisor: each sample moves the average 1/bodyEWMADivisor of the
-	// way towards itself.
-	bodyEWMADivisor = 5
+	// bodyRateWindow: the span a provider's rate is taken over, kept as
+	// bodyRateBuckets buckets so old samples drop out a bucket at a time.
+	bodyRateWindow  = time.Minute
+	bodyRateBuckets = 6
+	// bodyVerdictHold: how long a primary stays deferred before it can get
+	// its position back.
+	bodyVerdictHold = 30 * time.Second
 	// bodyVerdictEvery: how long one set of verdicts, and the scan order they
 	// give, serves connection acquisitions before being taken again.
 	bodyVerdictEvery = time.Second
@@ -90,35 +110,62 @@ type bodyScan struct {
 
 // bodyThroughput is one provider's measured body download rate.
 type bodyThroughput struct {
-	bytesPerSec atomic.Int64 // moving average; 0 = never measured
+	bytesPerSec atomic.Int64 // rate over bodyRateWindow; 0 = never measured
 	samples     atomic.Int64 // samples recorded, ever
 	sampledAt   atomic.Int64 // unix nanoseconds of the latest sample
 	exploredAt  atomic.Int64 // unix nanoseconds of the latest explorer let through
 	slow        atomic.Bool  // latest verdict: deferred behind the other primaries
+	changedAt   atomic.Int64 // unix nanoseconds the verdict last changed; 0 = never
+
+	mu      sync.Mutex
+	buckets [bodyRateBuckets]bodyRateBucket
 }
 
-// record folds one body download into the average. The first sample, and any
-// taken bodyExploreAfter or longer after the previous one, replace it.
+// bodyRateBucket sums the samples taken in one slice of bodyRateWindow.
+type bodyRateBucket struct {
+	slice int64 // which slice of time: unix nanoseconds / slice width
+	bytes int64
+	nanos int64
+	count int64
+}
+
+// record adds one body download to the window and takes the rate again. With
+// fewer than bodyMinSamples in the window the previous rate stands, unless it
+// is bodyExploreAfter old or there is none: then the window's few samples -
+// usually one, an explorer's - are all there is to go on.
 func (b *bodyThroughput) record(n int64, d time.Duration, now time.Time) {
 	if n < bodySampleMinBytes {
 		return
 	}
 	d = max(d, time.Microsecond)
-	sample := max(int64(float64(n)/d.Seconds()), 1)
+	width := int64(bodyRateWindow / bodyRateBuckets)
+	slice := now.UnixNano() / width
+
+	b.mu.Lock()
+	cur := &b.buckets[slice%bodyRateBuckets]
+	if cur.slice != slice {
+		*cur = bodyRateBucket{slice: slice}
+	}
+	cur.bytes += n
+	cur.nanos += int64(d)
+	cur.count++
+	var bytes, nanos, count int64
+	for _, bk := range b.buckets {
+		if bk.count > 0 && slice-bk.slice < bodyRateBuckets {
+			bytes += bk.bytes
+			nanos += bk.nanos
+			count += bk.count
+		}
+	}
 	last := b.sampledAt.Load()
 	stale := last == 0 || now.Sub(time.Unix(0, last)) >= bodyExploreAfter
-	for {
-		old := b.bytesPerSec.Load()
-		next := sample
-		if old > 0 && !stale {
-			next = max(old+(sample-old)/bodyEWMADivisor, 1)
-		}
-		if b.bytesPerSec.CompareAndSwap(old, next) {
-			break
-		}
+	if count >= bodyMinSamples || stale || b.bytesPerSec.Load() == 0 {
+		rate := float64(bytes) / (float64(nanos) / float64(time.Second))
+		b.bytesPerSec.Store(max(int64(rate), 1))
 	}
 	b.samples.Add(1)
 	b.sampledAt.Store(now.UnixNano())
+	b.mu.Unlock()
 }
 
 // usable reports the provider's rate when it has enough samples and the latest
@@ -164,7 +211,7 @@ func (c *Client) fastestBody(now time.Time) int64 {
 
 // bodyVerdict decides whether primary pp goes behind the other primaries,
 // logging a change of verdict. A primary without a usable sample keeps its
-// last verdict.
+// last verdict, and a deferred one stays deferred for bodyVerdictHold.
 func (c *Client) bodyVerdict(pp *ProviderPool, fastest int64, now time.Time) bool {
 	b := &pp.body
 	wasSlow := b.slow.Load()
@@ -172,12 +219,16 @@ func (c *Client) bodyVerdict(pp *ProviderPool, fastest int64, now time.Time) boo
 	if rate == 0 {
 		return wasSlow
 	}
+	if at := b.changedAt.Load(); wasSlow && at != 0 && now.UnixNano()-at < int64(bodyVerdictHold) {
+		return true
+	}
 	cut := min(int64(bodyFastEnough), fastest/bodySlowFactor)
 	slow := rate < cut
 	if wasSlow && !slow {
 		slow = rate*100 < cut*bodyRecoverPercent
 	}
 	if slow != wasSlow && b.slow.CompareAndSwap(wasSlow, slow) {
+		b.changedAt.Store(now.UnixNano())
 		msg := "Body routing: provider is fast enough again, back at its priority position"
 		if slow {
 			msg = "Body routing: provider is too slow, trying the other primaries first"

@@ -22,12 +22,14 @@ func newBodyTestClient(t *testing.T, providers []config.UsenetProvider) *Client 
 	return c
 }
 
-// setBody gives host a fresh, fully sampled body rate of mibs MiB/s.
+// setBody gives host a fresh, fully sampled body rate of mibs MiB/s, with no
+// verdict change pending its bodyVerdictHold.
 func setBody(c *Client, host string, mibs float64) {
 	b := &c.pools[host].body
 	b.bytesPerSec.Store(int64(mibs * (1 << 20)))
 	b.samples.Store(bodyMinSamples)
 	b.sampledAt.Store(time.Now().UnixNano())
+	b.changedAt.Store(0)
 }
 
 // freshScan takes new verdicts for this scan instead of reusing ones up to
@@ -71,20 +73,79 @@ func TestBodyThroughputRecord(t *testing.T) {
 	if got := b.bytesPerSec.Load(); got != 1<<20 {
 		t.Fatalf("first sample: got %d B/s, want %d", got, 1<<20)
 	}
+	// Under bodyMinSamples in the window, the rate already taken stands.
 	b.record(1<<20, 250*time.Millisecond, now.Add(time.Second))
-	if got, want := b.bytesPerSec.Load(), int64(1<<20+(4<<20-1<<20)/bodyEWMADivisor); got != want {
-		t.Fatalf("blended sample: got %d B/s, want %d", got, want)
+	if got := b.bytesPerSec.Load(); got != 1<<20 {
+		t.Fatalf("second sample moved the rate: got %d B/s, want %d", got, 1<<20)
+	}
+	// Five in the window: their bytes over their time, 5 MiB in 2 s.
+	for i := range 3 {
+		b.record(1<<20, 250*time.Millisecond, now.Add(time.Duration(2+i)*time.Second))
+	}
+	if got, want := b.bytesPerSec.Load(), int64(5<<20)/2; got != want {
+		t.Fatalf("window rate: got %d B/s, want %d", got, want)
 	}
 
-	// After a gap of bodyExploreAfter the sample replaces the average: a
-	// provider that recovered must not need many samples to look fast again.
-	b.record(1<<20, 50*time.Millisecond, now.Add(time.Second+bodyExploreAfter))
+	// A minute and more later the old samples have left the window: the new
+	// ones set the rate once there are enough of them.
+	later := now.Add(2 * bodyRateWindow)
+	for i := range bodyMinSamples {
+		b.record(1<<20, 100*time.Millisecond, later.Add(time.Duration(i)*time.Second))
+		if got := b.bytesPerSec.Load(); i < bodyMinSamples-1 && got != int64(5<<20)/2 {
+			t.Fatalf("sample %d of a fresh window moved the rate to %d B/s", i+1, got)
+		}
+	}
+	if got := b.bytesPerSec.Load(); got != 10<<20 {
+		t.Fatalf("fresh window rate: got %d B/s, want %d", got, 10<<20)
+	}
+
+	// After a gap of bodyExploreAfter one sample sets the rate: a provider
+	// that recovered must not need many samples to look fast again.
+	b.record(1<<20, 50*time.Millisecond, later.Add(bodyExploreAfter+time.Minute))
 	if got := b.bytesPerSec.Load(); got != 20<<20 {
 		t.Fatalf("stale sample: got %d B/s, want %d", got, 20<<20)
 	}
-	if b.samples.Load() != 3 {
-		t.Fatalf("samples = %d, want 3", b.samples.Load())
+	if b.samples.Load() != 11 {
+		t.Fatalf("samples = %d, want 11", b.samples.Load())
 	}
+}
+
+// One slow article among many moves the rate by its share of the window's
+// download time, not a fixed fraction of the way to itself: a 20-article
+// window at 10 MiB/s with one 1-second article stays above the cut.
+func TestBodyThroughputOneSlowArticle(t *testing.T) {
+	var b bodyThroughput
+	now := time.Now()
+	for i := range 20 {
+		b.record(1<<20, 100*time.Millisecond, now.Add(time.Duration(i)*time.Second))
+	}
+	b.record(1<<20, time.Second, now.Add(20*time.Second))
+	got := float64(b.bytesPerSec.Load()) / (1 << 20)
+	if got < 7 || got > 7.1 { // 21 MiB in 3 s
+		t.Fatalf("rate after one slow article = %.2f MiB/s, want 7", got)
+	}
+}
+
+// A deferred primary stays deferred for bodyVerdictHold even when its rate
+// recovers at once; a reinstated one can be deferred again straight away.
+func TestBodyScanOrderVerdictHold(t *testing.T) {
+	providers := []config.UsenetProvider{
+		{Host: "p1", Priority: 1, MaxConnections: 4},
+		{Host: "p2", Priority: 2, MaxConnections: 4},
+	}
+	c := newBodyTestClient(t, providers)
+	now := time.Now()
+	setBody(c, "p2", 40)
+	setBody(c, "p1", 1)
+	wantOrder(t, freshScan(c, now), "p2", "p1")
+
+	p1 := &c.pools["p1"].body
+	p1.bytesPerSec.Store(30 << 20)
+	wantOrder(t, freshScan(c, now.Add(bodyVerdictHold-time.Second)), "p2", "p1")
+	wantOrder(t, freshScan(c, now.Add(bodyVerdictHold)), "p1", "p2")
+
+	p1.bytesPerSec.Store(1 << 20)
+	wantOrder(t, freshScan(c, now.Add(bodyVerdictHold+time.Second)), "p2", "p1")
 }
 
 // While no primary is slow the scan is plain priority order, with no copy.
@@ -172,7 +233,7 @@ func TestBodyScanOrderBackupsKeepTheirPlaces(t *testing.T) {
 	// Only a backup is fast: the primaries are judged against each other.
 	setBody(c, "fast", 1.5)
 	setBody(c, "b2", 100)
-	got := freshScan(c, time.Now())
+	got := freshScan(c, time.Now().Add(bodyVerdictHold)) // past slow's hold
 	if &got[0] != &c.providers[0] {
 		t.Fatalf("order = %v: a backup's rate made a primary slow", bodyHosts(got))
 	}
@@ -198,7 +259,7 @@ func TestBodyScanOrderHardQuota(t *testing.T) {
 	}
 
 	c.bw = quotaTracker("capped", 100, 100, 10) // hard quota
-	got := freshScan(c, time.Now())
+	got := freshScan(c, time.Now().Add(bodyVerdictHold)) // past slowest's hold
 	wantOrder(t, got, "capped", "slower", "slowest")
 	if c.pools["slowest"].body.slow.Load() {
 		t.Error("slowest (1 MiB/s) judged slow against slower (3): only a hard-quota provider was 4x faster")
@@ -322,6 +383,50 @@ func TestBodyRoutingOverConnections(t *testing.T) {
 	}
 	if slow.bodyReqs.Load() != 2 || fast.bodyReqs.Load() != 2 {
 		t.Fatalf("BODY requests slow=%d fast=%d, want the fetch on the fast provider (2 and 2)", slow.bodyReqs.Load(), fast.bodyReqs.Load())
+	}
+}
+
+// sleepyWriter is a caller whose writes stall, like a disk cache under a sweep.
+type sleepyWriter struct {
+	bytes.Buffer
+	d time.Duration
+}
+
+func (w *sleepyWriter) Write(p []byte) (int, error) {
+	time.Sleep(w.d)
+	return w.Buffer.Write(p)
+}
+
+// Time spent in the caller's writes is not charged to the provider: a body
+// served at loopback speed into a writer that stalls on every write still
+// records a fast rate.
+func TestBodyRateLeavesOutCallerWrites(t *testing.T) {
+	data := bytes.Repeat([]byte("decypharr body routing "), (bodySampleMinBytes+1<<16)/23)
+	srv := startFakeNNTP(t, 0)
+	srv.bodies = map[string]string{"seg@test": yencWire(data, 0)}
+	p, _ := twoLocalProviders(t, srv, srv)
+	c := newBodyTestClient(t, []config.UsenetProvider{p})
+
+	out := &sleepyWriter{d: 100 * time.Millisecond}
+	start := time.Now()
+	err := c.ExecuteWithFailover(context.Background(), func(conn *Connection) error {
+		out.Reset()
+		_, _, err := conn.StreamBodyMeta("seg@test", out)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Fatalf("got %d bytes, want %d", out.Len(), len(data))
+	}
+	b := &c.pools[p.Host].body
+	if b.samples.Load() != 1 {
+		t.Fatalf("samples = %d, want 1", b.samples.Load())
+	}
+	wall := float64(len(data)) / time.Since(start).Seconds()
+	if got := float64(b.bytesPerSec.Load()); got < 4*wall {
+		t.Fatalf("recorded %.0f B/s, not far above the %.0f B/s the stalled writes allowed", got, wall)
 	}
 }
 

@@ -646,12 +646,31 @@ func (c *Connection) StreamBodyMeta(messageID string, w io.Writer) (int64, *Yenc
 	dec := nntpyenc.AcquireDecoder(c.reader)
 	// Always release decoder back to pool, even on panic
 	defer nntpyenc.ReleaseDecoder(dec)
-	n, err := c.copyBodyWithIdleDeadline(w, dec, timeouts.StreamBodyTimeout)
+	// Body routing times the download, not the caller: time spent inside w
+	// (a disk cache stalled by a sweep) is left out of the provider's rate.
+	tw := &timedWriter{w: w}
+	n, err := c.copyBodyWithIdleDeadline(tw, dec, timeouts.StreamBodyTimeout)
 	if err != nil {
 		return n, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
-	c.noteBody(n, time.Since(start))
+	c.noteBody(n, time.Since(start)-tw.spent)
 	return n, metadataFromDecoder(dec, nil), nil
+}
+
+// timedWriter adds up the time spent inside its writer's Write calls. It is
+// called once per decoder Read - a handful per article, rapidyenc filling up
+// to the 128 KB copy buffer each time - and reads only the monotonic clock
+// (see progressUpdateStride for why clock reads on this path are counted).
+type timedWriter struct {
+	w     io.Writer
+	spent time.Duration
+}
+
+func (t *timedWriter) Write(p []byte) (int, error) {
+	start := nanotimeNow()
+	n, err := t.w.Write(p)
+	t.spent += time.Duration(nanotimeNow() - start)
+	return n, err
 }
 
 // noteBody hands a completed body download to the owning client's body
