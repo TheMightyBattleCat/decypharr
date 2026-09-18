@@ -105,7 +105,7 @@ func persistDurableRanges(ctx context.Context, src precacheNZBSource, writer dfs
 	persistDurableSpan(ctx, src, writer, nil, entryName, infoHash, filename, fileSize, 0, fileSize, log)
 }
 
-// persistDurableSpan is persistDurableRanges over the segments that start in
+// persistDurableSpan is persistDurableRanges over the segments that overlap
 // [lo, hi), skipping any the durable cache already holds when have is set:
 // reading one back goes through the reader, which re-downloads a segment its
 // scratch cache has already evicted only for WriteAtNoOverwrite to discard it.
@@ -176,10 +176,14 @@ func (s persistStats) log(log zerolog.Logger, entryName, filename string, segmen
 		Msg(msg)
 }
 
-// persistSegments copies file's CLEAN segments that start in [lo, hi) from
+// persistSegments copies file's CLEAN segments that overlap [lo, hi) from
 // the reader into the durable cache - the walk behind persistDurableSpan and
-// burstToDurable. The pending-repair set is read on every call, so a burst
-// persisting chunk by chunk sees damage its latest chunk surfaced.
+// burstToDurable. Overlap, not start: a segment straddling a chunk boundary
+// is fetched with either chunk, and one skipped as durable must not leave
+// the other chunk's pass without it. With have set, the second chunk to
+// reach it finds it durable and leaves it. The pending-repair set is read on
+// every call, so a burst persisting chunk by chunk sees damage its latest
+// chunk surfaced.
 func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCacheRangeWriter, have dfsCacheRangePresence, entryName, infoHash, filename string, file *storage.NZBFile, fileSize, lo, hi int64, log zerolog.Logger) persistStats {
 	var st persistStats
 	dead := make(map[int]bool)
@@ -192,7 +196,7 @@ func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCache
 	var buf []byte
 	for idx, seg := range file.Segments {
 		start, end := seg.StartOffset, seg.EndOffset+1 // EndOffset is inclusive
-		if start < lo || start >= hi {
+		if end <= lo || start >= hi {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -335,15 +339,6 @@ func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWrite
 	}
 	res.segmentsTotal = len(file.Segments)
 
-	// Segments are persisted by where they start, so the first chunk also
-	// takes the segment `from` falls inside.
-	first := from
-	for _, seg := range file.Segments {
-		if seg.StartOffset <= from && from <= seg.EndOffset {
-			first = seg.StartOffset
-			break
-		}
-	}
 	for off := from; off < fileSize; off += chunk {
 		n := min(chunk, fileSize-off)
 		if have != nil && have.HasCachedRange(entryName, filename, off, n) {
@@ -352,11 +347,7 @@ func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWrite
 		}
 		err := src.ReadAheadRange(ctx, infoHash, filename, off, n, concurrency)
 		res.fetched += n
-		lo := off
-		if off == from {
-			lo = first
-		}
-		res.persist.add(persistSegments(ctx, src, writer, have, entryName, infoHash, filename, file, fileSize, lo, off+n, log))
+		res.persist.add(persistSegments(ctx, src, writer, have, entryName, infoHash, filename, file, fileSize, off, off+n, log))
 		if err != nil {
 			return res, err
 		}
