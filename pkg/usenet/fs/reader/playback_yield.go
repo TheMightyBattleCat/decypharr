@@ -168,6 +168,61 @@ func (sr *StreamingReader) yieldToPlayback(ctx context.Context, nextSeg int) err
 	}
 }
 
+// verifyStallWorkers is how many of a yielding verification read's prefetch
+// workers keep fetching while playback of another file is stalling; the rest
+// wait until it has gone readAheadYieldFor without a stall. On 2026-09-18 the
+// nightly sweep's checks held all 150 connections of the two fast providers
+// and the production install's 92 MiB/s link while a REMUX stalled. Four workers is about the
+// synchronous verification read's pace (~24 MiB/s), which keeps a narrowed
+// check well inside ffprobe's time limits, where pausing it outright could
+// time a healthy file out into a false verdict.
+const verifyStallWorkers = 4
+
+// verificationThrottled reports whether a yielding verification read's
+// prefetch should run narrowed now.
+func (sr *StreamingReader) verificationThrottled(ctx context.Context, now time.Time) bool {
+	return yieldingVerification(ctx) && sr.stalls != nil && sr.stalls.stalledOther(sr, now) && yieldEnabled()
+}
+
+// waitVerifyThrottle holds FetchRangeWindowed's worker (0-based) before it
+// claims a segment while the read is throttled, returning false only when ctx
+// or the reader ends. Workers below verifyStallWorkers, and every worker of a
+// read not marked ContextForYieldingVerification, never wait. A held worker
+// also stops waiting once exhausted reports nothing left to claim, so the
+// call returns when the narrowed workers finish rather than when playback
+// stops stalling. since is shared by the call's workers and logs the
+// narrowing and its end once each.
+func (sr *StreamingReader) waitVerifyThrottle(ctx context.Context, worker, concurrency int, since *atomic.Int64, exhausted func() bool) bool {
+	if worker < verifyStallWorkers || !yieldingVerification(ctx) {
+		return true
+	}
+	poll := readAheadYieldPoll
+	if sr.stalls != nil {
+		poll = sr.stalls.poll
+	}
+	for {
+		now := time.Now()
+		if exhausted() || !sr.verificationThrottled(ctx, now) {
+			if at := since.Swap(0); at != 0 {
+				sr.logger.Debug().Dur("throttled", now.Sub(time.Unix(0, at))).
+					Msg("verification prefetch back to full width: no playback stalls for the yield window")
+			}
+			return true
+		}
+		if since.CompareAndSwap(0, now.UnixNano()) {
+			sr.logger.Debug().Int("workers", verifyStallWorkers).Int("of", concurrency).
+				Msg("verification prefetch narrowed: playback of another file is waiting on the network")
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-sr.ctx.Done():
+			return false
+		case <-time.After(poll):
+		}
+	}
+}
+
 // yieldEnabled reports whether read-ahead bursts pause for stalled playback.
 func yieldEnabled() bool {
 	return config.Get().Precache.YieldToPlayback()

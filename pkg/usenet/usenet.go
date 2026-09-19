@@ -1619,6 +1619,13 @@ func ContextForVerificationRead(ctx context.Context) context.Context {
 	return reader.ContextWithoutPadding(ctx)
 }
 
+// ContextForYieldingVerification marks a verification read as background work
+// whose prefetch narrows while playback of another file stalls - see
+// reader.ContextForYieldingVerification.
+func ContextForYieldingVerification(ctx context.Context) context.Context {
+	return reader.ContextForYieldingVerification(ctx)
+}
+
 // DeadSegmentSignal is a one-way latch a verification read carries so the
 // ffprobe checker that spawned it can tell, after the fact, whether the
 // fetcher ever observed a confirmed-dead (430) segment - see

@@ -738,9 +738,11 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			registerVerifyBudget(res.infoHash, name, budget)
 			sig := NewDeadSegmentSignal()
 			registerDeadSignal(res.infoHash, name, sig)
+			unmarkSweep := registerSweepVerification(res.infoHash, name)
 			started := time.Now()
 			cause := &unverifiedCause{}
 			ok, reason, conclusive, coverage := checker.checkConfirmed(contextWithUnverifiedCause(ctx, cause), c.name, name, exp, skipDecode, sig, budget)
+			unmarkSweep()
 			unregisterDeadSignal(res.infoHash, name, sig)
 			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive

@@ -126,6 +126,8 @@ Read-ahead bursts (next-episode pre-caching, read-ahead of a file nobody is watc
 
 Through the DFS mount, the wait that counts is the player's own read waiting for data the mount doesn't have yet. The mount's downloaders read far ahead of the player, so a slow download there doesn't count as a stall on its own; the debug log shows those as `mount read-ahead: concurrent segment fetch blocked`.
 
+The nightly repair sweep's ffprobe checks yield too, by narrowing rather than pausing: while playback is waiting, each check's prefetch drops from up to 32 connections to 4 (about 24 MiB/s, still well inside ffprobe's time limits) and widens again 30 seconds after the last wait. Checks on import aren't narrowed. The debug log shows `verification prefetch narrowed` / `verification prefetch back to full width`.
+
 This is on by default. To turn it off (no UI setting):
 
 ```json

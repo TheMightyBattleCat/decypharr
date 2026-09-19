@@ -655,13 +655,30 @@ func (sr *StreamingReader) FetchRangeWindowed(ctx context.Context, base, total i
 		}
 	}
 
-	for range concurrency {
+	// A yielding verification read (the repair sweep's) runs only
+	// verifyStallWorkers wide while playback of another file is stalling.
+	// Throttled workers wait before claiming a segment, never while holding
+	// one, so the narrowed prefetch still fetches in order.
+	var throttledSince atomic.Int64
+	waitThrottle := func(worker int) bool {
+		exhausted := func() bool { return int(nextSeg.Load()) > endSeg }
+		if !sr.waitVerifyThrottle(ctx, worker, concurrency, &throttledSince, exhausted) {
+			recordCtxErr()
+			return false
+		}
+		return true
+	}
+
+	for worker := range concurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
 				if ctx.Err() != nil {
 					recordCtxErr()
+					return
+				}
+				if !waitThrottle(worker) {
 					return
 				}
 				seg := int(nextSeg.Add(1)) - 1

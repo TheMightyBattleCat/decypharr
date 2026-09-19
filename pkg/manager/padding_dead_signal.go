@@ -65,6 +65,35 @@ func DeadSignalForVerificationRead(infoHash, fileName string) *DeadSegmentSignal
 	return sig
 }
 
+// sweepVerifyRegistry marks the files the repair sweep is probing, joined to
+// the WebDAV handler the same way deadSignalRegistry is. A sweep's
+// verification read is background work, so the handler marks it to narrow its
+// prefetch while playback of another file stalls; an import's check, which
+// never registers here, keeps full width.
+var sweepVerifyRegistry sync.Map // map[string]*struct{}
+
+// registerSweepVerification marks infoHash/fileName as probed by the sweep
+// and returns the call that unmarks it.
+func registerSweepVerification(infoHash, fileName string) func() {
+	if infoHash == "" {
+		return func() {}
+	}
+	key, tok := deadSignalKey(infoHash, fileName), new(struct{})
+	sweepVerifyRegistry.Store(key, tok)
+	return func() { sweepVerifyRegistry.CompareAndDelete(key, tok) }
+}
+
+// ContextForVerificationReadOf is ContextForVerificationRead for a read of
+// infoHash/fileName, adding the sweep's yield mark when the sweep is the one
+// probing it.
+func ContextForVerificationReadOf(ctx context.Context, infoHash, fileName string) context.Context {
+	ctx = ContextForVerificationRead(ctx)
+	if _, ok := sweepVerifyRegistry.Load(deadSignalKey(infoHash, fileName)); ok {
+		ctx = usenet.ContextForYieldingVerification(ctx)
+	}
+	return ctx
+}
+
 // ContextWithVerifyBudget attaches b to ctx for the metered verification read
 // - see usenet.ContextWithVerifyBudget.
 func ContextWithVerifyBudget(ctx context.Context, b *VerifyBudget) context.Context {

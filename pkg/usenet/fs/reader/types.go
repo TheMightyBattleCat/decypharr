@@ -341,6 +341,21 @@ func ContextForPlayback(ctx context.Context) context.Context {
 	return context.WithValue(ctx, playbackCtxKey{}, true)
 }
 
+type yieldingVerificationCtxKey struct{}
+
+// ContextForYieldingVerification marks a verification read that is background
+// work - the nightly repair sweep's ffprobe check, not an import waiting on
+// its verdict - so its windowed prefetch narrows while playback of another
+// file is stalling (see FetchRangeWindowed).
+func ContextForYieldingVerification(ctx context.Context) context.Context {
+	return context.WithValue(ctx, yieldingVerificationCtxKey{}, true)
+}
+
+func yieldingVerification(ctx context.Context) bool {
+	v, _ := ctx.Value(yieldingVerificationCtxKey{}).(bool)
+	return v
+}
+
 type bufferedPlaybackCtxKey struct{}
 
 // ContextForBufferedPlayback marks a playback ctx whose reads fill a buffer
