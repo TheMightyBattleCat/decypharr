@@ -29,9 +29,17 @@ import (
 )
 
 const (
-	// precacheReadAheadTimeout bounds one read-ahead burst so a stalled
-	// provider can't wedge a background goroutine forever.
+	// precacheReadAheadTimeout is the least time one read-ahead burst gets;
+	// readAheadTimeout scales it with the bytes left, up to
+	// precacheReadAheadTimeoutCap, so a stalled provider still can't wedge a
+	// background goroutine forever.
 	precacheReadAheadTimeout = 30 * time.Minute
+	// precacheReadAheadFloorRate is the rate a burst is given time for. On
+	// 2026-09-18 a REMUX burst under the nightly sweep ran at 4.2 MiB/s and
+	// hit the flat 30 minutes with ~18 GB of its ~26 GB still to fetch. Since
+	// bursts persist chunk by chunk, time past 30 minutes loses nothing.
+	precacheReadAheadFloorRate  = 4 << 20
+	precacheReadAheadTimeoutCap = 4 * time.Hour
 
 	// precacheTriggeredTTL bounds how long a (entry,file) dedup key is
 	// remembered, so the map backing it can't grow without bound across a
@@ -489,7 +497,7 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 
 	concurrency := p.cfg().ReadAheadConcurrency()
 
-	ctx, cancel := context.WithTimeout(context.Background(), precacheReadAheadTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), readAheadTimeout(size-from))
 	defer cancel()
 
 	// Same gate as the next-episode burst: the point of the read-ahead is to
@@ -935,4 +943,12 @@ func (p *Precache) PurgeIncomplete(execute bool) (deleted, skippedInflight []str
 	}
 
 	return deleted, skippedInflight, failed, freedBytes, nil
+}
+
+// readAheadTimeout is how long a read-ahead burst over remaining bytes gets:
+// long enough to fetch them at precacheReadAheadFloorRate, never less than
+// precacheReadAheadTimeout nor more than precacheReadAheadTimeoutCap.
+func readAheadTimeout(remaining int64) time.Duration {
+	d := time.Duration(float64(max(remaining, 0)) / precacheReadAheadFloorRate * float64(time.Second))
+	return min(max(d, precacheReadAheadTimeout), precacheReadAheadTimeoutCap)
 }
