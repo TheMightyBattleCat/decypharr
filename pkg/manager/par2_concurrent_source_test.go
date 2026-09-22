@@ -318,3 +318,33 @@ func TestConcurrentSliceSourceDoesNotTrackOtherErrorsAsNotFound(t *testing.T) {
 		t.Errorf("NotFoundIndices() = %v, want empty - a timeout is not a confirmed not-found", got)
 	}
 }
+
+// Cancelling a source whose consumer has stopped reading (an early-stopped
+// pass) stops the fetches. fetchOne takes no context, so without the checks
+// in run() the unblocked workers read the rest of the release.
+func TestConcurrentSliceSourceStopsFetchingWhenCancelled(t *testing.T) {
+	const n = 2000
+	order := make([]int64, n)
+	for i := range order {
+		order[i] = int64(i)
+	}
+	var calls atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	src := newConcurrentSliceSource(ctx, order, 4, func(i int64) ([]byte, error) {
+		calls.Add(1)
+		time.Sleep(time.Millisecond)
+		return []byte{byte(i)}, nil
+	})
+	for i := int64(0); i < 5; i++ {
+		if _, err := src.ReadSlice(i); err != nil {
+			t.Fatalf("ReadSlice(%d): %v", i, err)
+		}
+	}
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	settled := calls.Load()
+	time.Sleep(200 * time.Millisecond)
+	if after := calls.Load(); after != settled || after > 100 {
+		t.Fatalf("fetches after cancel: %d then %d of %d, want them stopped", settled, after, n)
+	}
+}

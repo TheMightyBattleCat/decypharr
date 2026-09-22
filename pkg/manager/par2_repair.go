@@ -2075,7 +2075,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			}
 			return data, err
 		}
-		sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
+		// Each round's source gets its own context, cancelled as soon as the
+		// pass returns. An early-stopped or failed pass otherwise left its
+		// workers holding fetched slices (up to 3x the connection count x
+		// SliceSize) and their connections until the whole job ended.
+		roundCtx, roundCancel := context.WithCancel(ctx)
+		sliceSource := newConcurrentSliceSource(roundCtx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
 		var repairErr error
 		// Stop the pass once the unreadable intact slices outnumber the
 		// recovery slices left over: the next round would need more than
@@ -2087,6 +2092,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			MaxUnavailable:     max(0, spare),
 			OnChecksumMismatch: func(i int64) { checksumBad = append(checksumBad, i) },
 		})
+		roundCancel()
 		if repairErr == nil {
 			break
 		}

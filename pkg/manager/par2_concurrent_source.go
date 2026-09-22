@@ -105,7 +105,16 @@ func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency
 func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(int64) ([]byte, error)) {
 	p := pool.New().WithContext(ctx).WithMaxGoroutines(maxConcurrency)
 	for _, idx := range order {
+		// A cancelled source (the round is over - see runRepair) must stop
+		// fetching: fetchOne does not take the context, so without these
+		// checks every remaining slice of the release would still be read.
+		if ctx.Err() != nil {
+			break
+		}
 		p.Go(func(ctx context.Context) error {
+			if ctx.Err() != nil {
+				return nil
+			}
 			data, err := fetchOne(idx)
 			if err != nil {
 				// This slice's backing data is unreadable at this position:
