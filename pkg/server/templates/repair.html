@@ -262,10 +262,10 @@
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
                     </label>
                     <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
-                           title="ON (recommended): when playback hits an unwatchable file, always try a PAR2 repair first, as long as the release has PAR2 data - even if the quick estimate says there isn't enough recovery data. That estimate assumes every recorded-dead segment needs a recovery slice, but many 'dead' segments are actually intact (they get healed without any recovery data) and partly damaged recovery volumes still count. If the repair gives up for good, the file is re-grabbed straight away, so the only cost is the time of one repair attempt.&#10;&#10;OFF: if the estimate says recovery is short, skip PAR2 and immediately delete, blocklist and re-search the release through Sonarr/Radarr.&#10;&#10;Only affects playback failures. Import checks and the repair sweep always re-grab.">
+                           title="Enabled (recommended): when a file fails during playback and its release includes PAR2 data, a PAR2 repair runs before any re-grab. Each failed segment is first re-fetched and verified against the PAR2 checksums; segments that verify are restored directly, and the remainder are reconstructed from the recovery data. If the file cannot be recovered, the release is re-grabbed immediately.&#10;&#10;Disabled: the repair runs only when a pre-check estimates that the retained recovery data covers the recorded damage. Otherwise the release is deleted, blocklisted and re-searched in Sonarr/Radarr straight away.&#10;&#10;Applies to playback failures only. Import checks and scheduled repair sweeps always re-grab damaged releases.">
                         <span>
-                            <span class="block font-medium">Try PAR2 before re-grabbing <i class="bi bi-info-circle opacity-60"></i></span>
-                            <span class="block text-xs opacity-70">Don't let the rough recovery estimate skip PAR2 on playback failures. Hover for details.</span>
+                            <span class="block font-medium">Repair before re-grab <i class="bi bi-info-circle opacity-60"></i></span>
+                            <span class="block text-xs opacity-70">Playback failures are repaired with PAR2 first; the release is re-grabbed only if repair is not possible.</span>
                         </span>
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPar2TryBeforeRegrab">
                     </label>
