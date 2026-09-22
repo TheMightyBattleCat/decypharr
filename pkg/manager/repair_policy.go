@@ -67,7 +67,9 @@ const (
 // record (or backfillable from the still-on-disk source NZB) with recovery
 // coverage sufficient for the pending damage (see Par2Repair.par2Usable,
 // which reuses the same check that drives the overlay GUI's "repairable"
-// badge). A file whose record predates PAR2 retention, or whose damage
+// badge). With config.Repair.Par2TryBeforeRegrab on (the default), that
+// coverage estimate is skipped and any pending damage counts as usable - the
+// repair pass decides, and a terminal verdict still re-grabs. A file whose record predates PAR2 retention, or whose damage
 // exceeds what the retained recovery volumes can fix, is par2Usable=false
 // even with the toggle on - there is no truth-table row for "PAR2 enabled
 // but not usable"; it takes the disabled path below.

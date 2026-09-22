@@ -261,6 +261,14 @@
                         </span>
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
                     </label>
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
+                           title="ON (recommended): when playback hits an unwatchable file, always try a PAR2 repair first, as long as the release has PAR2 data - even if the quick estimate says there isn't enough recovery data. That estimate assumes every recorded-dead segment needs a recovery slice, but many 'dead' segments are actually intact (they get healed without any recovery data) and partly damaged recovery volumes still count. If the repair gives up for good, the file is re-grabbed straight away, so the only cost is the time of one repair attempt.&#10;&#10;OFF: if the estimate says recovery is short, skip PAR2 and immediately delete, blocklist and re-search the release through Sonarr/Radarr.&#10;&#10;Only affects playback failures. Import checks and the repair sweep always re-grab.">
+                        <span>
+                            <span class="block font-medium">Try PAR2 before re-grabbing <i class="bi bi-info-circle opacity-60"></i></span>
+                            <span class="block text-xs opacity-70">Don't let the rough recovery estimate skip PAR2 on playback failures. Hover for details.</span>
+                        </span>
+                        <input type="checkbox" class="toggle toggle-primary" id="overlayPar2TryBeforeRegrab">
+                    </label>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">

@@ -2499,6 +2499,8 @@ class RepairManager {
             $('overlayPadMaxRatio').placeholder = d.pad_max_byte_ratio ?? '';
             $('overlayPadMaxRatio').value = c.pad_max_byte_ratio ?? '';
         }
+        // Unset means on (config.Par2TryBeforeRegrabEnabled).
+        if ($('overlayPar2TryBeforeRegrab')) $('overlayPar2TryBeforeRegrab').checked = c.par2_try_before_regrab !== false;
         if ($('overlayPar2Mode')) $('overlayPar2Mode').value = c.par2_repair_mode || 'auto_all';
         if ($('overlayPar2MinSegments')) {
             $('overlayPar2MinSegments').placeholder = d.par2_repair_min_segments ?? '';
@@ -2518,6 +2520,7 @@ class RepairManager {
             const payload = {
                 playback_padding: !!$('overlayPlaybackPadding')?.checked,
                 par2_repair: !!$('overlayPar2Repair')?.checked,
+                par2_try_before_regrab: !!$('overlayPar2TryBeforeRegrab')?.checked,
                 pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
                 pad_max_total_segments: parseInt($('overlayPadMaxTotal')?.value, 10) || 0,
                 pad_max_byte_ratio: parseFloat($('overlayPadMaxRatio')?.value) || 0,

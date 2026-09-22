@@ -562,6 +562,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// that used to silently wipe the Arr webhook token.
 	newConfig.Repair.PlaybackPadding = currentConfig.Repair.PlaybackPadding
 	newConfig.Repair.Par2Repair = currentConfig.Repair.Par2Repair
+	newConfig.Repair.Par2TryBeforeRegrab = currentConfig.Repair.Par2TryBeforeRegrab
 	newConfig.Repair.PadMaxRunSegments = currentConfig.Repair.PadMaxRunSegments
 	newConfig.Repair.PadMaxTotalSegments = currentConfig.Repair.PadMaxTotalSegments
 	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio

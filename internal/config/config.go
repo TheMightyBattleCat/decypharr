@@ -368,6 +368,19 @@ type RepairConfig struct {
 	// convention as PlaybackPadding.
 	Par2Repair *bool `json:"par2_repair,omitempty"`
 
+	// Par2TryBeforeRegrab, when enabled, lets a playback failure try a PAR2
+	// repair before an automatic re-grab even when the quick recovery
+	// estimate (one recovery slice per recorded-dead segment, against the
+	// slice counts in the PAR2 volume filenames) says it falls short. That
+	// estimate counts segments playback recorded dead on a single failed pass
+	// - often intact, and healed without any recovery data - and cannot see
+	// partly usable volumes, so it routed repairable files to delete +
+	// blocklist + re-search. With it on, the repair pass decides; if it gives
+	// up for good, the playback path still re-grabs straight away. Off keeps
+	// the estimate as the gate. Defaults true when unset, same convention as
+	// Par2Repair.
+	Par2TryBeforeRegrab *bool `json:"par2_try_before_regrab,omitempty"`
+
 	// PadMaxRunSegments, PadMaxTotalSegments, and PadMaxByteRatio are the
 	// playback-padding caps (see pkg/usenet/overlay.Policy) - the longest
 	// contiguous run of dead segments, the most dead segments total, and the
@@ -422,7 +435,7 @@ func (r RepairConfig) IsZero() bool {
 		!r.RepairOnPlaybackFailure &&
 		!r.FFProbeCheck && r.FFProbeTimeout == "" && r.FFProbePath == "" && !r.FFProbeOnImport && r.FFProbeDecodeCheck == nil &&
 		!r.CleanupSuperseded &&
-		r.PlaybackPadding == nil && r.Par2Repair == nil && r.ImportAvailabilityCheck == nil &&
+		r.PlaybackPadding == nil && r.Par2Repair == nil && r.Par2TryBeforeRegrab == nil && r.ImportAvailabilityCheck == nil &&
 		r.PadMaxRunSegments == 0 && r.PadMaxTotalSegments == 0 && r.PadMaxByteRatio == 0 &&
 		r.Par2RepairMode == "" && r.Par2RepairMinSegments == 0 &&
 		r.Par2UrgentConcurrency == 0 && r.PrecacheReadAhead == nil
@@ -438,6 +451,13 @@ func (r RepairConfig) PlaybackPaddingEnabled() bool {
 // when unset (see Par2Repair's doc comment).
 func (r RepairConfig) Par2RepairEnabled() bool {
 	return r.Par2Repair == nil || *r.Par2Repair
+}
+
+// Par2TryBeforeRegrabEnabled reports whether a playback failure tries PAR2
+// before re-grabbing regardless of the recovery estimate, defaulting to true
+// when unset (see Par2TryBeforeRegrab's doc comment).
+func (r RepairConfig) Par2TryBeforeRegrabEnabled() bool {
+	return r.Par2TryBeforeRegrab == nil || *r.Par2TryBeforeRegrab
 }
 
 // ImportAvailabilityCheckEnabled reports whether the import-time segment
@@ -999,6 +1019,10 @@ func (c *Config) applyRepairDefaults() {
 	if c.Repair.Par2Repair == nil {
 		v := true
 		c.Repair.Par2Repair = &v
+	}
+	if c.Repair.Par2TryBeforeRegrab == nil {
+		v := true
+		c.Repair.Par2TryBeforeRegrab = &v
 	}
 	// PrecacheReadAhead defaults OFF (nil left as nil), unlike
 	// PlaybackPadding/Par2Repair above - read-ahead is bandwidth- and

@@ -731,7 +731,25 @@ func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
 		}
 		return true, ""
 	}
-	return p.coverageSufficient(nzbID, nzb)
+	var pendingSlices uint32
+	if pending, perr := p.manager.usenet.OverlayPendingRepair(nzbID); perr == nil {
+		pendingSlices = estimateNeededSlices(pending)
+	}
+	return par2CoverageGate(config.Get().Repair.Par2TryBeforeRegrabEnabled(), pendingSlices, func() (bool, string) {
+		return p.coverageSufficient(nzbID, nzb)
+	})
+}
+
+// par2CoverageGate is par2Usable's last step. With tryFirst
+// (config.Repair.Par2TryBeforeRegrab) any pending damage makes PAR2 usable,
+// and the repair pass itself decides - its gates heal intact dead segments
+// first and use partly dead volumes, which the name-only coverage estimate
+// cannot see. Without it the estimate decides, as before.
+func par2CoverageGate(tryFirst bool, pendingSlices uint32, coverage func() (bool, string)) (bool, string) {
+	if tryFirst && pendingSlices > 0 {
+		return true, ""
+	}
+	return coverage()
 }
 
 // par2RecoveryCapacity returns the total number of recovery slices available
