@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -307,6 +308,60 @@ func TestPar2SuspectFailuresTurnTerminalAfterRepeats(t *testing.T) {
 	if c := classifyPar2Failure(badSum); c.terminal || !c.suspect {
 		t.Fatalf("checksum-bad intact slice: %+v, want suspect", c)
 	}
+}
+
+// An early-stopped pass - more unreadable slices than spare recovery - ends
+// the round loop with its causes named, so a short read stays suspect. It
+// used to fold them in and go round again, where the capacity gate returned
+// "more damage than recorded" (terminal) on the first attempt.
+func TestPar2EarlyStoppedPassStaysSuspect(t *testing.T) {
+	const sliceSize = 100
+	var slices [][]byte
+	for i := 0; i < 8; i++ {
+		slices = append(slices, repeatByte(byte(i+1), sliceSize))
+	}
+	idx := buildSingleFileIndexWithIFSC(t, sliceSize, [16]byte{0x0a}, "a.rar", slices)
+	gone := unreadableSlices{size: sliceSize, gone: map[int64]bool{2: true, 3: true, 4: true}}
+	const k, available = 1, 3 // spare = 2, and three slices are unreadable
+	_, repairErr := par2.RepairWith(idx, []int64{0}, []par2.RecoverySlice{{Exponent: 0, Data: make([]byte, sliceSize)}}, gone,
+		par2.RepairOptions{MaxUnavailable: available - k})
+	if repairErr == nil || !strings.Contains(repairErr.Error(), "pass stopped") {
+		t.Fatalf("RepairWith: %v, want an early stop", repairErr)
+	}
+	newly := 3
+	if !par2RoundShouldStop(newly, 0, k, available) {
+		t.Fatal("round 0 went round again although the enlarged damage cannot fit the recovery budget")
+	}
+	if par2RoundShouldStop(1, 0, 1, 10) {
+		t.Fatal("stopped although the enlarged damage fits")
+	}
+
+	short := par2RoundCapError(0, 0, newly, 0, repairErr)
+	if c := classifyPar2Failure(short); c.terminal || !c.suspect {
+		t.Fatalf("early-stopped short read %q: %+v, want suspect", short, c)
+	}
+	badSum := par2RoundCapError(0, 0, 0, newly, repairErr)
+	if c := classifyPar2Failure(badSum); c.terminal || !c.suspect {
+		t.Fatalf("early-stopped checksum failure %q: %+v, want suspect", badSum, c)
+	}
+	gonePosting := par2RoundCapError(2, 0, 1, 0, repairErr)
+	if c := classifyPar2Failure(gonePosting); !c.terminal {
+		t.Fatalf("early stop with confirmed-missing slices %q: %+v, want terminal", gonePosting, c)
+	}
+}
+
+// unreadableSlices serves intact slices, except those in gone, which are
+// unavailable the way a dead article makes them.
+type unreadableSlices struct {
+	size int
+	gone map[int64]bool
+}
+
+func (u unreadableSlices) ReadSlice(i int64) ([]byte, error) {
+	if u.gone[i] {
+		return nil, fmt.Errorf("%w: article gone", par2.ErrSliceUnavailable)
+	}
+	return repeatByte(byte(i+1), u.size), nil
 }
 
 // Repair's own intact-slice abort is typed, so it is recognised through any

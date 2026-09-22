@@ -2191,34 +2191,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the short-read case, and one that made a geometry bug on intact data
 		// indistinguishable from genuine provider damage.
 		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
-		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
-			type cause struct {
-				n    int
-				text string
-			}
-			var causes []cause
-			for _, c := range []cause{
-				{confirmedMissing, "confirmed missing across every provider"},
-				{corrupt, "corrupt on every provider"},
-				{shortRead, "decoded shorter than their recorded size"},
-				{len(checksumBad), "failed their PAR2 checksum"},
-			} {
-				if c.n > 0 {
-					causes = append(causes, c)
-				}
-			}
-			switch len(causes) {
-			case 0:
-			case 1:
-				return fmt.Errorf("repair: %d intact slice(s) %s: %w", causes[0].n, causes[0].text, repairErr)
-			default:
-				parts := make([]string, len(causes))
-				for i, c := range causes {
-					parts[i] = fmt.Sprintf("%d %s", c.n, c.text)
-				}
-				return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", len(notFound)+len(checksumBad), strings.Join(parts, ", "), repairErr)
-			}
-			return fmt.Errorf("repair: %w", repairErr)
+		if par2RoundShouldStop(len(newlyDamaged), round, k, int(available)) {
+			return par2RoundCapError(confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr)
 		}
 		p.logger.Info().
 			Str("entry", entryName).
@@ -2274,6 +2248,54 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		written = append(written, dr)
 	}
 	return nil
+}
+
+// par2RoundShouldStop decides whether runRepair's round loop ends with the
+// cause-labelled error instead of folding newly unreadable slices in and
+// trying again: nothing new was found, the round cap is reached, or the
+// enlarged damaged set cannot fit the recovery budget. The last case is the
+// one an early-stopped pass always hits. Without it the loop went round
+// again and the next round's opening capacity gate returned "more damage
+// than recorded" - terminal - so a short-read or checksum-bad pass, which
+// classifyPar2Failure treats as suspect, went terminal on its first attempt.
+func par2RoundShouldStop(newlyDamaged, round, k, available int) bool {
+	return newlyDamaged == 0 ||
+		round >= maxIntactRepairRounds-1 ||
+		k+newlyDamaged > min(available, par2.MaxRepairSlices)
+}
+
+// par2RoundCapError names why intact slices were unreadable when the round
+// loop stops. The cause text is load-bearing: classifyPar2Failure keeps a
+// confirmed-dead cause terminal and a short read or bad checksum suspect.
+func par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
+	type cause struct {
+		n    int
+		text string
+	}
+	var causes []cause
+	for _, c := range []cause{
+		{confirmedMissing, "confirmed missing across every provider"},
+		{corrupt, "corrupt on every provider"},
+		{shortRead, "decoded shorter than their recorded size"},
+		{checksumBad, "failed their PAR2 checksum"},
+	} {
+		if c.n > 0 {
+			causes = append(causes, c)
+		}
+	}
+	switch len(causes) {
+	case 0:
+		return fmt.Errorf("repair: %w", repairErr)
+	case 1:
+		return fmt.Errorf("repair: %d intact slice(s) %s: %w", causes[0].n, causes[0].text, repairErr)
+	}
+	total := 0
+	parts := make([]string, len(causes))
+	for i, c := range causes {
+		total += c.n
+		parts[i] = fmt.Sprintf("%d %s", c.n, c.text)
+	}
+	return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", total, strings.Join(parts, ", "), repairErr)
 }
 
 // deadRefsByFile groups refs back into the file -> dead segments shape
