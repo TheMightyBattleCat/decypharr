@@ -72,6 +72,9 @@ class RepairManager {
         // pollOverlayProgress. Cleared and rebuilt on every renderOverlayFiles
         // pass so a stale row never keeps polling after the table's rebuilt.
         this.overlayProgressTimers = new Map();
+        // overlayKey -> started_at of the last finished progress record that
+        // triggered a list reload (see pollOverlayProgress).
+        this.overlayProgressSeenTerminal = new Map();
         this.bind();
         this.loadAll();
     }
@@ -1632,8 +1635,10 @@ class RepairManager {
         await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayHistory(), this.loadOverlayOrphanCount()]);
     }
 
+    // Keyed by nzb_id: a re-grab twin shares the entry name, and keying by
+    // name made the two rows share one selection and one progress poller.
     overlayKey(f) {
-        return `${f.entry}::${f.file}`;
+        return `${f.nzb_id || f.entry}::${f.file}`;
     }
 
     async parseJSONSafe(res) {
@@ -1808,9 +1813,15 @@ class RepairManager {
     }
 
     overlayRepairableBadge(f) {
-        const pending = Math.max(f.dead_segments || 0, f.par2_dead_segments_discovered || 0) + (f.padded_segments || 0) > 0;
+        // Pending is what the server calls pending (recorded dead + padded).
+        // par2_dead_segments_discovered comes from the last attempt's state and
+        // made rows with nothing pending show "no par2" with no reason.
+        const pending = (f.dead_segments || 0) + (f.padded_segments || 0) > 0;
         if (!pending) return '<span class="badge badge-ghost badge-sm">n/a</span>';
         if (f.repairable) return '<span class="badge badge-success badge-sm" title="PAR2 repair is available">repairable</span>';
+        if (f.par2_terminal) {
+            return `<span class="badge badge-error badge-sm" title="${this.escapeAttr(f.repair_status_reason || f.par2_last_error || 'automatic retries stopped')}">gave up</span>`;
+        }
         const reason = f.not_repairable_reason || '';
         if (/recovery slice/i.test(reason)) {
             return `<span class="badge badge-warning badge-sm" title="${this.escapeAttr(reason)}">insufficient recovery</span>`;
@@ -1968,7 +1979,7 @@ class RepairManager {
         const tick = async () => {
             let p = null;
             try {
-                p = await this.fetchJSON(`${this.api}/overlay/repair-progress?entry=${encodeURIComponent(f.entry)}&file=${encodeURIComponent(f.file)}`);
+                p = await this.fetchJSON(`${this.api}/overlay/repair-progress?entry=${encodeURIComponent(f.entry)}&file=${encodeURIComponent(f.file)}&nzb_id=${encodeURIComponent(f.nzb_id || '')}`);
             } catch (e) {
                 console.error('Failed to poll overlay repair progress', e);
                 return;
@@ -1976,7 +1987,14 @@ class RepairManager {
             const cell = document.getElementById(domId);
             if (cell) cell.innerHTML = this.renderOverlayProgressBody(p);
 
+            // The progress record is the most recent job's, finished or not.
+            // A queued row whose previous job already finished saw that old
+            // terminal phase on every tick, reloaded the list, was re-rendered
+            // still queued and polled again at once - a request loop for as
+            // long as it stayed queued. Each finished record reloads once.
             if (p && (p.phase === 'completed' || p.phase === 'failed')) {
+                if (this.overlayProgressSeenTerminal.get(key) === p.started_at) return;
+                this.overlayProgressSeenTerminal.set(key, p.started_at);
                 clearInterval(this.overlayProgressTimers.get(key));
                 this.overlayProgressTimers.delete(key);
                 this.loadOverlayFiles();
@@ -2056,8 +2074,8 @@ class RepairManager {
                     <div class="opacity-50" title="Informational only - declared size PAR2 protects on Usenet, not a disk cost">protects ${this.formatBytes(f.protected_release_bytes || 0)}</div>
                 </td>
                 <td class="text-right whitespace-nowrap">
-                    <button class="btn btn-xs btn-outline" data-action="repair-now" ${!(f.repairable || f.backfill_eligible) ? 'disabled' : ''}
-                            title="${this.escapeAttr(f.repairable ? 'Run a PAR2 repair pass now' : (f.backfill_eligible ? 'Rebuild PAR2 references from source, then repair' : (f.not_repairable_reason || 'Not repairable')))}"
+                    <button class="btn btn-xs btn-outline" data-action="repair-now" ${!(f.manual_repair_allowed || f.repairable || f.backfill_eligible) ? 'disabled' : ''}
+                            title="${this.escapeAttr(this.overlayRepairNowTitle(f))}"
                             aria-label="Repair now">
                         <i class="bi bi-tools"></i>
                     </button>
@@ -2092,12 +2110,23 @@ class RepairManager {
         this.updateOverlayBulkBar();
     }
 
+    // A terminal ("gave up") or coverage-short row can still be retried by
+    // hand: the server re-evaluates it from scratch, healing intact dead
+    // segments first. The button used to be disabled for exactly those rows.
+    overlayRepairNowTitle(f) {
+        if (f.backfill_eligible && !f.repairable) return 'Rebuild PAR2 references from source, then repair';
+        if (f.par2_terminal) return 'Retry the PAR2 repair now (automatic retries have stopped)';
+        if (f.repairable) return 'Run a PAR2 repair pass now';
+        if (f.manual_repair_allowed) return 'Try a PAR2 repair pass now (recovery may be short; intact dead segments are healed first)';
+        return f.not_repairable_reason || 'Not repairable';
+    }
+
     async overlayRepairNow(f) {
         try {
             const res = await fetch(`${this.api}/overlay/repair-now`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({entry: f.entry, file: f.file}),
+                body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
@@ -2113,16 +2142,21 @@ class RepairManager {
     }
 
     async overlayVerify(f) {
+        window.createToast(`Verifying ${f.file} - this downloads the whole file and can take minutes`, 'info');
         try {
             const res = await fetch(`${this.api}/overlay/verify`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({entry: f.entry, file: f.file}),
+                body: JSON.stringify({entry: f.entry, file: f.file, nzb_id: f.nzb_id}),
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+            // "unsupported" (an extracted archive member, no index retained)
+            // was reported as a red "Verify FAILED".
             if (data && data.pass) {
                 window.createToast(`Verify passed: ${f.file} matches PAR2's whole-file MD5`, 'success');
+            } else if (data && data.status === 'unsupported') {
+                window.createToast(`Can't verify ${f.file}: ${data.reason || 'not supported for this file'}`, 'warning');
             } else {
                 window.createToast(`Verify FAILED for ${f.file}: ${(data && data.reason) || 'MD5 mismatch'}`, 'error');
             }
@@ -2171,22 +2205,29 @@ class RepairManager {
         }
     }
 
+    // Select-all acts on the rows the filters show. It used to select every
+    // loaded file, so "Delete & re-search selected" after filtering to a few
+    // rows blocklisted every hidden one as well.
     toggleOverlaySelectAll(checked) {
         this.overlaySelected.clear();
         if (checked) {
-            for (const f of this.overlayFiles) this.overlaySelected.add(this.overlayKey(f));
+            for (const f of this.filteredOverlayFiles()) this.overlaySelected.add(this.overlayKey(f));
         }
         this.renderOverlayFiles();
     }
 
     toggleOverlayRowSelect(key, checked) {
         if (checked) this.overlaySelected.add(key); else this.overlaySelected.delete(key);
-        const all = document.getElementById('overlaySelectAllCheckbox');
-        if (all) {
-            all.checked = this.overlayFiles.length > 0 && this.overlaySelected.size === this.overlayFiles.length;
-            all.indeterminate = this.overlaySelected.size > 0 && this.overlaySelected.size < this.overlayFiles.length;
-        }
         this.updateOverlayBulkBar();
+    }
+
+    syncOverlaySelectAllCheckbox() {
+        const all = document.getElementById('overlaySelectAllCheckbox');
+        if (!all) return;
+        const visible = this.filteredOverlayFiles();
+        const picked = visible.filter((f) => this.overlaySelected.has(this.overlayKey(f))).length;
+        all.checked = visible.length > 0 && picked === visible.length;
+        all.indeterminate = picked > 0 && picked < visible.length;
     }
 
     clearOverlaySelection() {
@@ -2199,20 +2240,24 @@ class RepairManager {
         this.renderOverlayFiles();
     }
 
+    // Only rows the filters currently show: a row selected and then filtered
+    // out of view must not be caught by a bulk action.
     overlaySelectedFiles() {
-        return this.overlayFiles.filter((f) => this.overlaySelected.has(this.overlayKey(f)));
+        return this.filteredOverlayFiles().filter((f) => this.overlaySelected.has(this.overlayKey(f)));
     }
 
     updateOverlayBulkBar() {
         const bar = document.getElementById('overlayBulkBar');
         const count = document.getElementById('overlaySelectedCount');
-        if (count) count.textContent = this.overlaySelected.size;
-        if (bar) bar.classList.toggle('hidden', this.overlaySelected.size === 0);
+        const selected = this.overlaySelectedFiles();
+        this.syncOverlaySelectAllCheckbox();
+        if (count) count.textContent = selected.length;
+        if (bar) bar.classList.toggle('hidden', selected.length === 0);
 
-        const failedSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'failed');
-        const cleanSelected = this.overlaySelectedFiles().filter((f) => f.verdict === 'clean');
+        const failedSelected = selected.filter((f) => f.verdict === 'failed');
+        const cleanSelected = selected.filter((f) => f.verdict === 'clean');
 
-        const allCount = this.overlaySelected.size;
+        const allCount = selected.length;
         const deleteResearchBtn = document.getElementById('overlayBulkDeleteResearchBtn');
         if (deleteResearchBtn && deleteResearchBtn.dataset.confirming !== 'true') {
             deleteResearchBtn.disabled = allCount === 0;

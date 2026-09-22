@@ -86,6 +86,12 @@ type OverlayFile struct {
 	// them too even though Repairable itself is false.
 	BackfillEligible bool `json:"backfill_eligible"`
 
+	// ManualRepairAllowed is whether "repair now" can start a pass: damage is
+	// pending and the release has PAR2 data (or can backfill it). Unlike
+	// Repairable it ignores the coverage estimate and a terminal verdict,
+	// both of which a manual pass re-evaluates.
+	ManualRepairAllowed bool `json:"manual_repair_allowed"`
+
 	// Par2Terminal mirrors storage.Par2RepairState.Terminal: true means the
 	// automatic path has given up re-enqueuing this file (see
 	// Par2Repair.par2ShouldAutoEnqueue) after a failure classifyPar2Failure
@@ -256,8 +262,10 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 		retainedMetaBytes := par2RetainedMetaBytes(nzb)
 
 		repairable, notRepairableReason := false, "par2 repair worker unavailable"
+		manualPossible := false
 		if par2Repair != nil {
 			repairable, notRepairableReason = par2Repair.Availability(nzbID)
+			manualPossible, _ = par2Repair.ManualRepairPossible(nzbID)
 		}
 		running := par2Repair != nil && par2Repair.IsRunning(nzbID)
 		queued := !running && par2Repair != nil && par2Repair.IsQueued(nzbID)
@@ -318,6 +326,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 				of.NotRepairableReason = notRepairableReason
 				of.BackfillEligible = s.par2RefsBackfillEligible(nzbID)
 			}
+			of.ManualRepairAllowed = pending && (manualPossible || of.BackfillEligible)
 			if repairState != nil {
 				of.Par2Terminal = repairState.Terminal
 				of.Par2AttemptCount = repairState.AttemptCount
@@ -573,6 +582,20 @@ func (s *Server) resolveOverlayEntry(req overlayFileRequest) (*storage.Entry, er
 	return s.manager.GetEntryByName(req.Entry, req.File)
 }
 
+// resolveOverlayRowEntry is resolveOverlayEntry for actions on the exact row
+// the GUI shows (repair-now, verify, screen, progress): the row's nzb_id wins
+// when it still names an entry. Name resolution follows the live folder to
+// whichever grab owns it now, so with a same-named re-grab twin it acted on
+// a different NZB than the row the user clicked.
+func (s *Server) resolveOverlayRowEntry(req overlayFileRequest) (*storage.Entry, error) {
+	if req.NzbID != "" {
+		if entry, err := s.manager.GetEntry(req.NzbID); err == nil && entry != nil {
+			return entry, nil
+		}
+	}
+	return s.resolveOverlayEntry(req)
+}
+
 // handleOverlayRepairNow enqueues an immediate PAR2 repair pass for one
 // file's entry, bypassing the repair sweep's StopSchedule window (a manual,
 // user-initiated repair runs now) but not any other gate - see
@@ -583,7 +606,7 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	entry, err := s.resolveOverlayEntry(req)
+	entry, err := s.resolveOverlayRowEntry(req)
 	if err != nil || entry == nil {
 		http.Error(w, "Entry not found", http.StatusNotFound)
 		return
@@ -594,7 +617,7 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "PAR2 repair worker not available", http.StatusServiceUnavailable)
 		return
 	}
-	if repairable, reason := par2Repair.Availability(entry.InfoHash); !repairable {
+	if possible, reason := par2Repair.ManualRepairPossible(entry.InfoHash); !possible {
 		// Availability rejects outright when PAR2 refs were never retained,
 		// but the source .nzb backing them may still be on disk - dispatch
 		// anyway in that case and let runRepair's own backfill
@@ -656,8 +679,9 @@ func (s *Server) handleOverlayRepairProgress(w http.ResponseWriter, r *http.Requ
 	req := overlayFileRequest{
 		Entry: strings.TrimSpace(r.URL.Query().Get("entry")),
 		File:  strings.TrimSpace(r.URL.Query().Get("file")),
+		NzbID: strings.TrimSpace(r.URL.Query().Get("nzb_id")),
 	}
-	entry, err := s.resolveOverlayEntry(req)
+	entry, err := s.resolveOverlayRowEntry(req)
 	if err != nil || entry == nil {
 		http.Error(w, "Entry not found", http.StatusNotFound)
 		return
@@ -684,7 +708,7 @@ func (s *Server) handleOverlayVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	entry, err := s.resolveOverlayEntry(req)
+	entry, err := s.resolveOverlayRowEntry(req)
 	if err != nil || entry == nil {
 		http.Error(w, "Entry not found", http.StatusNotFound)
 		return
@@ -700,7 +724,16 @@ func (s *Server) handleOverlayVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	utils.JSONResponse(w, map[string]any{"pass": pass, "reason": reason}, http.StatusOK)
+	// "unsupported" (an extracted archive member, no index retained) is not
+	// a failed check - the GUI showed both as "Verify FAILED".
+	status := "pass"
+	if !pass {
+		status = "unsupported"
+		if reason == manager.Par2VerifyMismatch {
+			status = "fail"
+		}
+	}
+	utils.JSONResponse(w, map[string]any{"pass": pass, "status": status, "reason": reason}, http.StatusOK)
 }
 
 // handleOverlayScreen full-STATs every segment of a degraded file - not just
@@ -714,7 +747,7 @@ func (s *Server) handleOverlayScreen(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	entry, err := s.resolveOverlayEntry(req)
+	entry, err := s.resolveOverlayRowEntry(req)
 	if err != nil || entry == nil {
 		http.Error(w, "Entry not found", http.StatusNotFound)
 		return

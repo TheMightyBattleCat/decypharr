@@ -626,6 +626,40 @@ func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string)
 	return p.coverageSufficient(nzbID, nzb)
 }
 
+// ManualRepairPossible reports whether a user-initiated pass for nzbID can
+// run at all: Availability's structural checks without its coverage
+// estimate. That estimate (one slice per recorded-dead segment, against
+// filename-derived volume counts) kept the GUI from even starting a pass
+// that the heal or partly dead volumes can complete; the pass's own gates
+// decide instead. A missing PAR2 record is left to the caller's backfill
+// check.
+func (p *Par2Repair) ManualRepairPossible(nzbID string) (ok bool, reason string) {
+	if p == nil || p.manager.usenet == nil {
+		return false, "usenet client not configured"
+	}
+	if !config.Get().Repair.Par2RepairEnabled() {
+		return false, "par2 repair disabled"
+	}
+	nzb, err := p.manager.usenet.GetNZB(nzbID)
+	if err != nil {
+		return false, "nzb record not found"
+	}
+	if len(nzb.Par2Source) == 0 {
+		return false, "no posted-file layout retained for this release"
+	}
+	if len(nzb.Par2Files) == 0 {
+		return false, "no par2 metadata retained for this release"
+	}
+	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		return false, "failed to read overlay state"
+	}
+	if estimateNeededSlices(pending) == 0 {
+		return false, "no damage pending repair"
+	}
+	return true, ""
+}
+
 // coverageSufficient is Availability's damage-vs-recovery-coverage check,
 // factored out so par2Usable can share it once it has separately confirmed
 // nzb.Par2Source/Par2Files are present (or established they're
@@ -862,10 +896,15 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 	var sum [16]byte
 	copy(sum[:], h.Sum(nil))
 	if sum != fd.FileMD5 {
-		return false, "whole-file MD5 mismatch", nil
+		return false, Par2VerifyMismatch, nil
 	}
 	return true, "", nil
 }
+
+// Par2VerifyMismatch is the reason Verify gives when the bytes were checked
+// and are wrong. Every other reason with pass=false means the file could not
+// be checked at all.
+const Par2VerifyMismatch = "whole-file MD5 mismatch"
 
 // EnqueueUrgent schedules nzbID for an immediate URGENT-lane PAR2 repair
 // pass, prioritized ahead of any URGENT job with a larger proximity.
