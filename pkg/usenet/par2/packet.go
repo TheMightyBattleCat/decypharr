@@ -115,7 +115,11 @@ func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64)
 	pos := int64(0)
 	for pos+packetHeaderSize <= int64(len(data)) {
 		h, err := parsePacketHeader(data[pos:])
-		if err != nil || pos+h.Length > int64(len(data)) {
+		// Compared as remaining bytes, not pos+Length: a garbage header can
+		// declare a length near MaxInt64, and the sum would wrap negative,
+		// pass the check and panic the slice below. Lenient mode scans
+		// damaged volumes for magic, so such a header is reachable.
+		if err != nil || h.Length > int64(len(data))-pos {
 			if !lenient {
 				break
 			}

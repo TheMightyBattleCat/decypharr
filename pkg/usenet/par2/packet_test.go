@@ -32,6 +32,30 @@ func TestParsePacketHeaderRejectsBadMagic(t *testing.T) {
 	}
 }
 
+// A garbage header declaring a length near MaxInt64 used to wrap pos+Length
+// negative, pass the bounds check and panic the slice. Lenient mode resyncs
+// on magic inside damaged volumes, so it must resume past it instead.
+func TestWalkPacketsSurvivesOverflowingLength(t *testing.T) {
+	var setID [16]byte
+	good := buildPacket(t, setID, typeMain, []byte("body"))
+	bogus := make([]byte, packetHeaderSize)
+	copy(bogus[0:8], packetMagic[:])
+	binary.LittleEndian.PutUint64(bogus[8:16], uint64(1<<63-4)) // multiple of 4, near MaxInt64
+	data := append(append(append([]byte{}, good...), bogus...), good...)
+
+	seen := 0
+	err := walkPackets(data, func(packetHeader, int64) {}, func(packetHeader, []byte, int64) error {
+		seen++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkPackets: %v", err)
+	}
+	if seen != 2 {
+		t.Fatalf("saw %d packets, want both good ones around the bogus header", seen)
+	}
+}
+
 func TestParsePacketHeaderRejectsShortBuffer(t *testing.T) {
 	if _, err := parsePacketHeader(make([]byte, 10)); err == nil {
 		t.Fatalf("expected an error for a too-short buffer, got none")
