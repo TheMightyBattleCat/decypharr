@@ -2,9 +2,11 @@ package par2
 
 import (
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -331,4 +333,58 @@ func TestGoldenRepairAllRecoverySlices(t *testing.T) {
 		damagedList = append(damagedList, base+offsets[i])
 	}
 	gf.assertRepairMatchesOriginal(t, damagedList)
+}
+
+// unavailableSliceSource is fixtureSliceSource with some intact slices
+// unreadable, the way a dead article makes them.
+type unavailableSliceSource struct {
+	*fixtureSliceSource
+	gone  map[int64]struct{}
+	reads map[int64]int
+}
+
+func (s *unavailableSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
+	s.reads[globalIdx]++
+	if _, gone := s.gone[globalIdx]; gone {
+		return nil, fmt.Errorf("%w: article gone", ErrSliceUnavailable)
+	}
+	return s.fixtureSliceSource.ReadSlice(globalIdx)
+}
+
+// Unavailable intact slices do not stop the pass: every one is found in it,
+// the error names them all at once, and a retry with them added to the
+// damaged set repairs the lot. Tale of Castles S08E05 (2026-09-22) found one
+// dead intact slice per full re-read until the round cap made it terminal.
+func TestGoldenRepairCollectsEveryUnavailableSlice(t *testing.T) {
+	gf := loadGoldenFixture(t)
+	base1, _ := gf.idx.SliceBase(gf.fileIDByName["file1.bin"])
+	base2, _ := gf.idx.SliceBase(gf.fileIDByName["file2.bin"])
+	damaged := []int64{base1 + 1}
+	gone := map[int64]struct{}{base1 + 2: {}, base2 + 1: {}}
+
+	recovery := make([]RecoverySlice, len(damaged))
+	for i, ref := range gf.idx.Recovery[:len(damaged)] {
+		recovery[i] = RecoverySlice{Exponent: ref.Exponent, Data: gf.sources[ref.Source].Data[ref.Offset : ref.Offset+ref.Length]}
+	}
+	src := &unavailableSliceSource{
+		fixtureSliceSource: &fixtureSliceSource{idx: gf.idx, damaged: map[int64]struct{}{damaged[0]: {}}, byFile: gf.byFile},
+		gone:               gone,
+		reads:              map[int64]int{},
+	}
+	_, err := Repair(gf.idx, damaged, recovery, src)
+	if !errors.Is(err, ErrSliceUnavailable) {
+		t.Fatalf("Repair: %v, want ErrSliceUnavailable", err)
+	}
+	if !strings.HasPrefix(err.Error(), "2 intact slice(s) unavailable") {
+		t.Fatalf("Repair error %q does not count both unavailable slices", err)
+	}
+	for s := int64(0); s < gf.idx.NumSlices(); s++ {
+		if s == damaged[0] {
+			continue
+		}
+		if src.reads[s] != 1 {
+			t.Fatalf("slice %d read %d times, want every intact slice read once in the pass", s, src.reads[s])
+		}
+	}
+	gf.assertRepairMatchesOriginal(t, []int64{base1 + 1, base1 + 2, base2 + 1})
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/sourcegraph/conc/pool"
 
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
 
 // sliceFetchResult is one concurrent worker's outcome for one global PAR2
@@ -42,6 +43,13 @@ type deadCause uint8
 const (
 	causeConfirmedMissing deadCause = iota
 	causeShortRead
+	// causeCorrupt: every provider's copy failed its yEnc size/CRC check
+	// (ExecuteWithFailover returns the corrupt-article decode error only
+	// once each backbone has served a damaged copy). As gone as a 430 for
+	// this position. Seen on North Glen S20 NTb: CRC-bad on 9 providers,
+	// 430 on the 10th. It used to abort the pass with an error nothing
+	// classified, retried on backoff forever.
+	causeCorrupt
 )
 
 // concurrentSliceSource wraps a per-slice fetch function with a bounded
@@ -126,10 +134,17 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 					s.notFoundMu.Lock()
 					s.notFound[idx] = causeConfirmedMissing
 					s.notFoundMu.Unlock()
+					err = fmt.Errorf("%w: %w", par2.ErrSliceUnavailable, err)
 				case errors.Is(err, ErrSegmentShort):
 					s.notFoundMu.Lock()
 					s.notFound[idx] = causeShortRead
 					s.notFoundMu.Unlock()
+					err = fmt.Errorf("%w: %w", par2.ErrSliceUnavailable, err)
+				case nntp.IsCorruptArticleError(err):
+					s.notFoundMu.Lock()
+					s.notFound[idx] = causeCorrupt
+					s.notFoundMu.Unlock()
+					err = fmt.Errorf("%w: %w", par2.ErrSliceUnavailable, err)
 				}
 			}
 			select {
@@ -170,17 +185,20 @@ func (s *concurrentSliceSource) NotFoundIndices() []int64 {
 // segment size we persisted overstates what the article really decodes to (see
 // exactSegGeometry), and the slices counted here may be wholly intact data
 // being reconstructed from parity for no reason.
-func (s *concurrentSliceSource) DeadCauseCounts() (confirmedMissing, shortRead int) {
+func (s *concurrentSliceSource) DeadCauseCounts() (confirmedMissing, shortRead, corrupt int) {
 	s.notFoundMu.Lock()
 	defer s.notFoundMu.Unlock()
 	for _, cause := range s.notFound {
-		if cause == causeShortRead {
+		switch cause {
+		case causeShortRead:
 			shortRead++
-			continue
+		case causeCorrupt:
+			corrupt++
+		default:
+			confirmedMissing++
 		}
-		confirmedMissing++
 	}
-	return confirmedMissing, shortRead
+	return confirmedMissing, shortRead, corrupt
 }
 
 // ReadSlice implements par2.SliceSource, satisfying the "read exactly once

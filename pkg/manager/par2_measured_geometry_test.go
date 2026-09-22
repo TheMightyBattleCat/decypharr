@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -385,5 +386,60 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 	}
 	if _, ok := store.OverlayPatchBytes(nzbID, ref.Name, 3); ok {
 		t.Fatal("segment 3 patched although its article is gone")
+	}
+}
+
+// A recovery volume with one dead article still yields the recovery slices
+// the gap does not touch. It used to be dropped whole, and Under Reef
+// S11E06 (2026-09-22) was declared to have 0 recovery slices.
+func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
+	vol, err := os.ReadFile("../usenet/par2/testdata/par2/fixture.vol1+2.par2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.ReadFile("../usenet/par2/testdata/par2/fixture.par2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: vol}})
+	if err != nil || len(full.Recovery) != 2 {
+		t.Fatalf("fixture: %d recovery slices, err %v; want 2", len(full.Recovery), err)
+	}
+
+	// Cut the volume into 1000-byte "articles" and kill one.
+	const article = 1000
+	ref := storage.Par2FileRef{Name: "fixture.vol1+2.par2", Size: int64(len(vol))}
+	bodies := map[string][]byte{}
+	for off, i := 0, 0; off < len(vol); off, i = off+article, i+1 {
+		id := fmt.Sprintf("<v%d>", i)
+		bodies[id] = vol[off:min(off+article, len(vol))]
+		ref.Segments = append(ref.Segments, storage.Par2SegmentRef{MessageID: id, Bytes: int64(len(bodies[id]))})
+	}
+	dead := fmt.Sprintf("<v%d>", (len(vol)/4)/article) // inside the first recovery packet: the second is found only by resyncing
+	fetch := func(_ context.Context, id string) ([]byte, error) {
+		if id == dead {
+			return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "gone"}
+		}
+		return bodies[id], nil
+	}
+
+	data, err := fetchWholePar2File(context.Background(), fetch, ref)
+	if err != nil {
+		t.Fatalf("fetchWholePar2File with one dead article: %v", err)
+	}
+	idx, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: data}})
+	if err != nil {
+		t.Fatalf("ParseIndex: %v", err)
+	}
+	if len(idx.Recovery) != 1 {
+		t.Fatalf("%d recovery slices parsed, want the 1 the dead article does not touch", len(idx.Recovery))
+	}
+
+	// Every article gone: that is not-found, as before.
+	allDead := func(context.Context, string) ([]byte, error) {
+		return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "gone"}
+	}
+	if _, err := fetchWholePar2File(context.Background(), allDead, ref); !nntp.IsArticleNotFoundError(err) {
+		t.Fatalf("all articles dead: %v, want not-found", err)
 	}
 }

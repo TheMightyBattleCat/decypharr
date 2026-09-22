@@ -594,3 +594,38 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 		t.Errorf("ReadSlice(3)[0] = %#x, want 0x0B (fileB)", data[0])
 	}
 }
+
+// Volumes named only by number ("vol-02.par2"), as on North Glen S20 NTb:
+// all eight files used to count as index files, so the release reported 0
+// recovery slices and was refused before anything was fetched. Sizes from
+// S20E01.
+func TestCensusPar2VolumesNumberedWithoutRange(t *testing.T) {
+	files := []storage.Par2FileRef{
+		{Name: "SP.vol-01.par2", Size: 37396},
+		{Name: "SP.vol-02.par2", Size: 806026},
+		{Name: "SP.vol-03.par2", Size: 1611406},
+		{Name: "SP.vol-04.par2", Size: 3184808},
+		{Name: "SP.vol-05.par2", Size: 6294290},
+		{Name: "SP.vol-06.par2", Size: 12476170},
+		{Name: "SP.vol-07.par2", Size: 24802485},
+		{Name: "SP.vol-08.par2", Size: 42468226},
+	}
+	vols, indexFiles := censusPar2Volumes(files)
+	if len(indexFiles) != 1 || indexFiles[0].Name != "SP.vol-01.par2" {
+		t.Fatalf("indexFiles = %+v, want just vol-01 (metadata only)", indexFiles)
+	}
+	want := map[string]uint32{
+		"SP.vol-02.par2": 1, "SP.vol-03.par2": 3, "SP.vol-04.par2": 5, "SP.vol-05.par2": 9,
+		"SP.vol-06.par2": 17, "SP.vol-07.par2": 33, "SP.vol-08.par2": 56,
+	}
+	if len(vols) != len(want) {
+		t.Fatalf("got %d vols, want %d: %+v", len(vols), len(want), vols)
+	}
+	for _, v := range vols {
+		// Rounded up from the size ratio: never below the real count
+		// (1, 2, 4, 8, 16, 32, 55).
+		if v.count != want[v.ref.Name] {
+			t.Errorf("%s: count %d, want %d", v.ref.Name, v.count, want[v.ref.Name])
+		}
+	}
+}

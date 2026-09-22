@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
 
 func TestConcurrentSliceSourceReturnsResultsForCorrectIndex(t *testing.T) {
@@ -171,7 +172,7 @@ func TestConcurrentSliceSourceTracksShortSegmentAsNotFound(t *testing.T) {
 // intact data indistinguishable from a dead posting, in the logs and in the
 // terminal classifier.
 func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
-	order := []int64{0, 1, 2, 3}
+	order := []int64{0, 1, 2, 3, 4}
 	notFoundErr := &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
 	fetchOne := func(idx int64) ([]byte, error) {
 		switch idx {
@@ -182,6 +183,11 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 		case 3:
 			// A transient timeout is neither: it must not be counted at all.
 			return nil, context.DeadlineExceeded
+		case 4:
+			if corruptErr == nil {
+				return nil, context.DeadlineExceeded // no CRC-checking decoder in this build
+			}
+			return nil, corruptErr
 		}
 		return []byte{byte(idx)}, nil
 	}
@@ -190,15 +196,28 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 		_, _ = src.ReadSlice(idx)
 	}
 
-	confirmedMissing, shortRead := src.DeadCauseCounts()
+	confirmedMissing, shortRead, corrupt := src.DeadCauseCounts()
+	wantCorrupt, wantTotal := 0, 2
+	if corruptErr != nil {
+		wantCorrupt, wantTotal = 1, 3
+	}
+	if corrupt != wantCorrupt {
+		t.Errorf("corrupt = %d, want %d (only the every-provider CRC failure)", corrupt, wantCorrupt)
+	}
 	if confirmedMissing != 1 {
 		t.Errorf("confirmedMissing = %d, want 1 (only the 430)", confirmedMissing)
 	}
 	if shortRead != 1 {
 		t.Errorf("shortRead = %d, want 1 (only the ErrSegmentShort)", shortRead)
 	}
-	if total := len(src.NotFoundIndices()); total != 2 {
-		t.Errorf("NotFoundIndices() has %d entries, want 2 - the timeout must not be folded in", total)
+	if total := len(src.NotFoundIndices()); total != wantTotal {
+		t.Errorf("NotFoundIndices() has %d entries, want %d - the timeout must not be folded in", total, wantTotal)
+	}
+	// Each unreadable slice is marked so par2.Repair finishes the pass.
+	for _, idx := range []int64{1, 2} {
+		if _, err := newConcurrentSliceSource(context.Background(), []int64{idx}, 1, fetchOne).ReadSlice(idx); !errors.Is(err, par2.ErrSliceUnavailable) {
+			t.Errorf("slice %d: %v, want ErrSliceUnavailable", idx, err)
+		}
 	}
 }
 

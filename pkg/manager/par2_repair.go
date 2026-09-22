@@ -47,6 +47,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -182,6 +183,11 @@ func uncheckedPosted(fetch articleFetchFunc) postedFetchFunc {
 // which files are smallest, from filenames alone, with no need to fetch
 // anything first; see censusPar2Volumes for the count math per separator.
 var par2VolPattern = regexp.MustCompile(`(?i)\.vol(\d+)([+-])(\d+)\.par2$`)
+
+// par2NumberedVolPattern matches recovery volumes named only by sequence
+// number, with no slice range: "release.vol-03.par2" (seen on North Glen
+// S20 NTb postings, vol-01..vol-08) or "release.vol03.par2".
+var par2NumberedVolPattern = regexp.MustCompile(`(?i)\.vol-?\d+\.par2$`)
 
 // urgentJob is one pending URGENT-lane request: an nzbID and how far
 // playback currently is from the damaged region it's protecting, in
@@ -2030,16 +2036,32 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// as "confirmed missing across every provider" - a false statement for
 		// the short-read case, and one that made a geometry bug on intact data
 		// indistinguishable from genuine provider damage.
-		confirmedMissing, shortRead := sliceSource.DeadCauseCounts()
+		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
 		if len(newlyDamaged) == 0 || round >= maxIntactRepairRounds-1 {
-			switch {
-			case confirmedMissing > 0 && shortRead > 0:
-				return fmt.Errorf("repair: %d intact slice(s) unreadable - %d confirmed missing across every provider, %d decoded shorter than their recorded size: %w",
-					len(notFound), confirmedMissing, shortRead, repairErr)
-			case confirmedMissing > 0:
-				return fmt.Errorf("repair: %d intact slice(s) confirmed missing across every provider: %w", confirmedMissing, repairErr)
-			case shortRead > 0:
-				return fmt.Errorf("repair: %d intact slice(s) decoded shorter than their recorded size: %w", shortRead, repairErr)
+			type cause struct {
+				n    int
+				text string
+			}
+			var causes []cause
+			for _, c := range []cause{
+				{confirmedMissing, "confirmed missing across every provider"},
+				{corrupt, "corrupt on every provider"},
+				{shortRead, "decoded shorter than their recorded size"},
+			} {
+				if c.n > 0 {
+					causes = append(causes, c)
+				}
+			}
+			switch len(causes) {
+			case 0:
+			case 1:
+				return fmt.Errorf("repair: %d intact slice(s) %s: %w", causes[0].n, causes[0].text, repairErr)
+			default:
+				parts := make([]string, len(causes))
+				for i, c := range causes {
+					parts[i] = fmt.Sprintf("%d %s", c.n, c.text)
+				}
+				return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", len(notFound), strings.Join(parts, ", "), repairErr)
 			}
 			return fmt.Errorf("repair: %w", repairErr)
 		}
@@ -2048,6 +2070,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Int("newly_damaged", len(newlyDamaged)).
 			Int("confirmed_missing", confirmedMissing).
 			Int("short_read", shortRead).
+			Int("corrupt", corrupt).
 			Int("round", round+1).
 			Bool("stat_sweep_ran", statSwept).
 			Msg("par2 repair: intact slice(s) unreadable; expanding damaged set and retrying")
@@ -2253,8 +2276,64 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 		}
 		vols = append(vols, par2Volume{ref: f, start: uint32(start), count: uint32(count)})
 	}
+	vols, indexFiles = censusNumberedVolumes(vols, indexFiles)
 	sort.Slice(vols, func(i, j int) bool { return vols[i].ref.Size < vols[j].ref.Size })
 	return vols, indexFiles
+}
+
+// censusNumberedVolumes moves recovery volumes whose names carry no slice
+// range (see par2NumberedVolPattern) out of indexFiles. Treated as index
+// files, a release made only of those reported 0 recovery slices and was
+// refused as unrepairable before anything was fetched.
+//
+// Their slice counts are estimated from sizes: every PAR2 file repeats the
+// same metadata, so the smallest .par2 is that metadata alone, and the
+// smallest step above it is one recovery slice plus its packet header. The
+// estimate rounds up; it only sizes the fetch and the early capacity gate,
+// and the solve gates on the slices actually parsed (topUpParsedRecovery). A
+// numbered file no larger than the smallest stays an index file.
+func censusNumberedVolumes(vols []par2Volume, indexFiles []storage.Par2FileRef) ([]par2Volume, []storage.Par2FileRef) {
+	base := int64(-1)
+	var numbered []storage.Par2FileRef
+	for _, f := range indexFiles {
+		if !strings.HasSuffix(strings.ToLower(f.Name), ".par2") {
+			continue
+		}
+		if base < 0 || f.Size < base {
+			base = f.Size
+		}
+		if par2NumberedVolPattern.MatchString(f.Name) {
+			numbered = append(numbered, f)
+		}
+	}
+	if len(numbered) == 0 {
+		return vols, indexFiles
+	}
+	unit := int64(0)
+	for _, f := range numbered {
+		if d := f.Size - base; d > 0 && (unit == 0 || d < unit) {
+			unit = d
+		}
+	}
+	if unit == 0 {
+		return vols, indexFiles
+	}
+	isVol := make(map[string]bool, len(numbered))
+	for _, f := range numbered {
+		n := (f.Size - base + unit - 1) / unit
+		if n <= 0 {
+			continue
+		}
+		isVol[f.Name] = true
+		vols = append(vols, par2Volume{ref: f, count: uint32(n)})
+	}
+	kept := indexFiles[:0:0]
+	for _, f := range indexFiles {
+		if !isVol[f.Name] {
+			kept = append(kept, f)
+		}
+	}
+	return vols, kept
 }
 
 // statRecoveryVolumes replaces censusPar2Volumes' filename-derived paper
@@ -2641,16 +2720,37 @@ func fetchMoreVolumes(
 // PAR2 file (index or recovery volume). PAR2 files are posted directly (not
 // extracted from an archive), so their segments concatenate straight into
 // the file's real bytes with no trimming.
+//
+// An article confirmed missing is left out rather than failing the file: a
+// PAR2 file is a run of self-checking packets, so a dead article costs only
+// the packets it overlaps, and par2.ParseIndex resumes at the next packet
+// after the gap. Failing the whole file threw away every recovery slice in
+// it - Under Reef S11E06's volumes each span 88-176 articles. The file is
+// reported not-found only when every article is missing. Any other error
+// (a timeout, a cancelled job) still fails it: that says nothing about the
+// article.
 func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.Par2FileRef) ([]byte, error) {
 	out := make([]byte, 0, f.Size)
+	missing := 0
+	var firstMissing error
 	for _, seg := range f.Segments {
 		fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
 		data, err := fetch(fetchCtx, seg.MessageID)
 		cancel()
 		if err != nil {
+			if nntp.IsArticleNotFoundError(err) && ctx.Err() == nil {
+				if missing == 0 {
+					firstMissing = fmt.Errorf("fetch %s: %w", seg.MessageID, err)
+				}
+				missing++
+				continue
+			}
 			return nil, fmt.Errorf("fetch %s: %w", seg.MessageID, err)
 		}
 		out = append(out, data...)
+	}
+	if missing > 0 && missing == len(f.Segments) {
+		return nil, firstMissing
 	}
 	return out, nil
 }

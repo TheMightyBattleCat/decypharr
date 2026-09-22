@@ -1,6 +1,9 @@
 package par2
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // PostedFile is the minimal shape needed to match a release's posted file
 // (storage.PostedFileRef, in the caller's terms) against the PAR2 index's
@@ -84,6 +87,10 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 
 	var matches []Match
 	var skipped []MatchSkip
+	// hashed marks posted files whose MD5-16k was computed. A hash that
+	// matched nothing is evidence against every candidate, so the name pass
+	// below never overrides it.
+	hashed := make(map[int]bool)
 	for length, fileIDs := range byLength {
 		postedIdxs, ok := postedByLength[length]
 		if !ok {
@@ -113,6 +120,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 				continue
 			}
 			md5ByPosted[pi] = sum
+			hashed[pi] = true
 		}
 
 		for _, fid := range fileIDs {
@@ -162,6 +170,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 			skipped = append(skipped, MatchSkip{PostedIndex: pi, Err: fmt.Errorf("residual MD5-16k for posted file %q: %w", posted[pi].Name, err)})
 			continue
 		}
+		hashed[pi] = true
 		var cand [16]byte
 		found := 0
 		for _, fid := range idx.FileOrder {
@@ -219,6 +228,43 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 		matches = append(matches, newMatch(idx, posted, pi, fid))
 		matchedFID[fid] = true
 		matchedPosted[pi] = true
+	}
+
+	// Unique-name pass, last: a posted file still unmatched, whose MD5-16k
+	// could not be computed, and whose name equals exactly one
+	// still-unmatched FileDesc's (ignoring case) is that file. It is reached
+	// when the passes above had no usable signal - an estimated length that
+	// fits no bucket, plus a first article that is dead, so MD5-16k cannot be
+	// computed. A file whose hash was computed and matched nothing is left
+	// alone: that is evidence it is not the named file. Leaving the file unmatched folded
+	// every one of its slices into the damaged set, which a whole RAR volume
+	// can push past the recovery budget. No fetch; a wrong pairing is still
+	// caught by par2.Repair's per-slice IFSC check, which never fabricates.
+	unmatchedFDByName := make(map[string][][16]byte)
+	for _, fid := range idx.FileOrder {
+		if matchedFID[fid] {
+			continue
+		}
+		if fd := idx.Files[fid]; fd != nil && fd.Name != "" {
+			key := strings.ToLower(fd.Name)
+			unmatchedFDByName[key] = append(unmatchedFDByName[key], fid)
+		}
+	}
+	unmatchedPostedByName := make(map[string][]int)
+	for pi := range posted {
+		if !matchedPosted[pi] && !hashed[pi] && posted[pi].Name != "" {
+			key := strings.ToLower(posted[pi].Name)
+			unmatchedPostedByName[key] = append(unmatchedPostedByName[key], pi)
+		}
+	}
+	for name, fids := range unmatchedFDByName {
+		pis := unmatchedPostedByName[name]
+		if len(fids) != 1 || len(pis) != 1 {
+			continue
+		}
+		matches = append(matches, newMatch(idx, posted, pis[0], fids[0]))
+		matchedFID[fids[0]] = true
+		matchedPosted[pis[0]] = true
 	}
 
 	// A posted file skipped in the tie-break pass is retried in the

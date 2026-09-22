@@ -24,6 +24,15 @@ var ErrChecksumMismatch = errors.New("par2: checksum verification failed")
 // recovery data.
 var errIntactChecksumAbort = errors.New("intact slices failed their own IFSC checksum")
 
+// ErrSliceUnavailable marks an intact slice whose bytes cannot be read at all
+// (its backing article is gone, or decodes short). A SliceSource wraps its
+// ReadSlice error with it to let Repair finish the pass instead of stopping
+// there: the slice is skipped, every other unavailable slice is found in the
+// same pass, and Repair returns them all together (wrapping this sentinel)
+// once the pass ends, so the caller can add them to the damaged set in one
+// retry rather than one slice per full re-read.
+var ErrSliceUnavailable = errors.New("par2: intact slice unavailable")
+
 // IsIntactChecksumAbort reports whether err is Repair's intact-slice checksum
 // abort.
 func IsIntactChecksumAbort(err error) bool {
@@ -159,11 +168,20 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 	}
 
 	mismatches := 0
+	unavailable := 0
+	var firstUnavailable error
 	for s := int64(0); s < idx.numSlices; s++ {
 		if _, isDamaged := damagedPos[s]; isDamaged {
 			continue
 		}
 		data, err := intact.ReadSlice(s)
+		if err != nil && errors.Is(err, ErrSliceUnavailable) {
+			if unavailable == 0 {
+				firstUnavailable = fmt.Errorf("par2: read intact slice %d: %w", s, err)
+			}
+			unavailable++
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("par2: read intact slice %d: %w", s, err)
 		}
@@ -183,6 +201,9 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 		}
 
 		accumulateSlice(accum, data, inputConstant(s), recovery, workers)
+	}
+	if unavailable > 0 {
+		return nil, fmt.Errorf("%d intact slice(s) unavailable, first: %w", unavailable, firstUnavailable)
 	}
 
 	// Build and invert M[j][d] = C_{damaged[d]}^{E_j}.

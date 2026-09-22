@@ -320,9 +320,10 @@ func TestMatchFilesLastOneStandingStaysAmbiguous(t *testing.T) {
 	idx := syntheticIndex(t, 4096, files, [][16]byte{fA, fB})
 
 	// nil MD5_16k on both: no tie-break, no residual, both stay unmatched.
+	// Obfuscated posted names, so the unique-name pass has nothing either.
 	posted := []PostedFile{
-		{Name: "a.rar", Length: 5000},
-		{Name: "b.rar", Length: 5000},
+		{Name: "8f3a.bin", Length: 5000},
+		{Name: "c91d.bin", Length: 5000},
 	}
 	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
@@ -333,6 +334,20 @@ func TestMatchFilesLastOneStandingStaysAmbiguous(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("matches = %+v, want 0 - 2x2 length group is ambiguous", matches)
+	}
+
+	// With the PAR2 names, each pairs with its namesake.
+	posted[0].Name, posted[1].Name = "a.rar", "B.RAR"
+	matches, _, err = MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	got := map[int][16]byte{}
+	for _, m := range matches {
+		got[m.PostedIndex] = m.FileID
+	}
+	if len(matches) != 2 || got[0] != fA || got[1] != fB {
+		t.Fatalf("matches = %+v, want a.rar -> fA and B.RAR -> fB by name", matches)
 	}
 }
 
@@ -435,8 +450,9 @@ func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
 	wantErr := errors.New("nntp: connection reset")
 	posted := []PostedFile{
 		{Name: "a.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return md5A, nil }},
-		{Name: "b.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
-		{Name: "c.rar", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+		// Obfuscated names: the unique-name pass cannot resolve these.
+		{Name: "8f3a.bin", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
+		{Name: "c91d.bin", Length: 5000, MD5_16k: func() ([16]byte, error) { return [16]byte{}, wantErr }},
 	}
 	matches, skipped, err := MatchFiles(idx, posted)
 	if err != nil {
@@ -458,8 +474,9 @@ func TestMatchFilesPartialOnTieBreakFetchError(t *testing.T) {
 }
 
 // The same fetch error, but this time the residual MD5-16k pass is the one
-// that hits it (the file's length missed every bucket). Still best-effort,
-// still reported as a skip.
+// that hits it (the file's length missed every bucket). Still best-effort:
+// with no other unmatched candidate, the unique-name pass pairs it with the
+// FileDesc of the same name, so the skip is resolved.
 func TestMatchFilesPartialOnResidualFetchError(t *testing.T) {
 	fExact, fTail := fid(1), fid(2)
 	idx := &Index{
@@ -478,10 +495,42 @@ func TestMatchFilesPartialOnResidualFetchError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
 	}
+	if len(matches) != 2 {
+		t.Fatalf("matches = %+v, want both files", matches)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want none once the name pass matched posted 1", skipped)
+	}
+
+	// Without a same-named FileDesc it stays a skip.
+	posted[1].Name = "renamed.010"
+	matches, skipped, err = MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles returned hard error, want nil: %v", err)
+	}
 	if len(matches) != 1 || matches[0].PostedIndex != 0 {
 		t.Fatalf("matches = %+v, want exactly {posted 0 -> fExact}", matches)
 	}
 	if len(skipped) != 1 || skipped[0].PostedIndex != 1 || !errors.Is(skipped[0].Err, wantErr) {
 		t.Fatalf("skipped = %+v, want one entry for posted index 1 wrapping %v", skipped, wantErr)
+	}
+}
+
+// A hash that was computed and matched nothing is evidence against the
+// same-named FileDesc: the name pass must not pair them.
+func TestMatchFilesNamePassRespectsAComputedHash(t *testing.T) {
+	fA := fid(1)
+	idx := syntheticIndex(t, 4096, map[[16]byte]*FileDesc{
+		fA: {FileID: fA, Length: 5000, MD5_16k: [16]byte{0xAA}, Name: "a.rar"},
+	}, [][16]byte{fA})
+	posted := []PostedFile{
+		{Name: "a.rar", Length: 4999, MD5_16k: func() ([16]byte, error) { return [16]byte{0xEE}, nil }},
+	}
+	matches, _, err := MatchFiles(idx, posted)
+	if err != nil {
+		t.Fatalf("MatchFiles: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("matches = %+v, want none: its MD5-16k says it is not a.rar", matches)
 	}
 }

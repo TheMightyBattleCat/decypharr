@@ -8,6 +8,7 @@
 package par2
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
@@ -90,30 +91,50 @@ func verifyPacketMD5(h packetHeader, packet []byte) bool {
 // A packet whose header parses and whose declared length fits the buffer but
 // whose packet MD5 does not verify is handled per onChecksumError. When that
 // callback is nil, walkPackets stops with an error (the strict default). When
-// it is non-nil, walkPackets invokes it, advances past the packet's declared
-// length, and continues. The length field sits ahead of the region the packet
-// MD5 covers and is structurally validated by parsePacketHeader, so advancing
-// by it is a sound resync point - the next iteration lands on a valid header
-// or stops cleanly on garbage. Skipping lets a caller salvage an index from a
-// source set where one volume carries a mis-served or mis-decoded article,
-// relying on PAR2's duplication of the structural packets across every volume.
+// it is non-nil (lenient), walkPackets invokes it and resumes at the next
+// packet magic, and it resumes the same way instead of stopping when a header
+// is unreadable. A volume assembled around a dead article has that article's
+// bytes missing or zero-filled at a length that need not match, so neither
+// the damaged packet's length field nor the end of the damaged region says
+// where the next packet starts; the magic does. Resuming lets a caller
+// salvage every intact packet of such a volume - recovery slices included -
+// and an index from a source set where one volume carries a mis-served or
+// mis-decoded article, relying on PAR2's duplication of the structural
+// packets across every volume.
 func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64), fn func(h packetHeader, packet []byte, offset int64) error) error {
+	lenient := onChecksumError != nil
+	// resync moves past a damaged region in lenient mode: to the next packet
+	// magic after pos, or reports that there is none.
+	resync := func(pos int64) (int64, bool) {
+		next := bytes.Index(data[pos+1:], packetMagic[:])
+		if next < 0 {
+			return 0, false
+		}
+		return pos + 1 + int64(next), true
+	}
 	pos := int64(0)
 	for pos+packetHeaderSize <= int64(len(data)) {
 		h, err := parsePacketHeader(data[pos:])
-		if err != nil {
-			break
-		}
-		if pos+h.Length > int64(len(data)) {
-			break
+		if err != nil || pos+h.Length > int64(len(data)) {
+			if !lenient {
+				break
+			}
+			var ok bool
+			if pos, ok = resync(pos); !ok {
+				break
+			}
+			continue
 		}
 		packet := data[pos : pos+h.Length]
 		if !verifyPacketMD5(h, packet) {
-			if onChecksumError == nil {
+			if !lenient {
 				return fmt.Errorf("par2: packet MD5 mismatch at offset %d (type %q)", pos, packetTypeName(h.Type))
 			}
 			onChecksumError(h, pos)
-			pos += h.Length
+			var ok bool
+			if pos, ok = resync(pos); !ok {
+				break
+			}
 			continue
 		}
 		if err := fn(h, packet, pos); err != nil {

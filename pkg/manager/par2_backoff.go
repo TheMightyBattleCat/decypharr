@@ -114,6 +114,9 @@ var par2TerminalSubstrings = []string{
 	// runRepair. The typed nntp.IsArticleNotFoundError check above can't
 	// see this case because repairErr itself isn't an nntp.Error here.
 	"confirmed missing across every provider",
+	// The same, for intact articles every provider serves CRC-bad (see
+	// causeCorrupt): no retry fetches a good copy.
+	"corrupt on every provider",
 }
 
 // par2SuspectSubstrings are failures classified suspect (see
