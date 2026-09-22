@@ -76,9 +76,17 @@ const (
 	// window (see Repair.repairWindowOpen) is reconsidered.
 	par2RetryInterval = time.Minute
 
-	// par2JobTimeout bounds one NZB's whole PAR2 pass (index fetch through
-	// verification), so a stalled provider can't wedge the worker forever.
+	// par2JobTimeout is the base bound on one NZB's whole PAR2 pass (index
+	// fetch through verification), so a stalled provider can't wedge the
+	// worker forever. par2JobTimeoutFor extends it by release size.
 	par2JobTimeout = 20 * time.Minute
+	// par2JobTimeoutMax caps par2JobTimeoutFor.
+	par2JobTimeoutMax = 4 * time.Hour
+	// par2JobPassFloor is the throughput par2JobTimeoutFor allows each full
+	// read of the release at, and par2JobPasses how many reads it allows
+	// for: a discovery pass, the solve, and one more round.
+	par2JobPassFloor = 4 << 20 // bytes per second
+	par2JobPasses    = 3
 
 	// par2ArticleFetchTimeout bounds a single article fetch within a job.
 	par2ArticleFetchTimeout = 60 * time.Second
@@ -1051,7 +1059,11 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	progress.SetEntryName(entryName)
 
 	jobCtx, jobCancel := context.WithCancel(p.ctx)
-	timeoutCtx, timeoutCancel := context.WithTimeout(jobCtx, par2JobTimeout)
+	var releaseBytes int64
+	if hdr, herr := p.manager.usenet.GetNZBHeader(nzbID); herr == nil && hdr != nil {
+		releaseBytes = hdr.TotalSize
+	}
+	timeoutCtx, timeoutCancel := context.WithTimeout(jobCtx, par2JobTimeoutFor(releaseBytes))
 	defer timeoutCancel()
 	if lane == laneUrgent {
 		timeoutCtx = nntp.WithPriority(timeoutCtx, nntp.PriorityUrgent)
@@ -2231,6 +2243,22 @@ func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName
 	for file := range pending {
 		p.manager.usenet.EvictCache(nzbID, file)
 	}
+}
+
+// par2JobTimeoutFor is the deadline for one PAR2 job on a release of
+// releaseBytes: par2JobTimeout plus par2JobPasses full reads at
+// par2JobPassFloor, capped at par2JobTimeoutMax. A flat 20 minutes cancelled
+// legitimate repairs of large releases mid-solve - Tale of Castles S08E05
+// (6.3 GB, one discovery pass and one solve pass) needs 25 minutes - and a
+// deadline counts as transient, so they retried and were cancelled forever.
+// Stalls stay bounded by the idle watchdog (par2JobIdleTimeout), which is
+// what the flat bound was really for.
+func par2JobTimeoutFor(releaseBytes int64) time.Duration {
+	d := par2JobTimeout
+	if releaseBytes > 0 {
+		d += time.Duration(par2JobPasses*releaseBytes/par2JobPassFloor) * time.Second
+	}
+	return min(d, par2JobTimeoutMax)
 }
 
 // estimateNeededSlices is a cheap upper bound (one slice per dead segment)

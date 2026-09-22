@@ -475,3 +475,16 @@ func TestFetchPar2FileConcurrentKeepsOrder(t *testing.T) {
 		t.Fatalf("transport error: %v, want the timeout", err)
 	}
 }
+
+func TestPar2JobTimeoutScalesWithReleaseSize(t *testing.T) {
+	if got := par2JobTimeoutFor(0); got != par2JobTimeout {
+		t.Fatalf("unknown size: %s, want the base %s", got, par2JobTimeout)
+	}
+	// Tale of Castles S08E05: 6.29 GB took 24m53s for two passes.
+	if got := par2JobTimeoutFor(6_292_222_528); got < 60*time.Minute {
+		t.Fatalf("6.3 GB release: %s, want room for three passes", got)
+	}
+	if got := par2JobTimeoutFor(200 << 30); got != par2JobTimeoutMax {
+		t.Fatalf("200 GB release: %s, want the %s cap", got, par2JobTimeoutMax)
+	}
+}
