@@ -421,6 +421,83 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 	}
 }
 
+// A recovery gate that is about to fail (no recovery volumes, too few for the
+// recorded damage) first heals whatever dead segments are really intact,
+// with no parity and no network matching. It used to return terminal before
+// the heal ever ran.
+func TestHealWithoutRecoveryHealsIntactDeadSegments(t *testing.T) {
+	m, _ := newTestManagerForReap(t)
+	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
+
+	content, articles, ref := estimatedFixture()
+	const sliceSize = 40
+	var slices [][]byte
+	for off := 0; off < len(content); off += sliceSize {
+		slices = append(slices, content[off:off+sliceSize])
+	}
+	idx := buildSingleFileIndexWithIFSC(t, sliceSize, [16]byte{0x07}, ref.Name, slices)
+
+	const nzbID = "nzb-heal-gate"
+	readerFile := storage.NZBFile{Name: ref.Name}
+	for i, seg := range ref.Segments {
+		readerFile.Segments = append(readerFile.Segments, storage.NZBSegment{
+			Number: i + 1, MessageID: seg.MessageID, Bytes: 60,
+		})
+	}
+	readerFile.Segments[4].Bytes = 40
+	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}, Par2Source: []storage.PostedFileRef{ref}}
+	pending := map[string][]overlay.DeadSegment{}
+	for _, i := range []int{1, 2, 3} {
+		seg := ref.Segments[i]
+		if err := m.usenet.RecordOverlayDead(nzbID, ref.Name, i, seg.MessageID, 60); err != nil {
+			t.Fatalf("record dead %d: %v", i, err)
+		}
+		pending[ref.Name] = append(pending[ref.Name], overlay.DeadSegment{Index: i, MessageID: seg.MessageID, Bytes: 60})
+	}
+	delete(articles, "<p4>") // segment 3 really is gone, and STAT says so
+	stat := func(_ context.Context, ids []string) ([]nntp.StatResult, error) {
+		out := make([]nntp.StatResult, len(ids))
+		for i, id := range ids {
+			out[i] = nntp.StatResult{MessageID: id, Available: id != "<p4>"}
+			if id == "<p4>" {
+				out[i].Error = &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "no such article"}
+			}
+		}
+		return out, nil
+	}
+	f := &yencFetcher{articles: articles, calls: map[string]int{}}
+
+	healed, total := p.healWithoutRecovery(context.Background(), nzbID, "Some.Release", nzb, idx, pending, f.fetch, nil, stat)
+	// Segment 2's last slice [160,200) runs into segment 3's gone article, so
+	// it cannot be proven and is left for parity.
+	if healed != 1 || total != 3 {
+		t.Fatalf("healed %d of %d, want 1 of 3", healed, total)
+	}
+	if _, ok := m.usenet.OverlayPatchBytes(nzbID, ref.Name, 3); ok {
+		t.Fatal("segment 3 patched although STAT confirmed its article gone")
+	}
+	patch, ok := m.usenet.OverlayPatchBytes(nzbID, ref.Name, 1)
+	if !ok || !bytes.Equal(patch, content[60:120]) {
+		t.Fatalf("segment 1 patch = %d bytes (ok=%v), want its real bytes", len(patch), ok)
+	}
+	if _, ok := m.usenet.OverlayPatchBytes(nzbID, ref.Name, 2); ok {
+		t.Fatal("segment 2 patched although a slice it needs is unprovable")
+	}
+
+	// With the article back, every dead segment heals and the gate is moot.
+	articles["<p4>"] = yencArticle{data: content[180:240], meta: &nntp.YencMetadata{Part: 4, Total: 5, Size: 280, Offset: 180, PartSize: 60, Begin: 181, End: 240}}
+	if healed, _ := p.healWithoutRecovery(context.Background(), nzbID, "Some.Release", nzb, idx, map[string][]overlay.DeadSegment{ref.Name: pending[ref.Name][1:]}, f.fetch, nil, nil); healed != 2 {
+		t.Fatalf("second pass healed %d of 2", healed)
+	}
+
+	// A partial heal is reported without the gate's text, which carries the
+	// terminal substrings, so the next attempt re-evaluates the rest.
+	partial := fmt.Errorf("healed %d of %d dead segments without parity; re-evaluating the remaining damage", healed, total)
+	if c := classifyPar2Failure(partial); c.terminal {
+		t.Fatalf("partial heal classified terminal: %+v", c)
+	}
+}
+
 // forgetRecorder is a MountManager that records ForgetCachedRange calls.
 type forgetRecorder struct{ ranges [][2]int64 }
 

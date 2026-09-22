@@ -1599,10 +1599,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 
 	// A rough, name-only upper bound on how many damaged slices we could
 	// possibly need (actual count depends on slice size, known only once the
-	// index is parsed) - catch the hopeless case before fetching anything.
-	if available == 0 {
-		return fmt.Errorf("no PAR2 recovery volumes retained")
-	}
+	// index is parsed) - catch the hopeless case before fetching any
+	// recovery volume. Checked after the (small) index files are fetched, so
+	// a dead segment that is really intact can still be healed without
+	// parity - see healBeforeRecoveryGate.
 
 	// Fetch every index (non-volume) file, plus enough of the smallest
 	// recovery volumes to plausibly cover every dead segment - "fully
@@ -1628,7 +1628,15 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// only be worse: skip the entire recovery-volume fetch (many minutes of
 	// 430s for a large release) and declare terminal now. The authoritative
 	// exact gate in the solve loop below is unchanged.
-	if earlyIdx, perr := par2.ParseIndex(sources); perr == nil {
+	earlyIdx, earlyErr := par2.ParseIndex(sources)
+	if earlyErr != nil {
+		earlyIdx = nil
+	}
+	if available == 0 {
+		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
+			fmt.Errorf("no PAR2 recovery volumes retained"))
+	}
+	if earlyIdx != nil {
 		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, nzb.Par2Match, p.logger); earlyK > 0 {
 			if earlyK > par2.MaxRepairSlices || uint32(earlyK) > available {
 				p.logger.Info().
@@ -1637,7 +1645,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 					Uint32("available", available).
 					Str("entry", entryName).
 					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
-				return fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", earlyK, par2.MaxRepairSlices, available)
+				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
+					fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", earlyK, par2.MaxRepairSlices, available))
 			}
 		}
 	}
@@ -1690,7 +1699,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
 			Msg("par2: no recovery slices fetched, skipping file matching")
-		return fmt.Errorf("%d damaged slices but only 0 recovery slices fetched/available", deadCount)
+		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource,
+			fmt.Errorf("%d damaged slices but only 0 recovery slices fetched/available", deadCount))
 	}
 
 	// Match every posted file in the release (not just the ones with dead
@@ -2308,6 +2318,143 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 			Msg("par2 repair: dead segment(s) fetched intact and verified against PAR2 checksums; patched without parity")
 	}
 	return remaining, nil
+}
+
+// errHealNoTieBreak is what healWithoutRecovery's MD5-16k callbacks return:
+// with no recovery data in hand the pass fetches nothing to break a length
+// tie, so a tied file is simply left unmatched.
+var errHealNoTieBreak = errors.New("par2 heal: length tie not broken without recovery data")
+
+// healBeforeRecoveryGate runs when a recovery-capacity gate is about to fail
+// the job terminally (no recovery volumes, the early arithmetic check, or no
+// recovery slice parsed). Those gates count every recorded-dead segment as
+// damage, but playback records a segment dead on one failover pass, and the
+// article is often back (Deep in Orbit S02E01: all nine). Healing needs no
+// parity - only the index's IFSC - so it is tried first:
+//   - every dead segment healed: the job succeeds (nil);
+//   - some healed: a transient error, so the next attempt re-evaluates the
+//     smaller damage against the same recovery data;
+//   - none healed: gateErr, unchanged.
+func (p *Par2Repair) healBeforeRecoveryGate(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, pending map[string][]overlay.DeadSegment, fetch postedFetchFunc, cacheSource *cacheSlicedSource, gateErr error) error {
+	healed, total := p.healWithoutRecovery(ctx, nzbID, entryName, nzb, idx, pending, fetch, cacheSource, p.manager.usenet.StatSegments)
+	switch {
+	case total > 0 && healed == total:
+		p.logger.Info().Str("entry", entryName).Int("healed", healed).AnErr("gate", gateErr).
+			Msg("par2 repair: every dead segment healed without recovery data")
+		return nil
+	case ctx.Err() != nil:
+		return ctx.Err() // interrupted mid-heal proves nothing about the recovery data
+	case healed > 0:
+		// Deliberately not wrapping gateErr: its text carries the terminal
+		// substrings this attempt has just disproved for part of the damage.
+		p.logger.Info().Str("entry", entryName).Int("healed", healed).Int("dead", total).AnErr("gate", gateErr).
+			Msg("par2 repair: healed part of the damage without recovery data; retrying on the rest")
+		return fmt.Errorf("healed %d of %d dead segments without parity; re-evaluating the remaining damage", healed, total)
+	default:
+		return gateErr
+	}
+}
+
+// healWithoutRecovery maps pending's dead segments onto idx with no network
+// matching - the persisted match cache, or MatchFiles' unique-length and
+// unique-name pairings with every tie left unbroken - skips the articles STAT
+// confirms gone, and heals the rest through healFetchableDeadSegments. It
+// returns how many were healed out of how many were pending; a segment that
+// cannot be mapped counts as not healed.
+func (p *Par2Repair) healWithoutRecovery(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, pending map[string][]overlay.DeadSegment, fetch postedFetchFunc, cacheSource *cacheSlicedSource, stat func(context.Context, []string) ([]nntp.StatResult, error)) (healed, total int) {
+	for _, segs := range pending {
+		total += len(segs)
+	}
+	if idx == nil || nzb == nil || total == 0 || ctx.Err() != nil {
+		return 0, total
+	}
+
+	matches, ok := par2MatchFromCache(idx, nzb.Par2Source, nzb.Par2Match)
+	if !ok {
+		posted := make([]par2.PostedFile, len(nzb.Par2Source))
+		for i, f := range nzb.Par2Source {
+			posted[i] = par2.PostedFile{Name: f.Name, Length: f.Size, MD5_16k: func() ([16]byte, error) {
+				return [16]byte{}, errHealNoTieBreak
+			}}
+		}
+		var err error
+		if matches, _, err = par2.MatchFiles(idx, posted); err != nil {
+			return 0, total
+		}
+	}
+	byPosted := make(map[int][16]byte, len(matches))
+	for _, m := range matches {
+		byPosted[m.PostedIndex] = m.FileID
+	}
+	type segPos struct{ posted, seg int }
+	where := make(map[string]segPos)
+	for pi := range nzb.Par2Source {
+		for si, seg := range nzb.Par2Source[pi].Segments {
+			where[seg.MessageID] = segPos{pi, si}
+		}
+	}
+
+	var ids []string
+	for _, segs := range pending {
+		for _, s := range segs {
+			ids = append(ids, s.MessageID)
+		}
+	}
+	missing := make(map[string]struct{})
+	if stat != nil {
+		statCtx, cancel := context.WithTimeout(ctx, par2RecoveryStatTimeout)
+		results, err := stat(statCtx, ids)
+		cancel()
+		if err == nil {
+			for _, r := range results {
+				if !r.Available && nntp.IsArticleNotFoundError(r.Error) {
+					missing[r.MessageID] = struct{}{}
+				}
+			}
+		}
+	}
+
+	fetchers := make(map[[16]byte]*postedFileFetcher)
+	var refs []par2DeadRef
+	for file, segs := range pending {
+		for _, s := range segs {
+			if _, gone := missing[s.MessageID]; gone {
+				continue
+			}
+			pos, ok := where[s.MessageID]
+			if !ok {
+				continue
+			}
+			fileID, ok := byPosted[pos.posted]
+			if !ok {
+				continue
+			}
+			fd := idx.Files[fileID]
+			if fd == nil {
+				continue
+			}
+			f := fetchers[fileID]
+			if f == nil {
+				ref := nzb.Par2Source[pos.posted]
+				f = newPostedFileFetcher(ctx, fetch, ref, cacheSource, fd.Length, p.logger.With().Str("entry", entryName).Str("file", ref.Name).Logger())
+				f.resolveGeometry()
+				fetchers[fileID] = f
+			}
+			refs = append(refs, par2DeadRef{
+				file: file,
+				seg:  s,
+				rng:  postedRange{fileID: fileID, start: f.base[pos.seg], end: f.base[pos.seg] + f.segSizes[pos.seg]},
+			})
+		}
+	}
+	if len(refs) == 0 {
+		return 0, total
+	}
+	remaining, err := p.healFetchableDeadSegments(ctx, nzbID, entryName, nzb, idx, fetchers, refs, nil)
+	if err != nil {
+		return 0, total
+	}
+	return len(refs) - len(remaining), total
 }
 
 // readVerifiedRange reads [start, end) of f - a window inside the dead
