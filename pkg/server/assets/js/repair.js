@@ -75,6 +75,7 @@ class RepairManager {
         // overlayKey -> started_at of the last finished progress record that
         // triggered a list reload (see pollOverlayProgress).
         this.overlayProgressSeenTerminal = new Map();
+        this.overlayProgressLastReload = new Map();
         this.bind();
         this.loadAll();
     }
@@ -1993,8 +1994,20 @@ class RepairManager {
             // still queued and polled again at once - a request loop for as
             // long as it stayed queued. Each finished record reloads once.
             if (p && (p.phase === 'completed' || p.phase === 'failed')) {
-                if (this.overlayProgressSeenTerminal.get(key) === p.started_at) return;
+                if (this.overlayProgressSeenTerminal.get(key) === p.started_at) {
+                    // The job sets its finished phase before it records the
+                    // outcome and deregisters, so the one reload can still
+                    // see "running". Only a running row reloads again, at
+                    // most every 10s; a queued one waits for its new job.
+                    const last = this.overlayProgressLastReload.get(key) || 0;
+                    if (f.repair_status === 'running' && Date.now() - last >= 10000) {
+                        this.overlayProgressLastReload.set(key, Date.now());
+                        this.loadOverlayFiles();
+                    }
+                    return;
+                }
                 this.overlayProgressSeenTerminal.set(key, p.started_at);
+                this.overlayProgressLastReload.set(key, Date.now());
                 clearInterval(this.overlayProgressTimers.get(key));
                 this.overlayProgressTimers.delete(key);
                 this.loadOverlayFiles();
