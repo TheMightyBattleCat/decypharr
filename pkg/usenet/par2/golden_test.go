@@ -388,3 +388,29 @@ func TestGoldenRepairCollectsEveryUnavailableSlice(t *testing.T) {
 	}
 	gf.assertRepairMatchesOriginal(t, []int64{base1 + 1, base1 + 2, base2 + 1})
 }
+
+// With a spare-recovery budget, a pass stops once the unavailable slices
+// exceed it rather than reading the rest of the release.
+func TestGoldenRepairStopsWhenUnavailableExceedsBudget(t *testing.T) {
+	gf := loadGoldenFixture(t)
+	base1, _ := gf.idx.SliceBase(gf.fileIDByName["file1.bin"])
+	damaged := []int64{base1}
+	gone := map[int64]struct{}{base1 + 1: {}, base1 + 2: {}}
+	recovery := []RecoverySlice{{Exponent: gf.idx.Recovery[0].Exponent, Data: gf.sources[gf.idx.Recovery[0].Source].Data[gf.idx.Recovery[0].Offset : gf.idx.Recovery[0].Offset+gf.idx.Recovery[0].Length]}}
+	src := &unavailableSliceSource{
+		fixtureSliceSource: &fixtureSliceSource{idx: gf.idx, damaged: map[int64]struct{}{base1: {}}, byFile: gf.byFile},
+		gone:               gone,
+		reads:              map[int64]int{},
+	}
+	_, err := RepairWith(gf.idx, damaged, recovery, src, RepairOptions{MaxUnavailable: 1})
+	if !errors.Is(err, ErrSliceUnavailable) || !strings.Contains(err.Error(), "pass stopped") {
+		t.Fatalf("RepairWith: %v, want a stopped pass", err)
+	}
+	read := 0
+	for _, n := range src.reads {
+		read += n
+	}
+	if total := int(gf.idx.NumSlices()) - 1; read >= total {
+		t.Fatalf("read %d of %d intact slices, want the pass stopped early", read, total)
+	}
+}

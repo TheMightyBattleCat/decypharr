@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -441,5 +442,36 @@ func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
 	}
 	if _, err := fetchWholePar2File(context.Background(), allDead, ref); !nntp.IsArticleNotFoundError(err) {
 		t.Fatalf("all articles dead: %v, want not-found", err)
+	}
+}
+
+// Concurrent article fetches keep article order; a transport error still
+// fails the file (it says nothing about the article); a 430 is left out.
+func TestFetchPar2FileConcurrentKeepsOrder(t *testing.T) {
+	var ref storage.Par2FileRef
+	var want []byte
+	for i := 0; i < 40; i++ {
+		ref.Segments = append(ref.Segments, storage.Par2SegmentRef{MessageID: fmt.Sprintf("<a%d>", i)})
+		want = append(want, byte(i), byte(i), byte(i))
+	}
+	fetch := func(_ context.Context, id string) ([]byte, error) {
+		var i int
+		fmt.Sscanf(id, "<a%d>", &i)
+		time.Sleep(time.Duration((i*7)%5) * time.Millisecond)
+		return []byte{byte(i), byte(i), byte(i)}, nil
+	}
+	got, err := fetchPar2FileConcurrent(context.Background(), fetch, ref, 6)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("concurrent fetch: err=%v, bytes in order=%v", err, bytes.Equal(got, want))
+	}
+
+	transport := func(_ context.Context, id string) ([]byte, error) {
+		if id == "<a17>" {
+			return nil, &nntp.Error{Type: nntp.ErrorTypeTimeout, Message: "slow"}
+		}
+		return fetch(context.Background(), id)
+	}
+	if _, err := fetchPar2FileConcurrent(context.Background(), transport, ref, 6); err == nil || !nntp.IsTimeoutError(err) {
+		t.Fatalf("transport error: %v, want the timeout", err)
 	}
 }

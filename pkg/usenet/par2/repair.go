@@ -116,6 +116,21 @@ type RepairedSlice struct {
 // returned - a slice that fails is an error, never a returned (possibly
 // wrong) result.
 func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceSource) ([]RepairedSlice, error) {
+	return RepairWith(idx, damaged, recovery, intact, RepairOptions{MaxUnavailable: -1})
+}
+
+// RepairOptions tunes RepairWith.
+type RepairOptions struct {
+	// MaxUnavailable stops a pass once more than this many intact slices
+	// have come back ErrSliceUnavailable: the caller cannot cover that many
+	// more damaged slices from its recovery data, so reading the rest of
+	// the release only confirms a verdict already reached. Negative means
+	// no limit.
+	MaxUnavailable int
+}
+
+// RepairWith is Repair with options.
+func RepairWith(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceSource, opts RepairOptions) ([]RepairedSlice, error) {
 	k := len(damaged)
 	if k == 0 {
 		return nil, nil
@@ -180,6 +195,9 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 				firstUnavailable = fmt.Errorf("par2: read intact slice %d: %w", s, err)
 			}
 			unavailable++
+			if opts.MaxUnavailable >= 0 && unavailable > opts.MaxUnavailable {
+				return nil, fmt.Errorf("%d intact slice(s) unavailable, more than the %d spare recovery slices can cover - pass stopped, first: %w", unavailable, opts.MaxUnavailable, firstUnavailable)
+			}
 			continue
 		}
 		if err != nil {

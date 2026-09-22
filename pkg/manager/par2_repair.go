@@ -112,6 +112,10 @@ const (
 	// verdict the first few misses already settled. Only genuine 430s count;
 	// transient/transport errors reset the counter.
 	par2RecoveryMaxConsecutiveNotFound = 3
+	// par2FileFetchConcurrency is how many articles of one PAR2 file
+	// fetchWholePar2File fetches at once. fetchMoreVolumes instead splits
+	// the processing connection budget across the volumes in a wave.
+	par2FileFetchConcurrency = 4
 
 	// par2DefaultUrgentConcurrency is used when
 	// config.Repair.Par2UrgentConcurrency is unset/non-positive.
@@ -1902,12 +1906,15 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	// Each round attempts the solve with the current damaged set; a hard,
-	// confirmed-across-every-provider 430 on what was assumed to be an
-	// intact slice means that slice's data is genuinely gone too - not a
-	// reason to keep retrying the SAME attempt (par2.Repair already gives up
-	// on the first ReadSlice error it sees), but a reason to fold it into
-	// the damaged set and retry the solve, if recovery coverage still
-	// allows it. Bounded by maxIntactRepairRounds; a release with damage
+	// confirmed-across-every-provider 430 (or an every-provider corrupt
+	// copy, or a short read) on what was assumed to be an intact slice
+	// means that slice's data is gone too - not a reason to retry the SAME
+	// attempt, but a reason to fold it into the damaged set and retry the
+	// solve, if recovery coverage still allows it. par2.Repair streams past
+	// such slices (par2.ErrSliceUnavailable) and reports every one found in
+	// the pass, so a round adds all of them at once - the STAT sweep above
+	// under-reports (a provider can answer STAT 223 for an article whose
+	// BODY is gone everywhere), so this is where most of them surface. Bounded by maxIntactRepairRounds; a release with damage
 	// beyond what the overlay had recorded aborts with a clear terminal
 	// reason well before that, rather than spinning.
 	var repaired []par2.RepairedSlice
@@ -1993,7 +2000,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		sliceSource := newConcurrentSliceSource(ctx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
 		var repairErr error
-		repaired, repairErr = par2.Repair(idx, damaged, recovery, sliceSource)
+		// Stop the pass once the unreadable intact slices outnumber the
+		// recovery slices left over: the next round would need more than
+		// are retained, so the rest of the read only confirms the verdict
+		// (Under Reef S11E06 read 2 GB to find 45 against 5 retained).
+		spare := min(int(available), par2.MaxRepairSlices) - k
+		repaired, repairErr = par2.RepairWith(idx, damaged, recovery, sliceSource, par2.RepairOptions{MaxUnavailable: max(0, spare)})
 		if repairErr == nil {
 			break
 		}
@@ -2650,7 +2662,7 @@ func fetchMoreVolumes(
 					results[i] = volumeFetchResult{count: v.count, err: ctx.Err()}
 					return
 				}
-				data, err := fetchWholePar2File(ctx, fetch, v.ref)
+				data, err := fetchPar2FileConcurrent(ctx, fetch, v.ref, maxConc/len(wave))
 				if err != nil {
 					if nntp.IsArticleNotFoundError(err) {
 						results[i] = volumeFetchResult{count: v.count, err: err, notFound: true}
@@ -2730,24 +2742,62 @@ func fetchMoreVolumes(
 // (a timeout, a cancelled job) still fails it: that says nothing about the
 // article.
 func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.Par2FileRef) ([]byte, error) {
+	return fetchPar2FileConcurrent(ctx, fetch, f, par2FileFetchConcurrency)
+}
+
+// fetchPar2FileConcurrent is fetchWholePar2File with its articles fetched
+// workers at a time: a volume can run to 176 articles, and each dead one
+// costs a full failover round (6-9 s seen on Under Reef S11E06), which one
+// at a time made a two-volume fetch take nearly seven minutes.
+func fetchPar2FileConcurrent(ctx context.Context, fetch articleFetchFunc, f storage.Par2FileRef, workers int) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	results := make([]result, len(f.Segments))
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p := pool.New().WithMaxGoroutines(max(1, workers))
+	for i, seg := range f.Segments {
+		p.Go(func() {
+			if fctx.Err() != nil {
+				results[i] = result{err: fctx.Err()}
+				return
+			}
+			segCtx, segCancel := context.WithTimeout(fctx, par2ArticleFetchTimeout)
+			data, err := fetch(segCtx, seg.MessageID)
+			segCancel()
+			if err != nil && !nntp.IsArticleNotFoundError(err) {
+				cancel() // a real failure fails the file: stop the rest
+			}
+			results[i] = result{data: data, err: err}
+		})
+	}
+	p.Wait()
+
 	out := make([]byte, 0, f.Size)
 	missing := 0
 	var firstMissing error
-	for _, seg := range f.Segments {
-		fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
-		data, err := fetch(fetchCtx, seg.MessageID)
-		cancel()
-		if err != nil {
-			if nntp.IsArticleNotFoundError(err) && ctx.Err() == nil {
-				if missing == 0 {
-					firstMissing = fmt.Errorf("fetch %s: %w", seg.MessageID, err)
-				}
-				missing++
-				continue
-			}
-			return nil, fmt.Errorf("fetch %s: %w", seg.MessageID, err)
+	for i, r := range results {
+		if r.err == nil {
+			out = append(out, r.data...)
+			continue
 		}
-		out = append(out, data...)
+		if nntp.IsArticleNotFoundError(r.err) && ctx.Err() == nil {
+			if missing == 0 {
+				firstMissing = fmt.Errorf("fetch %s: %w", f.Segments[i].MessageID, r.err)
+			}
+			missing++
+			continue
+		}
+		// The first real failure, not a cancellation it caused.
+		if errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
+			continue
+		}
+		return nil, fmt.Errorf("fetch %s: %w", f.Segments[i].MessageID, r.err)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	if missing > 0 && missing == len(f.Segments) {
 		return nil, firstMissing

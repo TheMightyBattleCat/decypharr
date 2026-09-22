@@ -109,20 +109,21 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 			data, err := fetchOne(idx)
 			if err != nil {
 				// This slice's backing data is unreadable at this position:
-				// either a hard 430 confirmed across every provider
+				// a hard 430 confirmed across every provider
 				// (ExecuteWithFailover already exhausted them all before
-				// returning it), or a backing article that decoded too short to
-				// serve the bytes the slice needs (ErrSegmentShort). Either way
-				// it's not a transient hiccup - retrying the same fetch yields
-				// the same result - so both are folded into the damaged set for
-				// recovery-slice reconstruction. The CAUSE is retained because
-				// the two mean opposite things about where the fault lies; see
-				// deadCause. Recorded regardless of whether ReadSlice ever gets
-				// asked for this exact index: par2.Repair aborts on the FIRST
-				// error it sees, so a later index's failure here would otherwise
-				// be silently lost - see runRepair's retry loop, which
-				// reclassifies every index collected here into the damaged set
-				// at once.
+				// returning it), a copy every provider serves corrupt, or a
+				// backing article that decoded too short to serve the bytes
+				// the slice needs (ErrSegmentShort). None is a transient
+				// hiccup - retrying the same fetch yields the same result - so
+				// all are folded into the damaged set for recovery-slice
+				// reconstruction. The CAUSE is retained because they mean
+				// different things about where the fault lies; see deadCause.
+				// The error is marked par2.ErrSliceUnavailable so par2.Repair
+				// skips the slice and finishes the pass, and every index
+				// collected here reaches runRepair's retry loop at once. It is
+				// recorded here as well, regardless of whether ReadSlice gets
+				// asked for this index: a pass that stops on some other error
+				// still reports what it found.
 				//
 				// The 430 test comes first: readRange wraps a fetch failure as
 				// "fetch segment N: <err>" and a short decode as
