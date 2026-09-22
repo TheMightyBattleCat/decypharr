@@ -414,3 +414,52 @@ func TestGoldenRepairStopsWhenUnavailableExceedsBudget(t *testing.T) {
 		t.Fatalf("read %d of %d intact slices, want the pass stopped early", read, total)
 	}
 }
+
+// corruptSliceSource serves some intact slices with a flipped byte, the way
+// a mis-served article that passes its own yEnc CRC would.
+type corruptSliceSource struct {
+	*fixtureSliceSource
+	bad map[int64]struct{}
+}
+
+func (s *corruptSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
+	data, err := s.fixtureSliceSource.ReadSlice(globalIdx)
+	if err != nil {
+		return nil, err
+	}
+	if _, bad := s.bad[globalIdx]; bad {
+		data = append([]byte(nil), data...)
+		data[0] ^= 0xff
+	}
+	return data, nil
+}
+
+// An intact slice failing its IFSC checksum is reported and skipped, not
+// accumulated. Accumulating it guaranteed the solve failed its own IFSC check
+// after a full read, which was then classified terminal; skipped, it is
+// reconstructed from parity on the next round like an unreadable slice.
+func TestGoldenRepairReportsChecksumMismatchedIntactSlice(t *testing.T) {
+	gf := loadGoldenFixture(t)
+	base1, _ := gf.idx.SliceBase(gf.fileIDByName["file1.bin"])
+	base2, _ := gf.idx.SliceBase(gf.fileIDByName["file2.bin"])
+	damaged := []int64{base1 + 1}
+	bad := base2 + 1
+
+	recovery := []RecoverySlice{{Exponent: gf.idx.Recovery[0].Exponent, Data: gf.sources[gf.idx.Recovery[0].Source].Data[gf.idx.Recovery[0].Offset : gf.idx.Recovery[0].Offset+gf.idx.Recovery[0].Length]}}
+	src := &corruptSliceSource{
+		fixtureSliceSource: &fixtureSliceSource{idx: gf.idx, damaged: map[int64]struct{}{damaged[0]: {}}, byFile: gf.byFile},
+		bad:                map[int64]struct{}{bad: {}},
+	}
+	var reported []int64
+	_, err := RepairWith(gf.idx, damaged, recovery, src, RepairOptions{MaxUnavailable: -1, OnChecksumMismatch: func(i int64) { reported = append(reported, i) }})
+	if errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("RepairWith: %v - a single bad intact slice must not end as a checksum failure", err)
+	}
+	if !errors.Is(err, ErrSliceUnavailable) {
+		t.Fatalf("RepairWith: %v, want ErrSliceUnavailable", err)
+	}
+	if len(reported) != 1 || reported[0] != bad {
+		t.Fatalf("reported %v, want [%d]", reported, bad)
+	}
+	gf.assertRepairMatchesOriginal(t, []int64{base1 + 1, bad})
+}

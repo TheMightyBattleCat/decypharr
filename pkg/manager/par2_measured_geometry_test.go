@@ -294,6 +294,19 @@ func TestPar2SuspectFailuresTurnTerminalAfterRepeats(t *testing.T) {
 	if c := classifyPar2Failure(confirmed); !c.terminal {
 		t.Fatalf("confirmed-missing failure: %+v, want terminal", c)
 	}
+
+	// The early stop wraps "... spare recovery slices can cover - pass
+	// stopped", which used to match the terminal "recovery slice" entry and
+	// skip the suspect retries.
+	stopped := fmt.Errorf("repair: 6 intact slice(s) decoded shorter than their recorded size: %w",
+		fmt.Errorf("6 intact slice(s) unavailable, more than the 5 spare recovery slices can cover - pass stopped, first: %w", par2.ErrSliceUnavailable))
+	if c := classifyPar2Failure(stopped); c.terminal || !c.suspect {
+		t.Fatalf("early-stopped short read: %+v, want suspect", c)
+	}
+	badSum := fmt.Errorf("repair: 1 intact slice(s) failed their PAR2 checksum: %w", par2.ErrSliceUnavailable)
+	if c := classifyPar2Failure(badSum); c.terminal || !c.suspect {
+		t.Fatalf("checksum-bad intact slice: %+v, want suspect", c)
+	}
 }
 
 // Repair's own intact-slice abort is typed, so it is recognised through any

@@ -2083,7 +2083,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// are retained, so the rest of the read only confirms the verdict
 		// (Under Reef S11E06 read 2 GB to find 45 against 5 retained).
 		spare := min(int(available), par2.MaxRepairSlices) - k
-		repaired, repairErr = par2.RepairWith(idx, damaged, recovery, sliceSource, par2.RepairOptions{MaxUnavailable: max(0, spare)})
+		var checksumBad []int64 // intact slices whose bytes failed their IFSC this round
+		repaired, repairErr = par2.RepairWith(idx, damaged, recovery, sliceSource, par2.RepairOptions{
+			MaxUnavailable:     max(0, spare),
+			OnChecksumMismatch: func(i int64) { checksumBad = append(checksumBad, i) },
+		})
 		if repairErr == nil {
 			break
 		}
@@ -2108,11 +2112,17 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 
 		notFound := sliceSource.NotFoundIndices()
-		newlyDamaged := make([]int64, 0, len(notFound))
-		for _, ni := range notFound {
-			if _, already := damagedPos[ni]; !already {
-				newlyDamaged = append(newlyDamaged, ni)
+		newlyDamaged := make([]int64, 0, len(notFound)+len(checksumBad))
+		seenNew := make(map[int64]struct{}, len(notFound)+len(checksumBad))
+		for _, ni := range append(notFound, checksumBad...) {
+			if _, already := damagedPos[ni]; already {
+				continue
 			}
+			if _, dup := seenNew[ni]; dup {
+				continue
+			}
+			seenNew[ni] = struct{}{}
+			newlyDamaged = append(newlyDamaged, ni)
 		}
 		if len(newlyDamaged) > 0 && deadDiscovered != nil {
 			// Rounds never overlap (each round's damagedPos guards against
@@ -2137,6 +2147,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				{confirmedMissing, "confirmed missing across every provider"},
 				{corrupt, "corrupt on every provider"},
 				{shortRead, "decoded shorter than their recorded size"},
+				{len(checksumBad), "failed their PAR2 checksum"},
 			} {
 				if c.n > 0 {
 					causes = append(causes, c)
@@ -2151,7 +2162,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				for i, c := range causes {
 					parts[i] = fmt.Sprintf("%d %s", c.n, c.text)
 				}
-				return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", len(notFound), strings.Join(parts, ", "), repairErr)
+				return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", len(notFound)+len(checksumBad), strings.Join(parts, ", "), repairErr)
 			}
 			return fmt.Errorf("repair: %w", repairErr)
 		}
@@ -2161,6 +2172,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Int("confirmed_missing", confirmedMissing).
 			Int("short_read", shortRead).
 			Int("corrupt", corrupt).
+			Int("checksum_bad", len(checksumBad)).
 			Str("providers", nntp.DescribeOutcomes(nntp.FailoverOutcomes(repairErr))).
 			Int("round", round+1).
 			Bool("stat_sweep_ran", statSwept).

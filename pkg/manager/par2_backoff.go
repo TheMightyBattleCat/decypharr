@@ -128,6 +128,10 @@ var par2TerminalSubstrings = []string{
 // boundaries (fixed by postedFileFetcher.resolveGeometry) put them there.
 var par2SuspectSubstrings = []string{
 	"decoded shorter than their recorded size",
+	// An intact slice whose fetched bytes failed their IFSC (par2.RepairWith
+	// skips and reports it rather than accumulating it): a mis-served copy
+	// or a drifted boundary, not proof the posting is damaged.
+	"failed their PAR2 checksum",
 }
 
 // classifyPar2Failure decides whether err (a runRepair failure) should back
@@ -173,14 +177,22 @@ func classifyPar2Failure(err error) par2FailureClass {
 	if strings.Contains(msg, "packet MD5 mismatch") {
 		return par2FailureClass{}
 	}
+	// A suspect cause is checked before the terminal list: when the repair's
+	// early stop fires, the round-cap error wraps "more than the N spare
+	// recovery slices can cover", which matched the terminal "recovery slice"
+	// entry and made a short-read or bad-checksum failure terminal on its
+	// first attempt. A cause proving the data really is gone still makes the
+	// mix terminal.
+	if !strings.Contains(msg, "confirmed missing across every provider") && !strings.Contains(msg, "corrupt on every provider") {
+		for _, s := range par2SuspectSubstrings {
+			if strings.Contains(msg, s) {
+				return par2FailureClass{suspect: true, reason: msg}
+			}
+		}
+	}
 	for _, s := range par2TerminalSubstrings {
 		if strings.Contains(msg, s) {
 			return par2FailureClass{terminal: true, reason: msg}
-		}
-	}
-	for _, s := range par2SuspectSubstrings {
-		if strings.Contains(msg, s) {
-			return par2FailureClass{suspect: true, reason: msg}
 		}
 	}
 	return par2FailureClass{}

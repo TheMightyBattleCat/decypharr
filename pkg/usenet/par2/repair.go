@@ -65,8 +65,9 @@ const (
 	// (more likely, and worse) our posted-file/slice offset mapping has
 	// drifted for this region - so this stays deliberately tiny rather than
 	// merely nonzero: a real mapping bug reliably produces far more than a
-	// couple of mismatches, while this still tolerates an isolated glitch
-	// rather than aborting a would-be-correct repair over it. It exists
+	// couple of mismatches, while an isolated bad slice is skipped and
+	// reported as unavailable (see RepairOptions.OnChecksumMismatch) rather
+	// than aborting the pass - never accumulated. It exists
 	// purely as an early, cheap warning; the reconstructed slices' own
 	// CRC32+MD5 verification below is the actual, zero-tolerance
 	// correctness gate - nothing is ever accepted on the strength of this
@@ -127,6 +128,11 @@ type RepairOptions struct {
 	// the release only confirms a verdict already reached. Negative means
 	// no limit.
 	MaxUnavailable int
+	// OnChecksumMismatch, when set, is called with the global index of each
+	// intact slice that failed its IFSC checksum (up to the abort threshold).
+	// Such a slice is skipped and counted as unavailable, so the caller can
+	// add it to the damaged set. Called from Repair's own goroutine.
+	OnChecksumMismatch func(idx int64)
 }
 
 // RepairWith is Repair with options.
@@ -216,6 +222,23 @@ func RepairWith(idx *Index, damaged []int64, recovery []RecoverySlice, intact Sl
 			if mismatches > maxIntactChecksumMismatches {
 				return nil, fmt.Errorf("%w: %d %w - aborting rather than risk a fabricated repair from a drifted offset mapping", ErrChecksumMismatch, mismatches, errIntactChecksumAbort)
 			}
+			// Never accumulate it: one wrong intact slice shifts every
+			// accumulator, so the solve could only fail its own IFSC check
+			// - after a full read, as a terminal "checksum verification
+			// failed". Its true bytes are unknown here, exactly like an
+			// unreadable slice, so it is reported the same way and the
+			// caller can reconstruct it from parity next round.
+			if opts.OnChecksumMismatch != nil {
+				opts.OnChecksumMismatch(s)
+			}
+			if unavailable == 0 {
+				firstUnavailable = fmt.Errorf("par2: intact slice %d failed its IFSC checksum: %w", s, ErrSliceUnavailable)
+			}
+			unavailable++
+			if opts.MaxUnavailable >= 0 && unavailable > opts.MaxUnavailable {
+				return nil, fmt.Errorf("%d intact slice(s) unavailable, more than the %d spare recovery slices can cover - pass stopped, first: %w", unavailable, opts.MaxUnavailable, firstUnavailable)
+			}
+			continue
 		}
 
 		accumulateSlice(accum, data, inputConstant(s), recovery, workers)
