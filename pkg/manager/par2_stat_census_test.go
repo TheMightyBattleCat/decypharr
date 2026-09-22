@@ -89,12 +89,28 @@ func TestStatRecoveryVolumes(t *testing.T) {
 		}
 	})
 
-	t.Run("one dead segment condemns a multi-segment volume", func(t *testing.T) {
+	// A partly dead volume still yields every packet its dead articles do
+	// not overlap (fetchWholePar2File + lenient ParseIndex), so it is kept,
+	// behind the whole volumes. Dropping it on one 430 under-counted the
+	// recovery the capacity gates compare against (Under Reef S11E06: every
+	// volume missing 1-9 of 88-176 articles).
+	t.Run("a partly dead volume is kept and fetched last", func(t *testing.T) {
 		vols := []par2Volume{
 			makeTestVol("v0.par2", 5, "a0@n", "a1@n", "a2@n"),
 			makeTestVol("v1.par2", 5, "b0@n", "b1@n"),
 		}
 		got := statRecoveryVolumes(ctx, parallelFetchNopLogger, mockStat(map[string]bool{"a1@n": true}, nil), vols, "e")
+		if availOf(got) != 10 || len(got) != 2 || got[0].ref.Name != "v1.par2" || got[1].ref.Name != "v0.par2" {
+			t.Fatalf("got %v avail %d, want [v1.par2 v0.par2] avail 10", volNames(got), availOf(got))
+		}
+	})
+
+	t.Run("a volume with every article gone is dropped", func(t *testing.T) {
+		vols := []par2Volume{
+			makeTestVol("v0.par2", 5, "a0@n", "a1@n"),
+			makeTestVol("v1.par2", 5, "b0@n", "b1@n"),
+		}
+		got := statRecoveryVolumes(ctx, parallelFetchNopLogger, mockStat(map[string]bool{"a0@n": true, "a1@n": true}, nil), vols, "e")
 		if availOf(got) != 5 || len(got) != 1 || got[0].ref.Name != "v1.par2" {
 			t.Fatalf("got %v avail %d, want [v1.par2] avail 5", volNames(got), availOf(got))
 		}

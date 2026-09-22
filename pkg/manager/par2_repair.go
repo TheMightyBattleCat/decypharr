@@ -2505,9 +2505,8 @@ func censusNumberedVolumes(vols []par2Volume, indexFiles []storage.Par2FileRef) 
 // statRecoveryVolumes replaces censusPar2Volumes' filename-derived paper
 // count with what the provider will actually serve: it STATs the segments of
 // the smallest recovery volumes - header only, no body download - and drops
-// any volume with a confirmed-missing article from the returned list. A
-// volume is unusable if ANY of its articles is gone (a partial RecvSlic
-// packet can't be parsed), so one 430 condemns the whole volume.
+// any volume whose every article is confirmed missing from the returned list.
+// A volume with only some articles gone is kept, behind the whole ones.
 //
 // Only the volumes that could actually be reached before the MaxRepairSlices
 // cap (smallest-first, plus one slack volume) are probed - fetchMoreVolumes
@@ -2566,19 +2565,48 @@ func statRecoveryVolumes(
 	for _, r := range results {
 		byID[r.MessageID] = r
 	}
+	// A volume is dropped only when every article is confirmed gone - the
+	// rule fetchWholePar2File applies. One with some articles gone still
+	// yields every recovery packet the dead ones do not overlap (ParseIndex
+	// resyncs past the gap), so it keeps its paper count and moves behind
+	// the whole volumes; the solve gates on the slices actually parsed.
+	// Dropping it on one 430 under-counted "available", which the capacity
+	// gates turn into a terminal verdict.
 	dead := make(map[string]struct{})
+	partial := make(map[string]struct{})
 	for _, v := range candidates {
+		gone := 0
 		for _, seg := range v.ref.Segments {
 			if r, ok := byID[seg.MessageID]; ok && !r.Available && nntp.IsArticleNotFoundError(r.Error) {
-				dead[v.ref.Name] = struct{}{}
-				break
+				gone++
 			}
+		}
+		switch {
+		case gone == 0:
+		case gone == len(v.ref.Segments):
+			dead[v.ref.Name] = struct{}{}
+		default:
+			partial[v.ref.Name] = struct{}{}
 		}
 	}
 
 	var availBefore, availAfter uint32
 	for _, v := range vols {
 		availBefore += v.count
+	}
+	if len(partial) > 0 {
+		whole := make([]par2Volume, 0, len(vols))
+		var damaged []par2Volume
+		for _, v := range vols {
+			if _, ok := partial[v.ref.Name]; ok {
+				damaged = append(damaged, v)
+				continue
+			}
+			whole = append(whole, v)
+		}
+		vols = append(whole, damaged...)
+		logger.Info().Str("entry", entryName).Int("volumes_partial", len(partial)).
+			Msg("par2: recovery-volume STAT pre-census found volumes with some articles gone; fetching them last")
 	}
 	if len(dead) == 0 {
 		logger.Debug().Str("entry", entryName).
