@@ -341,6 +341,15 @@ func isIdleExpired(lastUsed time.Time, now time.Time) bool {
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
 	var lastErr error
 	var exclusions providerExclusions
+	// outcomes records what each provider actually answered, so a caller
+	// that turns this into a verdict - the reader pads a segment and queues
+	// a PAR2 repair on a not-found - can say which providers said what. On
+	// 2026-09-22 nine Deep in Orbit articles were padded as missing on every
+	// provider while three held them, and nothing logged had the answer.
+	var outcomes []ProviderOutcome
+	note := func(provider config.UsenetProvider, err error) {
+		outcomes = append(outcomes, ProviderOutcome{Host: provider.Host, Kind: outcomeKind(err)})
+	}
 	// unanswered holds, per host, the timeout from a provider that failed
 	// without ever giving a definitive answer for this article. Timeouts
 	// only: the reader counts repeated timeouts and pads once a segment has
@@ -395,6 +404,12 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// returnOrReleaseConn always releases the right semaphore slot.
 		var currentConn = conn
 		var currentProvider = connProvider
+		// errProvider is the provider that produced the error retry.Do
+		// finally returns. It is not always currentProvider: the retriable
+		// branch below switches providers in anticipation of a retry that
+		// the attempt budget may not allow, and charging that provider with
+		// the error would exclude one that had not answered.
+		errProvider := connProvider
 		// Healthy streaming is the overwhelmingly common case. Avoid building
 		// retry configuration and invoking retry.Do unless the first execution
 		// actually fails. When it does fail, pendingErr lets the retry closure
@@ -417,7 +432,9 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 					return nil
 				}
 
+				errProvider = currentProvider
 				noteOutcome(currentProvider, execErr)
+				note(currentProvider, execErr)
 				var nntpErr *Error
 				if errors.As(execErr, &nntpErr) {
 					switch nntpErr.Type {
@@ -493,6 +510,11 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			retry.LastErrorOnly(true),
 		)
 
+		if err == nil && len(outcomes) > 0 {
+			// Succeeded after at least one provider failed: keep the
+			// record, the caller may want it.
+			outcomes = append(outcomes, ProviderOutcome{Host: currentProvider.Host, Kind: "ok"})
+		}
 		// Success
 		if err == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
@@ -504,11 +526,11 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		lastErr = err
 
 		// Check if we should exclude this provider. The final error came from
-		// currentProvider - the retry above may have moved off connProvider
-		// after a timeout - so that is the provider it describes. Charging a
-		// 430 to connProvider instead excluded a provider that had only timed
-		// out, and a not-found then came back for an article it holds.
-		failedProvider := currentProvider
+		// errProvider - the retry above may have moved off connProvider after
+		// a timeout - so that is the provider it describes. Charging a 430 to
+		// connProvider instead excluded a provider that had only timed out,
+		// and a not-found then came back for an article it holds.
+		failedProvider := errProvider
 		var nntpErr *Error
 		if errors.As(err, &nntpErr) {
 			switch nntpErr.Type {
@@ -546,17 +568,90 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			}
 			c.logger.Debug().Str("provider", p.Host).Err(terr).
 				Msg("Article not found on the providers that answered; one only timed out, so not treating it as missing")
-			return terr
+			return withOutcomes(terr, outcomes)
 		}
 		if IsCorruptArticleError(lastErr) {
-			return lastErr // corrupt everywhere else: keep the decode error, as before
+			return withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
 		}
-		return notFound
+		return withOutcomes(notFound, outcomes)
 	}
 	if lastErr != nil {
-		return lastErr
+		return withOutcomes(lastErr, outcomes)
 	}
 	return errors.New("all providers failed")
+}
+
+// ProviderOutcome is what one provider answered for one article.
+type ProviderOutcome struct {
+	Host string
+	Kind string // ok, not_found, timeout, connection, busy, corrupt, decode, other
+}
+
+// FailoverError carries the per-provider outcomes alongside the error
+// ExecuteWithFailover settled on. It is transparent: its message is the
+// wrapped error's and it unwraps to it, so every IsArticleNotFoundError /
+// IsTimeoutError / errors.Is check behaves as if it were not there.
+type FailoverError struct {
+	Err      error
+	Outcomes []ProviderOutcome
+}
+
+func (e *FailoverError) Error() string { return e.Err.Error() }
+func (e *FailoverError) Unwrap() error { return e.Err }
+
+// FailoverOutcomes returns the per-provider outcomes recorded for err, or nil.
+func FailoverOutcomes(err error) []ProviderOutcome {
+	var fe *FailoverError
+	if errors.As(err, &fe) {
+		return fe.Outcomes
+	}
+	return nil
+}
+
+// DescribeOutcomes renders outcomes as "host=kind,host=kind" for a log line.
+func DescribeOutcomes(outcomes []ProviderOutcome) string {
+	if len(outcomes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(outcomes))
+	for _, o := range outcomes {
+		parts = append(parts, o.Host+"="+o.Kind)
+	}
+	return strings.Join(parts, ",")
+}
+
+func withOutcomes(err error, outcomes []ProviderOutcome) error {
+	if err == nil || len(outcomes) == 0 {
+		return err
+	}
+	return &FailoverError{Err: err, Outcomes: outcomes}
+}
+
+func outcomeKind(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if IsCorruptArticleError(err) {
+		return "corrupt"
+	}
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) {
+		return "other"
+	}
+	switch nntpErr.Type {
+	case ErrorTypeArticleNotFound:
+		return "not_found"
+	case ErrorTypeTimeout:
+		return "timeout"
+	case ErrorTypeConnection:
+		return "connection"
+	case ErrorTypeServerBusy:
+		return "busy"
+	case ErrorTypeYencDecode:
+		return "decode"
+	default:
+		return "other"
+	}
 }
 
 // ExecuteOnce runs fn on a single connection from any available provider,

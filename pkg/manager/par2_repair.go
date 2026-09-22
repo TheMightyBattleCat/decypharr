@@ -1767,7 +1767,16 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// per-round discovery.
 	progress.SetPhase(Par2PhaseProbing)
 	statCtx2, statCancel2 := context.WithTimeout(ctx, par2PostedStatTimeout)
-	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, entryName)
+	statControls := make([]string, 0, 8)
+	for _, segs := range pending {
+		for _, d := range segs {
+			if len(statControls) == cap(statControls) {
+				break
+			}
+			statControls = append(statControls, d.MessageID)
+		}
+	}
+	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName)
 	statCancel2()
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
@@ -1806,7 +1815,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		statMissingSet[mid] = struct{}{}
 	}
 	progress.SetPhase(Par2PhaseProbing)
-	deadRefs, err = p.healFetchableDeadSegments(ctx, nzbID, entryName, idx, fetchers, deadRefs, statMissingSet)
+	deadRefs, err = p.healFetchableDeadSegments(ctx, nzbID, entryName, nzb, idx, fetchers, deadRefs, statMissingSet)
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
 	if err != nil {
@@ -2095,6 +2104,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Int("confirmed_missing", confirmedMissing).
 			Int("short_read", shortRead).
 			Int("corrupt", corrupt).
+			Str("providers", nntp.DescribeOutcomes(nntp.FailoverOutcomes(repairErr))).
 			Int("round", round+1).
 			Bool("stat_sweep_ran", statSwept).
 			Msg("par2 repair: intact slice(s) unreadable; expanding damaged set and retrying")
@@ -2112,7 +2122,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	for _, dr := range deadRefs {
-		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, dr.rng.start, dr.rng.end)
+		start, end, werr := readerPatchWindow(nzb, dr)
+		if werr != nil {
+			return fmt.Errorf("patch window for %s segment %d: %w", dr.file, dr.seg.Index, werr)
+		}
+		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, start, end)
 		if err != nil {
 			return fmt.Errorf("extract repaired bytes for %s: %w", dr.seg.MessageID, err)
 		}
@@ -2152,7 +2166,7 @@ type par2DeadRef struct {
 // any reason, stays for the solve exactly as before. Seen live 2026-09-22:
 // all nine "dead" segments of Deep in Orbit S02E01 were intact on three
 // providers, and the solve read 313 MB to fail on them.
-func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entryName string, idx *par2.Index, fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef, statMissing map[string]struct{}) ([]par2DeadRef, error) {
+func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef, statMissing map[string]struct{}) ([]par2DeadRef, error) {
 	u := p.manager.usenet
 	remaining := deadRefs[:0:0]
 	healed := 0
@@ -2165,7 +2179,14 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 			remaining = append(remaining, dr)
 			continue
 		}
-		data, ok := readVerifiedRange(idx, f, dr.rng)
+		start, end, werr := readerPatchWindow(nzb, dr)
+		if werr != nil {
+			p.logger.Warn().Err(werr).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: cannot place a patch for this dead segment; leaving it to the solve")
+			remaining = append(remaining, dr)
+			continue
+		}
+		data, ok := readVerifiedRange(idx, f, dr.rng, start, end)
 		if !ok {
 			remaining = append(remaining, dr)
 			continue
@@ -2190,10 +2211,11 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 	return remaining, nil
 }
 
-// readVerifiedRange reads [rng.start, rng.end) of f fresh from Usenet by way
-// of the whole PAR2 slices covering it, and returns it only if every one of
-// those slices passes its IFSC checksum.
-func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange) ([]byte, bool) {
+// readVerifiedRange reads [start, end) of f - a window inside the dead
+// article's posted range rng - fresh from Usenet by way of the whole PAR2
+// slices covering it, and returns it only if every one of those slices
+// passes its IFSC checksum.
+func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange, start, end int64) ([]byte, bool) {
 	slices, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
 	if err != nil || len(slices) == 0 {
 		return nil, false
@@ -2213,11 +2235,46 @@ func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange) (
 		}
 		verified[s] = data
 	}
-	out, err := extractPostedRange(idx, verified, rng.fileID, rng.start, rng.end)
+	out, err := extractPostedRange(idx, verified, rng.fileID, start, end)
 	if err != nil {
 		return nil, false
 	}
 	return out, true
+}
+
+// readerPatchWindow returns the byte range of dr's posted article that the
+// overlay patch must hold: the reader's slot for that segment, which is
+// [SegmentDataStart, +Bytes) inside the article.
+//
+// They differ whenever a posted article does not map one-to-one onto one
+// extracted file's bytes - a RAR volume's first article carries the volume
+// header ahead of the member's data, and its last can carry the next
+// member's. Writing the whole article there was refused by
+// overlay.Store.WritePatch ("repair and reader segment geometry disagree"),
+// so a repaired first article of a volume could never be stored, and with
+// the heal pass it would have failed the whole job.
+func readerPatchWindow(nzb *storage.NZB, dr par2DeadRef) (start, end int64, err error) {
+	file := nzb.GetFileByName(dr.file)
+	if file == nil {
+		return 0, 0, fmt.Errorf("file %q not in the NZB record", dr.file)
+	}
+	if dr.seg.Index < 0 || dr.seg.Index >= len(file.Segments) {
+		return 0, 0, fmt.Errorf("segment %d beyond the file's %d segments", dr.seg.Index, len(file.Segments))
+	}
+	seg := file.Segments[dr.seg.Index]
+	if seg.MessageID != dr.seg.MessageID {
+		return 0, 0, fmt.Errorf("segment %d is %s in the NZB record, not %s", dr.seg.Index, seg.MessageID, dr.seg.MessageID)
+	}
+	want := seg.Bytes
+	if want <= 0 {
+		want = dr.rng.end - dr.rng.start - seg.SegmentDataStart
+	}
+	start = dr.rng.start + seg.SegmentDataStart
+	end = start + want
+	if seg.SegmentDataStart < 0 || start < dr.rng.start || end > dr.rng.end {
+		return 0, 0, fmt.Errorf("reader slot [%d,+%d) does not fit the article's %d bytes", seg.SegmentDataStart, want, dr.rng.end-dr.rng.start)
+	}
+	return start, end, nil
 }
 
 // invalidateRepairedRanges drops stale copies of the ranges a repair just
@@ -2503,8 +2560,35 @@ func statPostedFileDamage(
 	stat func(context.Context, []string) ([]nntp.StatResult, error),
 	matches []par2.Match,
 	par2Source []storage.PostedFileRef,
+	controls []string,
 	entryName string,
 ) (missing []string, completed bool) {
+	// Calibrate first. Providers answer STAT 223 for articles whose body is
+	// gone everywhere - eweka did so for all 15 dead articles of Game of
+	// Castles S08E05, six others for Under Reef S11E06 - which makes a
+	// sweep that reports nothing missing worthless. controls are this
+	// release's own recorded-dead articles: playback already proved their
+	// bodies unfetchable, so STAT must report them missing. When it does
+	// not, the sweep is skipped rather than believed, and the first solve
+	// pass finds the damage instead (it collects every unreadable slice).
+	if len(controls) > 0 {
+		results, err := stat(ctx, controls)
+		if err != nil {
+			logger.Warn().Err(err).Str("entry", entryName).
+				Msg("par2: STAT control probe failed; damage will be found per-round instead")
+			return nil, false
+		}
+		for _, r := range results {
+			if r.Available || !nntp.IsArticleNotFoundError(r.Error) {
+				logger.Warn().
+					Str("entry", entryName).
+					Str("message_id", r.MessageID).
+					Msg("par2: a provider reports a known-dead article as present; skipping the STAT damage sweep for this release")
+				return nil, false
+			}
+		}
+	}
+
 	var msgIDs []string
 	for _, m := range matches {
 		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) {
@@ -2534,6 +2618,7 @@ func statPostedFileDamage(
 		Str("entry", entryName).
 		Int("segments_probed", len(msgIDs)).
 		Int("segments_missing", len(missing)).
+		Int("controls", len(controls)).
 		Dur("duration", time.Since(start)).
 		Msg("par2: posted-file STAT damage sweep complete")
 	return missing, true

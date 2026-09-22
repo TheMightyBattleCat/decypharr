@@ -254,7 +254,7 @@ func TestReadVerifiedRangeHealsOnlyAProvenArticle(t *testing.T) {
 	pf.resolveGeometry()
 	rng := postedRange{fileID: fileID, start: pf.base[1], end: pf.base[1] + pf.segSizes[1]}
 
-	got, ok := readVerifiedRange(idx, pf, rng)
+	got, ok := readVerifiedRange(idx, pf, rng, rng.start, rng.end)
 	if !ok {
 		t.Fatal("intact article not verified")
 	}
@@ -268,7 +268,7 @@ func TestReadVerifiedRangeHealsOnlyAProvenArticle(t *testing.T) {
 	articles["<p2>"] = bad
 	pf = newPostedFileFetcher(context.Background(), f.fetch, ref, nil, int64(len(content)), zerolog.Nop())
 	pf.resolveGeometry()
-	if _, ok := readVerifiedRange(idx, pf, rng); ok {
+	if _, ok := readVerifiedRange(idx, pf, rng, rng.start, rng.end); ok {
 		t.Fatal("a corrupted copy passed as verified")
 	}
 }
@@ -359,6 +359,14 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 
 	const nzbID = "nzb-heal"
 	store := m.usenet
+	// The reader reads each article whole here (SegmentDataStart 0).
+	readerFile := storage.NZBFile{Name: ref.Name}
+	for i, seg := range ref.Segments {
+		readerFile.Segments = append(readerFile.Segments, storage.NZBSegment{
+			Number: i + 1, MessageID: seg.MessageID, Bytes: pf.segSizes[i],
+		})
+	}
+	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
 	var refs []par2DeadRef
 	for _, i := range []int{1, 2, 3} {
 		seg := ref.Segments[i]
@@ -374,7 +382,7 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 	delete(articles, "<p4>") // segment 3: still gone
 	statMissing := map[string]struct{}{"<p3>": {}}
 
-	remaining, err := p.healFetchableDeadSegments(context.Background(), nzbID, "Some.Release", idx, fetchers, refs, statMissing)
+	remaining, err := p.healFetchableDeadSegments(context.Background(), nzbID, "Some.Release", nzb, idx, fetchers, refs, statMissing)
 	if err != nil {
 		t.Fatalf("heal: %v", err)
 	}
@@ -486,5 +494,69 @@ func TestPar2JobTimeoutScalesWithReleaseSize(t *testing.T) {
 	}
 	if got := par2JobTimeoutFor(200 << 30); got != par2JobTimeoutMax {
 		t.Fatalf("200 GB release: %s, want the %s cap", got, par2JobTimeoutMax)
+	}
+}
+
+// A RAR volume's first article carries the volume header, so the reader's
+// slot starts inside the article: the patch must hold that window, not the
+// whole article. WritePatch used to refuse the whole-article patch, and a
+// repaired first article of a volume could never be stored.
+func TestHealPatchesTheReaderSlotInsideAnArticle(t *testing.T) {
+	m, _ := newTestManagerForReap(t)
+	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
+
+	content, articles, ref := estimatedFixture()
+	const sliceSize = 40
+	var slices [][]byte
+	for off := 0; off < len(content); off += sliceSize {
+		slices = append(slices, content[off:off+sliceSize])
+	}
+	fileID := [16]byte{0x07}
+	idx := buildSingleFileIndexWithIFSC(t, sliceSize, fileID, "a.r00", slices)
+	f := &yencFetcher{articles: articles, calls: map[string]int{}}
+	pf := newPostedFileFetcher(context.Background(), f.fetch, ref, nil, int64(len(content)), zerolog.Nop())
+	pf.resolveGeometry()
+
+	// The member starts 20 bytes into article 0 and ends 5 bytes before the
+	// end of article 1 - the shape of a volume header plus a member boundary.
+	const header, tailCut = 20, 5
+	readerFile := storage.NZBFile{Name: "member.mkv"}
+	for i := range ref.Segments {
+		seg := storage.NZBSegment{Number: i + 1, MessageID: ref.Segments[i].MessageID, Bytes: pf.segSizes[i]}
+		switch i {
+		case 0:
+			seg.SegmentDataStart, seg.Bytes = header, pf.segSizes[0]-header
+		case 1:
+			seg.Bytes = pf.segSizes[1] - tailCut
+		}
+		readerFile.Segments = append(readerFile.Segments, seg)
+	}
+	const nzbID = "nzb-slot"
+	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	var refs []par2DeadRef
+	for _, i := range []int{0, 1} {
+		seg := readerFile.Segments[i]
+		if err := m.usenet.RecordOverlayDead(nzbID, readerFile.Name, i, seg.MessageID, seg.Bytes); err != nil {
+			t.Fatalf("record dead %d: %v", i, err)
+		}
+		refs = append(refs, par2DeadRef{
+			file: readerFile.Name,
+			seg:  overlay.DeadSegment{Index: i, MessageID: seg.MessageID, Bytes: seg.Bytes},
+			rng:  postedRange{fileID: fileID, start: pf.base[i], end: pf.base[i] + pf.segSizes[i]},
+		})
+	}
+
+	remaining, err := p.healFetchableDeadSegments(context.Background(), nzbID, "Some.Release", nzb, idx,
+		map[[16]byte]*postedFileFetcher{fileID: pf}, refs, map[string]struct{}{})
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("heal: err=%v remaining=%+v, want both patched", err, remaining)
+	}
+	head, ok := m.usenet.OverlayPatchBytes(nzbID, readerFile.Name, 0)
+	if !ok || !bytes.Equal(head, content[header:pf.segSizes[0]]) {
+		t.Fatalf("segment 0 patch = %d bytes (ok=%v), want the %d bytes after the volume header", len(head), ok, pf.segSizes[0]-header)
+	}
+	tail, ok := m.usenet.OverlayPatchBytes(nzbID, readerFile.Name, 1)
+	if !ok || !bytes.Equal(tail, content[pf.base[1]:pf.base[1]+pf.segSizes[1]-tailCut]) {
+		t.Fatalf("segment 1 patch = %d bytes (ok=%v), want the member's bytes only", len(tail), ok)
 	}
 }

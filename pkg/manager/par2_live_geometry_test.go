@@ -130,7 +130,7 @@ func TestLivePar2Geometry(t *testing.T) {
 				continue
 			}
 			rng := postedRange{fileID: fd.FileID, start: pf.base[s], end: pf.base[s] + pf.segSizes[s]}
-			data, ok := readVerifiedRange(idx, pf, rng)
+			data, ok := readVerifiedRange(idx, pf, rng, rng.start, rng.end)
 			if ok {
 				healed++
 			} else {

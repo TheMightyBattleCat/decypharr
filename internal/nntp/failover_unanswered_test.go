@@ -3,6 +3,7 @@ package nntp
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -134,5 +135,26 @@ func TestExecuteWithFailoverConnectionErrorPlusNotFoundIsMissing(t *testing.T) {
 	})
 	if !IsArticleNotFoundError(err) {
 		t.Fatalf("error = %v, want not-found", err)
+	}
+}
+
+// The error carries what each provider answered, so a caller that pads a
+// segment on a not-found can log which providers were asked and what they
+// said - and it stays transparent to every error check.
+func TestExecuteWithFailoverRecordsProviderOutcomes(t *testing.T) {
+	holder := startFakeNNTP(t, 0)
+	holder.bodies = map[string]string{"seg@test": yencWire(testPayload(), 0)}
+	empty := startFakeNNTP(t, 0)
+	pa, pb := twoLocalProviders(t, holder, empty)
+	pa.Backbone, pb.Backbone = "shared", "shared" // so the 430 is the verdict
+	c := newStatTestClient(t, []config.UsenetProvider{pa, pb}, 100)
+
+	err := fetchTimingOutOn(c, pa.Host, "seg@test")
+	if !IsArticleNotFoundError(err) {
+		t.Fatalf("error = %v, want not-found (still transparent through the wrapper)", err)
+	}
+	got := DescribeOutcomes(FailoverOutcomes(err))
+	if !strings.Contains(got, pa.Host+"=timeout") || !strings.Contains(got, pb.Host+"=not_found") {
+		t.Fatalf("outcomes = %q, want a timeout for %s and a not-found for %s", got, pa.Host, pb.Host)
 	}
 }

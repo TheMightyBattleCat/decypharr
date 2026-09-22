@@ -476,7 +476,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 					Str("file", sf.config.OverlayFile).
 					Int("segment", segIdx).
 					Msg("segment not padded: entry under sweep probe")
-			} else if sf.handleConfirmedMissing(ctx, segIdx, messageID) {
+			} else if sf.handleConfirmedMissing(ctx, segIdx, messageID, nntp.DescribeOutcomes(nntp.FailoverOutcomes(err))) {
 				// The slot now holds patch/pad bytes and is OnDisk, so the
 				// streak that may have brought us here is spent.
 				sf.clearDownloadTimeout(segIdx)
@@ -515,6 +515,9 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	return nil
 }
 
+// providers is the per-provider outcome summary for the fetch that failed,
+// recorded so a pad can be explained afterwards.
+//
 // handleConfirmedMissing consults the overlay for a segment whose article
 // fetch has permanently failed across every provider. Returns true if it
 // wrote replacement bytes into the cache (patch or pad), in which case the
@@ -524,11 +527,15 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 // (see ContextForBurstDownload) - either way, the original
 // article-not-found error should propagate exactly as it did before this
 // feature existed.
-func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int, messageID string) bool {
+func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int, messageID, providers string) bool {
 	overlayHandle := sf.config.Overlay
 	file := sf.config.OverlayFile
 
 	if patch, ok := overlayHandle.PatchBytes(file, segIdx); ok {
+		if providers != "" {
+			sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Str("providers", providers).
+				Msg("serving an overlay patch for a segment the providers could not")
+		}
 		if err := sf.cache.Put(segIdx, patch); err != nil {
 			sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
 			return false
@@ -558,10 +565,16 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 	}
 
 	if overlayHandle.ShouldLogPad(file, segIdx) {
+		// providers is what each provider actually answered for this
+		// article (see nntp.FailoverOutcomes). Without it a pad only says
+		// "missing everywhere", which on 2026-09-22 turned out to be wrong
+		// for nine Deep in Orbit articles three providers still held, with
+		// nothing in the log to show which had been asked.
 		sf.logger.Info().
 			Str("entry", overlayHandle.NzbID()).
 			Str("file", file).
 			Int("segment", segIdx).
+			Str("providers", providers).
 			Msg("segment padded")
 	}
 

@@ -164,7 +164,7 @@ func TestStatPostedFileDamage(t *testing.T) {
 
 	t.Run("reports confirmed-missing across matched files only", func(t *testing.T) {
 		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger,
-			mockStat(map[string]bool{"a1": true, "b0": true, "c0": true}, nil), matches, src, "e")
+			mockStat(map[string]bool{"a1": true, "b0": true, "c0": true}, nil), matches, src, nil, "e")
 		if !ok {
 			t.Fatalf("completed = false, want true")
 		}
@@ -177,7 +177,7 @@ func TestStatPostedFileDamage(t *testing.T) {
 
 	t.Run("ambiguous per-segment error is not reported missing", func(t *testing.T) {
 		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger,
-			mockStat(nil, map[string]bool{"a1": true}), matches, src, "e")
+			mockStat(nil, map[string]bool{"a1": true}), matches, src, nil, "e")
 		if !ok || len(got) != 0 {
 			t.Fatalf("got ok=%v missing=%v, want ok=true missing=[]", ok, got)
 		}
@@ -187,22 +187,48 @@ func TestStatPostedFileDamage(t *testing.T) {
 		failing := func(context.Context, []string) ([]nntp.StatResult, error) {
 			return nil, fmt.Errorf("nntp client is closed")
 		}
-		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, failing, matches, src, "e")
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, failing, matches, src, nil, "e")
 		if ok || got != nil {
 			t.Fatalf("got ok=%v missing=%v, want ok=false missing=nil", ok, got)
 		}
 	})
 
 	t.Run("no matched files -> completed true, nil", func(t *testing.T) {
-		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(nil, nil), nil, src, "e")
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(nil, nil), nil, src, nil, "e")
 		if !ok || got != nil {
 			t.Fatalf("got ok=%v missing=%v, want ok=true missing=nil", ok, got)
 		}
 	})
 
+	// A control article the overlay recorded dead - its body is unfetchable
+	// on every provider - that STAT still calls present proves STAT is
+	// unreliable for this release, so the sweep is skipped, not believed.
+	t.Run("a lying control skips the sweep", func(t *testing.T) {
+		probed := 0
+		counting := func(ctx context.Context, ids []string) ([]nntp.StatResult, error) {
+			probed += len(ids)
+			return mockStat(map[string]bool{"a1": true}, nil)(ctx, ids)
+		}
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, counting, matches, src, []string{"a0"}, "e")
+		if ok || got != nil {
+			t.Fatalf("got ok=%v missing=%v, want ok=false missing=nil", ok, got)
+		}
+		if probed != 1 {
+			t.Fatalf("probed %d IDs, want only the control", probed)
+		}
+	})
+
+	t.Run("a control STAT agrees is missing lets the sweep run", func(t *testing.T) {
+		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger,
+			mockStat(map[string]bool{"a0": true, "b1": true}, nil), matches, src, []string{"a0"}, "e")
+		if !ok || len(got) != 2 {
+			t.Fatalf("got ok=%v missing=%v, want the sweep to run and report both", ok, got)
+		}
+	})
+
 	t.Run("out-of-range PostedIndex is skipped", func(t *testing.T) {
 		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(map[string]bool{"a0": true}, nil),
-			[]par2.Match{{PostedIndex: 0}, {PostedIndex: 99}, {PostedIndex: -1}}, src, "e")
+			[]par2.Match{{PostedIndex: 0}, {PostedIndex: 99}, {PostedIndex: -1}}, src, nil, "e")
 		if !ok || len(got) != 1 || got[0] != "a0" {
 			t.Fatalf("got ok=%v missing=%v, want ok=true missing=[a0]", ok, got)
 		}
