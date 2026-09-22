@@ -18,6 +18,18 @@ import (
 // failure mode to surface distinctly (a "CRC canary").
 var ErrChecksumMismatch = errors.New("par2: checksum verification failed")
 
+// errIntactChecksumAbort marks the ErrChecksumMismatch Repair returns when
+// intact INPUT slices fail their checksums (as opposed to a reconstructed
+// output slice): a claim about how the caller read them, not about the
+// recovery data.
+var errIntactChecksumAbort = errors.New("intact slices failed their own IFSC checksum")
+
+// IsIntactChecksumAbort reports whether err is Repair's intact-slice checksum
+// abort.
+func IsIntactChecksumAbort(err error) bool {
+	return errors.Is(err, errIntactChecksumAbort)
+}
+
 // MaxRepairSlices is the exported form of maxRepairSlices, for callers that
 // want to fail before fetching any recovery data when they already know a
 // damaged set is too large (e.g. against a vol-filename-derived recovery
@@ -166,7 +178,7 @@ func Repair(idx *Index, damaged []int64, recovery []RecoverySlice, intact SliceS
 		if !ok {
 			mismatches++
 			if mismatches > maxIntactChecksumMismatches {
-				return nil, fmt.Errorf("%w: %d intact slices failed their own IFSC checksum - aborting rather than risk a fabricated repair from a drifted offset mapping", ErrChecksumMismatch, mismatches)
+				return nil, fmt.Errorf("%w: %d %w - aborting rather than risk a fabricated repair from a drifted offset mapping", ErrChecksumMismatch, mismatches, errIntactChecksumAbort)
 			}
 		}
 

@@ -101,7 +101,7 @@ func jobSourceForIFSC(t *testing.T, cacheContent map[string][]byte, article []by
 
 	fetcher := newFakeFetcher(map[string][]byte{"<a1>": article})
 	fileRef := storage.PostedFileRef{Name: "a.rar", Size: 200, Segments: []storage.Par2SegmentRef{{MessageID: "<a1>", Bytes: 200}}}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, fileRef, cacheSrc, 200, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), fileRef, cacheSrc, 200, zerolog.Nop())
 
 	return &jobSliceSource{
 		idx:      idx,

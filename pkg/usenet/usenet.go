@@ -1131,11 +1131,39 @@ func (u *Usenet) RunDamageSample(ctx context.Context, nzoID, filename string, op
 // probes) - NOT the hot streaming path, which uses the cached/pooled
 // SegmentFetcher instead.
 func (u *Usenet) FetchArticle(ctx context.Context, messageID string) ([]byte, error) {
+	return u.FetchArticleChecked(ctx, messageID, nil)
+}
+
+// ArticleCheck judges a decoded article by its yEnc headers (meta is nil when
+// the article had none) and returns "" to accept it, or why it is not the
+// article the caller asked for.
+type ArticleCheck func(meta *nntp.YencMetadata) string
+
+// FetchArticleChecked is FetchArticle with an identity check. Providers can
+// hold a different upload's article under a reused Message-ID; it decodes
+// cleanly and passes its own CRC, so only its yEnc headers give it away. An
+// article check rejects is treated as a 430 from that provider, so failover
+// asks the next one - the same rule the streaming reader applies (see
+// reader.articleMismatch). A nil check accepts everything.
+func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, check ArticleCheck) ([]byte, error) {
 	var buf bytes.Buffer
 	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
 		buf.Reset()
-		_, err := conn.StreamBody(messageID, &buf)
-		return err
+		_, meta, err := conn.StreamBodyMeta(messageID, &buf)
+		if err != nil {
+			return err
+		}
+		if check != nil {
+			if reason := check(meta); reason != "" {
+				u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
+					Msg("Provider returned a different upload's article; trying the next provider")
+				return &nntp.Error{
+					Type:    nntp.ErrorTypeArticleNotFound,
+					Message: "article belongs to a different upload: " + reason,
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

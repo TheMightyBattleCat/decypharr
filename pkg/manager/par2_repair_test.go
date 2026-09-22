@@ -134,7 +134,7 @@ func TestPostedFileFetcherReadRangeSingleSegment(t *testing.T) {
 		Name: "f", Size: 1000,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 1000}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 0, zerolog.Nop())
 
 	got, err := pf.ReadRange(100, 200)
 	if err != nil {
@@ -162,7 +162,7 @@ func TestPostedFileFetcherReadRangeCrossesSegments(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 0, zerolog.Nop())
 
 	got, err := pf.ReadRange(90, 20) // 10 bytes from seg1, 10 from seg2
 	if err != nil {
@@ -190,7 +190,7 @@ func TestPostedFileFetcherReadRangeZeroPadsPastEOF(t *testing.T) {
 		Name: "f", Size: 90,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 0, zerolog.Nop())
 
 	got, err := pf.ReadRange(0, 100) // slice size 100, file only has 90 real bytes
 	if err != nil {
@@ -222,7 +222,7 @@ func TestPostedFileFetcherTrueLenServesRealTailBytes(t *testing.T) {
 		Name: "f", Size: 90,
 		Segments: []storage.Par2SegmentRef{{MessageID: "<seg1>", Bytes: 100}},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 100, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 100, zerolog.Nop())
 
 	got, err := pf.ReadRange(0, 100)
 	if err != nil {
@@ -248,7 +248,7 @@ func TestPostedFileFetcherTrueLenLowersBoundWhenSmaller(t *testing.T) {
 	// directions, not only when it raises an under-estimate. See
 	// TestReadRangeBoundsOverstampedTailByTrueLen for the live scenario
 	// (Riders seg58) this corrects.
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 80, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 80, zerolog.Nop())
 
 	got, err := pf.ReadRange(0, 100)
 	if err != nil {
@@ -303,7 +303,7 @@ func TestReadRangeBoundsOverstampedTailByTrueLen(t *testing.T) {
 		Size:     int64(numFullSegs*segSize + declaredTail),
 		Segments: segs,
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, trueLen, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, trueLen, zerolog.Nop())
 
 	got, err := pf.ReadRange(numFullSegs*segSize, segSize)
 	if err != nil {
@@ -336,7 +336,7 @@ func TestPostedFileFetcherCachesLastSegment(t *testing.T) {
 			{MessageID: "<seg2>", Bytes: 100},
 		},
 	}
-	pf := newPostedFileFetcher(context.Background(), fetcher.fetch, file, nil, 0, zerolog.Nop())
+	pf := newPostedFileFetcher(context.Background(), uncheckedPosted(fetcher.fetch), file, nil, 0, zerolog.Nop())
 
 	// Read from seg1 three times in a row - should only fetch it once.
 	for i := 0; i < 3; i++ {
@@ -571,8 +571,8 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 	src := &jobSliceSource{
 		idx: idx,
 		fetchers: map[[16]byte]*postedFileFetcher{
-			fileA: newPostedFileFetcher(context.Background(), fetcherA.fetch, fileARef, nil, 0, zerolog.Nop()),
-			fileB: newPostedFileFetcher(context.Background(), fetcherB.fetch, fileBRef, nil, 0, zerolog.Nop()),
+			fileA: newPostedFileFetcher(context.Background(), uncheckedPosted(fetcherA.fetch), fileARef, nil, 0, zerolog.Nop()),
+			fileB: newPostedFileFetcher(context.Background(), uncheckedPosted(fetcherB.fetch), fileBRef, nil, 0, zerolog.Nop()),
 		},
 	}
 

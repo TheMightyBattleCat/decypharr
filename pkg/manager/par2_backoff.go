@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -28,6 +29,10 @@ const (
 	// never overflows time.Duration - par2BackoffBase<<11 already exceeds
 	// par2BackoffCap by a wide margin, so anything beyond this just clamps.
 	par2BackoffMaxShift = 11
+	// par2SuspectAttemptLimit is how many consecutive attempts a suspect
+	// failure (see par2FailureClass.suspect) gets before it is taken at its
+	// word and made terminal: 5m, 10m and 20m of backoff between them.
+	par2SuspectAttemptLimit = 3
 )
 
 // par2BackoffDuration returns how long to wait before the next automatic
@@ -59,6 +64,16 @@ type par2FailureClass struct {
 	// reason is the human-readable classification, surfaced verbatim in the
 	// persisted Par2RepairState.TerminalReason and the overlay list.
 	reason string
+	// suspect marks a failure that looks terminal but can be manufactured by
+	// this code rather than the posting: intact slices failing their
+	// checksum, or articles decoding shorter than the geometry expected.
+	// Both were produced on a wholly intact release by estimated article
+	// boundaries (Deep in Orbit S02E01, 2026-09-22), so neither is trusted on
+	// a single attempt. It backs off like a transient failure and becomes
+	// terminal after par2SuspectAttemptLimit consecutive attempts, which a
+	// genuinely damaged posting reaches while a transient cause (a provider
+	// serving a bad copy) gets a chance to clear.
+	suspect bool
 }
 
 // par2TerminalSubstrings are runRepair failure messages that can never
@@ -99,20 +114,16 @@ var par2TerminalSubstrings = []string{
 	// runRepair. The typed nntp.IsArticleNotFoundError check above can't
 	// see this case because repairErr itself isn't an nntp.Error here.
 	"confirmed missing across every provider",
-	// The short-read half of the same round-cap return: every unreadable
-	// slice was a backing article that decoded to fewer bytes than its
-	// recorded size, with no confirmed 430 among them (see deadCause). Kept
-	// terminal to preserve the behaviour this wording was split out of - a
-	// genuinely truncated posting never heals, and these passes cost
-	// gigabytes each, so retrying one on a backoff is expensive.
-	//
-	// REVISIT if spurious short reads reappear: a short read is a claim about
-	// OUR arithmetic as much as the posting, so an over-estimated segment
-	// size can manufacture this verdict on wholly intact data. The
-	// lastSeg <= seedSeg guard in exactSegGeometry closes the known
-	// manufacturer; if the "decoded shorter" count stays nonzero on healthy
-	// releases after that, this entry is the thing to drop - it is the line
-	// between "unrepairable" and "try again later".
+}
+
+// par2SuspectSubstrings are failures classified suspect (see
+// par2FailureClass.suspect) rather than terminal outright. The short-read
+// half of runRepair's round-cap return - every unreadable slice was a backing
+// article that decoded to fewer bytes than its recorded size, with no
+// confirmed 430 among them (see deadCause) - used to be terminal. Spurious
+// short reads did reappear on a healthy release: estimated article
+// boundaries (fixed by postedFileFetcher.resolveGeometry) put them there.
+var par2SuspectSubstrings = []string{
 	"decoded shorter than their recorded size",
 }
 
@@ -129,6 +140,9 @@ func classifyPar2Failure(err error) par2FailureClass {
 		return par2FailureClass{}
 	}
 	if errors.Is(err, par2.ErrChecksumMismatch) {
+		if par2.IsIntactChecksumAbort(err) {
+			return par2FailureClass{suspect: true, reason: "intact slices failed their own checksum (CRC canary) - offset mapping or a mis-served copy"}
+		}
 		return par2FailureClass{terminal: true, reason: "checksum verification failed (CRC canary) - retained recovery/intact data can't be trusted"}
 	}
 	if nntp.IsArticleNotFoundError(err) {
@@ -161,7 +175,24 @@ func classifyPar2Failure(err error) par2FailureClass {
 			return par2FailureClass{terminal: true, reason: msg}
 		}
 	}
+	for _, s := range par2SuspectSubstrings {
+		if strings.Contains(msg, s) {
+			return par2FailureClass{suspect: true, reason: msg}
+		}
+	}
 	return par2FailureClass{}
+}
+
+// par2OutcomeClass is classifyPar2Failure for the attempts-th consecutive
+// failure: a suspect failure turns terminal once it has recurred
+// par2SuspectAttemptLimit times.
+func par2OutcomeClass(err error, attempts int) par2FailureClass {
+	class := classifyPar2Failure(err)
+	if class.suspect && attempts >= par2SuspectAttemptLimit {
+		class.terminal = true
+		class.reason = fmt.Sprintf("%s (after %d attempts)", class.reason, attempts)
+	}
+	return class
 }
 
 // par2ShouldAutoEnqueue reports whether nzbID's persisted repair state
@@ -194,12 +225,15 @@ func (p *Par2Repair) par2ShouldAutoEnqueue(nzbID string) bool {
 // future AUTOMATIC attempts resume). A nil err (success) clears all
 // backoff/terminal state entirely - best-effort, logged not returned, since
 // a state-tracking failure must never affect the repair pass itself.
-func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDiscovered int) {
+//
+// It returns the failure's classification for this attempt (see
+// par2OutcomeClass), which is what the persisted state records.
+func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDiscovered int) par2FailureClass {
 	if err == nil {
 		if derr := p.manager.storage.DeletePar2RepairState(nzbID); derr != nil {
 			p.logger.Debug().Err(derr).Str("entry", nzbID).Msg("par2 repair: failed to clear repair state after success")
 		}
-		return
+		return par2FailureClass{}
 	}
 
 	state, gerr := p.manager.storage.GetPar2RepairState(nzbID)
@@ -211,7 +245,7 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDisc
 	state.LastError = err.Error()
 	state.DeadSegmentsDiscovered = deadSegmentsDiscovered
 
-	class := classifyPar2Failure(err)
+	class := par2OutcomeClass(err, state.AttemptCount)
 	state.Terminal = class.terminal
 	if class.terminal {
 		state.TerminalReason = class.reason
@@ -224,4 +258,5 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDisc
 	if serr := p.manager.storage.SavePar2RepairState(state); serr != nil {
 		p.logger.Debug().Err(serr).Str("entry", nzbID).Msg("par2 repair: failed to persist repair state")
 	}
+	return class
 }

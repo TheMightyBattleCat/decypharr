@@ -60,6 +60,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
@@ -152,6 +153,20 @@ func (l repairLane) String() string {
 // be exercised with a fake in tests, without needing a real, provider-backed
 // Usenet client.
 type articleFetchFunc func(ctx context.Context, messageID string) ([]byte, error)
+
+// postedFetchFunc is articleFetchFunc for a posted file's articles, with an
+// identity check the fetch applies to every provider's copy (see
+// usenet.FetchArticleChecked and postedArticleMismatch). u.FetchArticleChecked
+// satisfies it directly; tests wrap a plain fake with uncheckedPosted.
+type postedFetchFunc func(ctx context.Context, messageID string, check usenet.ArticleCheck) ([]byte, error)
+
+// uncheckedPosted adapts an articleFetchFunc that has no yEnc headers to hand
+// a check (a test fake) into a postedFetchFunc that skips the check.
+func uncheckedPosted(fetch articleFetchFunc) postedFetchFunc {
+	return func(ctx context.Context, messageID string, _ usenet.ArticleCheck) ([]byte, error) {
+		return fetch(ctx, messageID)
+	}
+}
 
 // par2VolPattern matches both real-world PAR2 recovery-volume naming
 // conventions (case-insensitive): par2cmdline's "<base>.volSTART+COUNT.par2"
@@ -731,7 +746,7 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 			Name:   postedRef.Name,
 			Length: postedRef.Size,
 			MD5_16k: func() ([16]byte, error) {
-				return computeMD5_16k(ctx, u.FetchArticle, postedRef)
+				return computeMD5_16k(ctx, u.FetchArticleChecked, postedRef)
 			},
 		}}
 		matches, skipped, err := par2.MatchFiles(idx, postedFiles)
@@ -758,7 +773,9 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 			continue
 		}
 		fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
-		data, ferr := u.FetchArticle(fetchCtx, seg.MessageID)
+		data, ferr := u.FetchArticleChecked(fetchCtx, seg.MessageID, func(meta *nntp.YencMetadata) string {
+			return postedArticleMismatch(meta, i, 0, false, fd.Length)
+		})
 		cancel()
 		if ferr != nil {
 			return false, "", fmt.Errorf("fetch segment %d: %w", i, ferr)
@@ -1070,7 +1087,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			return
 		}
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
-		class := classifyPar2Failure(err)
+		class := p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
 			Msg("par2 repair unavailable")
@@ -1087,7 +1104,6 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			FailReason: err.Error(),
 			CRCCanary:  canary,
 		})
-		p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.notifyFailed(entryName, err, canary)
 		// A terminal failure - one backoff can never fix - marks the entry
 		// unrepairable (see the deferred release above): PAR2 being enabled
@@ -1427,17 +1443,22 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	u := p.manager.usenet
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 
-	// fetch wraps every article fetch this pass makes so runJob can report a
-	// real (not estimated) read_bytes total in the persisted attempt log -
-	// used in place of u.FetchArticle everywhere below.
-	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
-		data, err := u.FetchArticle(fctx, messageID)
+	// fetchPosted wraps every article fetch this pass makes so runJob can
+	// report a real (not estimated) read_bytes total in the persisted attempt
+	// log - used in place of u.FetchArticle everywhere below. A posted file's
+	// articles pass an identity check (see postedArticleMismatch); PAR2 files
+	// go through fetch, which has none.
+	fetchPosted := func(fctx context.Context, messageID string, check usenet.ArticleCheck) ([]byte, error) {
+		data, err := u.FetchArticleChecked(fctx, messageID, check)
 		if err == nil && readBytes != nil {
 			n := int64(len(data))
 			atomic.AddInt64(readBytes, n)
 			progress.AddUsenetBytes(n)
 		}
 		return data, err
+	}
+	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
+		return fetchPosted(fctx, messageID, nil)
 	}
 
 	nzb, err := u.GetNZB(nzbID)
@@ -1603,7 +1624,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Name:   f.Name,
 			Length: f.Size,
 			MD5_16k: func() ([16]byte, error) {
-				return computeMD5_16k(ctx, fetch, f)
+				return computeMD5_16k(ctx, fetchPosted, f)
 			},
 		}
 	}
@@ -1660,12 +1681,28 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	fetchers := make(map[[16]byte]*postedFileFetcher, len(matches))
-	msgIDRange := make(map[string]postedRange)
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		f := newPostedFileFetcher(ctx, fetch, file, cacheSource, idx.Files[m.FileID].Length, p.logger)
-		fetchers[m.FileID] = f
-		for i, seg := range file.Segments {
+		fetchers[m.FileID] = newPostedFileFetcher(ctx, fetchPosted, file, cacheSource, idx.Files[m.FileID].Length, p.logger.With().Str("entry", entryName).Str("file", file.Name).Logger())
+	}
+	// Measure the real article boundaries of every file whose refs are only
+	// estimates, before anything below maps a byte range to slices: dead
+	// segment ranges, patches and the intact-slice stream all depend on them.
+	// One article per file, fetched in parallel - it is the first article
+	// the stream reads anyway, and stays cached for it.
+	// Par2PhaseProbing: the idle watchdog ignores it, like the STAT sweep.
+	progress.SetPhase(Par2PhaseProbing)
+	gp := pool.New().WithMaxGoroutines(max(1, u.ProcessingMaxConnections()))
+	for _, f := range fetchers {
+		gp.Go(f.resolveGeometry)
+	}
+	gp.Wait()
+	progress.SetPhase(Par2PhaseFetchingRecovery)
+	progress.Touch()
+	msgIDRange := make(map[string]postedRange)
+	for _, m := range matches {
+		f := fetchers[m.FileID]
+		for i, seg := range nzb.Par2Source[m.PostedIndex].Segments {
 			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
 		}
 	}
@@ -1718,12 +1755,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// member with no posted-file identity of its own) to its damaged slice
 	// set within the posted file PAR2 actually protects.
 	damagedSet := make(map[int64]struct{})
-	type deadRef struct {
-		file string
-		seg  overlay.DeadSegment
-		rng  postedRange
-	}
-	var deadRefs []deadRef
+	var deadRefs []par2DeadRef
 	for file, segs := range pending {
 		for _, seg := range segs {
 			rng, ok := msgIDRange[seg.MessageID]
@@ -1734,14 +1766,41 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				}
 				return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file)
 			}
-			slices, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
-			if err != nil {
+			if _, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end); err != nil {
 				return fmt.Errorf("map dead segment %s to slices: %w", seg.MessageID, err)
 			}
-			for _, s := range slices {
-				damagedSet[s] = struct{}{}
-			}
-			deadRefs = append(deadRefs, deadRef{file: file, seg: seg, rng: rng})
+			deadRefs = append(deadRefs, par2DeadRef{file: file, seg: seg, rng: rng})
+		}
+	}
+
+	// A segment recorded dead may not be: playback records one on a single
+	// failover pass, and the article can be back (or was only slow) by the
+	// time this runs. Fetch those the STAT sweep saw alive and prove them
+	// against the PAR2 slice checksums; each one that passes is patched with
+	// its real bytes and needs no parity. When that covers every dead
+	// segment, the solve - a full read of the release - is skipped.
+	statMissingSet := make(map[string]struct{}, len(statMissing))
+	for _, mid := range statMissing {
+		statMissingSet[mid] = struct{}{}
+	}
+	progress.SetPhase(Par2PhaseProbing)
+	deadRefs, err = p.healFetchableDeadSegments(ctx, nzbID, entryName, idx, fetchers, deadRefs, statMissingSet)
+	progress.SetPhase(Par2PhaseFetchingRecovery)
+	progress.Touch()
+	if err != nil {
+		return err
+	}
+	if len(deadRefs) == 0 {
+		p.invalidateRepairedRanges(nzb, nzbID, entryName, pending)
+		return nil
+	}
+	for _, dr := range deadRefs {
+		slices, err := idx.DamagedSlices(dr.rng.fileID, dr.rng.start, dr.rng.end)
+		if err != nil {
+			return fmt.Errorf("map dead segment %s to slices: %w", dr.seg.MessageID, err)
+		}
+		for _, s := range slices {
+			damagedSet[s] = struct{}{}
 		}
 	}
 
@@ -2022,18 +2081,111 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		u.ClearFailedFile(nzbID, dr.file)
 	}
 
-	// The failedFiles un-poison above only clears the in-memory permanent-
-	// failure record. Two caches can still hold a stale zero-fill copy of the
-	// ranges just patched, from a prior playback that padded them before this
-	// repair produced real bytes - and neither consults the overlay patch on
-	// a plain cache hit (PatchBytes is only reached on a live article-fetch
-	// failure):
-	//   1. The persistent DFS mount cache - drop the patched output ranges so
-	//      the next read re-streams them (now served from the patch).
-	//   2. Any warm usenet streaming reader whose in-memory segment cache
-	//      still has the padded segment OnDisk - tear it down so the next
-	//      Stream builds a fresh reader. Idle-safe: a no-op while a viewer
-	//      still holds the file.
+	p.invalidateRepairedRanges(nzb, nzbID, entryName, pending)
+	return nil
+}
+
+// par2DeadRef is one recorded-dead segment and the posted-file byte range it
+// covers.
+type par2DeadRef struct {
+	file string
+	seg  overlay.DeadSegment
+	rng  postedRange
+}
+
+// healFetchableDeadSegments patches every dead segment whose article can be
+// fetched and proven intact, and returns the ones still needing parity.
+//
+// Proof is the PAR2 IFSC of every slice the segment's range touches, read
+// fresh from Usenet (never the DFS cache, which may hold its zero-fill): a
+// slice that passes carries exactly the posted bytes, so the patch cut from
+// those slices is what a parity reconstruction would have produced. Only
+// segments on exactly-measured geometry are tried - with estimated
+// boundaries the slice reads are themselves suspect. Anything that fails, for
+// any reason, stays for the solve exactly as before. Seen live 2026-09-22:
+// all nine "dead" segments of Deep in Orbit S02E01 were intact on three
+// providers, and the solve read 313 MB to fail on them.
+func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entryName string, idx *par2.Index, fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef, statMissing map[string]struct{}) ([]par2DeadRef, error) {
+	u := p.manager.usenet
+	remaining := deadRefs[:0:0]
+	healed := 0
+	for _, dr := range deadRefs {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		f := fetchers[dr.rng.fileID]
+		if _, missing := statMissing[dr.seg.MessageID]; missing || f == nil || !f.exact {
+			remaining = append(remaining, dr)
+			continue
+		}
+		data, ok := readVerifiedRange(idx, f, dr.rng)
+		if !ok {
+			remaining = append(remaining, dr)
+			continue
+		}
+		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
+			// e.g. a volume's first article, whose reader slot is shorter
+			// than the posted article. Leave it to the solve, which meets
+			// the same refusal at the end as it always has, rather than
+			// abort a pass that can still repair the other segments.
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: verified bytes for a dead segment could not be patched; leaving it to the solve")
+			remaining = append(remaining, dr)
+			continue
+		}
+		u.ClearFailedFile(nzbID, dr.file)
+		healed++
+	}
+	if healed > 0 {
+		p.logger.Info().Str("entry", entryName).Int("healed", healed).Int("remaining", len(remaining)).
+			Msg("par2 repair: dead segment(s) fetched intact and verified against PAR2 checksums; patched without parity")
+	}
+	return remaining, nil
+}
+
+// readVerifiedRange reads [rng.start, rng.end) of f fresh from Usenet by way
+// of the whole PAR2 slices covering it, and returns it only if every one of
+// those slices passes its IFSC checksum.
+func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange) ([]byte, bool) {
+	slices, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
+	if err != nil || len(slices) == 0 {
+		return nil, false
+	}
+	verified := make(map[int64][]byte, len(slices))
+	for _, s := range slices {
+		fileID, local, err := idx.SliceLocation(s)
+		if err != nil || fileID != rng.fileID {
+			return nil, false
+		}
+		data, _, err := f.readRange(local*idx.SliceSize, idx.SliceSize, false)
+		if err != nil {
+			return nil, false
+		}
+		if ok, err := idx.VerifySliceChecksum(s, data); err != nil || !ok {
+			return nil, false
+		}
+		verified[s] = data
+	}
+	out, err := extractPostedRange(idx, verified, rng.fileID, rng.start, rng.end)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// invalidateRepairedRanges drops stale copies of the ranges a repair just
+// patched. The failedFiles un-poison the patch writers do only clears the
+// in-memory permanent-failure record. Two caches can still hold a stale
+// zero-fill copy of those ranges, from a prior playback that padded them
+// before the repair produced real bytes - and neither consults the overlay
+// patch on a plain cache hit (PatchBytes is only reached on a live
+// article-fetch failure):
+//  1. The persistent DFS mount cache - drop the patched output ranges so the
+//     next read re-streams them (now served from the patch).
+//  2. Any warm usenet streaming reader whose in-memory segment cache still
+//     has the padded segment OnDisk - tear it down so the next Stream builds
+//     a fresh reader. Idle-safe: a no-op while a viewer still holds the file.
+func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName string, pending map[string][]overlay.DeadSegment) {
 	if fw := p.dfsCacheForgetter(); fw != nil {
 		for file, rngs := range buildDeadOutputRanges(nzb, pending) {
 			for _, r := range rngs {
@@ -2042,9 +2194,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 	for file := range pending {
-		u.EvictCache(nzbID, file)
+		p.manager.usenet.EvictCache(nzbID, file)
 	}
-	return nil
 }
 
 // estimateNeededSlices is a cheap upper bound (one slice per dead segment)
@@ -2507,11 +2658,16 @@ func fetchWholePar2File(ctx context.Context, fetch articleFetchFunc, f storage.P
 // computeMD5_16k fetches just enough leading segments of a posted file to
 // hash its first 16KB (or the whole file, if shorter) - MatchFiles only
 // calls this for a file whose length ties with another candidate.
-func computeMD5_16k(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
+func computeMD5_16k(ctx context.Context, fetch postedFetchFunc, f storage.PostedFileRef) ([16]byte, error) {
 	fetcher := newPostedFileFetcher(ctx, fetch, f, nil, 0, zerolog.Nop())
+	// The persisted Size is an estimate unless the refs are real. The first
+	// article's yEnc header carries the file's true size, and a file shorter
+	// than 16 KB is hashed whole - hashing the estimate instead zero-pads a
+	// small file (an .sfv, an .nfo) or reads past its only article.
+	fetcher.resolveGeometry()
 	n := int64(md5_16kSize)
-	if f.Size < n {
-		n = f.Size
+	if fetcher.length < n {
+		n = fetcher.length
 	}
 	data, err := fetcher.ReadRange(0, n)
 	if err != nil {
@@ -2531,11 +2687,20 @@ type postedRange struct {
 // pass repeatedly hit the same or the next segment.
 type postedFileFetcher struct {
 	ctx      context.Context
-	fetch    articleFetchFunc
+	fetch    postedFetchFunc
 	length   int64
 	segs     []storage.Par2SegmentRef
 	base     []int64 // base[i] = starting byte offset of segs[i] within the file
 	segSizes []int64 // segSizes[i] = exact decoded byte count for segs[i]
+
+	// trueLen is the file's real length when known (FileDesc.Length, or the
+	// first article's =ybegin size once resolveGeometry has read it), else 0.
+	trueLen int64
+	// exact is true when base/segSizes are the real article boundaries -
+	// real seed provenance (see segGeometryExact) or resolveGeometry measured
+	// them - rather than scaled estimates.
+	exact  bool
+	logger zerolog.Logger
 
 	// cacheSource, when non-nil, is tried before every Usenet fetch below -
 	// see cacheSlicedSource.readCached. Misses (no mapping, dead range, not
@@ -2577,6 +2742,19 @@ type postedFileFetcher struct {
 // Otherwise (no trueLen) the persisted Par2SegmentRef.Bytes estimates are
 // accumulated as-is - a graceful fallback for callers that lack FileDesc
 // (computeMD5_16k passes trueLen=0).
+// segGeometryExact reports whether exactSegGeometry uses the exact uniform
+// branch for segs: real seed provenance, and a final article no larger than
+// the seed.
+func segGeometryExact(segs []storage.Par2SegmentRef, trueLen int64) bool {
+	n := len(segs)
+	if n == 0 {
+		return false
+	}
+	seedSeg := segs[0].Bytes
+	lastSeg := trueLen - int64(n-1)*seedSeg
+	return trueLen > 0 && seedSeg > 0 && lastSeg > 0 && segs[0].Real && lastSeg <= seedSeg
+}
+
 func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerolog.Logger) (bases, sizes []int64) {
 	n := len(segs)
 	bases = make([]int64, n)
@@ -2676,13 +2854,171 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerol
 	return
 }
 
-func newPostedFileFetcher(ctx context.Context, fetch articleFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64, logger zerolog.Logger) *postedFileFetcher {
+func newPostedFileFetcher(ctx context.Context, fetch postedFetchFunc, f storage.PostedFileRef, cacheSource *cacheSlicedSource, trueLen int64, logger zerolog.Logger) *postedFileFetcher {
 	base, segSizes := exactSegGeometry(f.Segments, trueLen, logger)
 	length := f.Size
 	if trueLen > 0 {
 		length = trueLen
 	}
-	return &postedFileFetcher{ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, segSizes: segSizes, cacheSource: cacheSource, cacheIdx: -1}
+	return &postedFileFetcher{
+		ctx: ctx, fetch: fetch, length: length, segs: f.Segments, base: base, segSizes: segSizes,
+		trueLen: trueLen, exact: segGeometryExact(f.Segments, trueLen), logger: logger,
+		cacheSource: cacheSource, cacheIdx: -1,
+	}
+}
+
+// resolveGeometry replaces estimated article boundaries with measured ones.
+//
+// A posted file whose refs are estimates (Par2SegmentRef.Real false) gets its
+// boundaries from exactSegGeometry's scaled accumulate, which only anchors the
+// TOTAL: each estimate is off by its own tens to hundreds of bytes, so every
+// boundary after the first is misplaced. Seen live 2026-09-22 on Deep in Orbit
+// S02E01 FLAME: stored sizes of 717,0xx-717,5xx against real 716,800-byte
+// articles. readRange then copied each intact slice from the wrong offset (an
+// IFSC mismatch) or past the end of a real article (ErrSegmentShort), and the
+// repair aborted as terminal on a release with nothing missing.
+//
+// Posters cut every article but the last to one size, and the first article's
+// yEnc header states it (=ypart) along with the file's size (=ybegin). One
+// fetch of article 0 therefore gives the exact uniform geometry, checked for
+// consistency before it is used: the last article must come out no larger
+// than the others. On any doubt the estimates stay, exactly as before.
+//
+// Not safe for concurrent use with readRange: call it once, before the
+// fetcher is shared (runRepair and computeMD5_16k do).
+func (f *postedFileFetcher) resolveGeometry() {
+	if f.exact || len(f.segs) == 0 || f.fetch == nil {
+		return
+	}
+	n := len(f.segs)
+	// Article 0 is read first, as the stream would. If it is the dead one,
+	// any other full-size article measures the same size from its own
+	// =ypart offset, so try a couple more before giving up.
+	candidates := min(n, geometryProbeArticles)
+	if n > 1 {
+		candidates = min(n-1, geometryProbeArticles) // never the last: it is short
+	}
+	var lastErr error
+	for idx := 0; idx < candidates; idx++ {
+		seed, size, err := f.measureArticle(idx)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		f.applyUniformGeometry(seed, size)
+		return
+	}
+	f.logger.Warn().Err(lastErr).Int("articles_tried", candidates).
+		Msg("par2 geometry: could not measure the article size; keeping estimated segment sizes")
+}
+
+// geometryProbeArticles bounds how many leading articles resolveGeometry
+// tries before keeping the estimates.
+const geometryProbeArticles = 3
+
+// measureArticle fetches article idx and returns the uniform article size
+// and file size it implies. The single-entry segment cache keeps its bytes
+// for the stream.
+func (f *postedFileFetcher) measureArticle(idx int) (seed, size int64, err error) {
+	var meta *nntp.YencMetadata
+	check := f.identityCheck(idx)
+	capture := func(m *nntp.YencMetadata) string {
+		if reason := check(m); reason != "" {
+			return reason
+		}
+		meta = m
+		return ""
+	}
+	fetchCtx, cancel := context.WithTimeout(f.ctx, par2ArticleFetchTimeout)
+	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID, capture)
+	cancel()
+	if err != nil {
+		return 0, 0, fmt.Errorf("article %d: %w", idx, err)
+	}
+	f.cacheMu.Lock()
+	f.cacheIdx, f.cacheData = idx, data
+	f.cacheMu.Unlock()
+
+	seed = int64(len(data))
+	size = f.trueLen
+	switch {
+	case meta != nil && meta.PartSize > 0:
+		if meta.PartSize != seed || meta.Offset != int64(idx)*seed {
+			return 0, 0, fmt.Errorf("article %d: yEnc part of %d bytes at offset %d (decoded %d) is not a whole uniform part", idx, meta.PartSize, meta.Offset, seed)
+		}
+		if meta.Size > 0 {
+			if size == 0 {
+				size = meta.Size
+			} else if meta.Size != size {
+				return 0, 0, fmt.Errorf("article %d: yEnc file size %d disagrees with the PAR2 file length %d", idx, meta.Size, size)
+			}
+		}
+	case idx != 0:
+		// Without a part header only the first article's offset is known.
+		return 0, 0, fmt.Errorf("article %d: no yEnc part header to place it by", idx)
+	}
+	if size <= 0 || seed <= 0 {
+		return 0, 0, fmt.Errorf("article %d: no file length to anchor the geometry", idx)
+	}
+	n := int64(len(f.segs))
+	if last := size - (n-1)*seed; last <= 0 || last > seed {
+		return 0, 0, fmt.Errorf("article %d: %d-byte articles leave a last article of %d bytes in a %d-byte file of %d articles", idx, seed, last, size, n)
+	}
+	return seed, size, nil
+}
+
+// applyUniformGeometry sets every article to seed bytes, the last to what
+// remains of size.
+func (f *postedFileFetcher) applyUniformGeometry(seed, size int64) {
+	n := int64(len(f.segs))
+	for i := range f.segs {
+		f.base[i] = int64(i) * seed
+		f.segSizes[i] = seed
+	}
+	f.segSizes[n-1] = size - (n-1)*seed
+	f.length = size
+	f.trueLen = size
+	f.exact = true
+	f.logger.Debug().Int64("seed_segment", seed).Int64("last_segment", f.segSizes[n-1]).Int64("file_length", size).
+		Int64("segments", n).Msg("par2 geometry: measured uniform article size from a yEnc part header")
+}
+
+// identityCheck is the article check for segment idx of this file.
+func (f *postedFileFetcher) identityCheck(idx int) usenet.ArticleCheck {
+	return func(meta *nntp.YencMetadata) string {
+		return postedArticleMismatch(meta, idx, f.base[idx], f.exact, f.trueLen)
+	}
+}
+
+// postedArticleMismatch explains why meta is not article idx of a posted file,
+// or returns "" when it could be. Providers can serve a different upload's
+// article under a reused Message-ID (see reader.articleMismatch); that article
+// is CRC-valid against its own header, so without this the repair either
+// counts it short or reads its bytes as the file's.
+//
+// Three signals: the part number (idx+1), the file size from =ybegin, and -
+// once the geometry is exact - the part's offset. Any one alone can disagree
+// for a benign reason (an NZB that numbers parts its own way, an estimated
+// size), so two must disagree before the copy is refused.
+func postedArticleMismatch(meta *nntp.YencMetadata, idx int, wantOffset int64, exact bool, fileSize int64) string {
+	if meta == nil || meta.PartSize <= 0 {
+		return ""
+	}
+	bad := 0
+	if meta.Part > 0 && meta.Part != int64(idx+1) {
+		bad++
+	}
+	if fileSize > 0 && meta.Size > 0 && meta.Size != fileSize {
+		bad++
+	}
+	if exact && meta.Offset != wantOffset {
+		bad++
+	}
+	if bad < 2 {
+		return ""
+	}
+	return fmt.Sprintf("yEnc part %d of %d at offset %d in a %d-byte file, want part %d at offset %d in a %d-byte file",
+		meta.Part, meta.Total, meta.Offset, meta.Size, idx+1, wantOffset, fileSize)
 }
 
 func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
@@ -2716,7 +3052,7 @@ func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
 	// deadline. f.ctx (the job's own context, via par2JobTimeout) remains
 	// the backstop if it's already closer than that.
 	fetchCtx, cancel := context.WithTimeout(f.ctx, par2ArticleFetchTimeout)
-	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID)
+	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID, f.identityCheck(idx))
 	cancel()
 	if err != nil {
 		return nil, err
