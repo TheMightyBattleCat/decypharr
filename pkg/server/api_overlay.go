@@ -235,6 +235,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 
 	par2Repair := s.manager.Par2Repair()
 	refs := s.overlayArrRefs(r.Context())
+	latestAttempts := s.latestPar2AttemptsByNzb()
 
 	for _, nzbID := range nzbIDs {
 		// An entry can be deleted while its overlay state lingers on disk
@@ -262,7 +263,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 		queued := !running && par2Repair != nil && par2Repair.IsQueued(nzbID)
 		var lastAttempt *storage.Par2RepairAttempt
 		if !running && !queued {
-			lastAttempt, _ = s.manager.Storage().LatestPar2RepairAttemptForNzb(nzbID)
+			lastAttempt = latestAttempts[nzbID]
 		}
 		repairState, _ := s.manager.Storage().GetPar2RepairState(nzbID)
 
@@ -335,25 +336,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 				of.Repairable = false
 			}
 
-			switch {
-			case running:
-				of.RepairStatus = OverlayRepairRunning
-			case queued:
-				of.RepairStatus = OverlayRepairQueued
-			case pending && repairState != nil && repairState.Terminal:
-				of.RepairStatus = OverlayRepairUnrepairable
-				of.RepairStatusReason = repairState.TerminalReason
-			case pending && !repairable:
-				of.RepairStatus = OverlayRepairUnavailable
-				of.RepairStatusReason = notRepairableReason
-			case lastAttempt != nil && lastAttempt.Outcome == storage.Par2RepairOutcomeCompleted && !pending:
-				of.RepairStatus = OverlayRepairCompleted
-			case lastAttempt != nil && pending && (lastAttempt.Outcome == storage.Par2RepairOutcomeFailed || lastAttempt.Outcome == storage.Par2RepairOutcomeUnavailable):
-				of.RepairStatus = OverlayRepairFailed
-				of.RepairStatusReason = lastAttempt.FailReason
-			default:
-				of.RepairStatus = OverlayRepairNone
-			}
+			of.RepairStatus, of.RepairStatusReason = overlayRepairStatusFor(running, queued, pending, repairable, notRepairableReason, of.PatchedSegments, repairState, lastAttempt)
 
 			out = append(out, of)
 		}
@@ -366,6 +349,55 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 		return out[i].File < out[j].File
 	})
 	utils.JSONResponse(w, out, http.StatusOK)
+}
+
+// overlayRepairStatusFor derives a file's repair status from the live worker
+// state, its overlay counts, its persisted repair state and its latest
+// persisted attempt.
+func overlayRepairStatusFor(running, queued, pending, repairable bool, notRepairableReason string, patched int, state *storage.Par2RepairState, last *storage.Par2RepairAttempt) (OverlayRepairStatus, string) {
+	switch {
+	case running:
+		return OverlayRepairRunning, ""
+	case queued:
+		return OverlayRepairQueued, ""
+	case pending && state != nil && state.Terminal:
+		return OverlayRepairUnrepairable, state.TerminalReason
+	case pending && !repairable:
+		return OverlayRepairUnavailable, notRepairableReason
+	case !pending && patched > 0:
+		// The patches are the durable proof of a repair. The attempt history
+		// is not: a successful repair deletes its Par2RepairState, and the
+		// history can be cleared from the GUI, which left every repaired file
+		// showing "none".
+		if last == nil || last.Outcome != storage.Par2RepairOutcomeCompleted {
+			return OverlayRepairCompleted, "repaired; no attempt record retained"
+		}
+		return OverlayRepairCompleted, ""
+	case last != nil && last.Outcome == storage.Par2RepairOutcomeCompleted && !pending:
+		return OverlayRepairCompleted, ""
+	case last != nil && pending && (last.Outcome == storage.Par2RepairOutcomeFailed || last.Outcome == storage.Par2RepairOutcomeUnavailable):
+		return OverlayRepairFailed, last.FailReason
+	default:
+		return OverlayRepairNone, ""
+	}
+}
+
+// latestPar2AttemptsByNzb returns the most recent persisted PAR2 attempt for
+// every nzbID, from one pass over the history. The overlay list used to call
+// LatestPar2RepairAttemptForNzb per NZB, which lists and sorts the whole
+// history each time.
+func (s *Server) latestPar2AttemptsByNzb() map[string]*storage.Par2RepairAttempt {
+	out := make(map[string]*storage.Par2RepairAttempt)
+	attempts, err := s.manager.Storage().ListPar2RepairAttempts()
+	if err != nil {
+		return out
+	}
+	for _, a := range attempts { // newest first
+		if _, seen := out[a.NzbID]; !seen {
+			out[a.NzbID] = a
+		}
+	}
+	return out
 }
 
 // OverlayEntryDiskUsage is one entry's overlay disk-usage breakdown.
