@@ -331,9 +331,45 @@ func isIdleExpired(lastUsed time.Time, now time.Time) bool {
 // Uses exclusion-based connection acquisition: gets ANY available connection,
 // and on retryable errors, retries with exponential backoff before excluding the provider.
 // Uses avast/retry-go for retry handling.
+//
+// A not-found result means every provider answered not-found (directly, or by
+// sharing a backbone with one that did), or failed with something other than
+// a timeout. A provider that only timed out has not answered, so when one
+// remains, its timeout is returned instead of the not-found: callers pad and
+// queue PAR2 repair on a not-found, and an article one slow provider still
+// holds is not missing.
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
 	var lastErr error
 	var exclusions providerExclusions
+	// unanswered holds, per host, the timeout from a provider that failed
+	// without ever giving a definitive answer for this article. Timeouts
+	// only: the reader counts repeated timeouts and pads once a segment has
+	// burned maxDownloadTimeoutStreak of them, but nothing converts repeated
+	// connection or server-busy errors - holding a 430 back behind one of
+	// those would leave a dead article failing every read, never padded.
+	var unanswered map[string]error
+	// notFound is the last 430 any provider gave. It is the answer once no
+	// provider remains unanswered, even when a later provider only failed to
+	// connect: that is no answer about the article.
+	var notFound error
+	noteOutcome := func(provider config.UsenetProvider, err error) {
+		var nntpErr *Error
+		if !errors.As(err, &nntpErr) {
+			return
+		}
+		if nntpErr.Type == ErrorTypeArticleNotFound {
+			notFound = err
+		}
+		switch nntpErr.Type {
+		case ErrorTypeTimeout:
+			if unanswered == nil {
+				unanswered = make(map[string]error)
+			}
+			unanswered[provider.Host] = err
+		default:
+			delete(unanswered, provider.Host)
+		}
+	}
 
 	for providerAttempts := 0; providerAttempts < len(c.providers); providerAttempts++ {
 		if ctx.Err() != nil {
@@ -342,7 +378,15 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 
 		conn, connProvider, err := c.getAnyAvailableConnection(ctx, exclusions)
 		if err != nil {
-			lastErr = err
+			// Not an answer about the article: keep the last provider's
+			// verdict. Once every provider is excluded this is "no eligible
+			// providers available", which used to overwrite the 430 that
+			// excluded the last of them - on providers sharing a backbone a
+			// dead article then never read as not-found, so it was never
+			// padded or repaired.
+			if lastErr == nil {
+				lastErr = err
+			}
 			continue
 		}
 
@@ -373,6 +417,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 					return nil
 				}
 
+				noteOutcome(currentProvider, execErr)
 				var nntpErr *Error
 				if errors.As(execErr, &nntpErr) {
 					switch nntpErr.Type {
@@ -389,12 +434,15 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 						// otherwise one slow provider can consume the whole DFS
 						// no-progress window before failover gets a chance. If
 						// there is no alternative provider, fall back to retrying
-						// the same one.
-						retryExclusions := providerExclusions{}
+						// the same one. Providers already excluded for this
+						// article (a 430 on their backbone) stay excluded: asking
+						// one again only returns the same 430, now charged to the
+						// provider that timed out.
+						retryExclusions := exclusions.clone()
 						retryExclusions.excludeHost(failedProvider.Host)
 						newConn, newProvider, connErr := c.getAnyAvailableConnection(ctx, retryExclusions)
 						if connErr != nil {
-							newConn, newProvider, connErr = c.getAnyAvailableConnection(ctx, providerExclusions{})
+							newConn, newProvider, connErr = c.getAnyAvailableConnection(ctx, exclusions)
 						}
 						if connErr != nil {
 							return retry.Unrecoverable(connErr)
@@ -455,14 +503,19 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		c.returnOrReleaseConn(currentConn, currentProvider)
 		lastErr = err
 
-		// Check if we should exclude this provider
+		// Check if we should exclude this provider. The final error came from
+		// currentProvider - the retry above may have moved off connProvider
+		// after a timeout - so that is the provider it describes. Charging a
+		// 430 to connProvider instead excluded a provider that had only timed
+		// out, and a not-found then came back for an article it holds.
+		failedProvider := currentProvider
 		var nntpErr *Error
 		if errors.As(err, &nntpErr) {
 			switch nntpErr.Type {
 			case ErrorTypeArticleNotFound:
-				excludeForArticleNotFound(&exclusions, connProvider)
+				excludeForArticleNotFound(&exclusions, failedProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
-				exclusions.excludeHost(connProvider.Host)
+				exclusions.excludeHost(failedProvider.Host)
 			case ErrorTypeYencDecode:
 				if !IsCorruptArticleError(err) {
 					return err
@@ -472,19 +525,34 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				// bytes on four providers, intact on three others), so skip
 				// the backbone as for a 430. If every provider's copy is
 				// corrupt, the last decode error is returned as before.
-				excludeForArticleNotFound(&exclusions, connProvider)
+				excludeForArticleNotFound(&exclusions, failedProvider)
 			default:
 				// Non-retriable error, return immediately
 				return err
 			}
 		} else if customerror.IsPanicError(err) {
-			exclusions.excludeHost(connProvider.Host)
+			exclusions.excludeHost(failedProvider.Host)
 		} else {
 			// Unknown error type - return immediately
 			return err
 		}
 	}
 
+	if notFound != nil {
+		for _, p := range c.providers {
+			terr, ok := unanswered[p.Host]
+			if !ok || exclusions.excludesBackbone(p) {
+				continue // answered, or a provider on its backbone did
+			}
+			c.logger.Debug().Str("provider", p.Host).Err(terr).
+				Msg("Article not found on the providers that answered; one only timed out, so not treating it as missing")
+			return terr
+		}
+		if IsCorruptArticleError(lastErr) {
+			return lastErr // corrupt everywhere else: keep the decode error, as before
+		}
+		return notFound
+	}
 	if lastErr != nil {
 		return lastErr
 	}
@@ -1193,6 +1261,28 @@ func (e providerExclusions) excludes(provider config.UsenetProvider) bool {
 	}
 	_, ok := e.backbones[provider.Backbone]
 	return ok
+}
+
+// excludesBackbone reports whether provider's backbone (not its host) is
+// excluded - a provider on it answered not-found for this article.
+func (e providerExclusions) excludesBackbone(provider config.UsenetProvider) bool {
+	if provider.Backbone == "" || e.backbones == nil {
+		return false
+	}
+	_, ok := e.backbones[provider.Backbone]
+	return ok
+}
+
+// clone returns an independent copy of e.
+func (e providerExclusions) clone() providerExclusions {
+	var out providerExclusions
+	for h := range e.hosts {
+		out.excludeHost(h)
+	}
+	for b := range e.backbones {
+		out.excludeBackbone(b)
+	}
+	return out
 }
 
 func normalizeBackbone(backbone string) string {
