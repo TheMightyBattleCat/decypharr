@@ -249,6 +249,9 @@ type runningJob struct {
 	lane      repairLane
 	cancel    context.CancelFunc
 	preempted atomic.Bool
+	// done is closed once the job has deregistered, so a job for the same
+	// nzbID can wait out a preempted one instead of running alongside it.
+	done chan struct{}
 }
 
 // Par2Repair is the manager-level PAR2 repair worker. See the package doc
@@ -266,10 +269,6 @@ type Par2Repair struct {
 	// repair window was closed (see readyToRun) - loop's local pending slice
 	// mirrors this set so IsQueued can see them too.
 	deferred map[string]struct{}
-
-	// active holds the nzbID of the in-flight job, nil when idle. Read by
-	// IsRunning for the overlay management API's repair-status introspection.
-	active atomic.Pointer[string]
 
 	// progress holds live, per-nzbID job progress (phase, slice/byte
 	// counts) - see par2_progress.go. Updated frequently throughout
@@ -354,8 +353,9 @@ func (p *Par2Repair) Stop() {
 	p.wg.Wait()
 }
 
-// IsQueued reports whether nzbID currently has a PAR2 pass waiting to run
-// (queued or deferred by a closed repair window).
+// IsQueued reports whether nzbID currently has a PAR2 pass waiting to run in
+// either lane (batch-queued, deferred by a closed repair window, or waiting
+// in the URGENT heap).
 func (p *Par2Repair) IsQueued(nzbID string) bool {
 	if p == nil || nzbID == "" {
 		return false
@@ -364,18 +364,68 @@ func (p *Par2Repair) IsQueued(nzbID string) bool {
 	_, q := p.queued[nzbID]
 	_, d := p.deferred[nzbID]
 	p.mu.Unlock()
-	return q || d
+	if q || d {
+		return true
+	}
+	p.urgentMu.Lock()
+	_, u := p.urgentSet[nzbID]
+	p.urgentMu.Unlock()
+	return u
 }
 
-// IsRunning reports whether nzbID's PAR2 pass is the one currently executing.
+// IsRunning reports whether a PAR2 pass for nzbID is executing in either
+// lane. It used to read a single "active" pointer that every lane's job
+// overwrote and cleared on exit, so an URGENT pass never showed as running
+// and any two overlapping jobs hid each other.
 func (p *Par2Repair) IsRunning(nzbID string) bool {
 	if p == nil || nzbID == "" {
 		return false
 	}
-	if id := p.active.Load(); id != nil {
-		return *id == nzbID
+	p.runningMu.Lock()
+	_, ok := p.running[nzbID]
+	p.runningMu.Unlock()
+	return ok
+}
+
+// claimRun registers a job for nzbID in p.running, the one place that
+// guarantees at most one pass per nzbID. A preempted job still unwinding is
+// waited out - it may still be writing patches, since the solve and write
+// phases do not check its context. Any other job already registered means
+// this run is a duplicate: ok is false and the caller must return without
+// touching the handler registry, which the running job owns.
+func (p *Par2Repair) claimRun(ctx context.Context, nzbID string, lane repairLane, cancel context.CancelFunc) (job *runningJob, ok bool) {
+	for {
+		p.runningMu.Lock()
+		if p.running == nil {
+			p.running = make(map[string]*runningJob)
+		}
+		cur, busy := p.running[nzbID]
+		if !busy {
+			job = &runningJob{lane: lane, cancel: cancel, done: make(chan struct{})}
+			p.running[nzbID] = job
+			p.runningMu.Unlock()
+			return job, true
+		}
+		p.runningMu.Unlock()
+		if !cur.preempted.Load() {
+			return nil, false
+		}
+		select {
+		case <-cur.done:
+		case <-ctx.Done():
+			return nil, false
+		}
 	}
-	return false
+}
+
+// releaseRun deregisters job and wakes anything waiting on it.
+func (p *Par2Repair) releaseRun(nzbID string, job *runningJob) {
+	p.runningMu.Lock()
+	if p.running[nzbID] == job {
+		delete(p.running, nzbID)
+	}
+	p.runningMu.Unlock()
+	close(job.done)
 }
 
 // AutoEnqueue is the automatic-trigger entry point - called from the reader's
@@ -505,6 +555,14 @@ func (p *Par2Repair) RunNow(nzbID string) error {
 	}
 	if p.IsRunning(nzbID) {
 		return fmt.Errorf("par2 repair already running for this entry")
+	}
+	// An URGENT job waiting for this nzbID would run a second pass after
+	// ours, and its handler claim would be clobbered by the Set below.
+	p.urgentMu.Lock()
+	_, urgentQueued := p.urgentSet[nzbID]
+	p.urgentMu.Unlock()
+	if urgentQueued {
+		return fmt.Errorf("par2 repair already queued for this entry")
 	}
 
 	p.mu.Lock()
@@ -988,6 +1046,23 @@ func (p *Par2Repair) readyToRun() bool {
 // autoActionRegrab, so a terminal PAR2 failure surfaces in the overlay GUI
 // for a MANUAL "Delete & re-search" instead (see handleOverlayResearch).
 func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
+	base := p.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	jobCtx, jobCancel := context.WithCancel(base)
+	defer jobCancel()
+	// Claimed before anything else - the handler registry, the progress
+	// record - so a duplicate pass (RunNow racing the batch loop or an
+	// URGENT job) leaves both to the job that owns them.
+	job, ok := p.claimRun(base, nzbID, lane, jobCancel)
+	if !ok {
+		p.logger.Debug().Str("entry", nzbID).Str("lane", lane.String()).
+			Msg("par2 repair: a pass is already running for this entry; skipping duplicate")
+		return
+	}
+	defer p.releaseRun(nzbID, job)
+
 	start := time.Now()
 	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
 
@@ -1026,10 +1101,6 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		return
 	}
 
-	id := nzbID
-	p.active.Store(&id)
-	defer p.active.Store(nil)
-
 	entry, entryErr := p.manager.GetEntry(nzbID)
 	if entryErr != nil || entry == nil {
 		// A ghost overlay record - the backing entry is already gone
@@ -1058,7 +1129,6 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	entryName := entry.Name
 	progress.SetEntryName(entryName)
 
-	jobCtx, jobCancel := context.WithCancel(p.ctx)
 	var releaseBytes int64
 	if hdr, herr := p.manager.usenet.GetNZBHeader(nzbID); herr == nil && hdr != nil {
 		releaseBytes = hdr.TotalSize
@@ -1068,19 +1138,6 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	if lane == laneUrgent {
 		timeoutCtx = nntp.WithPriority(timeoutCtx, nntp.PriorityUrgent)
 	}
-
-	job := &runningJob{lane: lane, cancel: jobCancel}
-	p.runningMu.Lock()
-	p.running[nzbID] = job
-	p.runningMu.Unlock()
-	defer func() {
-		p.runningMu.Lock()
-		if p.running[nzbID] == job {
-			delete(p.running, nzbID)
-		}
-		p.runningMu.Unlock()
-		jobCancel()
-	}()
 
 	// Idle watchdog: cancel a repair that stalls with no forward progress
 	// during a network phase. Exits cleanly when the job ends (timeoutCtx is
