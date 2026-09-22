@@ -1879,8 +1879,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return err
 	}
 	if len(deadRefs) == 0 {
-		p.invalidateRepairedRanges(nzb, nzbID, entryName, pending)
-		return nil
+		return nil // every dead segment healed; the heal invalidated them
 	}
 	for _, dr := range deadRefs {
 		slices, err := idx.DamagedSlices(dr.rng.fileID, dr.rng.start, dr.rng.end)
@@ -2190,6 +2189,14 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		repairedByIndex[rs.Index] = rs.Data
 	}
 
+	// Whatever gets patched is invalidated even if a later segment fails
+	// here: its stale zero-fill would otherwise outlive the patch.
+	var written []par2DeadRef
+	defer func() {
+		if len(written) > 0 {
+			p.invalidateRepairedRanges(nzb, nzbID, entryName, deadRefsByFile(written))
+		}
+	}()
 	for _, dr := range deadRefs {
 		start, end, werr := readerPatchWindow(nzb, dr)
 		if werr != nil {
@@ -2209,10 +2216,19 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// short-circuiting on a stale cause. Covers both automatic repair
 		// and a manual "repair now" (RunNow runs this exact same path).
 		u.ClearFailedFile(nzbID, dr.file)
+		written = append(written, dr)
 	}
-
-	p.invalidateRepairedRanges(nzb, nzbID, entryName, pending)
 	return nil
+}
+
+// deadRefsByFile groups refs back into the file -> dead segments shape
+// invalidateRepairedRanges takes.
+func deadRefsByFile(refs []par2DeadRef) map[string][]overlay.DeadSegment {
+	out := make(map[string][]overlay.DeadSegment)
+	for _, dr := range refs {
+		out[dr.file] = append(out[dr.file], dr.seg)
+	}
+	return out
 }
 
 // par2DeadRef is one recorded-dead segment and the posted-file byte range it
@@ -2238,6 +2254,7 @@ type par2DeadRef struct {
 func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef, statMissing map[string]struct{}) ([]par2DeadRef, error) {
 	u := p.manager.usenet
 	remaining := deadRefs[:0:0]
+	var healedRefs []par2DeadRef
 	healed := 0
 	for _, dr := range deadRefs {
 		if ctx.Err() != nil {
@@ -2271,7 +2288,14 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 			continue
 		}
 		u.ClearFailedFile(nzbID, dr.file)
+		healedRefs = append(healedRefs, dr)
 		healed++
+	}
+	// Invalidated here, not by the caller on success: the solve that follows
+	// can still fail, and the healed segments' stale zero-fill in the DFS
+	// cache and warm readers would then outlive their patches.
+	if len(healedRefs) > 0 {
+		p.invalidateRepairedRanges(nzb, nzbID, entryName, deadRefsByFile(healedRefs))
 	}
 	if healed > 0 {
 		p.logger.Info().Str("entry", entryName).Int("healed", healed).Int("remaining", len(remaining)).

@@ -609,6 +609,9 @@ func (u *Usenet) HasBandwidthHeadroom() bool {
 // normal idle-timeout cleanup (cleanupIdleFS). Returns false (no-op) if the
 // entry doesn't exist or is currently in use.
 func (u *Usenet) EvictCache(nzoID, filename string) bool {
+	if u == nil || u.fs == nil {
+		return false
+	}
 	key := fsKey(nzoID, filename)
 	entry, ok := u.fs.Load(key)
 	if !ok {

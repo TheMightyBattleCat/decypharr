@@ -377,9 +377,12 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 	for i, seg := range ref.Segments {
 		readerFile.Segments = append(readerFile.Segments, storage.NZBSegment{
 			Number: i + 1, MessageID: seg.MessageID, Bytes: pf.segSizes[i],
+			StartOffset: pf.base[i], EndOffset: pf.base[i] + pf.segSizes[i] - 1,
 		})
 	}
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	forgot := &forgetRecorder{}
+	m.mountManager = forgot
 	var refs []par2DeadRef
 	for _, i := range []int{1, 2, 3} {
 		seg := ref.Segments[i]
@@ -409,6 +412,26 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 	if _, ok := store.OverlayPatchBytes(nzbID, ref.Name, 3); ok {
 		t.Fatal("segment 3 patched although its article is gone")
 	}
+	// The heal drops the stale cache copy of what it patched itself: the
+	// solve for segments 2 and 3 can still fail, and the caller only
+	// invalidated on full success, leaving segment 1's zero-fill served.
+	want := [2]int64{pf.base[1], pf.segSizes[1]}
+	if len(forgot.ranges) != 1 || forgot.ranges[0] != want {
+		t.Fatalf("forgot %v, want only segment 1's range %v", forgot.ranges, want)
+	}
+}
+
+// forgetRecorder is a MountManager that records ForgetCachedRange calls.
+type forgetRecorder struct{ ranges [][2]int64 }
+
+func (f *forgetRecorder) Start(context.Context) error { return nil }
+func (f *forgetRecorder) Stop() error                 { return nil }
+func (f *forgetRecorder) Stats() map[string]any       { return nil }
+func (f *forgetRecorder) IsReady() bool               { return true }
+func (f *forgetRecorder) Type() string                { return "test" }
+func (f *forgetRecorder) Refresh([]string) error      { return nil }
+func (f *forgetRecorder) ForgetCachedRange(_, _ string, off, length int64) {
+	f.ranges = append(f.ranges, [2]int64{off, length})
 }
 
 // A recovery volume with one dead article still yields the recovery slices
