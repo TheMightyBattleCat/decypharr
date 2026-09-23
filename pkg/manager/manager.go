@@ -820,13 +820,58 @@ func (m *Manager) SubmitJob(job *Job) error {
 // (see Usenet.SetOverlayFailedNotifier) - fired whenever a file's damage
 // freshly exceeds the padding caps (or it isn't a paddable container),
 // meaning it now needs a re-grab rather than continuing to play degraded.
-func (m *Manager) notifyOverlayFileFailed(nzoID, file string) {
-	if m.Notifications == nil {
+// repairStreamedFailure starts the playback repair for a file that just went
+// past the pad caps while someone streams it. A viewer's reads keep padding
+// past the caps (see overlay.DecideForViewer), so no read fails and the
+// DFS escalation that used to start this never fires: PAR2 if usable,
+// otherwise a re-grab, whose delete waits for the stream to close (see
+// Repair.deleteEntryWhenIdle).
+func (m *Manager) repairStreamedFailure(nzoID, entryName, file string) {
+	if m.repair == nil || !m.Streaming(nzoID, file) {
 		return
 	}
+	cfg := config.Get().Repair
+	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
+		return
+	}
+	// A busy handler or the entry's cooldown is retried while the viewer is
+	// still on the file: its padded reads no longer fail, so nothing else
+	// would ask again.
+	deadline := time.Now().Add(streamedFailureRetryFor)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		out, err := m.repair.handleAutoDamage(ctx, RepairSourcePlayback, entryName, file, 0)
+		cancel()
+		m.logger.Info().Err(err).Str("entry", entryName).Str("nzb_id", nzoID).Str("file", file).
+			Bool("acted", out.acted).Bool("retry", out.retry).Str("reason", out.reason).
+			Msg("Streamed file passed the pad caps; kept padding for the viewer and handed it to repair")
+		if err != nil || !out.retry || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(streamedFailureRetryEvery)
+		if !m.Streaming(nzoID, file) {
+			return // the next play fails the read and escalates as before
+		}
+	}
+}
+
+// How often, and for how long, repairStreamedFailure asks again after a
+// retryable no-op.
+var (
+	streamedFailureRetryEvery = 30 * time.Second
+	streamedFailureRetryFor   = 30 * time.Minute
+)
+
+func (m *Manager) notifyOverlayFileFailed(nzoID, file string) {
 	entryName := nzoID
 	if entry, err := m.GetEntry(nzoID); err == nil && entry != nil {
 		entryName = entry.Name
+	}
+	// Called with the overlay's lock held, and repair reads the overlay:
+	// off this goroutine.
+	go m.repairStreamedFailure(nzoID, entryName, file)
+	if m.Notifications == nil {
+		return
 	}
 	m.Notifications.Notify(notifications.Event{
 		Type:    config.EventOverlayFileFailed,

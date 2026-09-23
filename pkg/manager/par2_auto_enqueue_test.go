@@ -48,3 +48,20 @@ func TestStreamingMatchesInfoHashAndFile(t *testing.T) {
 		t.Fatal("closed stream still reported")
 	}
 }
+
+// A same-name replacement's stream must not overwrite or remove the old
+// grab's record.
+func TestStreamRecordsKeptApartForSameNameGrabs(t *testing.T) {
+	m := &Manager{activeStreams: xsync.NewMap[string, *ActiveStream]()}
+	files := map[string]*storage.File{"e.mkv": {Name: "e.mkv", Size: 1, AddedOn: time.Now()}}
+	old := m.TrackStream(&storage.Entry{InfoHash: "old", Name: "Show", Files: files}, "e.mkv", "DFS")
+	repl := m.TrackStream(&storage.Entry{InfoHash: "new", Name: "Show", Files: files}, "e.mkv", "DFS")
+	if !m.Streaming("old", "") || !m.Streaming("new", "") {
+		t.Fatal("one grab's stream replaced the other's")
+	}
+	m.UntrackStream(repl)
+	if !m.Streaming("old", "") {
+		t.Fatal("closing the replacement's stream removed the old grab's")
+	}
+	m.UntrackStream(old)
+}

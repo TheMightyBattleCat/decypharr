@@ -121,6 +121,14 @@ type Repair struct {
 	activeStopFunc func() // called by the stop job for the active run
 	runWG          sync.WaitGroup
 
+	// idleDeletes holds the InfoHashes whose delete waits for a stream to
+	// close - see deleteEntryWhenIdle.
+	idleDeletes sync.Map
+
+	// deleteEntryFn replaces Manager.DeleteEntry for deleteEntryWhenIdle in
+	// tests; nil means the real one.
+	deleteEntryFn func(hash string) error
+
 	// coldPar2Slot lets one sweep PAR2 pass that fetches from Usenet run at
 	// a time (see coldSweepRepair).
 	coldPar2Slot sync.Mutex

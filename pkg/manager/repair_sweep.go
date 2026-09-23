@@ -1613,12 +1613,15 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 	}
 
 	for hash := range hashes {
-		if err := r.manager.DeleteEntry(hash, true); err != nil {
+		deleted, err := r.deleteEntryWhenIdle(hash, name)
+		if err != nil {
 			r.logger.Warn().Err(err).Str("entry", name).Str("infohash", hash).Msg("Repair: failed to delete fully-broken entry after re-search")
 			continue
 		}
-		r.logger.Info().Str("entry", name).Str("infohash", hash).Str(logger.FieldStatus, logger.StatusWarn).
-			Msg("Repair: deleted fully-broken entry after re-search")
+		if deleted {
+			r.logger.Info().Str("entry", name).Str("infohash", hash).Str(logger.FieldStatus, logger.StatusWarn).
+				Msg("Repair: deleted fully-broken entry after re-search")
+		}
 	}
 	// Entry fully removed: drop any lingering health record so a
 	// cut-short sweep can't try to re-heal a torrent that's gone.

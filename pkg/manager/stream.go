@@ -51,8 +51,14 @@ type ActiveStream struct {
 // registerStream registers an active stream for observability.
 // Returns the stream ID so the caller can remove it when streaming completes.
 func (m *Manager) registerStream(entryName, infoHash, fileName string, fileSize int64, source, debrid, client string) string {
-	// Use deterministic ID to ensure a single entry per file
+	// Use deterministic ID to ensure a single entry per file. A re-grab
+	// usually keeps the release name, so the InfoHash is part of it: the old
+	// grab's stream and its replacement's must not share (and overwrite, and
+	// on close remove) one record - see Repair.deleteEntryWhenIdle.
 	streamID := entryName + ":" + fileName
+	if infoHash != "" {
+		streamID += "@" + infoHash
+	}
 	now := utils.NowUnix()
 
 	stream := &ActiveStream{

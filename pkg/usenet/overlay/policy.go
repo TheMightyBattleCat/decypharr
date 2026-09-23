@@ -88,6 +88,40 @@ func recomputeVerdictLocked(fe *FileEntry) {
 // verdict. Only ever called after a segment's article fetch has permanently
 // failed across every provider.
 func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
+	return s.decide(nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments, false)
+}
+
+// Viewer ceilings: how much damage DecideForViewer still pads for someone
+// watching once the configured caps are exceeded. Past these the file is
+// mostly holes - a tenth of it, or a run of ~20 s of 1080p - and a stop is
+// the honest answer.
+const (
+	viewerMaxByteRatio   = 0.10
+	viewerMaxRunSegments = 64
+)
+
+// DecideForViewer is Decide for a read serving a client's stream. Past the
+// configured caps the file is still recorded failed - so repair policy
+// re-grabs it - but the segment is padded rather than failed, up to the
+// viewer ceilings: the viewer keeps watching with glitches while PAR2 or a
+// re-grab runs, instead of the player stopping at the first hole past the
+// cap. Header-region damage and non-video files fail as before.
+func (s *Store) DecideForViewer(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
+	return s.decide(nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments, true)
+}
+
+// viewerMayPad reports whether fe's damage is within the viewer ceilings.
+func viewerMayPad(fe *FileEntry, fileSize int64, policy Policy, totalSegments int) bool {
+	ceiling := Policy{
+		MaxRunSegments:   max(policy.MaxRunSegments, viewerMaxRunSegments),
+		MaxTotalSegments: int(^uint(0) >> 1),
+		MaxByteRatio:     max(policy.MaxByteRatio, viewerMaxByteRatio),
+	}
+	_, ok := WithinPadCaps(fe, fileSize, ceiling, totalSegments)
+	return ok
+}
+
+func (s *Store) decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int, viewer bool) (Decision, Verdict) {
 	if s.isRejected(nzbID) {
 		// Import was rejected and torn down; a straggling fetcher must not
 		// re-create the manifest. Fail the read (same as the fail-safe path
@@ -108,8 +142,9 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	fe := fileEntryLocked(m, file)
 
 	// A file already failed never pads again - the legacy repair path owns
-	// it now.
-	if fe.Verdict == VerdictFailed {
+	// it now. A viewer's read still may, within the viewer ceilings (see
+	// DecideForViewer).
+	if fe.Verdict == VerdictFailed && !viewer {
 		return DecisionFail, VerdictFailed
 	}
 
@@ -138,22 +173,37 @@ func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	// Store.SetPolicy) - and reuse them for every check below rather than
 	// re-deriving or re-clamping anything on this hot path.
 	policy := s.Policy()
-	if _, ok := WithinPadCaps(fe, fileSize, policy, totalSegments); !ok {
+	if _, ok := WithinPadCaps(fe, fileSize, policy, totalSegments); !ok || fe.Verdict == VerdictFailed {
+		wasFailed := fe.Verdict == VerdictFailed
 		fe.Verdict = VerdictFailed
+		if !viewer || !viewerMayPad(fe, fileSize, policy, totalSegments) {
+			_ = s.saveManifestLocked(nzbID, m)
+			if !wasFailed {
+				s.notifyFailed(nzbID, file)
+			}
+			return DecisionFail, VerdictFailed
+		}
+		markPaddedLocked(fe, segIndex)
 		_ = s.saveManifestLocked(nzbID, m)
-		s.notifyFailed(nzbID, file)
-		return DecisionFail, VerdictFailed
+		if !wasFailed {
+			s.notifyFailed(nzbID, file)
+		}
+		return DecisionPad, VerdictFailed
 	}
 
+	markPaddedLocked(fe, segIndex)
+	fe.Verdict = VerdictDegraded
+	_ = s.saveManifestLocked(nzbID, m)
+	return DecisionPad, VerdictDegraded
+}
+
+func markPaddedLocked(fe *FileEntry, segIndex int) {
 	for i := range fe.DeadSegments {
 		if fe.DeadSegments[i].Index == segIndex {
 			fe.DeadSegments[i].Status = StatusPadded
 			break
 		}
 	}
-	fe.Verdict = VerdictDegraded
-	_ = s.saveManifestLocked(nzbID, m)
-	return DecisionPad, VerdictDegraded
 }
 
 // CapEvaluation carries the raw damage figures WithinPadCaps derived while

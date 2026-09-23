@@ -419,6 +419,15 @@ func (h *Handle) Decide(file string, segIndex int, msgID string, segBytes, fileS
 	return h.store.Decide(h.nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments)
 }
 
+// DecideForViewer is Decide for a read serving a client's stream - see
+// Store.DecideForViewer.
+func (h *Handle) DecideForViewer(file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
+	if h == nil {
+		return DecisionFail, VerdictFailed
+	}
+	return h.store.DecideForViewer(h.nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments)
+}
+
 func (h *Handle) Verdict(file string) Verdict {
 	if h == nil {
 		return VerdictClean

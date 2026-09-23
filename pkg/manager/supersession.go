@@ -288,9 +288,13 @@ func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]stru
 		hashes[f.InfoHash] = struct{}{}
 	}
 	for hash := range hashes {
-		if err := r.manager.DeleteEntry(hash, true); err != nil {
+		deleted, err := r.deleteEntryWhenIdle(hash, entryName)
+		if err != nil {
 			r.logger.Warn().Err(err).Str("entry", entryName).Str("infohash", hash).Msg("Repair: failed to delete superseded entry")
 			continue
+		}
+		if !deleted {
+			continue // waits for its stream to close
 		}
 		r.logger.Info().Str("entry", entryName).Str("infohash", hash).Msg("Repair: deleted superseded entry")
 	}

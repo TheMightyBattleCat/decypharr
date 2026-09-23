@@ -563,7 +563,13 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 		return false
 	}
 
-	decision, _ := overlayHandle.Decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize(), sf.cache.SegmentCount())
+	decide := overlayHandle.Decide
+	if isPlaybackRead(ctx) {
+		// Someone is watching: past the caps, keep padding (within the
+		// viewer ceilings) while the repair runs, instead of stopping them.
+		decide = overlayHandle.DecideForViewer
+	}
+	decision, _ := decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize(), sf.cache.SegmentCount())
 	if decision != overlay.DecisionPad {
 		return false
 	}
