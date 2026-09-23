@@ -151,6 +151,12 @@ type fsEntry struct {
 	// reader without racing getOrCreateReader's Once. nil for the
 	// multi-volume reader, which has no segment cache or overlay.
 	streaming atomic.Pointer[reader.StreamingReader]
+
+	// gone is set by Delete: the NZB this entry reads is deleted, and new
+	// streams get ErrEntryGone instead of reusing the warm reader - which
+	// kept fetching the deleted grab's articles and turning their 430s
+	// into playback escalations. cleanupIdleFS reaps it once idle.
+	gone atomic.Bool
 }
 
 // fsEntryTombstone marks an entry claimed for teardown. Once refCount holds
@@ -556,9 +562,14 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 	// CAS, not a blind Add) is what closes the race against cleanupIdleFS:
 	// once the janitor claims an idle entry no new reference can be taken, so
 	// a stream can never end up on an entry whose reader is being closed.
-	if entry, ok := u.fs.Load(key); ok && entry.acquire() {
-		entry.lastAccessed.Store(utils.NowUnix())
-		return entry, key, nil
+	if entry, ok := u.fs.Load(key); ok {
+		if entry.gone.Load() {
+			return nil, key, fmt.Errorf("%w: deleted while its reader was open", ErrEntryGone)
+		}
+		if entry.acquire() {
+			entry.lastAccessed.Store(utils.NowUnix())
+			return entry, key, nil
+		}
 	}
 
 	// Slow path: need to create entry
@@ -764,6 +775,7 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 		_ = os.Remove(nzbPath)
 		return nil, nil, fmt.Errorf("failed to save NZB to storage: %w", err)
 	}
+	u.reviveNZB(nzb.ID) // an ID can be supplied by the caller, and so reused
 
 	u.logger.Debug().
 		Str("nzb_id", nzb.ID).
@@ -2623,11 +2635,19 @@ func (u *Usenet) Delete(nzoID string) error {
 		return fmt.Errorf("failed to delete NZB from storage: %w", err)
 	}
 
+	// Readers still open on this NZB must stop serving it (see fsEntry.gone).
+	u.retireReaders(nzoID)
+
 	// Drop any recorded dead-segment/patch state for this NZB. Keyed by
 	// nzbID (unique) rather than name, avoiding the name-twin hazard the DFS
 	// cache has. Best-effort: an overlay cleanup failure shouldn't fail the
 	// whole deletion, since the NZB record itself is already gone.
 	if u.overlay != nil {
+		// Reject first, as cleanupRejectedImport does: a fetch still draining
+		// on an open reader would otherwise re-create the manifest via
+		// RecordDead/Decide right after the RemoveAll below, leaving an
+		// orphan record for an entry that no longer exists.
+		u.overlay.MarkRejected(nzoID)
 		if err := u.overlay.DeleteEntry(nzoID); err != nil {
 			u.logger.Warn().Err(err).Str("nzb_id", nzoID).Msg("Failed to delete overlay entry")
 		}
@@ -2639,6 +2659,47 @@ func (u *Usenet) Delete(nzoID string) error {
 	// inherit a stale short-circuit from the grab it's replacing.
 	u.ClearFailedEntry(nzoID)
 	return nil
+}
+
+// retireReaders marks every open reader of nzoID's files gone, and tears
+// down those no stream holds right now; the rest go when idle.
+func (u *Usenet) retireReaders(nzoID string) {
+	if u.fs == nil || nzoID == "" {
+		return
+	}
+	prefix := fsKey(nzoID, "")
+	u.fs.Range(func(key string, entry *fsEntry) bool {
+		if !strings.HasPrefix(key, prefix) {
+			return true
+		}
+		entry.gone.Store(true)
+		if entry.claimForCleanup() {
+			u.fs.Delete(key)
+			entry.cleanup()
+		}
+		return true
+	})
+}
+
+// reviveNZB undoes Delete's fencing for an nzoID that is being added again:
+// the overlay rejection, and any gone reader not yet reaped (one a stream
+// still holds is left; that stream sees ErrEntryGone and the next open
+// after it is reaped builds a fresh reader).
+func (u *Usenet) reviveNZB(nzoID string) {
+	if u.overlay != nil {
+		u.overlay.ClearRejected(nzoID)
+	}
+	if u.fs == nil {
+		return
+	}
+	prefix := fsKey(nzoID, "")
+	u.fs.Range(func(key string, entry *fsEntry) bool {
+		if strings.HasPrefix(key, prefix) && entry.gone.Load() && entry.claimForCleanup() {
+			u.fs.Delete(key)
+			entry.cleanup()
+		}
+		return true
+	})
 }
 
 // PendingNZB is an unmanaged NZB file claimed by the metadata-directory watcher.

@@ -179,8 +179,11 @@ func (c *Cache) GetItem(entryName, filename string, fileSize int64) (*CacheItem,
 
 	// Fast path: already exists and isn't being torn down by the janitor.
 	if item, ok := c.items.Load(key); ok && !item.isClaimed() {
-		item.touch()
-		return item, nil
+		if c.itemCurrent(item, false) {
+			item.touch()
+			return item, nil
+		}
+		c.retireItem(item)
 	}
 
 	// Slow path: create with singleflight to avoid global lock
@@ -215,6 +218,56 @@ func (c *Cache) GetItem(entryName, filename string, fileSize int64) (*CacheItem,
 	return item, nil
 }
 
+// itemIdentityRecheck bounds how often itemCurrent re-resolves an item's
+// name: the pre-cache persist walk looks an item up once per segment.
+const itemIdentityRecheck = 5 * time.Second
+
+// itemCurrent reports whether item still serves the grab its entry name
+// resolves to. A re-grab usually keeps the release name, and while a
+// player still held the old grab's handle, reopening the name handed back
+// the old item - which streamed the deleted grab. True when the name
+// can't be resolved (nothing to compare against) or, unless force, was
+// checked within itemIdentityRecheck.
+func (c *Cache) itemCurrent(item *CacheItem, force bool) bool {
+	if item.entry == nil || item.entryName == "" {
+		return true
+	}
+	now := time.Now().UnixNano()
+	if !force && now-item.identityAt.Load() < int64(itemIdentityRecheck) {
+		return true
+	}
+	item.identityAt.Store(now)
+	hash, _, ok := c.currentIdentity(item.entryName, item.filename)
+	return !ok || hash == "" || hash == item.entry.InfoHash
+}
+
+// retireItem takes a cache item whose name now resolves to a different grab
+// out of service: it leaves the map, so the next GetItem builds a fresh one
+// (which starts empty - see loadSidecar), and stops writing the sidecar
+// they share. Handles already open keep reading it; the last Release closes
+// it, or it is closed now if none is open.
+func (c *Cache) retireItem(item *CacheItem) {
+	if item.retired.Swap(true) {
+		return
+	}
+	var removed bool
+	c.items.Compute(item.key, func(old *CacheItem, loaded bool) (*CacheItem, xsync.ComputeOp) {
+		if loaded && old == item {
+			removed = true
+			return nil, xsync.DeleteOp
+		}
+		return old, xsync.CancelOp
+	})
+	if removed {
+		c.itemCount.Add(-1)
+	}
+	c.logger.Info().Str("key", item.key).Str("info_hash", item.entry.InfoHash).
+		Msg("Cache item belongs to a replaced grab; retiring it")
+	if item.claimForClose() {
+		go func() { _ = item.Close() }()
+	}
+}
+
 // EntryInUse reports whether any file under entryName has a cache item with
 // an open handle. Removing an entry's cache directory under one would pull
 // the data file out from under a live reader.
@@ -244,6 +297,10 @@ func (c *Cache) PeekItem(entryName, filename string) (*CacheItem, bool) {
 	key := buildCacheKey(entryName, filename)
 	item, ok := c.items.Load(key)
 	if !ok || item.isClaimed() {
+		return nil, false
+	}
+	if !c.itemCurrent(item, false) {
+		c.retireItem(item) // its ranges are the old grab's
 		return nil, false
 	}
 	return item, true
@@ -629,15 +686,17 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	log := logger.NewRateLimitedLogger(logger.WithLogger(_logger))
 
 	item = &CacheItem{
-		cache:    c,
-		key:      key,
-		entry:    entry,
-		filename: filename,
-		buf:      buf,
-		metaPath: metaPath,
-		info:     info,
-		logger:   log.Rate(buildCacheKey(entryName, filename)),
+		cache:     c,
+		key:       key,
+		entry:     entry,
+		entryName: entryName,
+		filename:  filename,
+		buf:       buf,
+		metaPath:  metaPath,
+		info:      info,
+		logger:    log.Rate(buildCacheKey(entryName, filename)),
 	}
+	item.identityAt.Store(time.Now().UnixNano()) // entry was resolved just now
 
 	item.downloaders = NewDownloaders(c.ctx, c.manager, item, c.config)
 	item.startMetaWriter()
@@ -1079,10 +1138,19 @@ func (c *Cache) GetStats() map[string]any {
 // cache — so this struct only carries the per-item *policy* state
 // (downloaders coordinator, pin/refcounts, metadata persistence).
 type CacheItem struct {
-	cache    *Cache
-	key      string
-	entry    *storage.Entry
-	filename string
+	cache     *Cache
+	key       string
+	entry     *storage.Entry
+	entryName string
+	filename  string
+
+	// identityAt is when itemCurrent last confirmed entry is still the
+	// grab this name resolves to (unix nanos). retired is set once it
+	// isn't: the item is out of the map, writes no more metadata (its
+	// sidecar path now belongs to the replacement), and is closed once its
+	// last handle goes - see Cache.retireItem.
+	identityAt atomic.Int64
+	retired    atomic.Bool
 
 	buf      *buffer.Buffer
 	metaPath string
@@ -1150,6 +1218,9 @@ func (item *CacheItem) markMetadataDirty() {
 }
 
 func (item *CacheItem) flushMetadata(force bool) {
+	if item.retired.Load() {
+		return // the sidecar path belongs to the item that replaced this one
+	}
 	if !force && !item.metaDirty.Load() {
 		return
 	}
@@ -1315,6 +1386,11 @@ func (item *CacheItem) Release() {
 	// Last handle closed: stop in-flight downloads so we don't keep stale
 	// downloader goroutines active after the file is no longer in use.
 	item.StopDownloaders()
+	// A retired item is already out of the map, so the janitor will never
+	// reach it; close it here once nothing holds it.
+	if item.retired.Load() && item.claimForClose() {
+		_ = item.Close()
+	}
 }
 
 // StopDownloaders stops active downloads but keeps the cache item alive

@@ -258,6 +258,14 @@ func (s *Store) MarkRejected(nzbID string) {
 	s.rejected.Store(nzbID, struct{}{})
 }
 
+// ClearRejected undoes MarkRejected, for an nzbID that is being added again.
+func (s *Store) ClearRejected(nzbID string) {
+	if s == nil || nzbID == "" {
+		return
+	}
+	s.rejected.Delete(nzbID)
+}
+
 // isRejected reports whether MarkRejected was called for nzbID.
 func (s *Store) isRejected(nzbID string) bool {
 	if s == nil {

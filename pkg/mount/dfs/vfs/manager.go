@@ -81,8 +81,17 @@ func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
 		// the increment and fall through to create a fresh entry.
 		if entry, ok := m.files.Load(key); ok {
 			entry.refCount.Add(1)
-			if !entry.deleted.Load() {
+			// An open is when a player reopens a name a re-grab has
+			// replaced, so check the item's grab unthrottled: the old
+			// handle may still hold it, and handing it out again streamed
+			// the deleted grab.
+			current := !entry.item.retired.Load() && m.cache.itemCurrent(entry.item, true)
+			if !current {
+				m.cache.retireItem(entry.item)
+			}
+			if current && !entry.deleted.Load() {
 				if sf := NewStreamingFile(entry.item); sf != nil {
+					sf.entry = entry
 					return sf, nil
 				}
 			}
@@ -106,6 +115,7 @@ func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
 			actual.refCount.Add(1)
 			if !actual.deleted.Load() {
 				if sf := NewStreamingFile(actual.item); sf != nil {
+					sf.entry = actual
 					return sf, nil
 				}
 			}
@@ -121,6 +131,7 @@ func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
 			m.retireEntry(key, entry)
 			continue
 		}
+		sf.entry = entry
 		m.totalFiles.Add(1)
 		m.activeFiles.Add(1)
 		return sf, nil
@@ -141,9 +152,27 @@ func (m *Manager) retireEntry(key string, entry *fileEntry) {
 	})
 }
 
-// ReleaseFile decrements the reference count
-func (m *Manager) ReleaseFile(info *manager.FileInfo) {
+// ReleaseFile decrements the reference count sf's handle holds. With sf (a
+// handle from GetFile) that is the entry it was opened on; by name, a handle
+// on a retired entry released the replacement's reference instead. A nil
+// sf falls back to the entry the name maps to.
+func (m *Manager) ReleaseFile(info *manager.FileInfo, sf *StreamingFile) {
 	key := buildFileKey(info.Parent(), info.Name())
+
+	if sf != nil && sf.entry != nil {
+		entry := sf.entry
+		if entry.refCount.Add(-1) <= 0 {
+			entry.deleted.Store(true)
+			m.files.Compute(key, func(old *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
+				if loaded && old == entry {
+					return nil, xsync.DeleteOp
+				}
+				return old, xsync.CancelOp
+			})
+			m.activeFiles.Add(-1)
+		}
+		return
+	}
 
 	if entry, ok := m.files.Load(key); ok {
 		if entry.refCount.Add(-1) <= 0 {

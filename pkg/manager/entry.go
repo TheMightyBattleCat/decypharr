@@ -49,6 +49,12 @@ func (f *FileInfo) ActiveDebrid() string { return f.activeDebrid }
 func (f *FileInfo) CanDelete() bool      { return f.canDelete }
 func (f *FileInfo) IsRemote() bool       { return len(f.content) == 0 }
 func (f *FileInfo) ByteRange() *[2]int64 { return f.byteRange }
+
+// NewFileInfoForTest builds the FileInfo of a file under parent, for tests
+// in other packages (its fields are unexported).
+func NewFileInfoForTest(parent, name string, size int64) *FileInfo {
+	return &FileInfo{name: name, parent: parent, size: size}
+}
 func (f *FileInfo) InfoHash() string     { return f.infohash }
 
 // GetTorrentMountPath returns the full mount path for a torrent

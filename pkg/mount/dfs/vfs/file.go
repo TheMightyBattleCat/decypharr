@@ -12,6 +12,11 @@ type StreamingFile struct {
 	item     *CacheItem
 	fileSize int64
 	closed   atomic.Bool
+
+	// entry is the Manager.files entry this handle holds a reference on,
+	// so ReleaseFile releases that one and not whichever entry the name
+	// maps to by then (a replacement, after the item was retired).
+	entry *fileEntry
 }
 
 // NewStreamingFile creates a new streaming file handle. It returns nil when

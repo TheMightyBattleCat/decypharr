@@ -465,7 +465,7 @@ func (f *FS) releaseHandleResources(handle *FileHandle) {
 		if err := handle.reader.Close(); err != nil && !customerror.IsSilentError(err) {
 			f.logger.Debug().Err(err).Msg("Failed to close VFS reader")
 		}
-		f.vfs.ReleaseFile(handle.info)
+		f.vfs.ReleaseFile(handle.info, handle.reader)
 		handle.reader = nil
 	}
 }

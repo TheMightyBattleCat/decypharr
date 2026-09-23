@@ -893,9 +893,12 @@ func (dls *Downloaders) escalatePlaybackFailure(cause error) {
 	filename := dls.item.filename
 	mgr := dls.manager
 
+	// nzb_id tells a failure on the live grab from one on a replaced grab
+	// that kept the same release name.
 	dls.item.logger.Warn().
 		Err(cause).
 		Str("entry", entryName).
+		Str("nzb_id", dls.item.entry.InfoHash).
 		Str("file", filename).
 		Msg("Playback read hit a missing article; escalating to repair")
 

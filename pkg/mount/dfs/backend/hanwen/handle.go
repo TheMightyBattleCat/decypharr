@@ -101,7 +101,7 @@ func (fh *Handle) Release(ctx context.Context) syscall.Errno {
 	if fh.streamFile != nil {
 		fh.streamFile.Close()
 		if fh.file != nil && fh.file.vfs != nil {
-			fh.file.vfs.ReleaseFile(fh.file.info)
+			fh.file.vfs.ReleaseFile(fh.file.info, fh.streamFile)
 		}
 	}
 
