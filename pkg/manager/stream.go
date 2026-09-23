@@ -36,6 +36,7 @@ var streamBufPool = sync.Pool{
 type ActiveStream struct {
 	ID         string `json:"id"`
 	EntryName  string `json:"entry_name"`
+	InfoHash   string `json:"info_hash,omitempty"`
 	FileName   string `json:"file_name"`
 	FileSize   int64  `json:"file_size"`
 	Source     string `json:"source"` // "torrent" or "nzb"
@@ -49,7 +50,7 @@ type ActiveStream struct {
 
 // registerStream registers an active stream for observability.
 // Returns the stream ID so the caller can remove it when streaming completes.
-func (m *Manager) registerStream(entryName, fileName string, fileSize int64, source, debrid, client string) string {
+func (m *Manager) registerStream(entryName, infoHash, fileName string, fileSize int64, source, debrid, client string) string {
 	// Use deterministic ID to ensure a single entry per file
 	streamID := entryName + ":" + fileName
 	now := utils.NowUnix()
@@ -57,6 +58,7 @@ func (m *Manager) registerStream(entryName, fileName string, fileSize int64, sou
 	stream := &ActiveStream{
 		ID:         streamID,
 		EntryName:  entryName,
+		InfoHash:   infoHash,
 		FileName:   fileName,
 		FileSize:   fileSize,
 		Source:     source,
@@ -221,7 +223,25 @@ func (m *Manager) TrackStream(entry *storage.Entry, filename, client string) str
 		debrid = entry.ActiveProvider
 	}
 
-	return m.registerStream(entry.Name, filename, file.Size, source, debrid, client)
+	return m.registerStream(entry.Name, entry.InfoHash, filename, file.Size, source, debrid, client)
+}
+
+// Streaming reports whether a client stream is open on any file of the
+// entry with this InfoHash (the DFS mount registers one per playback
+// session - see TrackStream). With filename set, only that file counts.
+func (m *Manager) Streaming(infoHash, filename string) bool {
+	if m == nil || m.activeStreams == nil || infoHash == "" {
+		return false
+	}
+	found := false
+	m.activeStreams.Range(func(_ string, s *ActiveStream) bool {
+		if s.InfoHash == infoHash && (filename == "" || s.FileName == filename) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // UntrackStream removes a previously-registered active stream if the ID is non-empty.

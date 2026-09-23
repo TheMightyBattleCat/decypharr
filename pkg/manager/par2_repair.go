@@ -452,6 +452,9 @@ func (p *Par2Repair) releaseRun(nzbID string, job *runningJob) {
 //     spending provider bandwidth on a PAR2 pass.
 //   - Par2RepairModeAutoAll (default): always queues, same as this feature's
 //     original (non-configurable) behavior.
+//
+// The threshold does not apply while someone is streaming the release (see
+// autoEnqueueAllowed).
 func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	if p == nil || nzbID == "" {
 		return
@@ -460,13 +463,9 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	if !cfg.Par2RepairEnabled() {
 		return
 	}
-	switch cfg.Par2RepairMode {
-	case config.Par2RepairModeManual:
+	watched := p.manager.Streaming(nzbID, "")
+	if !autoEnqueueAllowed(cfg.Par2RepairMode, cfg.Par2RepairMinSegments, deadSegments, watched) {
 		return
-	case config.Par2RepairModeAutoThreshold:
-		if deadSegments < cfg.Par2RepairMinSegments {
-			return
-		}
 	}
 	// This entry is currently under an ffprobe sweep probe, which is already
 	// pulling its articles over NNTP. An urgent PAR2 pass kicked off by the
@@ -485,6 +484,23 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	// same "playhead is already here" urgency as repair_sweep.go's playback
 	// caller passes.
 	p.EnqueueUrgent(nzbID, 0)
+}
+
+// autoEnqueueAllowed is AutoEnqueue's mode gate. Manual never queues;
+// threshold queues from minSegments dead segments - or at once while the
+// release is being streamed. The threshold is there to save bandwidth on
+// damage nobody is looking at; for a viewer, a pad below it was simply never
+// repaired (Salem Lord S01E01, one padded segment on 2026-09-21, never
+// queued), while a pass started now can patch the zeros before the player
+// reaches them - the mount reads up to read_ahead_size ahead.
+func autoEnqueueAllowed(mode config.Par2RepairMode, minSegments, deadSegments int, watched bool) bool {
+	switch mode {
+	case config.Par2RepairModeManual:
+		return false
+	case config.Par2RepairModeAutoThreshold:
+		return watched || deadSegments >= minSegments
+	}
+	return true
 }
 
 // Enqueue schedules nzbID for a BATCH-lane PAR2 repair pass. Deduped: a burst
