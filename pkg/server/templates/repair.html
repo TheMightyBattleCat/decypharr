@@ -154,9 +154,9 @@
             </div>
         </div>
         <div class="card-body p-0">
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="table table-hover">
-                    <thead class="bg-base-200">
+                    <thead class="bg-base-200 sticky top-0 z-10">
                     <tr>
                         <th>Started</th>
                         <th>Trigger</th>
@@ -246,29 +246,34 @@
             </p>
 
             <form id="overlayConfigForm" class="mt-4 space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 items-start">
+                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
+                           title="When a segment is confirmed dead during playback, serve zeros for it instead of stalling or stopping playback, within the caps below. The damage is recorded and queued for repair.">
                         <span>
-                            <span class="block font-medium">Playback padding</span>
+                            <span class="block font-medium">Playback padding <i class="bi bi-info-circle opacity-60"></i></span>
                             <span class="block text-xs opacity-70">Zero-fill a confirmed-dead segment instead of stalling/killing playback.</span>
                         </span>
                         <input type="checkbox" class="toggle toggle-primary" id="overlayPlaybackPadding">
                     </label>
-                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
-                        <span>
-                            <span class="block font-medium">PAR2 repair</span>
-                            <span class="block text-xs opacity-70">Reconstruct dead segments' true bytes from PAR2 recovery data.</span>
-                        </span>
-                        <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
-                    </label>
-                    <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
-                           title="Enabled (recommended): when a file fails during playback and its release includes PAR2 data, a PAR2 repair runs before any re-grab. Each failed segment is first re-fetched and verified against the PAR2 checksums; segments that verify are restored directly, and the remainder are reconstructed from the recovery data. If the file cannot be recovered, the release is re-grabbed immediately.&#10;&#10;Disabled: the repair runs only when a pre-check estimates that the retained recovery data covers the recorded damage. Otherwise the release is deleted, blocklisted and re-searched in Sonarr/Radarr straight away.&#10;&#10;Applies to playback failures only. Import checks and scheduled repair sweeps always re-grab damaged releases.">
-                        <span>
-                            <span class="block font-medium">Repair before re-grab <i class="bi bi-info-circle opacity-60"></i></span>
-                            <span class="block text-xs opacity-70">Playback failures are repaired with PAR2 first; the release is re-grabbed only if repair is not possible.</span>
-                        </span>
-                        <input type="checkbox" class="toggle toggle-primary" id="overlayPar2TryBeforeRegrab">
-                    </label>
+                    <div class="flex flex-col gap-3">
+                        <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
+                               title="Rebuild dead segments' real bytes from the release's PAR2 recovery data. A playback failure always tries PAR2 first: each failed segment is re-fetched and checked against the PAR2 checksums, the rest is rebuilt from recovery data, and the release is re-grabbed only if that is not possible.">
+                            <span>
+                                <span class="block font-medium">PAR2 repair <i class="bi bi-info-circle opacity-60"></i></span>
+                                <span class="block text-xs opacity-70">Reconstruct dead segments from PAR2 recovery data; playback failures try this before any re-grab.</span>
+                            </span>
+                            <input type="checkbox" class="toggle toggle-primary" id="overlayPar2Repair">
+                        </label>
+                        <label id="overlayPar2RepairOnSweepRow"
+                               class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
+                               title="Off (default): a sweep that finds a file with dead segments re-grabs it, unless every byte needed for a PAR2 repair is already in the cache.&#10;&#10;On: the sweep tries a PAR2 repair first, downloading the intact data from Usenet (about as much as a re-grab), and keeps the release if it works. It follows the auto-repair trigger below, runs one repair at a time, and a repair that fails is re-grabbed in the same sweep.&#10;&#10;Needs PAR2 repair on.">
+                            <span>
+                                <span class="block font-medium">PAR2 repair during sweeps <i class="bi bi-info-circle opacity-60"></i></span>
+                                <span class="block text-xs opacity-70">Try PAR2 on damage a sweep finds before re-grabbing; a failed repair is re-grabbed in the same sweep.</span>
+                            </span>
+                            <input type="checkbox" class="toggle toggle-primary" id="overlayPar2RepairOnSweep">
+                        </label>
+                    </div>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -301,8 +306,9 @@
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div class="form-control">
-                        <label class="label py-1" for="overlayPar2Mode">
-                            <span class="label-text font-medium">PAR2 auto-repair trigger</span>
+                        <label class="label py-1" for="overlayPar2Mode"
+                               title="When PAR2 repairs start without you pressing Repair now. Covers damage padded during playback and, with PAR2 repair during sweeps on, damage a sweep finds. A playback failure that padding can't cover always tries PAR2.">
+                            <span class="label-text font-medium">PAR2 auto-repair trigger <i class="bi bi-info-circle opacity-60"></i></span>
                         </label>
                         <select class="select select-bordered" id="overlayPar2Mode">
                             <option value="auto_all">Auto - repair every degraded file</option>
@@ -310,12 +316,17 @@
                             <option value="manual">Manual only - never auto-queue</option>
                         </select>
                     </div>
-                    <div class="form-control">
-                        <label class="label py-1" for="overlayPar2MinSegments">
-                            <span class="label-text font-medium">Threshold (min dead segments)</span>
+                    <div class="form-control" id="overlayPar2MinSegmentsField">
+                        <label class="label py-1" for="overlayPar2MinSegments"
+                               title="Repair a file once it has at least this many dead segments. Fewer stay padded. Set it below Max total segments: a file past that cap has already failed playback, so a threshold at or above it only repairs after playback breaks.">
+                            <span class="label-text font-medium">Threshold (min dead segments) <i class="bi bi-info-circle opacity-60"></i></span>
                         </label>
                         <input type="number" class="input input-bordered" id="overlayPar2MinSegments" min="1" step="1">
-                        <span class="label-text-alt opacity-60 mt-1">Only used in "auto - only above a threshold" mode.</span>
+                        <span class="label-text-alt opacity-60 mt-1" id="overlayPar2MinSegmentsHelp">Repair once a file has at least this many dead segments; fewer stay padded.</span>
+                        <span class="label-text-alt text-warning mt-1 hidden" id="overlayPar2MinSegmentsWarn">
+                            <i class="bi bi-exclamation-triangle"></i>
+                            At or above Max total segments (<span id="overlayPar2MinSegmentsMax">-</span>): a file fails playback before it reaches this, so padded damage is never repaired automatically. Set it lower.
+                        </span>
                     </div>
                 </div>
 
@@ -337,47 +348,64 @@
                         <i class="bi bi-cloud-arrow-down-fill mr-2 text-primary"></i>Pre-cache
                     </h3>
                     <p class="text-sm opacity-70 mt-1">
-                        Aggressive read-ahead once playback crosses a threshold, plus (for Sonarr episodes)
-                        burst-downloading the next episode ahead of time - trades bandwidth and disk footprint for a
-                        head start on repair.
+                        Downloads ahead of playback so damage is found and repaired, or the release re-grabbed,
+                        before you reach it: the rest of the file you're watching, then the next episodes of the
+                        season (Sonarr). Everything lands in the mount's cache, which evicts on its own.
                     </p>
                     <p class="text-sm opacity-70 mt-1" id="precacheStatusLine">Loading…</p>
                 </div>
                 <div class="stats stats-vertical sm:stats-horizontal shadow bg-base-200/60">
-                    <div class="stat py-2 px-4">
-                        <div class="stat-title text-xs">Footprint</div>
-                        <div class="stat-value text-base" id="precacheFootprint">-</div>
-                    </div>
-                    <div class="stat py-2 px-4">
-                        <div class="stat-title text-xs">Next episodes</div>
+                    <div class="stat py-2 px-4" title="How far the episode walk runs ahead of the one playing.">
+                        <div class="stat-title text-xs">Walk ahead</div>
                         <div class="stat-value text-base" id="precacheNextEpisodes">-</div>
+                    </div>
+                    <div class="stat py-2 px-4" title="Connections each pre-cache download uses: Settings → Providers → Usenet → Max Connections Per File.">
+                        <div class="stat-title text-xs">Connections</div>
+                        <div class="stat-value text-base" id="precacheConnections">-</div>
                     </div>
                 </div>
             </div>
 
             <form id="precacheConfigForm" class="mt-4 space-y-4">
-                <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2">
+                <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
+                       title="The master switch. Once playback passes the threshold, download the rest of the file and walk ahead through the season. Damage found on the way is repaired with PAR2 from the fresh cache, or the release is re-grabbed, before playback gets there. Uses extra bandwidth and cache.">
                     <span>
-                        <span class="block font-medium">Fast read-ahead</span>
-                        <span class="block text-xs opacity-70">Aggressively pre-fetch the rest of a file once playback passes the threshold so damage can be repaired before you reach it — uses extra bandwidth and cache.</span>
+                        <span class="block font-medium">Pre-cache ahead of playback <i class="bi bi-info-circle opacity-60"></i></span>
+                        <span class="block text-xs opacity-70">Download the rest of the playing file and the episodes after it, repairing damage before you reach it.</span>
                     </span>
                     <input type="checkbox" class="toggle toggle-primary" id="precacheReadAhead">
                 </label>
 
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
                     <div class="form-control">
-                        <label class="label py-1" for="precacheMaxBytesGiB">
-                            <span class="label-text font-medium">Max cache footprint (GiB)</span>
-                        </label>
-                        <input type="number" class="input input-bordered" id="precacheMaxBytesGiB" min="0" max="256" step="0.5">
-                        <span class="label-text-alt opacity-60 mt-1">0-256 GiB. 0 disables pre-caching's footprint entirely (same as turning the toggle off).</span>
-                    </div>
-                    <div class="form-control">
-                        <label class="label py-1" for="precacheThresholdPercent">
-                            <span class="label-text font-medium">Read-ahead threshold (%)</span>
+                        <label class="label py-1" for="precacheThresholdPercent"
+                               title="How far into the playing file (by position) before pre-caching starts. Lower starts sooner; higher avoids pre-caching things you only sample.">
+                            <span class="label-text font-medium">Start at (% played) <i class="bi bi-info-circle opacity-60"></i></span>
                         </label>
                         <input type="number" class="input input-bordered" id="precacheThresholdPercent" min="1" max="100" step="1">
-                        <span class="label-text-alt opacity-60 mt-1">1-100. How far into playback before read-ahead kicks in.</span>
+                        <span class="label-text-alt opacity-60 mt-1">1-100. Default 10.</span>
+                    </div>
+                    <div class="form-control">
+                        <label class="label py-1" for="precacheEpisodesAhead"
+                               title="How many episodes after the one playing to download and repair. Each episode you play moves the window on by one. Episodes not grabbed yet are searched for in Sonarr. The walk never crosses into the next season.">
+                            <span class="label-text font-medium">Episodes ahead <i class="bi bi-info-circle opacity-60"></i></span>
+                        </label>
+                        <input type="number" class="input input-bordered" id="precacheEpisodesAhead" min="0" max="50" step="1">
+                        <label class="label cursor-pointer justify-start gap-2 py-1 mt-1"
+                               title="Walk to the last episode of the season instead of a fixed number ahead.">
+                            <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" id="precacheWholeSeason">
+                            <span class="label-text">Whole season</span>
+                        </label>
+                    </div>
+                    <div class="form-control">
+                        <span class="label py-1"
+                              title="Each download fetches this many segments at once, one Usenet connection each. It is the same number playback uses per file, set in Settings.">
+                            <span class="label-text font-medium">Connections per download <i class="bi bi-info-circle opacity-60"></i></span>
+                        </span>
+                        <div class="input input-bordered flex items-center opacity-70" id="precacheConnectionsField">-</div>
+                        <span class="label-text-alt opacity-60 mt-1">From
+                            <a href="{{.URLBase}}settings" class="link link-hover">Settings → Providers → Usenet → Max Connections Per File</a>.
+                        </span>
                     </div>
                 </div>
 

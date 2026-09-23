@@ -3,7 +3,6 @@
 // Settings live in the global Settings page; this controller only handles
 // status, run/stop, and history. Polls /api/repair/status while a run is
 // active so the UI reflects live progress.
-const PRECACHE_GIB = 1024 * 1024 * 1024;
 // PlexConfig.SessionCacheTTL is a Go time.Duration - it round-trips through
 // JSON as plain nanoseconds (no custom marshaller), while the "Session cache
 // TTL" input is in seconds for a human to read.
@@ -136,10 +135,15 @@ class RepairManager {
             e.preventDefault();
             this.saveOverlayConfig();
         });
+        ['overlayPar2Repair', 'overlayPar2Mode', 'overlayPar2MinSegments', 'overlayPadMaxTotal'].forEach((id) => {
+            $(id)?.addEventListener('input', () => this.updateOverlayConfigState());
+            $(id)?.addEventListener('change', () => this.updateOverlayConfigState());
+        });
         $('precacheConfigForm')?.addEventListener('submit', (e) => {
             e.preventDefault();
             this.savePrecacheConfig();
         });
+        $('precacheWholeSeason')?.addEventListener('change', () => this.updatePrecacheConfigState());
         $('plexConfigForm')?.addEventListener('submit', (e) => {
             e.preventDefault();
             this.savePlexConfig();
@@ -1503,20 +1507,25 @@ class RepairManager {
         const line = document.getElementById('precacheStatusLine');
         if (line) {
             if (!status.read_ahead_enabled) {
-                line.textContent = 'Read-ahead pre-caching is disabled.';
+                line.textContent = 'Pre-caching is off.';
             } else {
-                line.textContent = `Read-ahead kicks in at ${status.threshold_percent ?? 10}% into playback, `
-                    + `${status.read_ahead_concurrency ?? '-'} segments in parallel.`;
+                line.textContent = `Starts ${status.threshold_percent ?? 10}% into playback, `
+                    + `${status.read_ahead_concurrency ?? '-'} connections per download.`;
             }
         }
-        const footprint = document.getElementById('precacheFootprint');
-        if (footprint) {
-            footprint.textContent = `${this.formatBytes(status.precached_bytes || 0)} / ${this.formatBytes(status.max_bytes || 0)}`;
-        }
+        const connections = String(status.read_ahead_concurrency ?? '-');
+        const connStat = document.getElementById('precacheConnections');
+        if (connStat) connStat.textContent = connections;
+        const connField = document.getElementById('precacheConnectionsField');
+        if (connField) connField.textContent = connections;
         const nextEpisodes = document.getElementById('precacheNextEpisodes');
         if (nextEpisodes) {
             const n = status.next_episodes || 0;
-            nextEpisodes.textContent = n > 0 ? `${n} ahead${status.evict_after_watched ? ' · evict after watched' : ''}` : 'off';
+            let text = 'off';
+            if (status.whole_season) text = 'whole season';
+            else if (n > 0) text = `${n} episode${n === 1 ? '' : 's'}`;
+            if (text !== 'off' && status.evict_after_watched) text += ' · evict after watched';
+            nextEpisodes.textContent = text;
         }
         this.precachePaused = !!status.paused;
         const pauseBtn = document.getElementById('precachePauseBtn');
@@ -2499,13 +2508,38 @@ class RepairManager {
             $('overlayPadMaxRatio').placeholder = d.pad_max_byte_ratio ?? '';
             $('overlayPadMaxRatio').value = c.pad_max_byte_ratio ?? '';
         }
-        // Unset means on (config.Par2TryBeforeRegrabEnabled).
-        if ($('overlayPar2TryBeforeRegrab')) $('overlayPar2TryBeforeRegrab').checked = c.par2_try_before_regrab !== false;
+        if ($('overlayPar2RepairOnSweep')) $('overlayPar2RepairOnSweep').checked = c.par2_repair_on_sweep === true;
         if ($('overlayPar2Mode')) $('overlayPar2Mode').value = c.par2_repair_mode || 'auto_all';
         if ($('overlayPar2MinSegments')) {
             $('overlayPar2MinSegments').placeholder = d.par2_repair_min_segments ?? '';
             $('overlayPar2MinSegments').value = c.par2_repair_min_segments ?? '';
         }
+        this.updateOverlayConfigState();
+    }
+
+    // Greys out what the current choices make irrelevant: sweep repair needs
+    // PAR2 repair on, and the threshold only applies in threshold mode. Warns
+    // when the threshold is at or above Max total segments - a file past that
+    // cap has already failed playback, so padded damage never reaches it.
+    updateOverlayConfigState() {
+        const $ = (id) => document.getElementById(id);
+        const par2On = !!$('overlayPar2Repair')?.checked;
+        const sweep = $('overlayPar2RepairOnSweep');
+        if (sweep) sweep.disabled = !par2On;
+        $('overlayPar2RepairOnSweepRow')?.classList.toggle('opacity-50', !par2On);
+        $('overlayPar2RepairOnSweepRow')?.classList.toggle('cursor-not-allowed', !par2On);
+
+        const thresholdMode = $('overlayPar2Mode')?.value === 'auto_threshold';
+        const minInput = $('overlayPar2MinSegments');
+        if (minInput) minInput.disabled = !par2On || !thresholdMode;
+        $('overlayPar2MinSegmentsField')?.classList.toggle('opacity-50', !par2On || !thresholdMode);
+
+        const min = parseInt(minInput?.value || minInput?.placeholder, 10);
+        const maxTotal = parseInt($('overlayPadMaxTotal')?.value || $('overlayPadMaxTotal')?.placeholder, 10);
+        const overlap = par2On && thresholdMode && Number.isFinite(min) && Number.isFinite(maxTotal) && min >= maxTotal;
+        if ($('overlayPar2MinSegmentsMax')) $('overlayPar2MinSegmentsMax').textContent = Number.isFinite(maxTotal) ? maxTotal : '-';
+        $('overlayPar2MinSegmentsWarn')?.classList.toggle('hidden', !overlap);
+        $('overlayPar2MinSegmentsHelp')?.classList.toggle('hidden', overlap);
     }
 
     async saveOverlayConfig() {
@@ -2520,7 +2554,7 @@ class RepairManager {
             const payload = {
                 playback_padding: !!$('overlayPlaybackPadding')?.checked,
                 par2_repair: !!$('overlayPar2Repair')?.checked,
-                par2_try_before_regrab: !!$('overlayPar2TryBeforeRegrab')?.checked,
+                par2_repair_on_sweep: !!$('overlayPar2RepairOnSweep')?.checked,
                 pad_max_run_segments: parseInt($('overlayPadMaxRun')?.value, 10) || 0,
                 pad_max_total_segments: parseInt($('overlayPadMaxTotal')?.value, 10) || 0,
                 pad_max_byte_ratio: parseFloat($('overlayPadMaxRatio')?.value) || 0,
@@ -2554,11 +2588,20 @@ class RepairManager {
         const p = this.precacheConfig || {};
         const $ = (id) => document.getElementById(id);
         if ($('precacheReadAhead')) $('precacheReadAhead').checked = r.precache_read_ahead_enabled === true;
-        if ($('precacheMaxBytesGiB')) {
-            const bytes = p.precache_max_bytes ?? (10 * PRECACHE_GIB);
-            $('precacheMaxBytesGiB').value = Math.round((bytes / PRECACHE_GIB) * 100) / 100;
-        }
         if ($('precacheThresholdPercent')) $('precacheThresholdPercent').value = p.precache_threshold_percent || 10;
+        // Unset means on (config.PrecacheConfig.WholeSeason); unset count is 1.
+        if ($('precacheWholeSeason')) $('precacheWholeSeason').checked = p.precache_whole_season !== false;
+        if ($('precacheEpisodesAhead')) $('precacheEpisodesAhead').value = p.precache_next_episodes ?? 1;
+        this.updatePrecacheConfigState();
+    }
+
+    updatePrecacheConfigState() {
+        const whole = !!document.getElementById('precacheWholeSeason')?.checked;
+        const input = document.getElementById('precacheEpisodesAhead');
+        if (input) {
+            input.disabled = whole;
+            input.classList.toggle('opacity-50', whole);
+        }
     }
 
     async savePrecacheConfig() {
@@ -2566,21 +2609,16 @@ class RepairManager {
         const btn = $('precacheConfigSaveBtn');
         if (btn) btn.disabled = true;
         try {
-            const giB = parseFloat($('precacheMaxBytesGiB')?.value);
-            // 0/blank/negative -> 0 bytes, which the backend treats as an
-            // explicit disable (see PrecacheMaxBytes's doc comment), not
-            // "unset" - matches the min="0" on the input.
-            const maxBytes = Number.isFinite(giB) && giB > 0 ? Math.round(giB * PRECACHE_GIB) : 0;
-
-            // Only this form's repair field; the server keeps the rest (see
-            // saveOverlayConfig).
+            // Only this form's fields; the server keeps the rest of both
+            // sections (see saveOverlayConfig).
             const repairPayload = {
                 precache_read_ahead_enabled: !!$('precacheReadAhead')?.checked,
             };
+            const ahead = parseInt($('precacheEpisodesAhead')?.value, 10);
             const precachePayload = {
-                ...this.precacheConfig,
                 precache_threshold_percent: parseInt($('precacheThresholdPercent')?.value, 10) || 0,
-                precache_max_bytes: maxBytes,
+                precache_whole_season: !!$('precacheWholeSeason')?.checked,
+                precache_next_episodes: Number.isFinite(ahead) && ahead >= 0 ? ahead : 1,
             };
 
             const parseResponse = async (res) => {
