@@ -57,6 +57,13 @@ const (
 	// RepairSourceSweep is a segment confirmed missing by the repair
 	// sweep's own probe (see Repair.probeNZBFile / routeAutoRepair).
 	RepairSourceSweep RepairSource = "sweep"
+
+	// RepairSourcePrecache is a segment confirmed missing by a next-episode
+	// pre-cache burst (see Precache.recordReadiness). The cache is warm, so
+	// PAR2 pays off exactly as it does for playback; but nobody is watching
+	// yet, so a file PAR2 can't fix is re-grabbed now, while there is time
+	// for the replacement to land, rather than left padded for the viewer.
+	RepairSourcePrecache RepairSource = "precache"
 )
 
 // decideAutoRepairAction implements the coordinated auto-repair policy over
@@ -113,9 +120,21 @@ const (
 // responsible for consulting repairHandlerRegistry around the action this
 // returns, so an entry already being handled is never double-queued or
 // double-re-grabbed.
+//
+// source=precache takes PAR2 whenever it is usable, like playback, and
+// otherwise re-grabs for either verdict, like sweep:
+//
+//	par2 usable     + degraded or failed: queue PAR2.
+//	par2 not usable + degraded or failed: auto re-grab.
 func decideAutoRepairAction(source RepairSource, par2Usable bool, verdict overlay.Verdict) autoRepairAction {
 	switch verdict {
 	case overlay.VerdictDegraded:
+		if source == RepairSourcePrecache {
+			if par2Usable {
+				return autoActionQueuePar2
+			}
+			return autoActionRegrab
+		}
 		if source != RepairSourcePlayback {
 			return autoActionRegrab
 		}
@@ -124,7 +143,7 @@ func decideAutoRepairAction(source RepairSource, par2Usable bool, verdict overla
 		}
 		return autoActionNone
 	case overlay.VerdictFailed:
-		if source != RepairSourcePlayback {
+		if source != RepairSourcePlayback && source != RepairSourcePrecache {
 			return autoActionRegrab
 		}
 		if par2Usable {

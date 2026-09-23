@@ -1368,18 +1368,21 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 		return
 	}
 
-	// A PAR2 verdict is a whole-NZB outcome, not scoped to one file, so any
-	// one of pending's still-damaged files is as representative as another
-	// for the log fields and for the single-file scoping repairPlaybackFileNow
-	// applies when the name lines up with an Arr-known file.
-	fileName := entryName
+	// A PAR2 verdict is a whole-NZB outcome, so every still-damaged file is
+	// re-grabbed - in a season pack each episode is its own Arr file. This
+	// used to take one file in map order and leave the rest padded for the
+	// sweep. The bulk form skips the per-entry cooldown, which would refuse
+	// every file after the first, and the cache-only warm PAR2 pass, which
+	// can't succeed where this full pass just failed; the regrab guard still
+	// applies (auto=true).
+	files := make([]string, 0, len(pending))
 	for name := range pending {
-		fileName = name
-		break
+		files = append(files, name)
 	}
-
-	p.logger.Info().Str("entry", entryName).Str("file", fileName).
-		Msg("par2 repair: terminal verdict on urgent lane; initiating immediate regrab")
+	if len(files) == 0 {
+		files = append(files, entryName)
+	}
+	sort.Strings(files)
 
 	// No handlerRegrab claim is taken here: runJob already holds
 	// par2_running for this nzbID until it returns, so we are the exclusive
@@ -1387,10 +1390,14 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 	// this path - its own TryAcquire(handlerRegrab) could never win against
 	// the running PAR2 job, so it logged "already being handled" and did
 	// nothing.
-	if _, reason, rerr := p.repair.repairPlaybackFileNow(p.ctx, entryName, fileName, true, false); rerr != nil {
-		p.logger.Debug().Err(rerr).Str("entry", entryName).Msg("par2 repair: immediate regrab did not proceed")
-	} else if reason != "" {
-		p.logger.Debug().Str("entry", entryName).Str("reason", reason).Msg("par2 repair: immediate regrab skipped")
+	for _, fileName := range files {
+		p.logger.Info().Str("entry", entryName).Str("file", fileName).Int("files", len(files)).
+			Msg("par2 repair: terminal verdict on urgent lane; initiating immediate regrab")
+		if _, reason, rerr := p.repair.repairPlaybackFileNow(p.ctx, entryName, fileName, true, true); rerr != nil {
+			p.logger.Debug().Err(rerr).Str("entry", entryName).Str("file", fileName).Msg("par2 repair: immediate regrab did not proceed")
+		} else if reason != "" {
+			p.logger.Debug().Str("entry", entryName).Str("file", fileName).Str("reason", reason).Msg("par2 repair: immediate regrab skipped")
+		}
 	}
 }
 

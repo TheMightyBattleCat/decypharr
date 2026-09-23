@@ -207,6 +207,14 @@ func TestDecideAutoRepairActionSourceTruthTable(t *testing.T) {
 		{"sweep + failed + par2 enabled -> REGRAB (would be queue-par2 for playback)", RepairSourceSweep, true, overlay.VerdictFailed, autoActionRegrab},
 		{"sweep + failed + par2 disabled -> regrab", RepairSourceSweep, false, overlay.VerdictFailed, autoActionRegrab},
 		{"sweep + clean -> none", RepairSourceSweep, true, overlay.VerdictClean, autoActionNone},
+
+		// --- source=precache: PAR2 when usable (warm cache), else re-grab
+		// while nobody is watching yet - never left padded ---
+		{"precache + degraded + par2 usable -> queue par2", RepairSourcePrecache, true, overlay.VerdictDegraded, autoActionQueuePar2},
+		{"precache + degraded + par2 not usable -> REGRAB (would be pad for playback)", RepairSourcePrecache, false, overlay.VerdictDegraded, autoActionRegrab},
+		{"precache + failed + par2 usable -> queue par2", RepairSourcePrecache, true, overlay.VerdictFailed, autoActionQueuePar2},
+		{"precache + failed + par2 not usable -> regrab", RepairSourcePrecache, false, overlay.VerdictFailed, autoActionRegrab},
+		{"precache + clean -> none", RepairSourcePrecache, true, overlay.VerdictClean, autoActionNone},
 	}
 
 	for _, c := range cases {

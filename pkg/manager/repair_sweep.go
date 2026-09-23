@@ -2266,6 +2266,36 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 // "done" only when real work happened, instead of on every nil-error return
 // regardless of whether anything ran.
 func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName string) (acted bool, reason string, err error) {
+	// proximity=0: a live playback read just hit this damage right now.
+	out, err := r.handleAutoDamage(ctx, RepairSourcePlayback, entryName, fileName, 0)
+	return out.acted, out.reason, err
+}
+
+// precacheRepairProximity is the urgent-lane proximity a pre-cache repair is
+// queued at: the episode is next, not playing, so a live viewer's job
+// (proximity 0, or the read-ahead's playhead gap) goes first.
+const precacheRepairProximity = 20 * time.Minute
+
+// HandlePrecacheDamage is HandlePlaybackFailure for damage a next-episode
+// pre-cache burst found (see RepairSourcePrecache): PAR2 when usable,
+// otherwise a re-grab while nobody is watching yet.
+func (r *Repair) HandlePrecacheDamage(ctx context.Context, entryName, fileName string) (autoRepairOutcome, error) {
+	return r.handleAutoDamage(ctx, RepairSourcePrecache, entryName, fileName, precacheRepairProximity)
+}
+
+// autoRepairOutcome is what handleAutoDamage did. retry marks a no-op that
+// a later call can get past: another handler holds the entry for now, or
+// the entry's playback-repair cooldown is running. Either lasts minutes;
+// playback escalation re-fires by itself, pre-cache has to ask again.
+type autoRepairOutcome struct {
+	acted  bool
+	retry  bool
+	reason string
+}
+
+// handleAutoDamage consults decideAutoRepairAction for source and carries
+// the action out - see HandlePlaybackFailure.
+func (r *Repair) handleAutoDamage(ctx context.Context, source RepairSource, entryName, fileName string, proximity time.Duration) (autoRepairOutcome, error) {
 	entry, err := r.manager.GetEntryByName(entryName, fileName)
 	if err != nil || entry == nil || entry.InfoHash == "" || r.manager.usenet == nil {
 		// Can't resolve enough to consult the policy (non-NZB entry, no
@@ -2273,7 +2303,7 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 		// fall back to the pre-coordination default. Still the automatic
 		// path (see repairPlaybackFileNow's auto flag) - the regrab guard
 		// still applies if Arr context can be resolved further in.
-		return r.repairPlaybackFileNow(ctx, entryName, fileName, true, false)
+		return r.regrabOutcome(r.repairPlaybackFileNow(ctx, entryName, fileName, true, false))
 	}
 	nzbID := entry.InfoHash
 
@@ -2283,28 +2313,34 @@ func (r *Repair) HandlePlaybackFailure(ctx context.Context, entryName, fileName 
 	}
 	verdict := r.manager.usenet.OverlayVerdict(nzbID, fileName)
 
-	switch decideAutoRepairAction(RepairSourcePlayback, par2Usable, verdict) {
+	switch decideAutoRepairAction(source, par2Usable, verdict) {
 	case autoActionRegrab:
-		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
-			r.logger.Debug().Str("entry", entryName).Str("file", fileName).
-				Msg("playback repair: entry already being handled; skipping re-grab")
-			return false, "entry already being handled by another repair mechanism", nil
+		release, ok := r.handlers.TryAcquireRegrab(nzbID)
+		if !ok {
+			r.logger.Debug().Str("entry", entryName).Str("file", fileName).Str("source", string(source)).
+				Msg("auto repair: entry already being handled; skipping re-grab")
+			return autoRepairOutcome{retry: true, reason: "entry already being handled by another repair mechanism"}, nil
 		}
-		defer r.handlers.Release(nzbID)
-		return r.repairPlaybackFileNow(ctx, entryName, fileName, true, false)
+		defer release()
+		return r.regrabOutcome(r.repairPlaybackFileNow(ctx, entryName, fileName, true, false))
 	case autoActionQueuePar2:
 		if r.manager.par2Repair != nil {
-			// proximity=0: a live playback read just hit this damage right
-			// now, the same "playhead is already here" urgency as a
-			// precache-triggered job's closest possible proximity (see
-			// Precache.recordReadiness).
-			r.manager.par2Repair.EnqueueUrgent(nzbID, 0)
+			r.manager.par2Repair.EnqueueUrgent(nzbID, proximity)
 		}
-		return true, "", nil
+		return autoRepairOutcome{acted: true}, nil
 	default:
-		return false, fmt.Sprintf("no action needed (verdict=%s)", verdict), nil
+		return autoRepairOutcome{reason: fmt.Sprintf("no action needed (verdict=%s)", verdict)}, nil
 	}
 }
+
+// regrabOutcome wraps repairPlaybackFileNow's results; its cooldown refusal
+// is the retryable one.
+func (r *Repair) regrabOutcome(acted bool, reason string, err error) (autoRepairOutcome, error) {
+	return autoRepairOutcome{acted: acted, reason: reason, retry: strings.HasPrefix(reason, reasonWithinCooldown)}, err
+}
+
+// reasonWithinCooldown prefixes repairPlaybackFileNow's cooldown refusal.
+const reasonWithinCooldown = "within cooldown"
 
 // ClaimManualAutoRepairOverride force-claims nzbID's auto-repair
 // handler-registry slot for a manual, user-initiated re-grab, clearing any
@@ -2410,7 +2446,7 @@ func (r *Repair) repairPlaybackFileNow(ctx context.Context, entryName, fileName 
 			Str("entry", entryName).
 			Dur("since_last", time.Since(last)).
 			Msg("playback repair: skipped, entry within cooldown")
-		return false, fmt.Sprintf("within cooldown, %s remaining", remaining), nil
+		return false, fmt.Sprintf("%s, %s remaining", reasonWithinCooldown, remaining), nil
 	}
 	r.lastPlaybackRepair[cooldownKey] = time.Now()
 	r.playbackRepairMu.Unlock()

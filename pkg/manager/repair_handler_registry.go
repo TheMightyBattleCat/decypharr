@@ -100,6 +100,38 @@ func (reg *repairHandlerRegistry) TryAcquire(nzbID string, kind repairHandlerKin
 	return true
 }
 
+// TryAcquireRegrab claims nzbID for an automatic re-grab. Unlike TryAcquire
+// it may take over a terminal mark: terminal means PAR2 gave up on the
+// release, which is exactly when decideAutoRepairAction picks a re-grab, and
+// a season pack keeps its nzbID after one episode's re-grab - so the mark
+// used to block every sibling episode's re-grab until a restart or the
+// nightly sweep. A live claim (queued/running PAR2, another re-grab) still
+// wins. The returned release must be called when the re-grab ends; it puts
+// a taken-over terminal mark back.
+func (reg *repairHandlerRegistry) TryAcquireRegrab(nzbID string) (release func(), ok bool) {
+	if nzbID == "" {
+		return nil, false
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.reapIfStaleLocked(nzbID)
+	wasTerminal := false
+	if e, exists := reg.entries[nzbID]; exists {
+		if !e.terminal {
+			return nil, false
+		}
+		wasTerminal = true
+	}
+	reg.entries[nzbID] = &repairHandlerState{kind: handlerRegrab, since: reg.nowFn()}
+	return func() {
+		if wasTerminal {
+			reg.MarkTerminal(nzbID)
+			return
+		}
+		reg.Release(nzbID)
+	}, true
+}
+
 // Set unconditionally claims nzbID for kind, overwriting any existing
 // (non-terminal) claim and clearing terminal if set. This is the manual
 // override primitive: a user-initiated "repair now" / "delete & re-search"

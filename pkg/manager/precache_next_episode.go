@@ -519,49 +519,83 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 		return
 	}
 
-	// Route damage through the SAME decideAutoRepairAction(RepairSourcePlayback,
-	// ...) policy (and regrab guard) the live playback-failure path uses -
-	// HandlePlaybackFailure IS that path (see
-	// pkg/mount/dfs/vfs/downloaders.go's call for a live read), called here
-	// verbatim rather than re-implementing any part of its policy. Unlike
-	// the currently-playing read-ahead path (precache.go's repairAhead),
-	// this DOES re-grab on autoActionRegrab: nothing is playing yet, so
-	// there's no live stream to disrupt, and re-grabbing now gives the
-	// replacement time to land before playback actually reaches this
-	// episode. Given this library is mostly pre-PAR2-retention records, the
-	// common outcome here is re-grab, not PAR2 - expected and correct.
-	// regrabGuard applies exactly as it does to a playback-triggered
-	// re-grab, so a next episode that can't be fixed trips the guard and
-	// goes terminal with its reason surfaced, instead of looping.
-	if r := p.manager.Repair(); r != nil {
-		if _, _, err := r.HandlePlaybackFailure(ctx, entry.Name, filename); err != nil {
-			p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("next-episode pre-cache: damage handling failed")
+	// Route damage through decideAutoRepairAction(RepairSourcePrecache, ...)
+	// and the regrab guard, via HandlePrecacheDamage: PAR2 when usable (the
+	// cache is warm), otherwise a re-grab, since nothing is playing yet and
+	// the replacement has time to land before playback reaches this episode.
+	// This used to go through the playback policy, which leaves degraded
+	// damage without usable PAR2 padded - so a pre-cached episode without
+	// PAR2 was never fixed ahead of the viewer. regrabGuard applies exactly
+	// as for playback, so an episode that can't be fixed trips the guard
+	// instead of looping.
+	handle := func() autoRepairOutcome {
+		r := p.manager.Repair()
+		if r == nil {
+			return autoRepairOutcome{reason: "repair service unavailable"}
 		}
+		out, err := r.HandlePrecacheDamage(ctx, entry.Name, filename)
+		evt := p.logger.Debug()
+		if err != nil {
+			evt = evt.Err(err)
+		} else if out.acted {
+			evt = p.logger.Info()
+		}
+		evt.Str("entry", entry.Name).Str("file", filename).Bool("acted", out.acted).
+			Bool("retry", out.retry).Str("reason", out.reason).
+			Msg("next-episode pre-cache: damage handed to repair")
+		return out
 	}
 
-	deadline := time.Now().Add(precacheRepairWaitTimeout)
+	repaired, remaining := awaitPrecacheRepair(ctx, precacheRepairWaitTimeout, precacheRepairPollInterval,
+		precacheRepairRetryInterval, pendingCount, handle)
+	if repaired {
+		readiness.SegmentsRepaired = n
+		readiness.ReadyAt = time.Now()
+		// PENDING-REPAIR -> REPAIRED: persist the now-clean segments
+		// durably (a no-op for anything a re-grab replaced under a
+		// different InfoHash - there's nothing left here to persist).
+		p.persistCleanRanges(ctx, entry, filename, fileSize)
+		return
+	}
+	if remaining > 0 {
+		n = remaining
+	}
+	readiness.SegmentsPending = n
+}
+
+// precacheRepairRetryInterval is how often awaitPrecacheRepair asks again
+// after a retryable no-op (another handler owns the entry, or its cooldown
+// is running - see autoRepairOutcome.retry).
+const precacheRepairRetryInterval = 30 * time.Second
+
+// awaitPrecacheRepair hands damage to handle, then polls pending until it
+// reaches 0 (repaired=true), wait runs out or ctx ends. While handle's last
+// answer was a retryable no-op it is asked again every retryEvery: a season
+// pack's episode found damaged while a sibling's re-grab or PAR2 pass holds
+// the release used to be dropped until the nightly sweep (The Conjurors
+// S04E03, 2026-09-07, about 5 h). remaining is the last pending count seen
+// (-1 if never read).
+func awaitPrecacheRepair(ctx context.Context, wait, poll, retryEvery time.Duration,
+	pending func() int, handle func() autoRepairOutcome) (repaired bool, remaining int) {
+	remaining = -1
+	out := handle()
+	lastAsk := time.Now()
+	deadline := lastAsk.Add(wait)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			readiness.SegmentsPending = n
-			return
-		case <-time.After(precacheRepairPollInterval):
+			return false, remaining
+		case <-time.After(poll):
 		}
-		remaining := pendingCount()
-		if remaining == 0 {
-			readiness.SegmentsRepaired = n
-			readiness.ReadyAt = time.Now()
-			// PENDING-REPAIR -> REPAIRED: persist the now-clean segments
-			// durably (a no-op for anything a re-grab replaced under a
-			// different InfoHash - there's nothing left here to persist).
-			p.persistCleanRanges(ctx, entry, filename, fileSize)
-			return
+		if remaining = pending(); remaining == 0 {
+			return true, 0
 		}
-		if remaining > 0 {
-			n = remaining
+		if out.retry && time.Since(lastAsk) >= retryEvery {
+			out = handle()
+			lastAsk = time.Now()
 		}
 	}
-	readiness.SegmentsPending = n
+	return false, remaining
 }
 
 // notifyReadiness fires the "next play is ready" notification for a
