@@ -230,6 +230,36 @@ For Usenet probing, `nntp_connection_percent` (above) caps the share of NNTP con
 With `auto_repair: true`, a sweep deletes the broken Arr file records and triggers a search for replacements. Verification of those re-acquires happens later — the Arr import is asynchronous and the badge flips to `healthy` once the replacement file is in place.
 :::
 
+## PAR2 repair and pre-cache
+
+These settings live on the Repair page, in **Padding & PAR2 repair policy** and **Pre-cache**. They apply to Usenet (NZB) entries only.
+
+### PAR2 repair
+
+| Setting (JSON key)                | What it does                                                                                                                                                                                                                                      | Default    |
+|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| PAR2 repair (`par2_repair`)       | Rebuild dead segments from the release's PAR2 recovery data. A playback failure always tries PAR2 before any re-grab: each failed segment is re-fetched and checked against the PAR2 checksums, the rest is rebuilt, and the release is re-grabbed only if that fails. | on         |
+| PAR2 repair during sweeps (`par2_repair_on_sweep`) | A sweep that finds dead segments tries a PAR2 repair before re-grabbing, downloading the intact data from Usenet (about as much as a re-grab). Follows the trigger below, runs one repair at a time, and re-grabs a failed repair in the same sweep. Greyed out while PAR2 repair is off. | off |
+| Auto-repair trigger (`par2_repair_mode`) | `auto_all`: repair every degraded file. `auto_threshold`: only files with at least `par2_repair_min_segments` dead segments. `manual`: only from **Repair now**. | `auto_all` |
+
+Keep `par2_repair_min_segments` below **Max total segments** (`pad_max_total_segments`). A file past that cap fails playback, so a threshold at or above it only repairs after playback has already broken. The page warns when they overlap.
+
+Whatever the setting, a sweep first tries a free PAR2 pass when every intact byte is already in the cache.
+
+### Pre-cache
+
+| Setting (JSON key)                                  | What it does                                                                                                                                                               | Default |
+|-----------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| Pre-cache ahead of playback (`repair.precache_read_ahead_enabled`) | Master switch. Once playback passes the threshold, download the rest of the file, then walk ahead through the season. Damage found is repaired from the fresh cache, or the release re-grabbed, before playback gets there. | off |
+| Start at % played (`precache.precache_threshold_percent`) | How far into the playing file before pre-caching starts.                                                                                                                  | 10      |
+| Whole season (`precache.precache_whole_season`)     | Walk to the last episode of the season.                                                                                                                                    | on      |
+| Episodes ahead (`precache.precache_next_episodes`)  | With whole season off, how many episodes after the one playing to pre-cache (0-50, 0 = none). Each episode you play moves the window on by one.                            | 1       |
+
+- Each download uses **Settings → Providers → Usenet → Max Connections Per File** connections, the same number playback uses per file. One connection fetches one segment at a time, so segments in parallel and connections are the same number.
+- Episodes not grabbed yet are searched for in Sonarr. The walk stops there, and at the end of the season.
+- Pre-cached data lives in the mount's cache and is evicted by the cache's own rules. There is no separate size limit. `precache_max_bytes` is no longer shown; it only bounds bytes reserved by in-flight downloads, and 0 or unset means 256 GiB.
+- Without a Plex server configured, an episode that is already fully cached may not move the window on when played, because nothing reads from Usenet. Whole season avoids this.
+
 ## Troubleshooting
 
 ### Sweep takes too long
