@@ -21,9 +21,9 @@ type watchedEvict struct {
 }
 
 // queueWatchedEvict schedules the DFS cache of a watched pre-cached episode
-// for removal and tries once now. evictIfWatched runs at 90% of the file,
-// while the viewer still holds it, so the first try usually fails; the
-// maintenance tick retries (evictWatchedDue). "Evict after watched" used to
+// for removal by the maintenance tick (evictWatchedDue). evictIfWatched runs
+// at 90% of the file, while the viewer still holds it, and on a read path,
+// so nothing is removed here. "Evict after watched" used to
 // drop only the usenet reader's scratch buffer and release the budget: the
 // episode's durable DFS cache - the actual disk footprint - stayed.
 func (p *Precache) queueWatchedEvict(infoHash, entryName, filename string) {
@@ -36,7 +36,6 @@ func (p *Precache) queueWatchedEvict(infoHash, entryName, filename string) {
 		until: time.Now().Add(watchedEvictWindow),
 	}
 	p.evictMu.Unlock()
-	p.evictWatchedDue()
 }
 
 // evictWatchedDue tries every queued eviction once, dropping those that

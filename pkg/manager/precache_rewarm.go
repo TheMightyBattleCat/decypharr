@@ -99,17 +99,20 @@ func (p *Precache) rewarmDue() {
 			continue // Sonarr still serves the old grab
 		}
 
-		p.rewarmMu.Lock()
-		delete(p.rewarm, rewarmKey(t.ref))
-		p.rewarmMu.Unlock()
-		p.dropReadiness(t.oldKey)
-
 		p.logger.Info().Str("series", t.ref.seriesName).Int("season", t.ref.seasonNumber).
 			Int("episode", t.ref.episodeNumber).Str("entry", entry.Name).
 			Msg("next-episode pre-cache: re-grabbed episode imported; warming its replacement")
 		epCtx, cancel := context.WithTimeout(base, precacheNextEpisodeTimeout)
-		p.burstEpisode(epCtx, t.ref, next)
+		step := p.burstEpisode(epCtx, t.ref, next)
 		cancel()
+		if step == stepDeferred {
+			continue // budget or bandwidth said not now; try again next tick
+		}
+		// Burst, or nothing left to do (already warmed by a walk, paused).
+		p.rewarmMu.Lock()
+		delete(p.rewarm, rewarmKey(t.ref))
+		p.rewarmMu.Unlock()
+		p.dropReadiness(t.oldKey)
 	}
 }
 

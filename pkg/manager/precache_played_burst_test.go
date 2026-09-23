@@ -72,3 +72,29 @@ func TestObserveMountReadReachesPrecache(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// With Plex configured the progress poll covers cached files, and Observe's
+// Plex gate may fetch sessions over HTTP - which must not run for a mount
+// read - so mount reads report nothing.
+func TestObserveMountReadSkippedWithPlex(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	withPrecacheReadAhead(t)
+	cfg := config.Get()
+	prev := cfg.Plex
+	cfg.Plex.URL, cfg.Plex.Token = "http://plex.invalid:32400", "t"
+	t.Cleanup(func() { cfg.Plex = prev })
+
+	m := &Manager{}
+	p := NewPrecache(m)
+	m.precache = p
+	called := make(chan struct{}, 1)
+	p.playedBurst = func(*storage.Entry, string, int64) { called <- struct{}{} }
+	p.triggered["nzb:e.mkv"] = time.Now()
+
+	m.ObserveMountRead(&storage.Entry{InfoHash: "nzb", Protocol: config.ProtocolNZB}, "e.mkv", 950, 1000)
+	select {
+	case <-called:
+		t.Fatal("a mount read reached pre-cache with Plex configured")
+	case <-time.After(50 * time.Millisecond):
+	}
+}

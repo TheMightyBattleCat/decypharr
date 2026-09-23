@@ -574,8 +574,11 @@ func (p *Precache) awaitReadiness(ref walkIdentity, entry *storage.Entry, filena
 
 	res := awaitPrecacheRepair(ctx, precacheRepairWaitTimeout, precacheRepairPollInterval,
 		precacheRepairRetryInterval, pending, handle)
+	// Queued only once the row is settled: a rewarm tick drops the old row
+	// when the replacement is warmed, and storing after that would bring it
+	// back.
 	if regrabbed || res.gone {
-		p.addRewarm(ref, entry.InfoHash, key)
+		defer p.addRewarm(ref, entry.InfoHash, key)
 	}
 
 	row := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}

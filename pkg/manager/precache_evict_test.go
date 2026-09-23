@@ -31,6 +31,7 @@ func TestWatchedEvictRetriesUntilClosed(t *testing.T) {
 	p.storeReadiness(EpisodeReadiness{InfoHash: "h", Filename: "e.mkv", Clean: true})
 
 	p.queueWatchedEvict("h", "Show.S01E01", "e.mkv")
+	p.evictWatchedDue()
 	if len(mount.evicted) != 0 || len(p.evictQueue) != 1 {
 		t.Fatalf("evicted %v with the file open; queue=%d", mount.evicted, len(p.evictQueue))
 	}
@@ -57,6 +58,7 @@ func TestWatchedEvictSkipsFileBeingWritten(t *testing.T) {
 	p.markInflight("h:e.mkv")
 
 	p.queueWatchedEvict("h", "Show", "e.mkv")
+	p.evictWatchedDue()
 	if len(mount.evicted) != 0 {
 		t.Fatal("evicted a file a burst is writing")
 	}

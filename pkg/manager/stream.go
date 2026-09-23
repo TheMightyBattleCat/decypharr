@@ -182,9 +182,11 @@ func ContextForBufferedPlayback(ctx context.Context) context.Context {
 // the DFS cache; the mount reports reads it served from the cache, which
 // never reach Stream. Without them a fully cached episode never advanced a
 // finite-depth walk unless Plex was configured (its progress poll covers
-// that case). A no-op for anything but a usenet entry.
+// that case, so with Plex configured this does nothing - and Observe's Plex
+// gate can fetch sessions over HTTP, which must not happen on a mount read).
+// A no-op for anything but a usenet entry.
 func (m *Manager) ObserveMountRead(entry *storage.Entry, filename string, off, size int64) {
-	if entry == nil || entry.Protocol != config.ProtocolNZB || m.precache == nil {
+	if entry == nil || entry.Protocol != config.ProtocolNZB || m.precache == nil || config.Get().Plex.Enabled() {
 		return
 	}
 	m.precache.Observe(entry, filename, off, size)

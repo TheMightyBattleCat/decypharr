@@ -68,6 +68,38 @@ func TestRewarmDueBurstsReplacementOnceImported(t *testing.T) {
 	}
 }
 
+// A burst deferred by budget or bandwidth must leave the target queued, or
+// the replacement is never warmed.
+func TestRewarmDueKeepsDeferredTarget(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	withPrecacheReadAhead(t)
+	p := NewPrecache(&Manager{})
+	ref := walkIdentity{arr: &arr.Arr{Name: "sonarr"}, seriesId: 2, seasonNumber: 1, episodeNumber: 5}
+	p.storeReadiness(EpisodeReadiness{InfoHash: "old", Filename: "e05.mkv", SegmentsPending: 1})
+	p.addRewarm(ref, "old", "old:e05.mkv")
+	p.rewarmLookup = func(context.Context, walkIdentity) (arr.NextEpisodeInfo, bool, error) {
+		return arr.NextEpisodeInfo{HasFile: true}, true, nil
+	}
+	p.rewarmResolve = func(arr.NextEpisodeInfo) (*storage.Entry, string, bool) {
+		return &storage.Entry{InfoHash: "new"}, "e05.mkv", true
+	}
+	step := stepDeferred
+	p.rewarmBurst = func(context.Context, walkIdentity, arr.NextEpisodeInfo) episodeStep { return step }
+
+	p.rewarmDue()
+	if len(p.rewarm) != 1 {
+		t.Fatal("deferred re-warm dropped")
+	}
+	if _, ok := p.readiness["old:e05.mkv"]; !ok {
+		t.Fatal("old row dropped before the replacement was warmed")
+	}
+	step = stepBurst
+	p.rewarmDue()
+	if len(p.rewarm) != 0 {
+		t.Fatal("target kept after the replacement was warmed")
+	}
+}
+
 func TestRewarmDueForgetsExpiredTargets(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	withPrecacheReadAhead(t)

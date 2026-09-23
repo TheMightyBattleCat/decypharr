@@ -91,7 +91,9 @@ func (f *StreamingFile) observeRead(off int64) {
 	if !observeDue(last, pct) || !f.observedPct.CompareAndSwap(last, max(pct, 1)) {
 		return
 	}
-	f.item.cache.manager.ObserveMountRead(f.item.entry, f.item.filename, off, f.fileSize)
+	// Off the read path: this runs inside the player's read syscall.
+	mgr, entry, filename, size := f.item.cache.manager, f.item.entry, f.item.filename, f.fileSize
+	go mgr.ObserveMountRead(entry, filename, off, size)
 }
 
 // observeDue reports whether a read at pct should be reported, the last
