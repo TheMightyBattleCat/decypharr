@@ -897,7 +897,9 @@ func (r *Repair) par2TerminalWithDamage(nzbID, fileName string) bool {
 // entire release from Usenet instead of the cache-warm slices it relies on to
 // be cheap. Since the outcome for source=sweep never varies, this routes
 // straight to the re-grab path rather than consulting the policy for an
-// already-known answer.
+// already-known answer. healBrokenEntry still tries PAR2 first - the free
+// cache-only warm pass always, and a normal pass when
+// config.Repair.Par2RepairOnSweep is on (see coldSweepRepair).
 func (r *Repair) routeAutoRepair(entry *storage.Entry, res fileResult) fileResult {
 	nzbID := entry.InfoHash
 
@@ -1232,6 +1234,18 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 			}
 		}
 		fixed = r.warmSweepRepair(ctx, damaged)
+
+		// Opt-in: a normal PAR2 pass for what the warm pass could not fix.
+		// Whatever it doesn't complete is re-grabbed below, in this sweep.
+		rest := make([]storage.BrokenFile, 0, len(damaged))
+		for _, bf := range damaged {
+			if _, ok := fixed[bf.InfoHash]; !ok {
+				rest = append(rest, bf)
+			}
+		}
+		for id := range r.coldSweepRepair(ctx, rest) {
+			fixed[id] = struct{}{}
+		}
 	}
 	if len(fixed) > 0 {
 		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))

@@ -2,55 +2,81 @@ package config
 
 import "testing"
 
-// TestPrecacheMaxBytesZeroDisables proves an explicit PrecacheMaxBytes of 0
-// survives setDefaults as a real 0 (disabled), not a "0/unset" sentinel that
-// falls back to precacheDefaultMaxBytes - see PrecacheMaxBytes's *int64 doc
-// comment for why this needs the same pointer convention as
-// PrecacheNextEpisodes.
-func TestPrecacheMaxBytesZeroDisables(t *testing.T) {
-	var c Config
-	zero := int64(0)
-	c.Precache.PrecacheMaxBytes = &zero
-	c.setDefaults()
-
-	if c.Precache.PrecacheMaxBytes == nil || *c.Precache.PrecacheMaxBytes != 0 {
-		t.Fatalf("PrecacheMaxBytes = %v after setDefaults, want a pointer to 0", c.Precache.PrecacheMaxBytes)
+// TestPrecacheMaxBytes: the cap is no longer on the Repair page, so nothing a
+// user can no longer see may switch pre-caching off. Unset and <= 0 mean the
+// ceiling; values above it are clamped; values inside it are kept.
+func TestPrecacheMaxBytes(t *testing.T) {
+	ptr := func(v int64) *int64 { return &v }
+	cases := []struct {
+		name string
+		in   *int64
+		want int64
+	}{
+		{"unset", nil, precacheMaxBytesCeiling},
+		{"explicit zero no longer disables", ptr(0), precacheMaxBytesCeiling},
+		{"negative", ptr(-5), precacheMaxBytesCeiling},
+		{"above ceiling", ptr(300 << 30), precacheMaxBytesCeiling},
+		{"inside range", ptr(42 << 30), 42 << 30},
 	}
-	if got := c.Precache.MaxBytes(); got != 0 {
-		t.Fatalf("MaxBytes() = %d, want 0 (disabled)", got)
-	}
-}
-
-// TestPrecacheMaxBytesNilDefaults proves an unset (nil) PrecacheMaxBytes -
-// e.g. a config that predates this field, or one that has genuinely never
-// been saved - still falls back to precacheDefaultMaxBytes, not 0/disabled.
-func TestPrecacheMaxBytesNilDefaults(t *testing.T) {
-	var c Config
-	c.setDefaults()
-
-	if c.Precache.PrecacheMaxBytes == nil {
-		t.Fatalf("PrecacheMaxBytes is nil after setDefaults, want it materialized (same convention as PrecacheNextEpisodes)")
-	}
-	if got := c.Precache.MaxBytes(); got != precacheDefaultMaxBytes {
-		t.Fatalf("MaxBytes() = %d, want the default %d", got, int64(precacheDefaultMaxBytes))
+	for _, tc := range cases {
+		var c Config
+		c.Precache.PrecacheMaxBytes = tc.in
+		c.setDefaults()
+		if got := c.Precache.MaxBytes(); got != tc.want {
+			t.Errorf("%s: MaxBytes() = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 
-// TestPrecacheMaxBytesClampsToCeiling proves a value above the 256 GiB
-// ceiling is clamped down to it by setDefaults (a fat-finger backstop, not
-// the real guard - see PrecacheMaxBytes's doc comment), both in the stored
-// config and via the MaxBytes() accessor.
-func TestPrecacheMaxBytesClampsToCeiling(t *testing.T) {
-	var c Config
-	tooBig := int64(300 * 1024 * 1024 * 1024) // 300 GiB
-	c.Precache.PrecacheMaxBytes = &tooBig
-	c.setDefaults()
-
-	if c.Precache.PrecacheMaxBytes == nil || *c.Precache.PrecacheMaxBytes != precacheMaxBytesCeiling {
-		t.Fatalf("PrecacheMaxBytes = %v after setDefaults, want a pointer to the %d ceiling", c.Precache.PrecacheMaxBytes, int64(precacheMaxBytesCeiling))
+// TestPrecacheEpisodesAhead: whole season is on when unset (the walk always
+// ran to the season's end before the setting existed), and turning it off
+// uses the saved episode count - including an explicit 0, which disables it.
+func TestPrecacheEpisodesAhead(t *testing.T) {
+	on, off := true, false
+	three, zero := 3, 0
+	cases := []struct {
+		name  string
+		whole *bool
+		next  *int
+		want  int
+	}{
+		{"unset", nil, nil, -1},
+		{"whole season on ignores count", &on, &three, -1},
+		{"off uses count", &off, &three, 3},
+		{"off with unset count defaults to 1", &off, nil, 1},
+		{"off with zero disables", &off, &zero, 0},
 	}
-	if got := c.Precache.MaxBytes(); got != precacheMaxBytesCeiling {
-		t.Fatalf("MaxBytes() = %d, want the %d ceiling", got, int64(precacheMaxBytesCeiling))
+	for _, tc := range cases {
+		c := PrecacheConfig{PrecacheWholeSeason: tc.whole, PrecacheNextEpisodes: tc.next}
+		if got := c.EpisodesAhead(); got != tc.want {
+			t.Errorf("%s: EpisodesAhead() = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// IsZero must see the new field, or omitzero would drop a config whose
+	// only non-default setting is whole season off.
+	if (PrecacheConfig{PrecacheWholeSeason: &off}).IsZero() {
+		t.Error("IsZero() ignores PrecacheWholeSeason")
+	}
+}
+
+// TestPrecacheReadAheadConcurrencyUsesUsenetMaxConnections: bursts take the
+// Usenet "Max Connections Per File" setting; the saved
+// precache_read_ahead_concurrency (12 in every config saved before) is not
+// consulted.
+func TestPrecacheReadAheadConcurrencyUsesUsenetMaxConnections(t *testing.T) {
+	Reset()
+	SetConfigPath(t.TempDir())
+	t.Cleanup(Reset)
+	cfg := Get()
+
+	cfg.Usenet.MaxConnections = 20
+	c := PrecacheConfig{PrecacheReadAheadConcurrency: 12}
+	if got := c.ReadAheadConcurrency(); got != 20 {
+		t.Fatalf("ReadAheadConcurrency() = %d, want 20 (Usenet.MaxConnections)", got)
+	}
+	cfg.Usenet.MaxConnections = 0
+	if got := c.ReadAheadConcurrency(); got != 15 {
+		t.Fatalf("ReadAheadConcurrency() = %d with no Usenet setting, want the 15 default", got)
 	}
 }
 

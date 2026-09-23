@@ -562,7 +562,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// that used to silently wipe the Arr webhook token.
 	newConfig.Repair.PlaybackPadding = currentConfig.Repair.PlaybackPadding
 	newConfig.Repair.Par2Repair = currentConfig.Repair.Par2Repair
-	newConfig.Repair.Par2TryBeforeRegrab = currentConfig.Repair.Par2TryBeforeRegrab
+	newConfig.Repair.Par2RepairOnSweep = currentConfig.Repair.Par2RepairOnSweep
 	newConfig.Repair.PadMaxRunSegments = currentConfig.Repair.PadMaxRunSegments
 	newConfig.Repair.PadMaxTotalSegments = currentConfig.Repair.PadMaxTotalSegments
 	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio
@@ -751,15 +751,30 @@ func (s *Server) handleGetPrecacheConfig(w http.ResponseWriter, r *http.Request)
 	utils.JSONResponse(w, config.Get().Precache, http.StatusOK)
 }
 
-// handleUpdatePrecacheConfig saves config.Precache (threshold/concurrency/
-// next-episodes/max-bytes) - separate from handleUpdateRepairConfig because
-// it's a sibling Config field, not part of RepairConfig (see PrecacheConfig's
-// doc comment). Bounds-checking here rejects clearly-invalid input;
-// Config.applyPrecacheDefaults (run by cfg.Save()) is what actually clamps
-// PrecacheMaxBytes to its [0, 256GiB] range.
+// handleUpdatePrecacheConfig saves config.Precache - separate from
+// handleUpdateRepairConfig because it's a sibling Config field, not part of
+// RepairConfig (see PrecacheConfig's doc comment). The body is merged over
+// the live settings (see config.MergeJSON), so a field the form doesn't send
+// keeps its value instead of resetting.
 func (s *Server) handleUpdatePrecacheConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	current, err := json.Marshal(cfg.Precache)
+	if err != nil {
+		http.Error(w, "Failed to read current precache config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigBodyBytes))
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	merged, err := config.MergeJSON(current, body)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var req config.PrecacheConfig
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(merged, &req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -767,8 +782,11 @@ func (s *Server) handleUpdatePrecacheConfig(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Invalid precache_threshold_percent (must be between 1 and 100, or 0 for default)", http.StatusBadRequest)
 		return
 	}
+	if req.PrecacheNextEpisodes != nil && (*req.PrecacheNextEpisodes < 0 || *req.PrecacheNextEpisodes > 50) {
+		http.Error(w, "Invalid precache_next_episodes (must be between 0 and 50)", http.StatusBadRequest)
+		return
+	}
 
-	cfg := config.Get()
 	cfg.Precache = req
 	if err := cfg.Save(); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save precache config")

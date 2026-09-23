@@ -121,6 +121,10 @@ type Repair struct {
 	activeStopFunc func() // called by the stop job for the active run
 	runWG          sync.WaitGroup
 
+	// coldPar2Slot lets one sweep PAR2 pass that fetches from Usenet run at
+	// a time (see coldSweepRepair).
+	coldPar2Slot sync.Mutex
+
 	// lastPlaybackRepair tracks, per entry name, when a playback-failure repair
 	// was last kicked off. This lives on the manager (not the per-file
 	// Downloaders) so the cooldown SURVIVES the file being deleted and

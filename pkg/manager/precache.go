@@ -63,6 +63,20 @@ type Precache struct {
 	mu        sync.Mutex
 	triggered map[string]time.Time // "infoHash:filename" -> when work on it was kicked off (read-ahead or next-episode burst)
 
+	// walked records, per "infoHash:filename", when playback of that file
+	// last started a forward walk (see tryMarkWalked). Separate from
+	// triggered because a file the walk already burst-cached is marked
+	// there, yet playing it must still move the walk's window forward.
+	// Guarded by mu; pruned with triggered.
+	walked map[string]time.Time
+
+	// walks holds the forward walk running for each Sonarr series+season
+	// (see walkKey), so a second trigger in the same season extends the
+	// running walk's target instead of starting a parallel one. Guarded by
+	// walksMu.
+	walksMu sync.Mutex
+	walks   map[string]*forwardWalk
+
 	// paused/pausedKeys are runtime-only pause controls (SetPaused/
 	// SetKeyPaused), guarded by mu alongside triggered. Neither is
 	// persisted - they reset to false/empty on restart. The durable switch
@@ -149,6 +163,8 @@ func NewPrecache(m *Manager) *Precache {
 		manager:            m,
 		logger:             logger.New("precache"),
 		triggered:          make(map[string]time.Time),
+		walked:             make(map[string]time.Time),
+		walks:              make(map[string]*forwardWalk),
 		pausedKeys:         make(map[string]struct{}),
 		denyLogged:         make(map[string]struct{}),
 		progressSkipLogged: make(map[string]string),
@@ -225,9 +241,6 @@ func (p *Precache) checkSessionProgress() {
 		return
 	}
 	pc := p.cfg()
-	if pc.MaxBytes() <= 0 {
-		return
-	}
 	if p.Paused() {
 		return
 	}
@@ -260,11 +273,17 @@ func (p *Precache) checkSessionProgress() {
 		}
 		key := entry.InfoHash + ":" + filename
 		if !p.tryMarkTriggered(key) {
+			// Already burst-cached (usually by the walk itself): no second
+			// burst, but playing it still moves the walk's window forward.
+			if p.tryMarkWalked(key) {
+				go p.maybePrecacheNextEpisodes(entry, filename)
+			}
 			p.progressSkip(path, "already-triggered").
 				Str("entry", entry.Name).Str("file", filename).
 				Msg("progress trigger skipped: already triggered")
 			continue
 		}
+		p.tryMarkWalked(key) // readAhead walks forward once its burst ends
 		p.mu.Lock()
 		delete(p.progressSkipLogged, path)
 		p.mu.Unlock()
@@ -372,15 +391,6 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		return
 	}
 	cfg := p.cfg()
-	if cfg.MaxBytes() <= 0 {
-		// An explicit PrecacheMaxBytes of 0 disables pre-caching's footprint
-		// entirely (see PrecacheMaxBytes's doc comment) - equivalent to the
-		// master toggle being off, so no read-ahead burst starts either, not
-		// just next-episode bursts (which reserveBudget already gates on its
-		// own).
-		p.logGateDeny(key, "max_bytes", entry.Name, filename)
-		return
-	}
 	if !p.plexChecker.isPlexWatching(entry, filename) {
 		// Plex gate configured and this file isn't part of an active
 		// playing session (e.g. a library scan or thumbnail-generation
@@ -401,8 +411,14 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 	}
 
 	if !p.tryMarkTriggered(key) {
+		// See checkSessionProgress: a burst-cached file still extends the
+		// walk once when it is played.
+		if p.tryMarkWalked(key) {
+			go p.maybePrecacheNextEpisodes(entry, filename)
+		}
 		return
 	}
+	p.tryMarkWalked(key) // readAhead walks forward once its burst ends
 
 	go p.readAhead(entry, filename, start, size)
 }
@@ -432,6 +448,37 @@ func (p *Precache) pruneLocked(now time.Time) {
 			delete(p.triggered, k)
 		}
 	}
+	for k, t := range p.walked {
+		if now.Sub(t) > precacheTriggeredTTL {
+			delete(p.walked, k)
+		}
+	}
+}
+
+// tryMarkWalked is tryMarkTriggered's counterpart for the forward walk: true
+// the first time playback of key asks for a walk, so a file whose burst
+// already ran (triggered is set) still moves the walk forward once when it
+// is played, and the 15 s progress poll or every cache miss doesn't start
+// another.
+func (p *Precache) tryMarkWalked(key string) bool {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, done := p.walked[key]; done {
+		return false
+	}
+	p.walked[key] = now
+	p.pruneLocked(now)
+	return true
+}
+
+// untrigger forgets key in triggered, for a burst that was claimed but never
+// started (budget or bandwidth), so a later walk or its own playback can
+// still burst it.
+func (p *Precache) untrigger(key string) {
+	p.mu.Lock()
+	delete(p.triggered, key)
+	p.mu.Unlock()
 }
 
 // SetPaused sets or clears the global runtime pause - see the paused field's
@@ -750,6 +797,7 @@ type PrecacheSummary struct {
 	ThresholdPercent     int   `json:"threshold_percent"`
 	ReadAheadConcurrency int   `json:"read_ahead_concurrency"`
 	NextEpisodes         int   `json:"next_episodes"`
+	WholeSeason          bool  `json:"whole_season"`
 	EvictAfterWatched    bool  `json:"evict_after_watched"`
 	PrecachedBytes       int64 `json:"precached_bytes"`
 	MaxBytes             int64 `json:"max_bytes"`
@@ -822,6 +870,7 @@ func (p *Precache) Summary() PrecacheSummary {
 		ThresholdPercent:     cfg.ThresholdPercent(),
 		ReadAheadConcurrency: cfg.ReadAheadConcurrency(),
 		NextEpisodes:         cfg.NextEpisodes(),
+		WholeSeason:          cfg.WholeSeason(),
 		EvictAfterWatched:    cfg.PrecacheEvictAfterWatched,
 		PrecachedBytes:       p.precachedBytes.Load(),
 		MaxBytes:             cfg.MaxBytes(),

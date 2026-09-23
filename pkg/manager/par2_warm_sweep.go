@@ -55,18 +55,6 @@ const (
 	// par2WarmSweepPollInterval paces the StartedAt-guarded poll for RunNow's
 	// job to reach a terminal phase.
 	par2WarmSweepPollInterval = 1 * time.Second
-
-	// par2WarmSweepPollTimeout bounds how long the sweep will wait on one
-	// entry's warm-gated solve before giving up and falling through to the
-	// regrab path. Well under par2JobTimeout: everything this pass needs was
-	// already proven alive/resident by the preflight, so a healthy run
-	// should finish in a small fraction of that budget - a run that doesn't
-	// is exactly the kind of stall the sweep shouldn't block an entire pass
-	// on. The job itself is untouched by this timeout; it keeps running
-	// under Par2Repair's own lifecycle (and will reach its own terminal
-	// phase, or par2JobTimeout/watchIdle will end it) even if this function
-	// gives up on waiting for it.
-	par2WarmSweepPollTimeout = 5 * time.Minute
 )
 
 // errWarmSweepNoFetch is returned by the stub articleFetchFunc handed to
@@ -283,28 +271,9 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 
 	// Every intact slice this pass needs is already on disk, and recovery
 	// data was just confirmed alive - safe to actually solve it now.
-	prior, _ := p.Progress(nzbID)
-	priorStart := prior.StartedAt
-	if err := p.RunNow(nzbID); err != nil {
-		return false
-	}
-
-	deadline := time.Now().Add(par2WarmSweepPollTimeout)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			return false
-		}
-		if snap, ok := p.Progress(nzbID); ok && snap.StartedAt.After(priorStart) {
-			switch snap.Phase {
-			case Par2PhaseCompleted:
-				return true
-			case Par2PhaseFailed:
-				return false
-			}
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(par2WarmSweepPollInterval)
-	}
+	//
+	// Waits for the pass to end, however long it takes. This used to give
+	// up after 5 minutes and return false, and the caller then re-grabbed -
+	// deleting the entry while the still-running pass wrote its patches.
+	return p.runNowAndWait(ctx, nzbID)
 }

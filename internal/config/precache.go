@@ -14,45 +14,38 @@ type PrecacheConfig struct {
 	// Default 10.
 	PrecacheThresholdPercent int `json:"precache_threshold_percent,omitempty"`
 
-	// PrecacheReadAheadConcurrency bounds how many segments the read-ahead
-	// pass fetches in parallel for the remainder of a playing file -
-	// distinct from (and typically higher than) normal streaming prefetch
-	// concurrency, since read-ahead is a deliberate burst racing playback,
-	// not steady-state streaming. Default 12.
+	// PrecacheReadAheadConcurrency is no longer read: bursts use
+	// Usenet.MaxConnections (Settings > Usenet > Max Connections Per File),
+	// the per-file connection count playback uses - see ReadAheadConcurrency.
+	// Kept so an older config.json still parses.
 	PrecacheReadAheadConcurrency int `json:"precache_read_ahead_concurrency,omitempty"`
 
-	// PrecacheNextEpisodes is how many upcoming episodes (same series, next
-	// episode number, same season only) to burst-download and repair ahead
-	// of time once the current episode crosses the threshold. *int so 0 can
-	// mean "explicitly disabled" forever, not just before the first
-	// migration - nil defaults to 1. Movies have no "next episode"; this only
-	// applies to Sonarr-tracked episode files (see
-	// RepairConfig.PrecacheReadAhead for the movies' read-ahead equivalent).
+	// PrecacheNextEpisodes is how many upcoming episodes (same series, same
+	// season) to burst-download and repair ahead of the one playing, once it
+	// crosses the threshold. Ignored while PrecacheWholeSeason is on. *int so
+	// 0 can mean "explicitly disabled" - nil defaults to 1. Movies have no
+	// "next episode"; this only applies to Sonarr-tracked episode files.
 	PrecacheNextEpisodes *int `json:"precache_next_episodes,omitempty"`
+
+	// PrecacheWholeSeason, when on, walks forward to the end of the playing
+	// episode's season instead of stopping PrecacheNextEpisodes ahead. *bool
+	// so unset means on: before this field existed the walk always ran to the
+	// season's end (every finished burst restarted it at full depth), and an
+	// upgrade must not quietly shorten it.
+	PrecacheWholeSeason *bool `json:"precache_whole_season,omitempty"`
 
 	// PrecacheEvictAfterWatched, when true, reclaims a pre-cached next
 	// episode's disk footprint as soon as it has actually been watched,
 	// instead of leaving it to the normal cache idle-timeout.
 	PrecacheEvictAfterWatched bool `json:"precache_evict_after_watched,omitempty"`
 
-	// PrecacheMaxBytes caps the total on-disk footprint this feature will
-	// proactively hold at once (read-ahead bursts plus next-episode
-	// pre-caches) - this directly fights the project's minimal-storage goal,
-	// so it MUST stay bounded. *int64, same convention as PrecacheNextEpisodes,
-	// so an explicit 0 is distinguishable from unset: nil falls back to a
-	// conservative default (precacheDefaultMaxBytes), an explicit 0 disables
-	// pre-caching's footprint entirely (equivalent to turning
-	// RepairConfig.PrecacheReadAhead off - see Precache.Observe, which
-	// short-circuits before any durable write when MaxBytes()<=0), and any
-	// other value is clamped to [0, precacheMaxBytesCeiling] on every save
-	// (see Config.applyPrecacheDefaults). The ceiling is a fat-finger
-	// backstop, not the real guard - reserveBudget/HasBandwidthHeadroom
-	// accounting in pkg/manager.Precache is what actually enforces the cap
-	// live, checked before a next-episode burst starts and therefore before
-	// any bytes it fetches can be durably written into the DFS cache (see
-	// Precache.persistCleanRanges) - a released reservation does not mean
-	// those durable bytes were deleted, though; the DFS cache's own
-	// eviction (unrelated to this cap) is what eventually reclaims them.
+	// PrecacheMaxBytes bounds the bytes next-episode bursts hold reserved at
+	// once. A reservation is released as soon as its burst ends (or, with
+	// PrecacheEvictAfterWatched, once the episode is watched), so this is not
+	// a disk-footprint cap - the DFS cache's own eviction is what bounds
+	// disk. No longer on the Repair page. nil or <= 0 means
+	// precacheMaxBytesCeiling, and larger values are clamped to it. It never
+	// turns pre-caching off: RepairConfig.PrecacheReadAhead is the switch.
 	PrecacheMaxBytes *int64 `json:"precache_max_bytes,omitempty"`
 
 	// PrecacheYieldToPlayback pauses read-ahead bursts on other files while a
@@ -67,6 +60,7 @@ func (p PrecacheConfig) IsZero() bool {
 	return p.PrecacheThresholdPercent == 0 &&
 		p.PrecacheReadAheadConcurrency == 0 &&
 		p.PrecacheNextEpisodes == nil &&
+		p.PrecacheWholeSeason == nil &&
 		!p.PrecacheEvictAfterWatched &&
 		p.PrecacheMaxBytes == nil &&
 		p.PrecacheYieldToPlayback == nil
@@ -87,13 +81,32 @@ func (p PrecacheConfig) ThresholdPercent() int {
 	return p.PrecacheThresholdPercent
 }
 
-// ReadAheadConcurrency returns the configured concurrency, defaulting to 12
-// when unset/non-positive.
+// ReadAheadConcurrency returns how many segments a burst fetches at once:
+// Usenet.MaxConnections (Settings > Usenet > Max Connections Per File), the
+// per-file connection count playback uses. Each in-flight segment holds one
+// connection, so segments in parallel and connections are the same number.
+// PrecacheReadAheadConcurrency is not consulted - applyPrecacheDefaults used
+// to write 12 into every saved config, so honouring it would always win.
 func (p PrecacheConfig) ReadAheadConcurrency() int {
-	if p.PrecacheReadAheadConcurrency > 0 {
-		return p.PrecacheReadAheadConcurrency
+	if n := Get().Usenet.MaxConnections; n > 0 {
+		return n
 	}
-	return 12
+	return 15
+}
+
+// WholeSeason reports whether the forward walk runs to the end of the
+// season, defaulting to true when unset (see PrecacheWholeSeason).
+func (p PrecacheConfig) WholeSeason() bool {
+	return p.PrecacheWholeSeason == nil || *p.PrecacheWholeSeason
+}
+
+// EpisodesAhead is how far the forward walk goes: -1 for the rest of the
+// season, otherwise NextEpisodes (0 disables it).
+func (p PrecacheConfig) EpisodesAhead() int {
+	if p.WholeSeason() {
+		return -1
+	}
+	return p.NextEpisodes()
 }
 
 // NextEpisodes returns how many episodes ahead to pre-cache, defaulting to 1
@@ -108,29 +121,15 @@ func (p PrecacheConfig) NextEpisodes() int {
 	return *p.PrecacheNextEpisodes
 }
 
-// precacheDefaultMaxBytes is used when PrecacheMaxBytes is unset - conservative
-// on purpose (see PrecacheMaxBytes's doc comment).
-const precacheDefaultMaxBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
-
-// precacheMaxBytesCeiling is the hard upper bound PrecacheMaxBytes is clamped
-// to on every save - see PrecacheMaxBytes's doc comment.
+// precacheMaxBytesCeiling is both the default and the upper bound for
+// PrecacheMaxBytes - see its doc comment.
 const precacheMaxBytesCeiling = 256 * 1024 * 1024 * 1024 // 256 GiB
 
-// MaxBytes returns the configured cap in bytes: nil (unset) defaults to
-// precacheDefaultMaxBytes, an explicit 0 (or negative) disables pre-caching's
-// footprint, and anything else is clamped to precacheMaxBytesCeiling. Values
-// are already clamped at save time (Config.applyPrecacheDefaults); this
-// clamp is defensive for configs constructed directly (e.g. in tests).
+// MaxBytes returns the reservation bound in bytes: nil or <= 0 means
+// precacheMaxBytesCeiling, and anything larger is clamped to it.
 func (p PrecacheConfig) MaxBytes() int64 {
-	if p.PrecacheMaxBytes == nil {
-		return precacheDefaultMaxBytes
-	}
-	v := *p.PrecacheMaxBytes
-	if v <= 0 {
-		return 0
-	}
-	if v > precacheMaxBytesCeiling {
+	if p.PrecacheMaxBytes == nil || *p.PrecacheMaxBytes <= 0 || *p.PrecacheMaxBytes > precacheMaxBytesCeiling {
 		return precacheMaxBytesCeiling
 	}
-	return v
+	return *p.PrecacheMaxBytes
 }

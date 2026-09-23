@@ -90,6 +90,7 @@ func TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend(t *testing.T) 
 	live.Repair.FFProbeTimeout = "120s"
 	live.Repair.CleanupSuperseded = true
 	live.Repair.Par2UrgentConcurrency = 5
+	live.Repair.Par2RepairOnSweep = true
 
 	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
 	body := `{"bind_address":"0.0.0.0","port":"8282","download_folder":"/tmp/downloads",
@@ -101,7 +102,7 @@ func TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend(t *testing.T) 
 	}
 
 	r := persistedRepair(t)
-	if r.FFProbePath != "/opt/ffmpeg/ffprobe" || r.FFProbeTimeout != "120s" || !r.CleanupSuperseded || r.Par2UrgentConcurrency != 5 {
+	if r.FFProbePath != "/opt/ffmpeg/ffprobe" || r.FFProbeTimeout != "120s" || !r.CleanupSuperseded || r.Par2UrgentConcurrency != 5 || !r.Par2RepairOnSweep {
 		t.Errorf("repair settings the form does not send were reset: %+v", r)
 	}
 	if r.Workers != 3 || !r.AutoRepair || r.Schedule != "23:10" {
@@ -134,6 +135,42 @@ func TestHandleUpdateRepairConfig_PartialBodyKeepsOtherRepairSettings(t *testing
 	}
 	if r.PadMaxRunSegments != 4 || r.Par2RepairMode != "auto_threshold" || r.Par2RepairMinSegments != 32 {
 		t.Errorf("sent fields not applied: %+v", r)
+	}
+}
+
+// The pre-cache form sends only its own fields; the rest of the pre-cache
+// settings keep their values instead of resetting (the endpoint used to
+// replace the whole block with the body).
+func TestHandleUpdatePrecacheConfig_PartialBodyKeepsOtherSettings(t *testing.T) {
+	live := config.Get()
+	saved := live.Precache
+	t.Cleanup(func() { config.Get().Precache = saved })
+	off := false
+	capBytes := int64(42 << 30)
+	live.Precache.PrecacheYieldToPlayback = &off
+	live.Precache.PrecacheEvictAfterWatched = true
+	live.Precache.PrecacheMaxBytes = &capBytes
+
+	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	body := `{"precache_threshold_percent":20,"precache_whole_season":false,"precache_next_episodes":3}`
+	rec := httptest.NewRecorder()
+	s.handleUpdatePrecacheConfig(rec, httptest.NewRequest(http.MethodPut, "/api/precache/config", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	p := config.Get().Precache
+	if p.YieldToPlayback() || !p.PrecacheEvictAfterWatched || p.MaxBytes() != capBytes {
+		t.Errorf("pre-cache settings outside the form were reset: %+v", p)
+	}
+	if p.ThresholdPercent() != 20 || p.WholeSeason() || p.EpisodesAhead() != 3 {
+		t.Errorf("sent fields not applied: threshold=%d wholeSeason=%v ahead=%d", p.ThresholdPercent(), p.WholeSeason(), p.EpisodesAhead())
+	}
+
+	rec = httptest.NewRecorder()
+	s.handleUpdatePrecacheConfig(rec, httptest.NewRequest(http.MethodPut, "/api/precache/config", strings.NewReader(`{"precache_next_episodes":99}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("precache_next_episodes=99: status = %d, want 400", rec.Code)
 	}
 }
 

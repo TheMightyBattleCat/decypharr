@@ -6,13 +6,11 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 )
 
-// TestReserveBudgetDeniesWhenCapDisabled proves PrecacheMaxBytes=0 (the "0 =
-// disabled" cap from the Block 1 UI work) blocks a next-episode burst's
-// budget reservation - the gate precacheEpisodeFile checks BEFORE
-// ReadAhead/persistCleanRanges ever run, so no durable write can happen
-// when the cap is disabled, without needing a real DFS mount/usenet client
-// to prove it.
-func TestReserveBudgetDeniesWhenCapDisabled(t *testing.T) {
+// TestReserveBudgetZeroCapIsCeiling: the cap left the Repair page, so a saved
+// PrecacheMaxBytes of 0 no longer disables next-episode bursts - it means the
+// 256 GiB ceiling. Otherwise a value the user can no longer see would switch
+// pre-caching off while its toggle shows on.
+func TestReserveBudgetZeroCapIsCeiling(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	t.Cleanup(config.Reset)
 
@@ -21,8 +19,8 @@ func TestReserveBudgetDeniesWhenCapDisabled(t *testing.T) {
 	cfg.Precache.PrecacheMaxBytes = &zero
 
 	p := &Precache{}
-	if p.reserveBudget(1024) {
-		t.Fatalf("reserveBudget(1024) = true with PrecacheMaxBytes=0 (disabled), want false")
+	if !p.reserveBudget(1024) {
+		t.Fatalf("reserveBudget(1024) = false with PrecacheMaxBytes=0, want true (0 means the ceiling)")
 	}
 }
 
