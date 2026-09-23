@@ -47,7 +47,9 @@ func coldSweepEligible(cfg config.RepairConfig, reason string, filePending, rele
 // pass coldSweepEligible, returning the InfoHash values whose pass completed.
 // Passes run one at a time across the whole sweep (coldPar2Slot): each reads
 // a full release from Usenet, and the sweep's workers would otherwise start
-// several at once. A release whose pass did not complete has its handler
+// several at once. This runs inside a probe worker, so when several damaged
+// releases qualify, workers queue for the slot and the sweep slows to one
+// repair at a time. A release whose pass did not complete has its handler
 // claim put back to handlerRegrab, so the re-grab that follows, and
 // releaseRegrabClaims after it, see the claim routeAutoRepair made.
 func (r *Repair) coldSweepRepair(ctx context.Context, broken []storage.BrokenFile) map[string]struct{} {
@@ -59,6 +61,9 @@ func (r *Repair) coldSweepRepair(ctx context.Context, broken []storage.BrokenFil
 	cfg := config.Get().Repair
 	if !cfg.Par2RepairOnSweep {
 		return fixed
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	tried := make(map[string]struct{})
@@ -107,6 +112,31 @@ func (r *Repair) coldSweepRepair(ctx context.Context, broken []storage.BrokenFil
 	return fixed
 }
 
+// waitForInFlightPass waits until no pass for nzbID is running or queued,
+// then reports whether it left the release repaired: nothing pending in the
+// overlay. Judged by outcome rather than progress record, because a pass
+// still queued when the wait began has no record yet and the latest one
+// belongs to an older pass. False if ctx ends first.
+func (p *Par2Repair) waitForInFlightPass(ctx context.Context, nzbID string) bool {
+	for p.IsRunning(nzbID) || p.IsQueued(nzbID) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(par2WarmSweepPollInterval):
+		}
+	}
+	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		return false
+	}
+	for _, segs := range pending {
+		if len(segs) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // acquireColdPar2Slot takes coldPar2Slot, giving up if ctx ends first.
 func (r *Repair) acquireColdPar2Slot(ctx context.Context) bool {
 	for !r.coldPar2Slot.TryLock() {
@@ -134,7 +164,12 @@ func (p *Par2Repair) runNowAndWait(ctx context.Context, nzbID string) bool {
 	prior, _ := p.Progress(nzbID)
 	priorStart := prior.StartedAt
 	if err := p.RunNow(nzbID); err != nil {
-		return false
+		if !p.IsRunning(nzbID) && !p.IsQueued(nzbID) {
+			return false
+		}
+		// A pass is already running or queued. Returning false would let
+		// the caller re-grab under it, so wait for it to end.
+		return p.waitForInFlightPass(ctx, nzbID)
 	}
 
 	var idleSince time.Time

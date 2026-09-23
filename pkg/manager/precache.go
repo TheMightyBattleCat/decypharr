@@ -598,7 +598,10 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	}
 
 	p.repairAhead(entry, filename, from)
-	p.maybePrecacheNextEpisodes(entry, filename)
+	// Detached: a whole-season walk runs for hours, and this burst's deferred
+	// unmarkInflight would otherwise keep the playing file "in flight" (and
+	// out of PurgeIncomplete's reach) for all of it.
+	go p.maybePrecacheNextEpisodes(entry, filename)
 }
 
 // repairAhead checks whether the read-ahead pass left any damage pending for

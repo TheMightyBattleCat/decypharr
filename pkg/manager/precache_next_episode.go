@@ -232,6 +232,7 @@ func (p *Precache) precacheForwardWalk(ident walkIdentity, key string, w *forwar
 	// shutdown), so the log shows how far ahead the season actually got
 	// warmed rather than just a scatter of per-episode lines.
 	var burstsRun, searchesRequested, skipped int
+	deferred := false
 	walkStart := time.Now()
 	defer func() {
 		p.walksMu.Lock()
@@ -244,6 +245,7 @@ func (p *Precache) precacheForwardWalk(ident walkIdentity, key string, w *forwar
 			Int("burstsRun", burstsRun).
 			Int("searchesRequested", searchesRequested).
 			Int("skipped", skipped).
+			Bool("deferred", deferred).
 			Dur("elapsed", time.Since(walkStart)).
 			Msg("next-episode precache: forward walk complete")
 	}()
@@ -289,12 +291,19 @@ func (p *Precache) precacheForwardWalk(ident walkIdentity, key string, w *forwar
 		}
 
 		epCtx, cancel := context.WithTimeout(base, precacheNextEpisodeTimeout)
-		if p.precacheEpisodeFile(epCtx, next) {
-			burstsRun++
-		} else {
-			skipped++
-		}
+		step := p.precacheEpisodeFile(epCtx, next)
 		cancel()
+		switch step {
+		case stepBurst:
+			burstsRun++
+		case stepSkipped:
+			skipped++
+		case stepDeferred:
+			// Walking on would warm a later episode while this one stays
+			// cold. Stop; the next episode played starts the walk again.
+			deferred = true
+			return
+		}
 	}
 }
 
@@ -343,27 +352,28 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 // damage - cheap now, since intact slices come from the bytes just cached.
 // Records the outcome for Commit D (notifications/GUI). Best-effort: any
 // failure just means this episode isn't pre-cached, not a hard error.
-// Returns true only when a burst-download was actually started for this
-// file - the caller's forward-walk summary uses this to count episodes
-// genuinely warmed apart from ones skipped for pause/budget/already-done.
-func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) bool {
+// The step result tells the walk whether to go on: stepSkipped (not ours,
+// paused, already done) steps past this episode, stepDeferred (budget or
+// bandwidth) ends the walk so it never warms a later episode while this one
+// stays cold - the next episode played restarts it.
+func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) episodeStep {
 	target := readSymlinkTarget(next.Path)
 	if target == "" {
 		p.logger.Debug().Str("file", next.Path).Msg("next-episode precache: next episode is not a local symlink")
-		return false // not a decypharr-managed symlink (e.g. imported directly)
+		return stepSkipped // not a decypharr-managed symlink (e.g. imported directly)
 	}
 	dir, filename := filepath.Split(target)
 	entryName := filepath.Clean(filepath.Base(filepath.Clean(dir)))
 
 	nextEntry, err := p.manager.GetEntryByName(entryName, filename)
 	if err != nil || nextEntry == nil || nextEntry.Protocol != config.ProtocolNZB {
-		return false // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
+		return stepSkipped // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
 	}
 
 	if p.keyPaused(nextEntry.InfoHash, filename) {
 		p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
 			Msg("next-episode precache skipped: paused")
-		return false
+		return stepSkipped
 	}
 
 	key := nextEntry.InfoHash + ":" + filename
@@ -376,22 +386,22 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	p.mu.Unlock()
 	if already {
 		p.logger.Debug().Str("key", key).Msg("next-episode precache: already triggered for this file")
-		return false
+		return stepSkipped
 	}
 
-	// Both skips below un-claim key: it was claimed above but no burst ran,
-	// and leaving it claimed hid this episode from every later walk - and
-	// from its own read-ahead when played - for precacheTriggeredTTL (6 h).
+	// Both deferrals below un-claim key: it was claimed above but no burst
+	// ran, and leaving it claimed hid this episode from every later walk -
+	// and from its own read-ahead when played - for precacheTriggeredTTL.
 	if !p.reserveBudget(next.Size) {
 		p.untrigger(key)
-		p.logger.Debug().Str("entry", nextEntry.Name).Int64("size", next.Size).Msg("next-episode pre-cache skipped: PrecacheMaxBytes budget exhausted")
-		return false
+		p.logger.Debug().Str("entry", nextEntry.Name).Int64("size", next.Size).Msg("next-episode pre-cache deferred: PrecacheMaxBytes budget exhausted")
+		return stepDeferred
 	}
 	if !p.manager.usenet.HasBandwidthHeadroom() {
 		p.untrigger(key)
 		p.logger.Debug().Str("entry", nextEntry.Name).Msg("next-episode pre-cache deferred: no bandwidth headroom outside reserve")
 		p.releaseBudget(next.Size)
-		return false
+		return stepDeferred
 	}
 
 	// What does the DFS cache already hold for this file? Checked before the
@@ -470,8 +480,17 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 	// next episode itself, and playing this one extends the walk (see
 	// tryMarkWalked). The cascade restarted the walk at full depth after
 	// every burst, so any depth setting ran to the season's end.
-	return true
+	return stepBurst
 }
+
+// episodeStep is precacheEpisodeFile's outcome for the forward walk.
+type episodeStep int
+
+const (
+	stepBurst    episodeStep = iota // a burst ran (or the cache already held it all)
+	stepSkipped                     // nothing to do for this episode; walk on
+	stepDeferred                    // budget or bandwidth said not now; end the walk
+)
 
 // recordReadiness checks for damage the burst-download surfaced, routes it
 // through the live playback-failure policy if so, waits (bounded) for a

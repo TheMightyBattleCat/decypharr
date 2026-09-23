@@ -266,7 +266,7 @@
                         </label>
                         <label id="overlayPar2RepairOnSweepRow"
                                class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-base-300 px-3 py-2"
-                               title="Off (default): a sweep that finds a file with dead segments re-grabs it, unless every byte needed for a PAR2 repair is already in the cache.&#10;&#10;On: the sweep tries a PAR2 repair first, downloading the intact data from Usenet (about as much as a re-grab), and keeps the release if it works. It follows the auto-repair trigger below, runs one repair at a time, and a repair that fails is re-grabbed in the same sweep.&#10;&#10;Needs PAR2 repair on.">
+                               title="Off (default): a sweep that finds a file with dead segments re-grabs it, unless every byte needed for a PAR2 repair is already in the cache.&#10;&#10;On: the sweep tries a PAR2 repair first, downloading the intact data from Usenet (about as much as a re-grab), and keeps the release if it works. It follows the auto-repair trigger below and runs one repair at a time, so a sweep that finds several damaged releases takes longer (each repair can take 20 minutes or more). A repair that fails is re-grabbed in the same sweep.&#10;&#10;Needs PAR2 repair on.">
                             <span>
                                 <span class="block font-medium">PAR2 repair during sweeps <i class="bi bi-info-circle opacity-60"></i></span>
                                 <span class="block text-xs opacity-70">Try PAR2 on damage a sweep finds before re-grabbing; a failed repair is re-grabbed in the same sweep.</span>
