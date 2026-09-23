@@ -660,6 +660,11 @@ func (r *Repair) peekStaleNZBCacheBytesLogged(entryName string) int64 {
 // anything is left after that call, a healthy twin still needs this
 // directory and it must not be touched.
 //
+// A directory with a file open in the DFS cache is left too: removing it
+// would pull the data file out from under a live reader, and the next open
+// of a different grab under this name starts empty anyway (the sidecar
+// records its InfoHash).
+//
 // ok=false (0 bytes, nothing removed) covers every "not safe" and "nothing
 // there" case alike - this must never be treated as a failure; not removing
 // a directory is always safe, removing the wrong one is not.
@@ -678,6 +683,10 @@ func (r *Repair) removeStaleNZBCacheDir(entryName, excludeInfoHash string) (int6
 			return 0, false
 		}
 	}
+	if use, ok := r.manager.MountManager().(dfsEntryCacheUse); ok && use.EntryCacheInUse(entryName) {
+		r.logger.Debug().Str("entry", entryName).Msg("StaleNZB: cache dir has a file open; leaving it")
+		return 0, false
+	}
 
 	path, ok := r.staleNZBCacheDirPath(entryName)
 	if !ok {
@@ -693,6 +702,13 @@ func (r *Repair) removeStaleNZBCacheDir(entryName, excludeInfoHash string) (int6
 		return 0, false
 	}
 	return allocated, true
+}
+
+// dfsEntryCacheUse is satisfied by the DFS mount's MountManager: whether any
+// file under an entry name is open in its cache (see dfsCacheRangeWriter for
+// why this is type-asserted rather than imported).
+type dfsEntryCacheUse interface {
+	EntryCacheInUse(entryName string) bool
 }
 
 // RemoveEntryCacheDir removes the DFS cache directory for a single entry,

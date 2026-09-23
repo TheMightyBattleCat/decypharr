@@ -147,6 +147,13 @@ func (m *Manager) PurgeCache() (map[string]any, error) {
 	return m.vfs.PurgeCache(), nil
 }
 
+// EntryCacheInUse reports whether any file under entryName is open in the
+// VFS cache - see vfs.Manager.EntryCacheInUse. False when there is no VFS
+// mount.
+func (m *Manager) EntryCacheInUse(entryName string) bool {
+	return m.vfs != nil && m.vfs.EntryCacheInUse(entryName)
+}
+
 // PeekCachedRange reads [off, off+len(p)) of filename's cache item under
 // entryName directly from local disk, if already fully cached - see
 // vfs.Manager.PeekCachedRange. Never creates a cache item or triggers a

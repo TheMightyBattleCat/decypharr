@@ -227,6 +227,12 @@ func (m *Manager) PurgeCache() map[string]any {
 	return m.cache.PurgeCache()
 }
 
+// EntryCacheInUse reports whether any file under entryName is open in the
+// cache - see Cache.EntryInUse.
+func (m *Manager) EntryCacheInUse(entryName string) bool {
+	return m.cache != nil && m.cache.EntryInUse(entryName)
+}
+
 // PeekCachedRange reads [off, off+len(p)) of filename's cache item under
 // entryName directly from local disk, if already fully cached - see
 // Cache.PeekItem / CacheItem.ReadCachedRange. Never creates a cache item or

@@ -773,7 +773,22 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	// Entry is gone for good - forget any library paths recorded for it.
 	m.arrLibraryMap.removeEntry(torr.Name)
 
-	return m.storage.Delete(infohash)
+	if err := m.storage.Delete(infohash); err != nil {
+		return err
+	}
+
+	// Its DFS cache too. Before this only the stale-NZB sweep and the manual
+	// reclaim routes freed it, so every re-grab left the old grab's cached
+	// bytes behind. RemoveEntryCacheDir leaves the directory when a
+	// same-name entry still claims it or a file in it is open; the sidecar's
+	// InfoHash keeps a replacement from reading the old bytes either way.
+	if torr.IsNZB() && m.repair != nil {
+		if freed, ok := m.repair.RemoveEntryCacheDir(torr.GetFolder(), infohash); ok {
+			m.logger.Debug().Str("entry", torr.Name).Str("infohash", infohash).Int64("bytes_freed", freed).
+				Msg("Removed DFS cache dir for deleted entry")
+		}
+	}
+	return nil
 }
 
 func (m *Manager) DeleteTorrents(infohashes []string, removeFromDebrid bool) error {

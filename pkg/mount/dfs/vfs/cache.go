@@ -57,6 +57,11 @@ type Cache struct {
 
 	manager *manager.Manager
 
+	// identity resolves the grab currently served under (entryName,
+	// filename) - see currentIdentity. nil means ask manager; tests set it
+	// because they cannot build a *manager.Manager.
+	identity func(entryName, filename string) (infoHash string, size int64, ok bool)
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -210,6 +215,22 @@ func (c *Cache) GetItem(entryName, filename string, fileSize int64) (*CacheItem,
 	return item, nil
 }
 
+// EntryInUse reports whether any file under entryName has a cache item with
+// an open handle. Removing an entry's cache directory under one would pull
+// the data file out from under a live reader.
+func (c *Cache) EntryInUse(entryName string) bool {
+	prefix := entryName + "/"
+	inUse := false
+	c.items.Range(func(key string, item *CacheItem) bool {
+		if strings.HasPrefix(key, prefix) && item.opens.Load() > 0 {
+			inUse = true
+			return false
+		}
+		return true
+	})
+	return inUse
+}
+
 // PeekItem returns the already-open cache item for (entryName, filename), if
 // one exists right now, WITHOUT creating one - unlike GetItem, this never
 // allocates a new backing cache file or registers a new map entry. ok=false
@@ -234,11 +255,11 @@ func (c *Cache) PeekItem(entryName, filename string) (*CacheItem, bool) {
 // no live in-memory item (never opened this process, or evicted). This is
 // what lets a cache-coverage query find bytes a prior run already cached,
 // before anything reopens the file this run. ok=false if no metadata file
-// exists or its declared size is 0.
+// exists, its declared size is 0, or it was left by a different grab of the
+// same name (see sidecarBelongsTo).
 func (c *Cache) DiskCoverage(entryName, filename string) (cached, total int64, modTime time.Time, ok bool) {
-	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
-	var info ItemInfo
-	if err := decodeJSONFile(metaPath, &info); err != nil || info.Size == 0 {
+	info, ok := c.diskSidecar(entryName, filename)
+	if !ok {
 		return 0, 0, time.Time{}, false
 	}
 	return info.Rs.Size(), info.Size, info.ModTime, true
@@ -249,9 +270,8 @@ func (c *Cache) DiskCoverage(entryName, filename string) (cached, total int64, m
 // counterpart, for a file not open in this process. False when there is no
 // sidecar.
 func (c *Cache) DiskHasRange(entryName, filename string, off, length int64) bool {
-	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
-	var info ItemInfo
-	if err := decodeJSONFile(metaPath, &info); err != nil || info.Size == 0 {
+	info, ok := c.diskSidecar(entryName, filename)
+	if !ok {
 		return false
 	}
 	return info.Rs.Present(ranges.Range{Pos: off, Size: length})
@@ -534,12 +554,16 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	cachePath := filepath.Join(itemDir, filename)
 	metaPath := filepath.Join(itemDir, filename+".json")
 
+	entry, err := c.manager.GetEntryByName(entryName, filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get storage entry: %w", err)
+	}
+
 	// Load existing metadata before constructing the buffer so its range
 	// tracker is seeded with anything the prior session persisted.
-	var info ItemInfo
-	if err := decodeJSONFile(metaPath, &info); err != nil && !os.IsNotExist(err) {
-		c.logger.Warn().Err(err).Str("key", key).Msg("corrupt metadata, resetting")
-		info = ItemInfo{}
+	info, err := c.loadSidecar(key, entryName, filename, metaPath, cachePath, entry.InfoHash, fileSize)
+	if err != nil {
+		return nil, err
 	}
 
 	// Defend against a directory accidentally sitting at cachePath
@@ -603,11 +627,6 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	info.ATime = utils.Now()
 	_logger := c.logger.With().Str("entry", entryName).Str("filename", filename).Logger()
 	log := logger.NewRateLimitedLogger(logger.WithLogger(_logger))
-	entry, err := c.manager.GetEntryByName(entryName, filename)
-	if err != nil {
-		_ = buf.Close()
-		return nil, fmt.Errorf("failed to get storage entry: %w", err)
-	}
 
 	item = &CacheItem{
 		cache:    c,
@@ -624,6 +643,32 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	item.startMetaWriter()
 	item.markMetadataDirty()
 	return item, nil
+}
+
+// loadSidecar reads the metadata newItem seeds a cache item from. A missing
+// or corrupt sidecar yields an empty one. So does a sidecar left by a
+// different grab that shared this release name, and then its data file is
+// removed too: seeding those bytes would serve the old copy - with any
+// zero-fill its playback persisted - as this one. The result is stamped with
+// infoHash.
+func (c *Cache) loadSidecar(key, entryName, filename, metaPath, cachePath, infoHash string, fileSize int64) (ItemInfo, error) {
+	var info ItemInfo
+	if err := decodeJSONFile(metaPath, &info); err != nil && !os.IsNotExist(err) {
+		c.logger.Warn().Err(err).Str("key", key).Msg("corrupt metadata, resetting")
+		info = ItemInfo{}
+	}
+	if !sidecarBelongsTo(info, infoHash, fileSize) {
+		c.logger.Info().Str("entry", entryName).Str("file", filename).
+			Str("old_info_hash", info.InfoHash).Str("info_hash", infoHash).
+			Int64("old_size", info.Size).Int64("size", fileSize).
+			Msg("Cache held a different grab of this file; starting it empty")
+		info = ItemInfo{}
+		if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+			return ItemInfo{}, fmt.Errorf("failed to remove stale cache data: %w", err)
+		}
+	}
+	info.InfoHash = infoHash
+	return info, nil
 }
 
 // evictLoop runs periodic evict
@@ -1151,10 +1196,65 @@ func (item *CacheItem) flushMetadata(force bool) {
 
 // ItemInfo is persisted to disk
 type ItemInfo struct {
-	Size    int64         `json:"size"`
-	Rs      ranges.Ranges `json:"ranges"` // Downloaded regions
-	ModTime time.Time     `json:"mod_time"`
-	ATime   time.Time     `json:"atime"`
+	// InfoHash is the grab these bytes came from. The cache is keyed by
+	// entry name, and a re-grab usually keeps the release name (299 of 383
+	// on a production install), so without it a replacement inherited the old grab's
+	// ranges - zero-fill a playback padded included. Empty in sidecars
+	// written before it existed; see sidecarBelongsTo.
+	InfoHash string        `json:"info_hash,omitempty"`
+	Size     int64         `json:"size"`
+	Rs       ranges.Ranges `json:"ranges"` // Downloaded regions
+	ModTime  time.Time     `json:"mod_time"`
+	ATime    time.Time     `json:"atime"`
+}
+
+// sidecarBelongsTo reports whether a persisted sidecar describes the grab
+// now served under its name: the same InfoHash when both are known, and the
+// same size when both are known. The size check is what catches a sidecar
+// written before InfoHash was recorded.
+func sidecarBelongsTo(info ItemInfo, infoHash string, size int64) bool {
+	if info.InfoHash != "" && infoHash != "" && info.InfoHash != infoHash {
+		return false
+	}
+	if info.Size > 0 && size > 0 && info.Size != size {
+		return false
+	}
+	return true
+}
+
+// currentIdentity returns the InfoHash and size of the file now served as
+// filename under entryName. ok=false when it can't be resolved, and callers
+// then trust the sidecar as before.
+func (c *Cache) currentIdentity(entryName, filename string) (infoHash string, size int64, ok bool) {
+	if c.identity != nil {
+		return c.identity(entryName, filename)
+	}
+	if c.manager == nil {
+		return "", 0, false
+	}
+	entry, err := c.manager.GetEntryByName(entryName, filename)
+	if err != nil || entry == nil {
+		return "", 0, false
+	}
+	var fileSize int64
+	if f, ok := entry.Files[filename]; ok && f != nil {
+		fileSize = f.Size
+	}
+	return entry.InfoHash, fileSize, true
+}
+
+// diskSidecar reads filename's sidecar under entryName, or ok=false when it
+// is missing, empty, or left by a different grab of the same name.
+func (c *Cache) diskSidecar(entryName, filename string) (ItemInfo, bool) {
+	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
+	var info ItemInfo
+	if err := decodeJSONFile(metaPath, &info); err != nil || info.Size == 0 {
+		return ItemInfo{}, false
+	}
+	if hash, size, ok := c.currentIdentity(entryName, filename); ok && !sidecarBelongsTo(info, hash, size) {
+		return ItemInfo{}, false
+	}
+	return info, true
 }
 
 // touch updates access time
