@@ -390,6 +390,14 @@ func (h *Handle) PatchBytes(file string, segIndex int) ([]byte, bool) {
 	return h.store.PatchBytes(h.nzbID, file, segIndex)
 }
 
+// PatchedSegments returns the indices of file's patched segments.
+func (h *Handle) PatchedSegments(file string) []int {
+	if h == nil {
+		return nil
+	}
+	return h.store.PatchedSegments(h.nzbID, file)
+}
+
 func (h *Handle) WritePatch(file string, segIndex int, data []byte) error {
 	if h == nil {
 		return fmt.Errorf("overlay: nil handle")
@@ -620,6 +628,29 @@ func (s *Store) PatchBytes(nzbID, file string, segIndex int) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// PatchedSegments returns the indices of file's segments PAR2 has written a
+// patch for (one manifest read).
+func (s *Store) PatchedSegments(nzbID, file string) []int {
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	m, err := s.loadManifestLocked(nzbID)
+	mu.Unlock()
+	if err != nil {
+		return nil
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return nil
+	}
+	var out []int
+	for _, d := range fe.DeadSegments {
+		if d.Status == StatusPatched {
+			out = append(out, d.Index)
+		}
+	}
+	return out
 }
 
 // WritePatch stores repaired bytes for segIndex and marks it patched. Called

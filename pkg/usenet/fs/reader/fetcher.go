@@ -130,6 +130,12 @@ type SegmentFetcher struct {
 	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
 	prefetchWg     sync.WaitGroup
 
+	// patched has one bit per segment the overlay holds a PAR2 patch for:
+	// seeded when the fetcher is built, set by MarkPatched when a repair
+	// lands on this live reader. doFetch serves those from the patch
+	// without asking any provider - see servePatch.
+	patched []atomic.Uint64
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -184,8 +190,12 @@ func NewSegmentFetcher(
 		// very large NZBs: 100k segments consume about 12 KiB, versus roughly
 		// 400 KiB for one atomic.Bool per segment.
 		prefetchQueued: make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
+		patched:        make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
 		ctx:            ctx,
 		cancel:         cancel,
+	}
+	for _, idx := range config.Overlay.PatchedSegments(config.OverlayFile) {
+		sf.MarkPatched(idx)
 	}
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
@@ -286,6 +296,11 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 			return sf.doFetch(ctx, segIdx)
 		}
+	}
+
+	if sf.servePatch(segIdx) {
+		sf.stats.Downloads.Add(1)
+		return nil
 	}
 
 	// Acquire connection slot
@@ -582,6 +597,45 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write zero-fill padding into cache")
 		return false
 	}
+	return true
+}
+
+// MarkPatched records that the overlay now holds a PAR2 patch for segIdx.
+func (sf *SegmentFetcher) MarkPatched(segIdx int) {
+	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
+		return
+	}
+	sf.patched[segIdx>>6].Or(uint64(1) << uint(segIdx&63))
+}
+
+func (sf *SegmentFetcher) isPatched(segIdx int) bool {
+	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
+		return false
+	}
+	return sf.patched[segIdx>>6].Load()&(uint64(1)<<uint(segIdx&63)) != 0
+}
+
+// servePatch puts segIdx's PAR2 patch in the cache, for a segment marked
+// patched, and reports whether it did. A patch is the segment's recovered
+// bytes, so it needs no provider: before this, every read of a patched
+// segment first asked each provider in turn for the dead article (ten on
+// a production install) and only served the patch once all had said 430 - seconds at
+// the playhead, including the first read after a repair landed. Anything
+// that goes wrong here falls back to the normal fetch, which still ends in
+// the patch via handleConfirmedMissing.
+func (sf *SegmentFetcher) servePatch(segIdx int) bool {
+	if !sf.isPatched(segIdx) {
+		return false
+	}
+	patch, ok := sf.config.Overlay.PatchBytes(sf.config.OverlayFile, segIdx)
+	if !ok {
+		return false
+	}
+	if err := sf.cache.Put(segIdx, patch); err != nil {
+		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
+		return false
+	}
+	sf.clearDownloadTimeout(segIdx)
 	return true
 }
 
