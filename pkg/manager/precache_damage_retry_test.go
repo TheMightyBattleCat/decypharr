@@ -74,16 +74,16 @@ func TestAwaitPrecacheRepairRetriesBusyEntry(t *testing.T) {
 		return autoRepairOutcome{acted: true}
 	}
 	polls := 0
-	pending := func() int {
+	pending := func() (int, bool) {
 		polls++
 		if asks >= 3 && polls > 5 {
-			return 0
+			return 0, false
 		}
-		return 4
+		return 4, false
 	}
-	repaired, remaining := awaitPrecacheRepair(context.Background(), time.Second, time.Millisecond, 0, pending, handle)
-	if !repaired || remaining != 0 {
-		t.Fatalf("repaired=%v remaining=%d, want repaired", repaired, remaining)
+	res := awaitPrecacheRepair(context.Background(), time.Second, time.Millisecond, 0, pending, handle)
+	if !res.repaired || res.gone || res.remaining != 0 {
+		t.Fatalf("result = %+v, want repaired", res)
 	}
 	if asks != 3 {
 		t.Fatalf("handle called %d times, want 3 (two retryable no-ops, then acted)", asks)
@@ -93,12 +93,23 @@ func TestAwaitPrecacheRepairRetriesBusyEntry(t *testing.T) {
 func TestAwaitPrecacheRepairDoesNotReaskFinalNoop(t *testing.T) {
 	asks := 0
 	handle := func() autoRepairOutcome { asks++; return autoRepairOutcome{reason: "guard tripped"} }
-	repaired, remaining := awaitPrecacheRepair(context.Background(), 30*time.Millisecond, time.Millisecond, 0,
-		func() int { return 2 }, handle)
-	if repaired || remaining != 2 {
-		t.Fatalf("repaired=%v remaining=%d, want still damaged with 2 pending", repaired, remaining)
+	res := awaitPrecacheRepair(context.Background(), 30*time.Millisecond, time.Millisecond, 0,
+		func() (int, bool) { return 2, false }, handle)
+	if res.repaired || res.gone || res.remaining != 2 {
+		t.Fatalf("result = %+v, want still damaged with 2 pending", res)
 	}
 	if asks != 1 {
 		t.Fatalf("handle called %d times, want 1", asks)
+	}
+}
+
+// A re-grab that deletes the entry also deletes its overlay record, which
+// used to read as "0 pending" - a repair the row then claimed.
+func TestAwaitPrecacheRepairReportsDeletedEntryAsGone(t *testing.T) {
+	res := awaitPrecacheRepair(context.Background(), time.Second, time.Millisecond, 0,
+		func() (int, bool) { return 0, true },
+		func() autoRepairOutcome { return autoRepairOutcome{acted: true, regrab: true} })
+	if !res.gone || res.repaired {
+		t.Fatalf("result = %+v, want gone and not repaired", res)
 	}
 }

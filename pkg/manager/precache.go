@@ -25,6 +25,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -150,8 +151,20 @@ type Precache struct {
 	// is unset.
 	plexChecker *plexSessionChecker
 
+	// rewarmMu/rewarm hold pre-cached episodes that were re-grabbed, keyed
+	// by rewarmKey, until their replacement is imported and warmed - see
+	// rewarmDue.
+	rewarmMu sync.Mutex
+	rewarm   map[string]*rewarmTarget
+
+	// rewarmLookup/rewarmResolve/rewarmBurst replace rewarmDue's Sonarr
+	// lookup, symlink resolution and burst in tests; nil means the real ones.
+	rewarmLookup  func(ctx context.Context, ref walkIdentity) (arr.NextEpisodeInfo, bool, error)
+	rewarmResolve func(next arr.NextEpisodeInfo) (*storage.Entry, string, bool)
+	rewarmBurst   func(ctx context.Context, ref walkIdentity, next arr.NextEpisodeInfo) episodeStep
+
 	// ctx/cancel/wg govern progressTriggerLoop, the Plex playback-progress
-	// poll loop - see Start/Stop.
+	// poll loop, and rewarmLoop - see Start/Stop.
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -171,6 +184,7 @@ func NewPrecache(m *Manager) *Precache {
 		precached:          make(map[string]int64),
 		readiness:          make(map[string]EpisodeReadiness),
 		inflight:           make(map[string]int),
+		rewarm:             make(map[string]*rewarmTarget),
 		plexChecker:        newPlexSessionChecker(m),
 	}
 }
@@ -189,11 +203,12 @@ const precacheProgressPollInterval = 15 * time.Second
 // Start launches progressTriggerLoop, cancellable via ctx or Stop.
 func (p *Precache) Start(ctx context.Context) {
 	p.ctx, p.cancel = context.WithCancel(ctx)
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go p.progressTriggerLoop()
+	go p.rewarmLoop()
 }
 
-// Stop cancels progressTriggerLoop and waits for it to exit.
+// Stop cancels progressTriggerLoop and rewarmLoop and waits for them to exit.
 func (p *Precache) Stop() {
 	if p.cancel != nil {
 		p.cancel()
@@ -850,18 +865,32 @@ func (p *Precache) Summary() PrecacheSummary {
 	// refreshCacheCoverage's doc comment for why a miss never clears an
 	// already-known figure.
 	reader := p.cacheCoverageReader()
+	live := readiness[:0]
+	liveKeys := keys[:0]
+	var gone []string
 	for i := range readiness {
-		p.refreshCacheCoverage(reader, &readiness[i])
-		_, keyPaused := pausedSnap[readiness[i].InfoHash+":"+readiness[i].Filename]
-		readiness[i].Paused = globalPaused || keyPaused
+		r := readiness[i]
+		if !p.refreshReadinessDamage(&r) {
+			gone = append(gone, keys[i])
+			continue
+		}
+		p.refreshCacheCoverage(reader, &r)
+		_, keyPaused := pausedSnap[r.InfoHash+":"+r.Filename]
+		r.Paused = globalPaused || keyPaused
+		live = append(live, r)
+		liveKeys = append(liveKeys, keys[i])
 	}
-	if reader != nil {
-		p.readinessMu.Lock()
-		for i, k := range keys {
+	readiness = live
+	p.readinessMu.Lock()
+	for _, k := range gone {
+		delete(p.readiness, k)
+	}
+	for i, k := range liveKeys {
+		if _, still := p.readiness[k]; still {
 			p.readiness[k] = readiness[i]
 		}
-		p.readinessMu.Unlock()
 	}
+	p.readinessMu.Unlock()
 
 	sort.Slice(readiness, func(i, j int) bool { return readiness[i].ReadyAt.After(readiness[j].ReadyAt) })
 	if len(readiness) > precacheReadinessDisplayLimit {

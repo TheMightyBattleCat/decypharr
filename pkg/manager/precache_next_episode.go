@@ -29,13 +29,12 @@ const (
 	// Sonarr coordinate, which scans every Sonarr instance's media.
 	precacheWalkResolveTimeout = 5 * time.Minute
 
-	// precacheRepairWaitTimeout bounds how long precacheEpisodeFile waits
-	// for an URGENT repair it kicked off to finish before giving up and
-	// recording the episode as still-damaged. Pre-caching happens well
-	// before the episode is needed, so this can be generous without risking
-	// a glitch - unlike the live read-ahead path in precache.go, nothing is
-	// racing a playhead here.
-	precacheRepairWaitTimeout  = 5 * time.Minute
+	// precacheRepairWaitTimeout bounds how long awaitReadiness waits for
+	// the repair it handed an episode's damage to before recording the
+	// episode as still-damaged. The wait runs beside the walk, not in it,
+	// so it can cover a queued urgent PAR2 pass on a large release; a pass
+	// that lands later still updates the row (see OnPar2Repaired).
+	precacheRepairWaitTimeout  = 30 * time.Minute
 	precacheRepairPollInterval = 5 * time.Second
 )
 
@@ -291,7 +290,13 @@ func (p *Precache) precacheForwardWalk(ident walkIdentity, key string, w *forwar
 		}
 
 		epCtx, cancel := context.WithTimeout(base, precacheNextEpisodeTimeout)
-		step := p.precacheEpisodeFile(epCtx, next)
+		step := p.precacheEpisodeFile(epCtx, walkIdentity{
+			arr:           a,
+			seriesName:    ident.seriesName,
+			seriesId:      seriesId,
+			seasonNumber:  seasonNumber,
+			episodeNumber: next.EpisodeNumber,
+		}, next)
 		cancel()
 		switch step {
 		case stepBurst:
@@ -355,19 +360,12 @@ func (p *Precache) resolveSonarrEpisode(ctx context.Context, entry *storage.Entr
 // The step result tells the walk whether to go on: stepSkipped (not ours,
 // paused, already done) steps past this episode, stepDeferred (budget or
 // bandwidth) ends the walk so it never warms a later episode while this one
-// stays cold - the next episode played restarts it.
-func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisodeInfo) episodeStep {
-	target := readSymlinkTarget(next.Path)
-	if target == "" {
-		p.logger.Debug().Str("file", next.Path).Msg("next-episode precache: next episode is not a local symlink")
-		return stepSkipped // not a decypharr-managed symlink (e.g. imported directly)
-	}
-	dir, filename := filepath.Split(target)
-	entryName := filepath.Clean(filepath.Base(filepath.Clean(dir)))
-
-	nextEntry, err := p.manager.GetEntryByName(entryName, filename)
-	if err != nil || nextEntry == nil || nextEntry.Protocol != config.ProtocolNZB {
-		return stepSkipped // not a decypharr entry, or not usenet-backed (overlay/repair is usenet-only)
+// stays cold - the next episode played restarts it. ref is next's Sonarr
+// coordinate, kept so a re-grab of it can be re-warmed (see addRewarm).
+func (p *Precache) precacheEpisodeFile(ctx context.Context, ref walkIdentity, next arr.NextEpisodeInfo) episodeStep {
+	nextEntry, filename, ok := p.episodeEntry(next)
+	if !ok {
+		return stepSkipped
 	}
 
 	if p.keyPaused(nextEntry.InfoHash, filename) {
@@ -468,7 +466,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, next arr.NextEpisode
 			Msg("next-episode burst-download finished")
 	}
 
-	p.recordReadiness(burstCtx, nextEntry, filename, next.Size)
+	p.recordReadiness(ref, nextEntry, filename, next.Size)
 
 	if p.cfg().PrecacheEvictAfterWatched {
 		p.markPrecached(nextEntry.InfoHash, filename, next.Size)
@@ -492,31 +490,57 @@ const (
 	stepDeferred                    // budget or bandwidth said not now; end the walk
 )
 
-// recordReadiness checks for damage the burst-download surfaced, routes it
-// through the live playback-failure policy if so, waits (bounded) for a
-// PAR2 repair to land, and stores the outcome for Commit D.
-func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, filename string, fileSize int64) {
-	readiness := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}
-	defer func() {
-		p.readinessMu.Lock()
-		p.readiness[entry.InfoHash+":"+filename] = readiness
-		p.readinessMu.Unlock()
-		p.notifyReadiness(entry, readiness)
-	}()
-
-	pendingCount := func() int {
-		pending, err := p.manager.usenet.OverlayPendingRepair(entry.InfoHash)
-		if err != nil {
-			return -1
-		}
-		return len(pending[filename])
+// recordReadiness checks for damage the burst surfaced and records the
+// episode's readiness row. Damage is handed to repair and waited on beside
+// the walk (awaitReadiness), which moves on to the next episode meanwhile -
+// the wait used to hold the walk for up to 5 minutes per damaged episode.
+func (p *Precache) recordReadiness(ref walkIdentity, entry *storage.Entry, filename string, fileSize int64) {
+	row := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}
+	n, ok := p.overlayPendingCount(entry, filename)
+	if !ok || n <= 0 {
+		row.Clean = true
+		p.storeReadiness(row)
+		p.notifyReadiness(entry, row)
+		return
 	}
 
-	n := pendingCount()
-	if n <= 0 {
-		readiness.Clean = true
-		readiness.ReadyAt = time.Now()
-		return
+	// Shown as still damaged until the wait settles it.
+	row.SegmentsPending = n
+	p.storeReadiness(row)
+
+	key := entry.InfoHash + ":" + filename
+	p.markInflight(key) // persistCleanRanges may still write into the cache
+	go func() {
+		defer p.unmarkInflight(key)
+		p.awaitReadiness(ref, entry, filename, fileSize, n)
+	}()
+}
+
+// awaitReadiness hands a pre-cached episode's damage to repair, waits for it
+// (awaitPrecacheRepair), and settles the readiness row:
+//   - repaired: the row says so and the patched segments are persisted.
+//   - entry gone (a re-grab deleted it): the row is dropped, and the
+//     replacement is re-warmed once Sonarr has imported it (addRewarm).
+//   - still damaged: the row says how many segments; a PAR2 pass that
+//     lands later still updates it (OnPar2Repaired).
+//
+// A re-grab that keeps the entry (one episode of a season pack) is re-warmed
+// the same way.
+func (p *Precache) awaitReadiness(ref walkIdentity, entry *storage.Entry, filename string, fileSize int64, n int) {
+	// No zero-fill: persistCleanRanges reads the repaired segments back
+	// through the reader, and a pad must not be persisted as data.
+	ctx := usenet.ContextForBurstDownload(p.baseCtx())
+	key := entry.InfoHash + ":" + filename
+
+	pending := func() (int, bool) {
+		if !p.entryExists(entry.InfoHash) {
+			return 0, true
+		}
+		c, ok := p.overlayPendingCount(entry, filename)
+		if !ok {
+			return -1, false
+		}
+		return c, false
 	}
 
 	// Route damage through decideAutoRepairAction(RepairSourcePrecache, ...)
@@ -528,6 +552,7 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 	// PAR2 was never fixed ahead of the viewer. regrabGuard applies exactly
 	// as for playback, so an episode that can't be fixed trips the guard
 	// instead of looping.
+	regrabbed := false
 	handle := func() autoRepairOutcome {
 		r := p.manager.Repair()
 		if r == nil {
@@ -541,26 +566,50 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 			evt = p.logger.Info()
 		}
 		evt.Str("entry", entry.Name).Str("file", filename).Bool("acted", out.acted).
-			Bool("retry", out.retry).Str("reason", out.reason).
+			Bool("regrab", out.regrab).Bool("retry", out.retry).Str("reason", out.reason).
 			Msg("next-episode pre-cache: damage handed to repair")
+		regrabbed = regrabbed || (out.acted && out.regrab)
 		return out
 	}
 
-	repaired, remaining := awaitPrecacheRepair(ctx, precacheRepairWaitTimeout, precacheRepairPollInterval,
-		precacheRepairRetryInterval, pendingCount, handle)
-	if repaired {
-		readiness.SegmentsRepaired = n
-		readiness.ReadyAt = time.Now()
-		// PENDING-REPAIR -> REPAIRED: persist the now-clean segments
-		// durably (a no-op for anything a re-grab replaced under a
-		// different InfoHash - there's nothing left here to persist).
-		p.persistCleanRanges(ctx, entry, filename, fileSize)
+	res := awaitPrecacheRepair(ctx, precacheRepairWaitTimeout, precacheRepairPollInterval,
+		precacheRepairRetryInterval, pending, handle)
+	if regrabbed || res.gone {
+		p.addRewarm(ref, entry.InfoHash, key)
+	}
+
+	row := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}
+	switch {
+	case res.gone:
+		p.dropReadiness(key)
+		p.logger.Info().Str("entry", entry.Name).Str("file", filename).
+			Msg("next-episode pre-cache: episode was replaced; its replacement is re-warmed once imported")
 		return
+	case res.repaired:
+		row.SegmentsRepaired = n
+		defer p.persistRepaired(ctx, entry, filename, fileSize) // the row is settled first
+	default:
+		row.SegmentsPending = n
+		if res.remaining > 0 {
+			row.SegmentsPending = res.remaining
+		}
 	}
-	if remaining > 0 {
-		n = remaining
-	}
-	readiness.SegmentsPending = n
+	p.storeReadiness(row)
+	p.notifyReadiness(entry, row)
+}
+
+// storeReadiness records row under its "infoHash:filename" key.
+func (p *Precache) storeReadiness(row EpisodeReadiness) {
+	p.readinessMu.Lock()
+	p.readiness[row.InfoHash+":"+row.Filename] = row
+	p.readinessMu.Unlock()
+}
+
+// dropReadiness forgets the row under key.
+func (p *Precache) dropReadiness(key string) {
+	p.readinessMu.Lock()
+	delete(p.readiness, key)
+	p.readinessMu.Unlock()
 }
 
 // precacheRepairRetryInterval is how often awaitPrecacheRepair asks again
@@ -568,34 +617,48 @@ func (p *Precache) recordReadiness(ctx context.Context, entry *storage.Entry, fi
 // is running - see autoRepairOutcome.retry).
 const precacheRepairRetryInterval = 30 * time.Second
 
+// precacheRepairResult is how awaitPrecacheRepair's wait ended.
+type precacheRepairResult struct {
+	repaired  bool // pending reached 0
+	gone      bool // the entry no longer exists (a re-grab deleted it)
+	remaining int  // last pending count seen, -1 if never read
+}
+
 // awaitPrecacheRepair hands damage to handle, then polls pending until it
-// reaches 0 (repaired=true), wait runs out or ctx ends. While handle's last
-// answer was a retryable no-op it is asked again every retryEvery: a season
-// pack's episode found damaged while a sibling's re-grab or PAR2 pass holds
-// the release used to be dropped until the nightly sweep (The Conjurors
-// S04E03, 2026-09-07, about 5 h). remaining is the last pending count seen
-// (-1 if never read).
+// reaches 0, the entry is gone, wait runs out or ctx ends. While handle's
+// last answer was a retryable no-op it is asked again every retryEvery: a
+// season pack's episode found damaged while a sibling's re-grab or PAR2 pass
+// holds the release used to be dropped until the nightly sweep (The Conjurors
+// S04E03, 2026-09-07, about 5 h). pending reports gone=true once the entry
+// has been deleted; before, the deleted overlay read as "0 pending" and the
+// row claimed a repair.
 func awaitPrecacheRepair(ctx context.Context, wait, poll, retryEvery time.Duration,
-	pending func() int, handle func() autoRepairOutcome) (repaired bool, remaining int) {
-	remaining = -1
+	pending func() (count int, gone bool), handle func() autoRepairOutcome) precacheRepairResult {
+	res := precacheRepairResult{remaining: -1}
 	out := handle()
 	lastAsk := time.Now()
 	deadline := lastAsk.Add(wait)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return false, remaining
+			return res
 		case <-time.After(poll):
 		}
-		if remaining = pending(); remaining == 0 {
-			return true, 0
+		count, gone := pending()
+		if gone {
+			res.gone = true
+			return res
+		}
+		if res.remaining = count; count == 0 {
+			res.repaired = true
+			return res
 		}
 		if out.retry && time.Since(lastAsk) >= retryEvery {
 			out = handle()
 			lastAsk = time.Now()
 		}
 	}
-	return false, remaining
+	return res
 }
 
 // notifyReadiness fires the "next play is ready" notification for a

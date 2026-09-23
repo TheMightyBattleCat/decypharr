@@ -2628,6 +2628,13 @@ func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName
 		forget = func(file string, off, length int64) { fw.ForgetCachedRange(entryName, file, off, length) }
 	}
 	invalidateRepaired(nzb, pending, refresh, forget, func(d time.Duration, f func()) { time.AfterFunc(d, f) })
+
+	// Every pass that writes patches comes through here (the job, and the
+	// sweep's warm and cold passes), so this is where a pre-cached episode's
+	// readiness row learns its repair landed.
+	if p.manager.precache != nil {
+		p.manager.precache.OnPar2Repaired(nzbID)
+	}
 }
 
 // repairedRangeReforgetDelay is how long after a repair invalidateRepaired

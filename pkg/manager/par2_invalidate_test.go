@@ -30,7 +30,9 @@ func TestInvalidateRepairedRefreshesReaderBeforeForgettingDFS(t *testing.T) {
 	var delay time.Duration
 	invalidateRepaired(nzb, pending,
 		func(file string, segIdx []int) { calls = append(calls, fmt.Sprintf("refresh %s %v", file, segIdx)) },
-		func(file string, off, length int64) { calls = append(calls, fmt.Sprintf("forget %s %d+%d", file, off, length)) },
+		func(file string, off, length int64) {
+			calls = append(calls, fmt.Sprintf("forget %s %d+%d", file, off, length))
+		},
 		func(d time.Duration, f func()) { delay, delayed = d, f },
 	)
 

@@ -2286,10 +2286,13 @@ func (r *Repair) HandlePrecacheDamage(ctx context.Context, entryName, fileName s
 // autoRepairOutcome is what handleAutoDamage did. retry marks a no-op that
 // a later call can get past: another handler holds the entry for now, or
 // the entry's playback-repair cooldown is running. Either lasts minutes;
-// playback escalation re-fires by itself, pre-cache has to ask again.
+// playback escalation re-fires by itself, pre-cache has to ask again. regrab
+// marks an outcome that went down the re-grab path (as opposed to queueing
+// PAR2), so a caller knows a replacement is on its way.
 type autoRepairOutcome struct {
 	acted  bool
 	retry  bool
+	regrab bool
 	reason string
 }
 
@@ -2336,7 +2339,7 @@ func (r *Repair) handleAutoDamage(ctx context.Context, source RepairSource, entr
 // regrabOutcome wraps repairPlaybackFileNow's results; its cooldown refusal
 // is the retryable one.
 func (r *Repair) regrabOutcome(acted bool, reason string, err error) (autoRepairOutcome, error) {
-	return autoRepairOutcome{acted: acted, reason: reason, retry: strings.HasPrefix(reason, reasonWithinCooldown)}, err
+	return autoRepairOutcome{acted: acted, regrab: true, reason: reason, retry: strings.HasPrefix(reason, reasonWithinCooldown)}, err
 }
 
 // reasonWithinCooldown prefixes repairPlaybackFileNow's cooldown refusal.
