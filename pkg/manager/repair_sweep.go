@@ -1162,6 +1162,27 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 	})
 }
 
+// healWouldInterruptStream reports whether healing h now would pull a file
+// out from under a client stream: a broken file being streamed, or - when
+// every file is broken, so the heal deletes the whole entry - any streamed
+// file of it. A season pack's other episodes keep playing through a partial
+// heal, which keeps the entry. file names the streamed file.
+func (r *Repair) healWouldInterruptStream(h *storage.EntryHealth) (file string, watched bool) {
+	wholeEntry := h.BrokenCount > 0 && h.BrokenCount == h.FileCount
+	for _, bf := range h.BrokenFiles {
+		if bf.InfoHash == "" {
+			continue
+		}
+		if r.manager.Streaming(bf.InfoHash, bf.FileName) {
+			return bf.FileName, true
+		}
+		if wholeEntry && r.manager.Streaming(bf.InfoHash, "") {
+			return bf.FileName, true
+		}
+	}
+	return "", false
+}
+
 // healBrokenEntryGuarded runs healBrokenEntry for one entry the SCHEDULED
 // sweep found broken and decided to heal automatically - unlike
 // finalizeBrokenEntry's other automatic route (repairPlaybackFileNow, for
@@ -1180,6 +1201,15 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 // healBrokenEntry directly - never this.
 func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, bulkOverride bool) {
 	if h == nil {
+		return
+	}
+	if file, watched := r.healWouldInterruptStream(h); watched {
+		// The heal deletes the Arr file (and, for a fully broken entry, the
+		// entry itself) under the viewer, which ends their stream. Leave it
+		// broken for the next sweep; the viewer's own reads meanwhile route
+		// damage to PAR2 and, past the pad caps, to a playback re-grab.
+		r.logger.Info().Str("entry", name).Str("file", file).
+			Msg("Repair: sweep leaving a broken file for the next pass; it is being streamed")
 		return
 	}
 	for _, bf := range h.BrokenFiles {
