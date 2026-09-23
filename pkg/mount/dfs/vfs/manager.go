@@ -256,6 +256,15 @@ func (m *Manager) PurgeCache() map[string]any {
 	return m.cache.PurgeCache()
 }
 
+// EvictCachedFile removes filename's cached bytes under entryName unless it
+// is open - see Cache.EvictFile.
+func (m *Manager) EvictCachedFile(entryName, filename string) (int64, bool) {
+	if m.cache == nil {
+		return 0, false
+	}
+	return m.cache.EvictFile(entryName, filename)
+}
+
 // EntryCacheInUse reports whether any file under entryName is open in the
 // cache - see Cache.EntryInUse.
 func (m *Manager) EntryCacheInUse(entryName string) bool {

@@ -177,6 +177,19 @@ func ContextForBufferedPlayback(ctx context.Context) context.Context {
 	return usenet.ContextForBufferedPlayback(ctx)
 }
 
+// ObserveMountRead tells pre-cache a mount client read entry's filename at
+// off - see Precache.Observe. streamUsenet reports every read that misses
+// the DFS cache; the mount reports reads it served from the cache, which
+// never reach Stream. Without them a fully cached episode never advanced a
+// finite-depth walk unless Plex was configured (its progress poll covers
+// that case). A no-op for anything but a usenet entry.
+func (m *Manager) ObserveMountRead(entry *storage.Entry, filename string, off, size int64) {
+	if entry == nil || entry.Protocol != config.ProtocolNZB || m.precache == nil {
+		return
+	}
+	m.precache.Observe(entry, filename, off, size)
+}
+
 // NotePlaybackWait records that a client read of entry's filename waited d
 // on the buffer in front of Stream - see usenet.Usenet.NotePlaybackWait. A
 // no-op for anything but a usenet entry.

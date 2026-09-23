@@ -147,6 +147,16 @@ func (m *Manager) PurgeCache() (map[string]any, error) {
 	return m.vfs.PurgeCache(), nil
 }
 
+// EvictCachedFile removes filename's cached bytes under entryName unless it
+// is open - see vfs.Manager.EvictCachedFile. False when there is no VFS
+// mount.
+func (m *Manager) EvictCachedFile(entryName, filename string) (int64, bool) {
+	if m.vfs == nil {
+		return 0, false
+	}
+	return m.vfs.EvictCachedFile(entryName, filename)
+}
+
 // EntryCacheInUse reports whether any file under entryName is open in the
 // VFS cache - see vfs.Manager.EntryCacheInUse. False when there is no VFS
 // mount.

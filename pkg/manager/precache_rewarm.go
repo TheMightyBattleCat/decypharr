@@ -47,7 +47,8 @@ func (p *Precache) addRewarm(ref walkIdentity, oldInfoHash, oldKey string) {
 	p.rewarmMu.Unlock()
 }
 
-// rewarmLoop runs rewarmDue every precacheRewarmInterval until Stop.
+// rewarmLoop runs rewarmDue, and retries queued watched-episode evictions
+// (evictWatchedDue), every precacheRewarmInterval until Stop.
 func (p *Precache) rewarmLoop() {
 	defer p.wg.Done()
 	ticker := time.NewTicker(precacheRewarmInterval)
@@ -58,6 +59,7 @@ func (p *Precache) rewarmLoop() {
 			return
 		case <-ticker.C:
 			p.rewarmDue()
+			p.evictWatchedDue()
 		}
 	}
 }

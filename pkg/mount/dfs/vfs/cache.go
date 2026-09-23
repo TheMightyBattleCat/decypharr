@@ -268,6 +268,35 @@ func (c *Cache) retireItem(item *CacheItem) {
 	}
 }
 
+// EvictFile removes filename's cached bytes under entryName - data file and
+// sidecar - and closes its item if one is loaded. It refuses (ok=false)
+// while a handle has the file open, or while the item is being created or
+// torn down. freed is the byte count the sidecar listed as cached.
+func (c *Cache) EvictFile(entryName, filename string) (freed int64, ok bool) {
+	key := buildCacheKey(entryName, filename)
+	if item, loaded := c.items.Load(key); loaded {
+		if !item.claimForClose() {
+			return 0, false // open, or already being closed
+		}
+		c.items.Delete(key)
+		c.itemCount.Add(-1)
+		item.retired.Store(true) // no final sidecar write after the removal below
+		_ = item.Close()
+	}
+	dataPath := filepath.Join(c.config.CacheDir, entryName, filename)
+	var info ItemInfo
+	if err := decodeJSONFile(dataPath+".json", &info); err == nil {
+		freed = info.Rs.Size()
+	}
+	if err := os.Remove(dataPath); err != nil && !os.IsNotExist(err) {
+		return 0, false
+	}
+	if err := os.Remove(dataPath + ".json"); err != nil && !os.IsNotExist(err) {
+		return freed, false
+	}
+	return freed, true
+}
+
 // EntryInUse reports whether any file under entryName has a cache item with
 // an open handle. Removing an entry's cache directory under one would pull
 // the data file out from under a live reader.

@@ -79,6 +79,37 @@ func TestRetiredItemClosesOnLastRelease(t *testing.T) {
 	}
 }
 
+func TestEvictFileRefusesOpenFileThenRemovesIt(t *testing.T) {
+	c := newWritableTestCache(t)
+	item := newIdentityTestItem(t, c, "h")
+	if _, _, err := item.WriteAtNoOverwrite(make([]byte, 100), 0); err != nil {
+		t.Fatal(err)
+	}
+	item.flushMetadata(true)
+	dataPath := item.metaPath[:len(item.metaPath)-len(".json")]
+	if !item.Open() {
+		t.Fatal("setup: Open failed")
+	}
+
+	if _, ok := c.EvictFile("Show.S01E01", "e01.mkv"); ok {
+		t.Fatal("evicted a file with an open handle")
+	}
+	item.Release()
+
+	freed, ok := c.EvictFile("Show.S01E01", "e01.mkv")
+	if !ok || freed != 100 {
+		t.Fatalf("EvictFile = %d, %v; want 100, true", freed, ok)
+	}
+	for _, p := range []string{dataPath, item.metaPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s still on disk after eviction: %v", p, err)
+		}
+	}
+	if _, ok := c.items.Load(item.key); ok {
+		t.Fatal("evicted item still in the map")
+	}
+}
+
 // A handle opened on an entry that has since been retired must release that
 // entry, not the replacement now mapped under the same name.
 func TestReleaseFileReleasesTheHandlesOwnEntry(t *testing.T) {

@@ -17,6 +17,10 @@ type StreamingFile struct {
 	// so ReleaseFile releases that one and not whichever entry the name
 	// maps to by then (a replacement, after the item was retired).
 	entry *fileEntry
+
+	// observedPct is the read position (percent of the file, min 1) last
+	// reported to pre-cache - see observeRead. 0 until the first report.
+	observedPct atomic.Int32
 }
 
 // NewStreamingFile creates a new streaming file handle. It returns nil when
@@ -58,6 +62,9 @@ func (f *StreamingFile) ReadAtContext(ctx context.Context, p []byte, off int64) 
 	}
 
 	n, err := f.item.ReadAtContext(ctx, p, off)
+	if n > 0 {
+		f.observeRead(off)
+	}
 
 	// Handle partial read at EOF
 	if n < int(readSize) && err == nil {
@@ -65,6 +72,32 @@ func (f *StreamingFile) ReadAtContext(ctx context.Context, p []byte, off int64) 
 	}
 
 	return n, err
+}
+
+// observeReadStep is how far (percent of the file) a handle's reads move
+// between reports to pre-cache.
+const observeReadStep = 5
+
+// observeRead reports this handle's read position to pre-cache (see
+// manager.ObserveMountRead) each time it passes another observeReadStep
+// percent of the file, so a fully cached file still crosses the pre-cache
+// threshold. Pre-cache's own dedup keeps it to one burst or walk step.
+func (f *StreamingFile) observeRead(off int64) {
+	if f.fileSize <= 0 || f.item == nil || f.item.cache == nil || f.item.cache.manager == nil {
+		return
+	}
+	pct := int32(off * 100 / f.fileSize)
+	last := f.observedPct.Load()
+	if !observeDue(last, pct) || !f.observedPct.CompareAndSwap(last, max(pct, 1)) {
+		return
+	}
+	f.item.cache.manager.ObserveMountRead(f.item.entry, f.item.filename, off, f.fileSize)
+}
+
+// observeDue reports whether a read at pct should be reported, the last
+// report having been at last (0: none yet).
+func observeDue(last, pct int32) bool {
+	return last == 0 || pct >= last+observeReadStep
 }
 
 // Size returns the file size

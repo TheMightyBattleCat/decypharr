@@ -163,6 +163,14 @@ type Precache struct {
 	rewarmResolve func(next arr.NextEpisodeInfo) (*storage.Entry, string, bool)
 	rewarmBurst   func(ctx context.Context, ref walkIdentity, next arr.NextEpisodeInfo) episodeStep
 
+	// evictMu/evictQueue hold watched pre-cached episodes whose DFS cache
+	// is still to be removed - see queueWatchedEvict.
+	evictMu    sync.Mutex
+	evictQueue map[string]*watchedEvict
+
+	// playedBurst is playedBurstFile, replaceable in tests.
+	playedBurst func(entry *storage.Entry, filename string, from int64)
+
 	// ctx/cancel/wg govern progressTriggerLoop, the Plex playback-progress
 	// poll loop, and rewarmLoop - see Start/Stop.
 	ctx    context.Context
@@ -172,7 +180,7 @@ type Precache struct {
 
 // NewPrecache builds the precache service.
 func NewPrecache(m *Manager) *Precache {
-	return &Precache{
+	p := &Precache{
 		manager:            m,
 		logger:             logger.New("precache"),
 		triggered:          make(map[string]time.Time),
@@ -185,8 +193,11 @@ func NewPrecache(m *Manager) *Precache {
 		readiness:          make(map[string]EpisodeReadiness),
 		inflight:           make(map[string]int),
 		rewarm:             make(map[string]*rewarmTarget),
+		evictQueue:         make(map[string]*watchedEvict),
 		plexChecker:        newPlexSessionChecker(m),
 	}
+	p.playedBurst = p.playedBurstFile
+	return p
 }
 
 func (p *Precache) cfg() config.PrecacheConfig {
@@ -291,7 +302,7 @@ func (p *Precache) checkSessionProgress() {
 			// Already burst-cached (usually by the walk itself): no second
 			// burst, but playing it still moves the walk's window forward.
 			if p.tryMarkWalked(key) {
-				go p.maybePrecacheNextEpisodes(entry, filename)
+				go p.onPlayedBurst(entry, filename, f.Size*prog.viewOffset/prog.duration)
 			}
 			p.progressSkip(path, "already-triggered").
 				Str("entry", entry.Name).Str("file", filename).
@@ -429,7 +440,7 @@ func (p *Precache) Observe(entry *storage.Entry, filename string, start, size in
 		// See checkSessionProgress: a burst-cached file still extends the
 		// walk once when it is played.
 		if p.tryMarkWalked(key) {
-			go p.maybePrecacheNextEpisodes(entry, filename)
+			go p.onPlayedBurst(entry, filename, start)
 		}
 		return
 	}
@@ -619,6 +630,26 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	go p.maybePrecacheNextEpisodes(entry, filename)
 }
 
+// playedBurstFile is what playing a file a burst already cached does instead
+// of a read-ahead: queue an urgent repair for damage still ahead of the
+// playhead, then move the walk forward. A walked episode stays triggered for
+// precacheTriggeredTTL, so playing it within that window skipped readAhead -
+// and with it repairAhead - and damage its burst found was left for the
+// sweep.
+func (p *Precache) playedBurstFile(entry *storage.Entry, filename string, from int64) {
+	p.repairAhead(entry, filename, from)
+	p.maybePrecacheNextEpisodes(entry, filename)
+}
+
+// onPlayedBurst runs playedBurst, or playedBurstFile when unset.
+func (p *Precache) onPlayedBurst(entry *storage.Entry, filename string, from int64) {
+	if p.playedBurst != nil {
+		p.playedBurst(entry, filename, from)
+		return
+	}
+	p.playedBurstFile(entry, filename, from)
+}
+
 // repairAhead checks whether the read-ahead pass left any damage pending for
 // filename and, if so, enqueues an URGENT-lane PAR2 repair for it - budgeted
 // by the estimated playback-time gap between the current playhead and the
@@ -761,6 +792,7 @@ func (p *Precache) evictIfWatched(entry *storage.Entry, filename string, start, 
 		p.logger.Info().Str("entry", entry.Name).Str("file", filename).Msg("evicted pre-cached episode after it was watched")
 	}
 	p.releaseBudget(bytes)
+	p.queueWatchedEvict(entry.InfoHash, entry.Name, filename)
 }
 
 // markInflight records that a burst has started writing into the DFS cache
