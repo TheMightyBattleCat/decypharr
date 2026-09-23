@@ -782,6 +782,19 @@ func (sr *StreamingReader) Size() int64 {
 	return sr.totalSize
 }
 
+// RefetchSegments marks each cached segment in segIdx Empty, so the next read
+// fetches it again instead of serving what the cache holds. A PAR2 repair
+// calls this for the segments it patched: until then the cache can hold the
+// zero-fill a read padded them with, and a cache hit never consults the
+// overlay patch. The re-fetch fails on the dead article and
+// handleConfirmedMissing serves the patch, with its slot-size guard. A
+// segment not OnDisk is left alone; it has nothing stale to serve.
+func (sr *StreamingReader) RefetchSegments(segIdx []int) {
+	for _, i := range segIdx {
+		sr.cache.invalidateForRefetch(i)
+	}
+}
+
 // Stats returns a snapshot of current statistics.
 func (sr *StreamingReader) Stats() map[string]int64 {
 	return sr.stats.Snapshot()

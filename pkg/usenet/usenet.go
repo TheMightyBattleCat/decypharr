@@ -145,6 +145,12 @@ type fsEntry struct {
 	// time, when the owning nzbID and logical filename are known; nil when
 	// overlay support is disabled (e.g. no usable overlay store).
 	overlayOpts []reader.Option
+
+	// streaming is the reader as a *reader.StreamingReader, once created -
+	// published atomically so RefreshRepairedSegments can reach a live
+	// reader without racing getOrCreateReader's Once. nil for the
+	// multi-volume reader, which has no segment cache or overlay.
+	streaming atomic.Pointer[reader.StreamingReader]
 }
 
 // fsEntryTombstone marks an entry claimed for teardown. Once refCount holds
@@ -213,6 +219,9 @@ func (fe *fsEntry) getOrCreateReader() (fs.PrefetchableReaderAt, int64, error) {
 		fe.reader = readerAt
 		fe.readerSize = size
 		fe.readerCleanup = cleanup
+		if sr, ok := readerAt.(*reader.StreamingReader); ok {
+			fe.streaming.Store(sr)
+		}
 	})
 
 	if fe.readerErr != nil {
@@ -622,6 +631,28 @@ func (u *Usenet) EvictCache(nzoID, filename string) bool {
 	}
 	u.fs.Delete(key)
 	entry.cleanup()
+	return true
+}
+
+// RefreshRepairedSegments makes a live reader of filename fetch segIdx again
+// on its next read (see reader.StreamingReader.RefetchSegments), so segments
+// a PAR2 repair just patched are served from the patch rather than the
+// zero-fill the reader may still hold. Unlike EvictCache it works while a
+// viewer is streaming, and it keeps every other cached segment. Returns
+// false when no reader for the file is open.
+func (u *Usenet) RefreshRepairedSegments(nzoID, filename string, segIdx []int) bool {
+	if u == nil || u.fs == nil || len(segIdx) == 0 {
+		return false
+	}
+	entry, ok := u.fs.Load(fsKey(nzoID, filename))
+	if !ok {
+		return false
+	}
+	sr := entry.streaming.Load()
+	if sr == nil {
+		return false
+	}
+	sr.RefetchSegments(segIdx)
 	return true
 }
 

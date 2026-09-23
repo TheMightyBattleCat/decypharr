@@ -2609,23 +2609,62 @@ func readerPatchWindow(nzb *storage.NZB, dr par2DeadRef) (start, end int64, err 
 // zero-fill copy of those ranges, from a prior playback that padded them
 // before the repair produced real bytes - and neither consults the overlay
 // patch on a plain cache hit (PatchBytes is only reached on a live
-// article-fetch failure):
-//  1. The persistent DFS mount cache - drop the patched output ranges so the
-//     next read re-streams them (now served from the patch).
-//  2. Any warm usenet streaming reader whose in-memory segment cache still
-//     has the padded segment OnDisk - tear it down so the next Stream builds
-//     a fresh reader. Idle-safe: a no-op while a viewer still holds the file.
+// article-fetch failure). See invalidateRepaired for the order.
 func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName string, pending map[string][]overlay.DeadSegment) {
+	refresh := func(file string, segIdx []int) {
+		if p.manager.usenet != nil {
+			p.manager.usenet.RefreshRepairedSegments(nzbID, file, segIdx)
+		}
+	}
+	var forget func(file string, off, length int64)
 	if fw := p.dfsCacheForgetter(); fw != nil {
-		for file, rngs := range buildDeadOutputRanges(nzb, pending) {
-			for _, r := range rngs {
-				fw.ForgetCachedRange(entryName, file, r.start, r.end-r.start)
+		forget = func(file string, off, length int64) { fw.ForgetCachedRange(entryName, file, off, length) }
+	}
+	invalidateRepaired(nzb, pending, refresh, forget, func(d time.Duration, f func()) { time.AfterFunc(d, f) })
+}
+
+// repairedRangeReforgetDelay is how long after a repair invalidateRepaired
+// forgets the patched DFS ranges a second time.
+const repairedRangeReforgetDelay = 30 * time.Second
+
+// invalidateRepaired is invalidateRepairedRanges with its seams passed in.
+// The order matters:
+//  1. refresh the live usenet reader first, so its segment cache stops
+//     serving the zero-fill it may hold (the reader is shared with the
+//     viewer's stream and with read-ahead, so it is often live; tearing it
+//     down only worked while idle).
+//  2. then forget the DFS cache ranges, so the next read re-streams them
+//     from the reader - which now serves the patch. Forgetting first let a
+//     read in between re-stream the stale pad, and the DFS cache persists
+//     whatever a stream returns: permanent zeros after a good repair.
+//  3. forget them again after repairedRangeReforgetDelay, for a stream that
+//     had already read the pad from the reader before step 1 and wrote it
+//     after step 2. At worst that costs re-reading one article's range.
+//
+// forget may be nil (no DFS mount).
+func invalidateRepaired(nzb *storage.NZB, pending map[string][]overlay.DeadSegment,
+	refresh func(file string, segIdx []int), forget func(file string, off, length int64),
+	after func(d time.Duration, f func())) {
+	for file, segs := range pending {
+		idx := make([]int, 0, len(segs))
+		for _, s := range segs {
+			idx = append(idx, s.Index)
+		}
+		refresh(file, idx)
+	}
+	if forget == nil {
+		return
+	}
+	rngs := buildDeadOutputRanges(nzb, pending)
+	forgetAll := func() {
+		for file, rs := range rngs {
+			for _, r := range rs {
+				forget(file, r.start, r.end-r.start)
 			}
 		}
 	}
-	for file := range pending {
-		p.manager.usenet.EvictCache(nzbID, file)
-	}
+	forgetAll()
+	after(repairedRangeReforgetDelay, forgetAll)
 }
 
 // par2JobTimeoutFor is the deadline for one PAR2 job on a release of
