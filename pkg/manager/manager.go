@@ -97,6 +97,12 @@ type Manager struct {
 	// Active streams tracking
 	activeStreams *xsync.Map[string, *ActiveStream]
 
+	// streamedRepairs holds "nzbID:file" keys with a repairStreamedFailure
+	// running; streamedRepaired, when one last acted - see
+	// repairStreamedFailure.
+	streamedRepairs  sync.Map
+	streamedRepaired sync.Map
+
 	// In-flight queue-processor dispatches, keyed by InfoHash, to prevent
 	// duplicate goroutines from processing the same entry when the scheduler
 	// re-fires before the previous pass has updated the queue row.
@@ -276,6 +282,7 @@ func (m *Manager) init() {
 	if m.usenet != nil {
 		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
 		m.usenet.SetOverlayFailedNotifier(m.notifyOverlayFileFailed)
+		m.usenet.SetOverlayViewerPadNotifier(m.onViewerPaddedFailedFile)
 	}
 
 	// Initialize the read-ahead precache service (see precache.go). Depends
@@ -830,6 +837,19 @@ func (m *Manager) repairStreamedFailure(nzoID, entryName, file string) {
 	if m.repair == nil || !m.Streaming(nzoID, file) {
 		return
 	}
+	// Once per file at a time: a viewer pads many segments of one failed
+	// file, and each reports it.
+	// And not again soon after it acted: the entry lingers until the stream
+	// closes (see Repair.deleteEntryWhenIdle), and a second pass would only
+	// re-queue PAR2 or re-grab the same file again once the cooldown lapsed.
+	key := nzoID + ":" + file
+	if at, ok := m.streamedRepaired.Load(key); ok && time.Since(at.(time.Time)) < streamedRepairQuiet {
+		return
+	}
+	if _, running := m.streamedRepairs.LoadOrStore(key, struct{}{}); running {
+		return
+	}
+	defer m.streamedRepairs.Delete(key)
 	cfg := config.Get().Repair
 	if !cfg.Enabled || !cfg.AutoRepair || !cfg.RepairOnPlaybackFailure {
 		return
@@ -845,6 +865,9 @@ func (m *Manager) repairStreamedFailure(nzoID, entryName, file string) {
 		m.logger.Info().Err(err).Str("entry", entryName).Str("nzb_id", nzoID).Str("file", file).
 			Bool("acted", out.acted).Bool("retry", out.retry).Str("reason", out.reason).
 			Msg("Streamed file passed the pad caps; kept padding for the viewer and handed it to repair")
+		if out.acted {
+			m.streamedRepaired.Store(key, time.Now())
+		}
 		if err != nil || !out.retry || time.Now().After(deadline) {
 			return
 		}
@@ -861,6 +884,32 @@ var (
 	streamedFailureRetryEvery = 30 * time.Second
 	streamedFailureRetryFor   = 30 * time.Minute
 )
+
+// streamedRepairQuiet is how long repairStreamedFailure leaves a file alone
+// after its repair acted.
+const streamedRepairQuiet = 6 * time.Hour
+
+// onViewerPaddedFailedFile runs repairStreamedFailure for a viewer padded
+// past the caps. It covers a file that went failed before this viewer
+// opened it - notifyOverlayFileFailed only hears the transition - whose
+// failing read used to escalate on its own. Called with the overlay's lock
+// held, so it only starts a goroutine; repairStreamedFailure dedupes.
+func (m *Manager) onViewerPaddedFailedFile(nzoID, file string) {
+	key := nzoID + ":" + file
+	if _, running := m.streamedRepairs.Load(key); running {
+		return
+	}
+	if at, ok := m.streamedRepaired.Load(key); ok && time.Since(at.(time.Time)) < streamedRepairQuiet {
+		return
+	}
+	go func() {
+		entryName := nzoID
+		if entry, err := m.GetEntry(nzoID); err == nil && entry != nil {
+			entryName = entry.Name
+		}
+		m.repairStreamedFailure(nzoID, entryName, file)
+	}()
+}
 
 func (m *Manager) notifyOverlayFileFailed(nzoID, file string) {
 	entryName := nzoID

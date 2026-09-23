@@ -230,6 +230,12 @@ func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
 		case StateOnDisk:
 			return nil
 		case StateFailed:
+			if sf.recoverFailedForPlayback(ctx, segIdx) {
+				return nil
+			}
+			if sf.cache.GetState(segIdx) != StateFailed {
+				continue // another reader took the slot meanwhile
+			}
 			return sf.cache.GetError(segIdx)
 		}
 		break
@@ -283,6 +289,9 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		case StateOnDisk:
 			return nil
 		case StateFailed:
+			if sf.recoverFailedForPlayback(ctx, segIdx) {
+				return nil
+			}
 			return sf.cache.GetError(segIdx)
 		case StateFetching:
 			// Wait for the other fetcher
@@ -604,6 +613,40 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 		return false
 	}
 	return true
+}
+
+// recoverFailedForPlayback lets a playback read past a segment another read
+// left Failed with article-not-found. The reader is shared per file, and a
+// confirmed 430 is permanent for its lifetime, so a pre-cache burst (which
+// never pads), a read-ahead past the caps or a sweep verification read left
+// the slot failing every later read - the viewer's included, which never
+// reached the overlay (patch or viewer padding) and tripped the mount's
+// circuit breaker. The article's absence is already established, so this
+// goes straight to the overlay decision, without asking the providers again.
+// Returns false (slot still Failed, or another reader took it) when it
+// doesn't apply or the overlay declines.
+func (sf *SegmentFetcher) recoverFailedForPlayback(ctx context.Context, segIdx int) bool {
+	if !isPlaybackRead(ctx) || sf.config.Overlay == nil || sf.config.Overlay.IsSweepActive() {
+		return false
+	}
+	cached := sf.cache.GetError(segIdx)
+	if cached == nil || !nntp.IsArticleNotFoundError(cached) {
+		return false
+	}
+	seg := sf.cache.GetSegment(segIdx)
+	if seg == nil {
+		return false
+	}
+	sf.cache.ResetFailed(segIdx)
+	if !sf.cache.MarkFetching(segIdx) {
+		return false
+	}
+	if sf.servePatch(segIdx) || sf.handleConfirmedMissing(ctx, segIdx, seg.MessageID, "") {
+		sf.stats.Downloads.Add(1)
+		return true
+	}
+	sf.cache.MarkFailed(segIdx, cached)
+	return false
 }
 
 // MarkPatched records that the overlay now holds a PAR2 patch for segIdx.

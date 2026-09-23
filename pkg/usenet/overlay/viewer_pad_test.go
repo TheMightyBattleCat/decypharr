@@ -32,6 +32,27 @@ func TestDecideForViewerPadsPastCaps(t *testing.T) {
 	}
 }
 
+// Every viewer pad past the caps is reported, so a file that went failed
+// before the viewer opened it still gets its repair started.
+func TestViewerPadNotifierFiresForAlreadyFailedFile(t *testing.T) {
+	s := newTestStore(t)
+	s.SetPolicy(Policy{MaxRunSegments: 4, MaxTotalSegments: 0, MaxByteRatio: 1})
+	var pads int
+	s.SetViewerPadNotifier(func(string, string) { pads++ })
+
+	if d, _ := s.Decide("n", "m.mkv", 100, "", 1000, 1<<30, 1000); d != DecisionFail {
+		t.Fatal("setup: background read should fail past the caps")
+	}
+	for _, seg := range []int{200, 300} {
+		if d, _ := s.DecideForViewer("n", "m.mkv", seg, "", 1000, 1<<30, 1000); d != DecisionPad {
+			t.Fatalf("viewer seg %d: %v, want pad", seg, d)
+		}
+	}
+	if pads != 2 {
+		t.Fatalf("viewer pad notifier fired %d times, want 2", pads)
+	}
+}
+
 func TestDecideForViewerStopsAtCeilings(t *testing.T) {
 	s := newTestStore(t)
 	s.SetPolicy(Policy{MaxRunSegments: 4, MaxTotalSegments: 1, MaxByteRatio: 0.01})

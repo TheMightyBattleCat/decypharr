@@ -1093,6 +1093,15 @@ func (u *Usenet) SetOverlayFailedNotifier(fn func(nzoID, file string)) {
 	u.overlay.SetFailedNotifier(fn)
 }
 
+// SetOverlayViewerPadNotifier installs the callback invoked each time a
+// viewer's read is padded past the caps - see overlay.SetViewerPadNotifier.
+func (u *Usenet) SetOverlayViewerPadNotifier(fn func(nzoID, file string)) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetViewerPadNotifier(fn)
+}
+
 // overlayPolicyFromConfig derives the overlay padding-cap Policy from repair
 // config - already clamped by config's load/save path (see
 // RepairConfig.PadMaxRunSegments and friends), so this is a plain field copy.

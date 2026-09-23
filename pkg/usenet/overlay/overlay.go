@@ -123,6 +123,10 @@ type Store struct {
 	// can decide without a second lookup.
 	repairEnqueue atomic.Pointer[func(nzbID string, deadSegments int)]
 
+	// viewerPadNotify is told each time a viewer's read is padded past the
+	// caps - see SetViewerPadNotifier.
+	viewerPadNotify atomic.Pointer[func(nzbID, file string)]
+
 	// failedNotify is set by the manager-level owner to be told whenever a
 	// file's verdict transitions to failed (i.e. needs re-grab) - nil until
 	// then, in which case the transition is silently dropped, exactly as it
@@ -222,6 +226,28 @@ func (s *Store) notifyFailed(nzbID, file string) {
 		return
 	}
 	if p := s.failedNotify.Load(); p != nil && *p != nil {
+		(*p)(nzbID, file)
+	}
+}
+
+// SetViewerPadNotifier installs the callback invoked each time a viewer's
+// read is padded past the caps (see DecideForViewer) - on every such pad,
+// not only the transition, since a file failed before the viewer opened it
+// still needs its repair started. Called with the entry's lock held. fn may
+// be nil to disable it.
+func (s *Store) SetViewerPadNotifier(fn func(nzbID, file string)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.viewerPadNotify.Store(nil)
+		return
+	}
+	s.viewerPadNotify.Store(&fn)
+}
+
+func (s *Store) notifyViewerPad(nzbID, file string) {
+	if p := s.viewerPadNotify.Load(); p != nil && *p != nil {
 		(*p)(nzbID, file)
 	}
 }

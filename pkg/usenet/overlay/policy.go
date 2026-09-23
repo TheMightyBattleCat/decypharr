@@ -188,6 +188,7 @@ func (s *Store) decide(nzbID, file string, segIndex int, msgID string, segBytes,
 		if !wasFailed {
 			s.notifyFailed(nzbID, file)
 		}
+		s.notifyViewerPad(nzbID, file)
 		return DecisionPad, VerdictFailed
 	}
 
