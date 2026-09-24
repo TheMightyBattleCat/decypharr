@@ -3,37 +3,31 @@
 // a delete + re-search. It is a manager-level background service split into
 // two lanes:
 //
-//   - BATCH: today's original behaviour. One job at a time (the pass reads a
-//     meaningful fraction of a release over NNTP, so running several
-//     concurrently would just contend with itself), deduped by nzbID, and
-//     gated by the repair sweep's Schedule/StopSchedule window (see
-//     Repair.repairWindowOpen) - the same bandwidth-heavy-work-hours
-//     reasoning StopSchedule already applies to sweeps.
-//   - URGENT: fed by playback-proximity-aware callers (see EnqueueUrgent,
-//     wired up from the read-ahead/precache feature) that need a damaged
-//     region fixed before the playhead reaches it. Runs immediately -
-//     ignores the batch lane's off-peak window - at bounded concurrency, may
-//     preempt an in-flight BATCH pass for the same nzbID, and its NNTP
-//     fetches carry nntp.PriorityUrgent so they may draw a capped provider's
-//     reserve band instead of being demoted to fills-only. Both lanes remain
+//   - BATCH: one job at a time, deduped by nzbID, gated by the repair
+//     sweep's Schedule/StopSchedule window (see Repair.repairWindowOpen).
+//     Nothing in production feeds it any more: Enqueue has only test
+//     callers, so loop/readyToRun/repairWindowOpen never gate a real pass.
+//   - URGENT: AutoEnqueue (padding) and playback and pre-cache damage all go
+//     through EnqueueUrgent and run here, at any hour, at bounded
+//     concurrency. Its
+//     NNTP fetches carry nntp.PriorityUrgent so they may draw a capped
+//     provider's reserve band instead of being demoted to fills-only. It is
 //     gated by the bandwidth monitor's hard quota (QuotaBlocked) and by
 //     config.Repair.Par2RepairEnabled.
+//   - RunNow (manual "Repair now", warm and cold sweeps) runs runJob
+//     directly in its own goroutine.
 //
 // Escalation ordering end to end: a padded segment enqueues here; on success
-// the segment is patched and padding for it stops on the next read. On any
-// failure - no PAR2 data, too much damage, a fetch or verification failure -
+// the segment is patched, padding for it stops on the next read, and a file
+// left with every dead segment patched is no longer failed. On any failure -
+// no PAR2 data, too much damage, a fetch or verification failure -
 // classifyPar2Failure decides whether it's worth retrying (backed off) or
 // terminal. A terminal outcome marks the entry unrepairable in the handler
-// registry (see repair_handler_registry.go) - surfaced in the overlay GUI
-// for a MANUAL "Delete & re-search" - and never falls back to an automatic
-// re-grab: this worker only ever runs with PAR2 repair enabled (see
-// readyToRun/RunNow), and decideAutoRepairAction (repair_policy.go) never
-// selects an automatic re-grab in that case. With config.Repair.Par2Repair
-// disabled this worker is never queued at all - the caller's own
-// decideAutoRepairAction call routes straight to the legacy re-grab path
-// instead; with PlaybackPadding also disabled, EnqueueRepair is never even
-// called (see pkg/usenet/fs/reader) for the padding-triggered path, though
-// the sweep and playback-failure paths still queue this worker directly.
+// registry (see repair_handler_registry.go), surfaced in the overlay GUI for
+// a manual "Delete & re-search"; on the URGENT lane it also re-grabs straight
+// away (regrabOnTerminal), and the sweep re-grabs a PAR2-terminal file with
+// recorded damage. With config.Repair.Par2Repair disabled this worker is
+// never queued - decideAutoRepairAction routes straight to the re-grab path.
 package manager
 
 import (
