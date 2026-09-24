@@ -263,9 +263,28 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 			Msg("Import: removed files for rejected import")
 	}
 
-	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
+	nzbID := entryNZBID(entry)
+	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
 		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
 			Msg("Import: removed DFS cache dir for rejected import")
+	}
+
+	if d.manager.usenet != nil && nzbID != entry.InfoHash {
+		// A season split out of a multi-season NZB shares the NZB's overlay
+		// with its sibling seasons: remove only this season's file records,
+		// and never mark the whole nzbID rejected (that would stop the
+		// siblings recording damage).
+		for name := range entry.Files {
+			removed, err := d.manager.usenet.OverlayDeleteFile(nzbID, name)
+			if err != nil {
+				d.logger.Warn().Err(err).Str("entry", entry.Name).Str("nzb_id", nzbID).Str("file", name).
+					Msg("Import: failed to remove overlay record for rejected season import")
+			} else if removed {
+				d.logger.Info().Str("entry", entry.Name).Str("nzb_id", nzbID).Str("file", name).
+					Msg("Import: removed overlay record for rejected season import")
+			}
+		}
+		return
 	}
 
 	if d.manager.usenet != nil {
@@ -494,7 +513,7 @@ func (d *Downloader) markDeadPostingOnDeadSegment(entry *storage.Entry, reason s
 	if reason != ffprobeReasonDeadSegment || entry.Protocol != config.ProtocolNZB || d.manager.usenet == nil {
 		return
 	}
-	switch marked, err := d.manager.usenet.MarkPostingDeadByNZBID(entry.InfoHash); {
+	switch marked, err := d.manager.usenet.MarkPostingDeadByNZBID(entryNZBID(entry)); {
 	case err != nil:
 		d.logger.Debug().Err(err).Str("entry", entry.Name).
 			Msg("Import: dead-segment verdict but the NZB header lookup failed; identical re-lists will not be short-circuited")
@@ -505,6 +524,42 @@ func (d *Downloader) markDeadPostingOnDeadSegment(entry *storage.Entry, reason s
 		d.logger.Info().Str("entry", entry.Name).
 			Msg("Import: dead segment confirmed; marked the NZB posting as dead so an identical re-grab rejects at parse")
 	}
+}
+
+// entryNZBID returns the nzbID entry's usenet state is stored under: its NZB
+// record, overlay manifest, dead-posting mark, handler claim and the Arr's
+// download ID. That is entry.InfoHash for an ordinary NZB entry. A season
+// entry split out of a multi-season NZB (convertToMultiSeason) gets a
+// generated InfoHash while each of its files keeps the NZB's, so the files
+// are asked; streaming already resolves a file that way (GetEntryByName).
+func entryNZBID(entry *storage.Entry) string {
+	if entry == nil {
+		return ""
+	}
+	fallback := ""
+	for _, f := range entry.Files {
+		if f == nil || f.InfoHash == "" {
+			continue
+		}
+		if f.InfoHash == entry.InfoHash {
+			return entry.InfoHash
+		}
+		if fallback == "" || f.InfoHash < fallback {
+			fallback = f.InfoHash
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return entry.InfoHash
+}
+
+// fileNZBID is entryNZBID for one file of entry.
+func fileNZBID(entry *storage.Entry, file *storage.File) string {
+	if file != nil && file.InfoHash != "" {
+		return file.InfoHash
+	}
+	return entryNZBID(entry)
 }
 
 func (d *Downloader) markAsCompleted(entry *storage.Entry) {
@@ -984,7 +1039,7 @@ func (d *Downloader) processUsenetDownload(entry *storage.Entry) error {
 				_ = d.manager.queue.Update(entry)
 			}
 
-			if err := d.manager.usenet.Download(d.manager.ctx, entry.InfoHash, file.Name, destFile, progressCallback); err != nil {
+			if err := d.manager.usenet.Download(d.manager.ctx, fileNZBID(entry, file), file.Name, destFile, progressCallback); err != nil {
 				_ = os.Remove(destPath)
 				return fmt.Errorf("failed to download %s: %w", file.Name, err)
 			}

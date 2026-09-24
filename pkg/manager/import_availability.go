@@ -59,7 +59,8 @@ func (d *Downloader) importAvailabilityGate(entry *storage.Entry) (err error) {
 			continue
 		}
 
-		missing, cerr := d.manager.usenet.CheckFileDetailed(ctx, entry.InfoHash, file.Name)
+		nzbID := fileNZBID(entry, file)
+		missing, cerr := d.manager.usenet.CheckFileDetailed(ctx, nzbID, file.Name)
 		if cerr != nil {
 			// Non-fatal: a probe error (connection issues) doesn't mean the
 			// file is broken, just that this check couldn't run.
@@ -72,7 +73,7 @@ func (d *Downloader) importAvailabilityGate(entry *storage.Entry) (err error) {
 		}
 
 		for _, seg := range missing {
-			if rerr := d.manager.usenet.RecordOverlayDead(entry.InfoHash, file.Name, seg.Index, seg.MessageID, seg.Bytes); rerr != nil {
+			if rerr := d.manager.usenet.RecordOverlayDead(nzbID, file.Name, seg.Index, seg.MessageID, seg.Bytes); rerr != nil {
 				d.logger.Debug().Err(rerr).Str("entry", entry.Name).Str("file", file.Name).Int("segment", seg.Index).
 					Msg("Import: failed to record dead segment in overlay")
 			}

@@ -52,7 +52,7 @@ func (d *Downloader) paddingImportGate(entry *storage.Entry) (err error) {
 		ctx = context.Background()
 	}
 
-	pending, perr := d.manager.usenet.OverlayPendingRepair(entry.InfoHash)
+	pending, perr := d.manager.usenet.OverlayPendingRepair(entryNZBID(entry))
 	if perr != nil {
 		d.logger.Debug().Err(perr).Str("entry", entry.Name).
 			Msg("Import: padding check failed to run; skipping")
@@ -154,7 +154,7 @@ func (d *Downloader) statImportGate(entry *storage.Entry) (err error) {
 			continue
 		}
 
-		dead, total, herr := d.manager.usenet.StatFileHealth(ctx, entry.InfoHash, file.Name)
+		dead, total, herr := d.manager.usenet.StatFileHealth(ctx, fileNZBID(entry, file), file.Name)
 		if herr != nil {
 			d.logger.Debug().Err(herr).Str("entry", entry.Name).Str("file", file.Name).
 				Msg("Import: STAT census error, treating as inconclusive")

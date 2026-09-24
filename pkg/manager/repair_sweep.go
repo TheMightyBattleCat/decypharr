@@ -2756,7 +2756,9 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 	if entry == nil || entry.InfoHash == "" {
 		return errors.New("entry is required")
 	}
-	nzbID := entry.InfoHash
+	// The NZB's own ID: a season split out of a multi-season NZB has a
+	// generated InfoHash the Arr never saw (see entryNZBID).
+	nzbID := entryNZBID(entry)
 	if r.handlers != nil {
 		if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
 			r.logger.Debug().Str("entry", entry.Name).Str("file", fileName).
@@ -2771,7 +2773,7 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 		return fmt.Errorf("no arr configured for category %q", entry.Category)
 	}
 
-	history := a.GetHistory(entry.InfoHash, "1") // eventType 1 = grabbed
+	history := a.GetHistory(nzbID, "1") // eventType 1 = grabbed
 	if history == nil || len(history.Records) == 0 {
 		return fmt.Errorf("no grab history found for %q in arr %q", entry.Name, a.Name)
 	}
@@ -2805,7 +2807,7 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 					ArrKind:   arrKindFromType(a.Type),
 					MediaID:   mediaID,
 					EpisodeID: episodeID,
-					InfoHash:  entry.InfoHash,
+					InfoHash:  nzbID,
 				}},
 			}
 			r.markRegrabGuardTripped(entry.Name, fileName, h, guardReason)
