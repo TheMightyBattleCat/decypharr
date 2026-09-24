@@ -484,6 +484,23 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 
 	results, decodeRan, decodeCoverage, decodeAttempted := r.probeFiles(ctx, c, names, opts, decodeVerified)
+	if probeCutShort(ctx, results) {
+		// StopSchedule/StopRun ended the sweep before every file was probed.
+		// A verdict from the probed ones would record the rest healthy for
+		// the recheck interval, and could stamp the whole entry
+		// decode-verified for DecodeVerifyTTL - every day, for the slowest
+		// (multi-file) entries. Record nothing; the next sweep re-checks it.
+		// Re-grab claims routeAutoRepair took for files probed broken are
+		// normally released by the heal; there is none now.
+		r.releaseRegrabClaims(&storage.EntryHealth{BrokenFiles: r.brokenFiles(c, results)})
+		markProbeInterrupted(h, previous)
+		r.saveHealth(h)
+		r.logger.Debug().Str("entry", c.name).Msg("Repair: sweep stopped before every file was probed; left for the next sweep")
+		// The caller acts on what it is handed: an unknown verdict with no
+		// broken files, so nothing is healed from the stale record on a
+		// cancelled context.
+		return &storage.EntryHealth{EntryName: h.EntryName, Status: storage.HealthUnknown}, entryDecode{skipped: true}
+	}
 	if autoRepair {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -531,6 +548,31 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		skipped:    !decodeAttempted,
 		unverified: h.IsUnverified(),
 	}
+}
+
+// probeCutShort reports whether the sweep's context ended before probeFiles
+// reached every file: some results are placeholders for files never probed.
+func probeCutShort(ctx context.Context, results []fileResult) bool {
+	if ctx == nil || ctx.Err() == nil {
+		return false
+	}
+	for _, res := range results {
+		if res.reason == "context_cancelled" {
+			return true
+		}
+	}
+	return false
+}
+
+// markProbeInterrupted puts h back as it was before this run's probe, marked
+// dirty so the next sweep visits it. LastCheckedAt and the decode stamp are
+// left alone: nothing was verified.
+func markProbeInterrupted(h *storage.EntryHealth, previous storage.HealthStatus) {
+	h.Status = previous
+	h.PreviousStatus = ""
+	h.ActiveRunID = ""
+	h.Dirty = true
+	h.DirtyReason = "sweep stopped before every file was probed"
 }
 
 // entryDecode is what became of one probed entry's decode verification.
