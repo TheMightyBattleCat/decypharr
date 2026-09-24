@@ -1990,6 +1990,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if len(deadRefs) == 0 {
 		return nil // every dead segment healed; the heal invalidated them
 	}
+	// Only segments on measured geometry can be patched (see
+	// splitPlaceableDeadRefs). When none can, the solve - a full read of the
+	// release - would produce nothing writable; stop before it.
+	placeableRefs, unplaced := splitPlaceableDeadRefs(fetchers, deadRefs)
+	if len(placeableRefs) == 0 {
+		return unplaced
+	}
 	for _, dr := range deadRefs {
 		slices, err := idx.DamagedSlices(dr.rng.fileID, dr.rng.start, dr.rng.end)
 		if err != nil {
@@ -2286,7 +2293,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			p.invalidateRepairedRanges(nzb, nzbID, entryName, deadRefsByFile(written))
 		}
 	}()
-	for _, dr := range deadRefs {
+	for _, dr := range placeableRefs {
 		start, end, werr := readerPatchWindow(nzb, dr)
 		if werr != nil {
 			return fmt.Errorf("patch window for %s segment %d: %w", dr.file, dr.seg.Index, werr)
@@ -2307,7 +2314,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		u.ClearFailedFile(nzbID, dr.file)
 		written = append(written, dr)
 	}
-	return nil
+	// Segments whose boundaries were never measured stay recorded dead, and
+	// the pass reports them rather than claiming a full repair.
+	return unplaced
 }
 
 // par2RoundShouldStop decides whether runRepair's round loop ends with the
@@ -2374,6 +2383,42 @@ type par2DeadRef struct {
 	file string
 	seg  overlay.DeadSegment
 	rng  postedRange
+}
+
+// splitPlaceableDeadRefs separates dead segments whose posted file has
+// measured article boundaries - where a patch cut from the repaired slices
+// lands on exactly the article's bytes - from the rest. On estimated
+// boundaries the cut is shifted by however far the estimate is off, and
+// IFSC cannot catch it: it proves the reconstructed slices, not where the
+// patch window sits in them. unplaced, when non-nil, explains the rest and
+// wraps the geometry probe's error, so a dead head article (430) classifies
+// terminal and a timeout backs off.
+func splitPlaceableDeadRefs(fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef) (placeable []par2DeadRef, unplaced error) {
+	var skipped int
+	var cause error
+	var file string
+	for _, dr := range deadRefs {
+		// A one-article file has a single boundary, at 0, and its size is
+		// the PAR2 file length: nothing to measure.
+		if f := fetchers[dr.rng.fileID]; f != nil && (f.exact || (len(f.segs) == 1 && f.trueLen > 0)) {
+			placeable = append(placeable, dr)
+			continue
+		}
+		skipped++
+		if file == "" {
+			file = dr.file
+			if f := fetchers[dr.rng.fileID]; f != nil {
+				cause = f.geometryErr
+			}
+		}
+	}
+	if skipped == 0 {
+		return placeable, nil
+	}
+	if cause == nil {
+		cause = errors.New("no article could be measured")
+	}
+	return placeable, fmt.Errorf("%d dead segment(s) left unpatched: article boundaries of %q were not measured, so a patch cannot be placed: %w", skipped, file, cause)
 }
 
 // healFetchableDeadSegments patches every dead segment whose article can be
@@ -3409,8 +3454,11 @@ type postedFileFetcher struct {
 	// exact is true when base/segSizes are the real article boundaries -
 	// real seed provenance (see segGeometryExact) or resolveGeometry measured
 	// them - rather than scaled estimates.
-	exact  bool
-	logger zerolog.Logger
+	exact bool
+	// geometryErr is why resolveGeometry could not measure the article
+	// boundaries (the last probe's error), nil when it did or never ran.
+	geometryErr error
+	logger      zerolog.Logger
 
 	// cacheSource, when non-nil, is tried before every Usenet fetch below -
 	// see cacheSlicedSource.readCached. Misses (no mapping, dead range, not
@@ -3618,6 +3666,7 @@ func (f *postedFileFetcher) resolveGeometry() {
 		f.applyUniformGeometry(seed, size)
 		return
 	}
+	f.geometryErr = lastErr
 	f.logger.Warn().Err(lastErr).Int("articles_tried", candidates).
 		Msg("par2 geometry: could not measure the article size; keeping estimated segment sizes")
 }
