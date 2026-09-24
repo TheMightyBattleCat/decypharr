@@ -113,3 +113,66 @@ func invertMatrix(m gfMatrix) (gfMatrix, error) {
 	}
 	return result, nil
 }
+
+// PickRecovery chooses k of the candidate recovery exponents (by index into
+// exponents, in order of preference) whose rows M[j][d] = C_{damaged[d]}^{E_j}
+// form an invertible matrix for this damaged set, greedily keeping each row
+// that raises the rank. Repair used to take the first k and learn the matrix
+// was singular only after streaming the whole release; with gapped exponents
+// (skipped or 430'd volumes) that can happen, and a spare slice would have
+// solved it. An error means no k of the candidates are independent.
+func PickRecovery(damaged []int64, exponents []uint32, k int) ([]int, error) {
+	if k == 0 {
+		return nil, nil
+	}
+	if k != len(damaged) {
+		return nil, fmt.Errorf("par2: PickRecovery: k=%d but %d damaged slices", k, len(damaged))
+	}
+	for _, d := range damaged {
+		if d < 0 || d >= maxInputSlices {
+			return nil, fmt.Errorf("par2: damaged slice index %d out of range", d)
+		}
+	}
+	consts := make([]uint16, k)
+	for d, g := range damaged {
+		consts[d] = inputConstant(g)
+	}
+	// basis holds reduced rows; pivots[i] is basis[i]'s leading column.
+	var basis [][]uint16
+	var pivots []int
+	var chosen []int
+	for j, e := range exponents {
+		row := make([]uint16, k)
+		for d := range consts {
+			row[d] = gfPow(consts[d], e)
+		}
+		for i, b := range basis {
+			if f := row[pivots[i]]; f != 0 {
+				for c := range row {
+					row[c] ^= gfMul(b[c], f)
+				}
+			}
+		}
+		pivot := -1
+		for c, v := range row {
+			if v != 0 {
+				pivot = c
+				break
+			}
+		}
+		if pivot < 0 {
+			continue // dependent on the rows already chosen
+		}
+		inv := gfInv(row[pivot])
+		for c := range row {
+			row[c] = gfMul(row[c], inv)
+		}
+		basis = append(basis, row)
+		pivots = append(pivots, pivot)
+		chosen = append(chosen, j)
+		if len(chosen) == k {
+			return chosen, nil
+		}
+	}
+	return nil, fmt.Errorf("par2: no %d of the %d recovery slices are independent for this damage", k, len(exponents))
+}

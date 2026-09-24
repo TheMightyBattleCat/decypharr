@@ -2246,8 +2246,27 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return recoveryShortfall(k, len(idx.Recovery))
 		}
 
+		// Choose k recovery slices whose solve matrix is invertible for
+		// this damage before streaming the release: taking the first k
+		// found a singular matrix (possible with gapped exponents) only
+		// after the full read, and never tried a spare.
+		exps := make([]uint32, len(idx.Recovery))
+		for i, ref := range idx.Recovery {
+			exps[i] = ref.Exponent
+		}
+		picked, perr := par2.PickRecovery(damaged, exps, k)
+		if perr != nil {
+			if nextVolIdx < len(vols) {
+				return fmt.Errorf("%w (transient: more recovery volumes can be fetched)", perr)
+			}
+			return perr
+		}
+		chosenRefs := make([]par2.RecoverySliceRef, k)
+		for i, j := range picked {
+			chosenRefs[i] = idx.Recovery[j]
+		}
 		recovery := make([]par2.RecoverySlice, k)
-		for i, ref := range idx.Recovery[:k] {
+		for i, ref := range chosenRefs {
 			src := sources[ref.Source].Data
 			if ref.Offset+ref.Length > int64(len(src)) {
 				return fmt.Errorf("recovery slice %d out of range in %s", i, sources[ref.Source].Name)
