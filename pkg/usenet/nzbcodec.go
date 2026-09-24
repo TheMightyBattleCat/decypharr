@@ -99,12 +99,33 @@ func (r *byteReader) varint() (int64, error) {
 	return v, nil
 }
 
+// remaining is how many bytes are left to read. Lengths and counts decoded
+// from the blob are compared against it as uint64: int(n) of a corrupt
+// length >= 2^63 is negative, passed the old pos+int(n) check and panicked
+// the slice expression.
+func (r *byteReader) remaining() uint64 {
+	if r.pos >= len(r.buf) {
+		return 0
+	}
+	return uint64(len(r.buf) - r.pos)
+}
+
+// countFits rejects a decoded element count the rest of the buffer cannot
+// hold (every element takes at least one byte), before it sizes a make: a
+// corrupt count panicked makeslice or asked for gigabytes.
+func (r *byteReader) countFits(n uint64, what string) error {
+	if n > r.remaining() {
+		return fmt.Errorf("nzbcodec: %s count %d exceeds the %d bytes left", what, n, r.remaining())
+	}
+	return nil
+}
+
 func (r *byteReader) span() ([]byte, error) {
 	n, err := r.uvarint()
 	if err != nil {
 		return nil, err
 	}
-	if r.pos+int(n) > len(r.buf) {
+	if n > r.remaining() {
 		return nil, fmt.Errorf("nzbcodec: span out of range")
 	}
 	b := r.buf[r.pos : r.pos+int(n)]
@@ -153,7 +174,7 @@ func (r *byteReader) skip() error {
 	if err != nil {
 		return err
 	}
-	if r.pos+int(n) > len(r.buf) {
+	if n > r.remaining() {
 		return fmt.Errorf("nzbcodec: skip out of range")
 	}
 	r.pos += int(n)
@@ -532,7 +553,7 @@ func splitRegions(data []byte) (hc, sc, mc []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if r.pos+int(hLen) > len(data) {
+	if hLen > r.remaining() {
 		return nil, nil, nil, fmt.Errorf("nzbcodec: header region out of range")
 	}
 	hc = data[r.pos : r.pos+int(hLen)]
@@ -542,7 +563,7 @@ func splitRegions(data []byte) (hc, sc, mc []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if r.pos+int(sLen) > len(data) {
+	if sLen > r.remaining() {
 		return nil, nil, nil, fmt.Errorf("nzbcodec: seg region out of range")
 	}
 	sc = data[r.pos : r.pos+int(sLen)]
@@ -676,6 +697,9 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := r.countFits(nFiles, "file"); err != nil {
+		return nil, nil, err
+	}
 	nzb.Files = make([]storage.NZBFile, nFiles)
 	counts := make([]int, nFiles)
 	for i := range nFiles {
@@ -772,6 +796,9 @@ func readPar2FileRefs(r *byteReader) ([]storage.Par2FileRef, error) {
 	if n == 0 {
 		return nil, nil
 	}
+	if err := r.countFits(n, "par2 file"); err != nil {
+		return nil, err
+	}
 	out := make([]storage.Par2FileRef, n)
 	for i := range out {
 		if out[i].Name, err = r.strCopy(); err != nil {
@@ -795,6 +822,9 @@ func readPostedFileRefs(r *byteReader) ([]storage.PostedFileRef, error) {
 	if n == 0 {
 		return nil, nil
 	}
+	if err := r.countFits(n, "posted file"); err != nil {
+		return nil, err
+	}
 	out := make([]storage.PostedFileRef, n)
 	for i := range out {
 		if out[i].Name, err = r.strCopy(); err != nil {
@@ -817,6 +847,9 @@ func readPar2Segments(r *byteReader) ([]storage.Par2SegmentRef, error) {
 	}
 	if n == 0 {
 		return nil, nil
+	}
+	if err := r.countFits(n, "segment"); err != nil {
+		return nil, err
 	}
 	out := make([]storage.Par2SegmentRef, n)
 	for i := range out {
@@ -1043,6 +1076,9 @@ func readStrings(r *byteReader) ([]string, error) {
 	}
 	if n == 0 {
 		return nil, nil
+	}
+	if err := r.countFits(n, "string"); err != nil {
+		return nil, err
 	}
 	out := make([]string, n)
 	for i := range out {

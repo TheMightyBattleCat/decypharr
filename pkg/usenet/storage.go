@@ -242,6 +242,11 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 // decodeNZB decodes a meta blob, supporting both the v2 codec and legacy
 // protobuf files (which migrate to v2 on their next write).
 func decodeNZB(data []byte) (*storage.NZB, error) {
+	// An empty file (a crash between create and write) unmarshals as an
+	// empty legacy record and was served as a valid NZB with no files.
+	if len(data) == 0 {
+		return nil, fmt.Errorf("NZB meta file is empty")
+	}
 	if isCodecV2(data) {
 		return decodeNZBV2(data)
 	}
@@ -250,7 +255,11 @@ func decodeNZB(data []byte) (*storage.NZB, error) {
 	if err := proto.Unmarshal(data, &pb); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal NZB: %w", err)
 	}
-	return protoToNZB(&pb), nil
+	nzb := protoToNZB(&pb)
+	if nzb.ID == "" {
+		return nil, fmt.Errorf("NZB meta file is not a valid record (no ID)")
+	}
+	return nzb, nil
 }
 
 // DeleteNZB removes an NZB from file storage
