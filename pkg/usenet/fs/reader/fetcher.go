@@ -236,7 +236,13 @@ func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
 			if sf.cache.GetState(segIdx) != StateFailed {
 				continue // another reader took the slot meanwhile
 			}
-			return sf.cache.GetError(segIdx)
+			if err := sf.cache.GetError(segIdx); err != nil {
+				return err
+			}
+			// Failed with no recorded cause is not a result: fetch again
+			// rather than report success for a slot that holds nothing.
+			sf.cache.ResetFailed(segIdx)
+			continue
 		}
 		break
 	}

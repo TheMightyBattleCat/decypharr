@@ -729,8 +729,15 @@ func (sc *SegmentCache) invalidateForRefetch(segIdx int) {
 		if size := sc.segLengths[segIdx].Load(); size > 0 {
 			sc.curDisk.Add(-size)
 		}
+		sc.errors[segIdx].Store(nil)
+		return
 	}
-	sc.errors[segIdx].Store(nil)
+	// A slot a background read left Failed (a burst, a read-ahead past the
+	// caps, a verification read) must be fetched again too: after a repair
+	// its next fetch serves the patch. Clearing only the error left it Failed
+	// with no cause, which Fetch took for success and WaitForSegment for
+	// "segment N failed" - on every read, for the reader's life.
+	sc.ResetFailed(segIdx)
 }
 
 // wakeWaiters wakes any WaitForSegment callers parked on this segment's shard.
