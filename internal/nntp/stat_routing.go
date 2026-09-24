@@ -29,6 +29,11 @@ const (
 	// statSlowFactor: a home stays eligible while its STAT latency is at most
 	// this multiple of the fastest measured home.
 	statSlowFactor = 4
+	// statLeaveFactor: an eligible home only drops out past this multiple.
+	// A single threshold flipped a provider hovering near 4x on every
+	// worker's evaluation - four flips in one second on the production install, 18% of the
+	// log - as the fastest home's latency jumped between samples.
+	statLeaveFactor = 6
 	// statLatencyFloor is the least the fastest home's latency counts as when
 	// computing the cutoff, so one lucky sample can't shrink the eligible set.
 	// About one network round trip to a remote provider.
@@ -155,7 +160,11 @@ func (c *Client) statEligible(home *ProviderPool) (ok bool, lat, fastest time.Du
 		return false, time.Duration(l), time.Duration(best)
 	}
 	ref := max(best, int64(statLatencyFloor))
-	return l <= statSlowFactor*ref, time.Duration(l), time.Duration(best)
+	factor := int64(statSlowFactor)
+	if home.stat.eligible.Load() {
+		factor = statLeaveFactor // hysteresis: see statLeaveFactor
+	}
+	return l <= factor*ref, time.Duration(l), time.Duration(best)
 }
 
 // statOrder is the order BatchStat asks providers about a chunk: home first,
