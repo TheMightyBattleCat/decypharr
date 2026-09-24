@@ -193,6 +193,14 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	fileGroups := p.groupFiles(ctx, raw.Files)
 
 	if len(fileGroups) == 0 {
+		// A bare error makes the Arr retry the identical grab forever. When
+		// every file's type was known from its name (no network content
+		// detection that a timeout or cancellation could have cut short)
+		// the NZB simply holds no media: report it unavailable so it is
+		// queued failed and the Arr blocklists it.
+		if ctx.Err() == nil && !needsContentDetection(p, raw.Files) {
+			return nil, nil, fmt.Errorf("no valid file groups found in NZB: %w", ErrReleaseUnavailable)
+		}
 		return nil, nil, fmt.Errorf("no valid file groups found in NZB")
 	}
 
@@ -1713,4 +1721,16 @@ func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
 	}
 
 	return storage.NZBFileTypeUnknown
+}
+
+// needsContentDetection reports whether grouping had to probe any file's
+// content over the network (a file with segments whose type its name does
+// not reveal) - a step a timeout or cancellation can cut short.
+func needsContentDetection(p *NZBParser, files nzbparser.NzbFiles) bool {
+	for _, f := range files {
+		if len(f.Segments) > 0 && p.detectFileType(f.Filename) == storage.NZBFileTypeUnknown {
+			return true
+		}
+	}
+	return false
 }
