@@ -46,6 +46,9 @@ func (p *Precache) refreshCacheCoverage(reader dfsCacheCoverageReader, r *Episod
 	if reader == nil {
 		return
 	}
+	if !p.ownsCacheName(r.EntryName, r.Filename, r.InfoHash) {
+		return
+	}
 	cached, total, _, ok := reader.CacheCoverage(r.EntryName, r.Filename)
 	if !ok || total <= 0 {
 		return
@@ -81,6 +84,9 @@ func (p *Precache) populateFromCache() {
 			if !utils.IsMediaFile(filename) {
 				continue
 			}
+			if !p.ownsCacheName(entry.Name, filename, entry.InfoHash) {
+				continue
+			}
 			cached, total, modTime, ok := reader.CacheCoverage(entry.Name, filename)
 			if !ok || cached <= 0 || total <= 0 {
 				continue
@@ -112,6 +118,35 @@ func (p *Precache) populateFromCache() {
 		}
 		return nil
 	})
+}
+
+// ownsCacheName reports whether the entry stored under infoHash is the grab
+// now served as filename under entryName. The DFS cache is keyed by that
+// name, so its coverage is the current owner's: a same-name twin (an old
+// grab still in storage, e.g. waiting on a deferred delete) got a readiness
+// row showing the owner's cached bytes as its own. Files are compared, not
+// entries: a season split out of a multi-season NZB has its own InfoHash
+// while its files carry the NZB's, the same as the name index's. True when
+// either side can't be resolved, so a row is never dropped on a lookup
+// failure alone.
+func (p *Precache) ownsCacheName(entryName, filename, infoHash string) bool {
+	st := p.manager.Storage()
+	if st == nil || infoHash == "" {
+		return true
+	}
+	item, err := st.GetEntryItem(entryName)
+	if err != nil || item == nil {
+		return true
+	}
+	served := item.Files[filename]
+	if served == nil || served.InfoHash == "" {
+		return true
+	}
+	entry, err := p.manager.GetEntry(infoHash)
+	if err != nil || entry == nil {
+		return true
+	}
+	return fileNZBID(entry, entry.Files[filename]) == served.InfoHash
 }
 
 // overlayIsClean reports whether filename under entry currently has no
