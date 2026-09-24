@@ -482,6 +482,12 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 	}
 
 	if runErr != nil {
+		if ffprobeReadFailed(stderr.String()) {
+			// The body stopped short (a transport error behind a response
+			// whose headers were already sent), not a container that
+			// cannot be parsed: marked so checkConfirmed retries it.
+			return false, ffprobeReasonUnreadable + ffprobeReadFailedTag + ": " + firstLine(stderr.String()), true, ""
+		}
 		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true, ""
 	}
 
@@ -1404,7 +1410,11 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 		noteUnverified(ctx, unverifiedReadBudget)
 		return true, "", false, ""
 	}
-	if strings.HasPrefix(reason, ffprobeReasonUnreadable) {
+	// An unreadable container is permanent; a read that failed is not - a
+	// transport error behind already-sent headers ends the body short and
+	// looks unreadable to ffprobe, and skipping the retry turned it into a
+	// blocklisted release.
+	if strings.HasPrefix(reason, ffprobeReasonUnreadable) && !strings.Contains(reason, ffprobeReadFailedTag) {
 		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).Msg("[repair] Repair: skipping ffprobe retry — unreadable error is permanent")
 		return false, reason, conclusive, coverage
 	}
