@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -229,12 +230,19 @@ func (s *Storage) GetAll() []*Arr {
 func (s *Storage) SyncToConfig() []config.Arr {
 	cfg := config.Get()
 	arrConfigs := make(map[string]config.Arr)
+	// order is the config's order; the Settings page lists Arrs in it, so a
+	// map's order would reshuffle the cards on every load.
+	order := make([]string, 0, len(cfg.Arrs))
 	for _, a := range cfg.Arrs {
 		if a.Host == "" || a.Token == "" {
 			continue // Skip empty arrs
 		}
+		if _, seen := arrConfigs[a.Name]; !seen {
+			order = append(order, a.Name)
+		}
 		arrConfigs[a.Name] = a
 	}
+	var added []string
 
 	s.arrs.Range(func(name string, arr *Arr) bool {
 		exists, ok := arrConfigs[name]
@@ -251,6 +259,7 @@ func (s *Storage) SyncToConfig() []config.Arr {
 			arrConfigs[name] = exists
 		} else {
 			// AddOrUpdate new arr config
+			added = append(added, name)
 			arrConfigs[name] = config.Arr{
 				Name:             arr.Name,
 				Host:             arr.Host,
@@ -263,10 +272,12 @@ func (s *Storage) SyncToConfig() []config.Arr {
 		}
 		return true
 	})
-	// Convert map to slice
+	// Config order first, then Arrs only runtime storage knows (auto-detected
+	// since the last save) by name.
+	sort.Strings(added)
 	arrs := make([]config.Arr, 0, len(arrConfigs))
-	for _, a := range arrConfigs {
-		arrs = append(arrs, a)
+	for _, name := range append(order, added...) {
+		arrs = append(arrs, arrConfigs[name])
 	}
 	return arrs
 }
@@ -282,7 +293,7 @@ func (s *Storage) SyncFromConfig(arrs []config.Arr) {
 		if ac, ok := newMaps.Load(name); ok {
 			// Update existing arr with new config values.
 			// Only preserve the resolved host from memory if the new host is invalid.
-			if utils.ValidateURL(ac.Host) == nil {
+			if utils.ValidateURL(ac.Host) != nil {
 				ac.Host = arr.Host
 			}
 			ac.Token = cmp.Or(ac.Token, arr.Token)
