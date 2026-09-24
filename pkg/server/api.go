@@ -597,7 +597,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	newConfig.Arrs = validArrs
 
 	// Sync arr storage with the new configuration
-	s.manager.Arr().SyncFromConfig(newConfig.Arrs)
+	s.manager.Arr().SyncFromConfig(newConfig.Arrs, currentConfig.Arrs)
 
 	// Save the updated config. This also applies defaults to newConfig, so the
 	// restart comparison below sees a fully-normalized config on both sides.

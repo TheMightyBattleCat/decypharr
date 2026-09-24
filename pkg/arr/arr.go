@@ -282,10 +282,18 @@ func (s *Storage) SyncToConfig() []config.Arr {
 	return arrs
 }
 
-func (s *Storage) SyncFromConfig(arrs []config.Arr) {
+// SyncFromConfig replaces runtime storage with a saved Arr list. previous is
+// the list saved before this save: an Arr in it that arrs leaves out was
+// deleted in Settings and is dropped, while an Arr only runtime storage knows
+// (auto-detected since the last save) is kept.
+func (s *Storage) SyncFromConfig(arrs, previous []config.Arr) {
 	newMaps := xsync.NewMap[string, *Arr]()
 	for _, a := range arrs {
 		newMaps.Store(a.Name, New(a.Name, a.Host, a.Token, a.SkipRepair, a.DownloadUncached, a.SelectedDebrid, a.Source))
+	}
+	wasSaved := make(map[string]bool, len(previous))
+	for _, a := range previous {
+		wasSaved[a.Name] = true
 	}
 
 	// AddOrUpdate or update arrs from config
@@ -298,7 +306,7 @@ func (s *Storage) SyncFromConfig(arrs []config.Arr) {
 			}
 			ac.Token = cmp.Or(ac.Token, arr.Token)
 			newMaps.Store(name, ac)
-		} else {
+		} else if !wasSaved[name] {
 			newMaps.Store(name, arr)
 		}
 		return true

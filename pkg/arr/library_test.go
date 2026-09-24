@@ -35,7 +35,7 @@ func TestSyncFromConfigAppliesEditedHost(t *testing.T) {
 	s := &Storage{arrs: xsync.NewMap[string, *Arr]()}
 	s.AddOrUpdate(New("sonarr", "http://old-host:8989", "k", false, nil, "", "manual"))
 
-	s.SyncFromConfig([]config.Arr{{Name: "sonarr", Host: "http://new-host:8989", Token: "k"}})
+	s.SyncFromConfig([]config.Arr{{Name: "sonarr", Host: "http://new-host:8989", Token: "k"}}, nil)
 
 	if got := s.Get("sonarr").Host; got != "http://new-host:8989" {
 		t.Fatalf("host after save = %q, want the edited host", got)
@@ -51,7 +51,7 @@ func TestSyncFromConfigKeepsResolvedHostWhenConfigHostInvalid(t *testing.T) {
 	s := &Storage{arrs: xsync.NewMap[string, *Arr]()}
 	s.AddOrUpdate(New("tv", "http://sonarr:8989", "k", false, nil, "", "auto"))
 
-	s.SyncFromConfig([]config.Arr{{Name: "tv", Host: "", Token: "k", Source: "auto"}})
+	s.SyncFromConfig([]config.Arr{{Name: "tv", Host: "", Token: "k", Source: "auto"}}, nil)
 
 	if got := s.Get("tv").Host; got != "http://sonarr:8989" {
 		t.Fatalf("host = %q, want the resolved host kept", got)
@@ -87,5 +87,42 @@ func TestSyncToConfigKeepsConfigOrder(t *testing.T) {
 		if strings.Join(names, ",") != strings.Join(want, ",") {
 			t.Fatalf("order = %v, want %v", names, want)
 		}
+	}
+}
+
+// Deleting an Arr card in Settings must remove it: the save posts the list
+// without it, and the next page load must not bring it back.
+func TestSyncFromConfigDropsDeletedArr(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	live := config.Get()
+	saved := live.Arrs
+	t.Cleanup(func() { config.Get().Arrs = saved })
+	s := &Storage{arrs: xsync.NewMap[string, *Arr]()}
+	s.AddOrUpdate(New("sonarr", "http://h:8989", "a", false, nil, "", ""))
+	s.AddOrUpdate(New("old-radarr", "http://h:7878", "b", false, nil, "", ""))
+	// Auto-detected since the last save: only runtime storage knows it.
+	s.AddOrUpdate(New("tv", "http://h:8989", "a", false, nil, "", "auto"))
+
+	previous := []config.Arr{
+		{Name: "sonarr", Host: "http://h:8989", Token: "a"},
+		{Name: "old-radarr", Host: "http://h:7878", Token: "b"},
+	}
+	kept := previous[:1]
+	s.SyncFromConfig(kept, previous)
+	live.Arrs = kept
+
+	if s.Get("old-radarr") != nil {
+		t.Fatal("deleted Arr still in runtime storage")
+	}
+	if s.Get("tv") == nil {
+		t.Fatal("an auto-detected Arr the page never saved was dropped")
+	}
+	got := s.SyncToConfig()
+	names := make([]string, len(got))
+	for i, a := range got {
+		names[i] = a.Name
+	}
+	if strings.Join(names, ",") != "sonarr,tv" {
+		t.Fatalf("next page load lists %v, want [sonarr tv]", names)
 	}
 }
