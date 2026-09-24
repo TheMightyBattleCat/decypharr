@@ -38,7 +38,17 @@ func TestDeferredDeleteSurvivesRestart(t *testing.T) {
 		t.Fatalf("deleteEntryWhenIdle = %v, %v; want deferred", deleted, err)
 	}
 	stop()
-	time.Sleep(30 * time.Millisecond)
+	// Wait for r1's waiter to exit (it reads idleDeletePoll, which the
+	// cleanup above restores).
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if _, pending := r1.idleDeletes.Load("old"); !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("r1's deferred-delete waiter did not exit on shutdown")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	m.UntrackStream(stream)
 	if ok, _ := m.EntryExists("old"); !ok {
 		t.Fatal("setup: entry deleted before the restart")

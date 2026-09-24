@@ -198,7 +198,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		// detection that a timeout or cancellation could have cut short)
 		// the NZB simply holds no media: report it unavailable so it is
 		// queued failed and the Arr blocklists it.
-		if ctx.Err() == nil && !needsContentDetection(p, raw.Files) {
+		if ctx.Err() == nil && holdsOnlyKnownNonMedia(p, raw.Files) {
 			return nil, nil, fmt.Errorf("no valid file groups found in NZB: %w", ErrReleaseUnavailable)
 		}
 		return nil, nil, fmt.Errorf("no valid file groups found in NZB")
@@ -1733,4 +1733,20 @@ func needsContentDetection(p *NZBParser, files nzbparser.NzbFiles) bool {
 		}
 	}
 	return false
+}
+
+// holdsOnlyKnownNonMedia reports whether an NZB that yielded no file groups
+// did so because it genuinely holds no media: at least one file has
+// articles, and every such file's type is known from its name. An NZB with
+// no articles at all is malformed input, not an unavailable release, and one
+// needing network detection may only have been cut short.
+func holdsOnlyKnownNonMedia(p *NZBParser, files nzbparser.NzbFiles) bool {
+	withArticles := false
+	for _, f := range files {
+		if len(f.Segments) > 0 {
+			withArticles = true
+			break
+		}
+	}
+	return withArticles && !needsContentDetection(p, files)
 }

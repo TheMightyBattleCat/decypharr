@@ -34,7 +34,11 @@ func TestNoValidFileGroups(t *testing.T) {
 		t.Fatal("an obfuscated name must count as needing content detection")
 	}
 	known := nzbparser.NzbFiles{{Filename: "release.nfo", Segments: nzbparser.NzbSegments{{Number: 1, Id: "x@y"}}}}
-	if needsContentDetection(p, known) {
-		t.Fatal("a .nfo needs no content detection")
+	if needsContentDetection(p, known) || !holdsOnlyKnownNonMedia(p, known) {
+		t.Fatal("a .nfo needs no content detection and is known non-media")
+	}
+	// No file with any articles: malformed input, not an unavailable release.
+	if holdsOnlyKnownNonMedia(p, nzbparser.NzbFiles{{Filename: "x.nfo"}}) {
+		t.Fatal("an NZB without articles must keep the plain error")
 	}
 }
