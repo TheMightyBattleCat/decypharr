@@ -1692,13 +1692,19 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 		// otherwise it's a Repaired count with no corresponding evidence of
 		// what actually happened.
 		if len(succeeded) > 0 {
+			// Files assembled wrong at import are re-grabbed keeping the
+			// release: nothing was blocklisted, so don't say it was.
+			msg := "Repair: partially repaired entry - blocklisted + re-searched broken files, entry kept"
+			if keepEntryForReGrab(h.BrokenFiles) {
+				msg = "Repair: re-searched files assembled wrong at import, keeping the release (not blocklisted), entry kept"
+			}
 			r.logger.Info().
 				Str("entry", name).
 				Int("broken_files", h.BrokenCount).
 				Int("total_files", h.FileCount).
 				Str(logger.FieldStatus, logger.StatusWarn).
 				Str(logger.FieldNote, fmt.Sprintf("%d of %d files re-searched", h.BrokenCount, h.FileCount)).
-				Msg("Repair: partially repaired entry - blocklisted + re-searched broken files, entry kept")
+				Msg(msg)
 		}
 		return
 	}

@@ -766,9 +766,20 @@ func (r *Repair) logRunFinished(run *storage.RepairRun) {
 	if reason != "" {
 		ev = ev.Str("reason", reason)
 	}
-	ev.Str("run_id", run.ID).Str(logger.FieldStatus, status).
+	// A FixBroken / Clear / Replace batch runs through the same finish as a
+	// sweep; it used to log as "Repair sweep completed", indistinguishable
+	// from one (fourteen "0 probed • 25 repaired" sweeps on 09-18 were
+	// Replace batches). Sweeps keep their message.
+	kind := "sweep"
+	for _, p := range []string{"fix-broken", "clear-broken", "replace"} {
+		if strings.HasPrefix(run.Source, p) {
+			kind = "batch"
+			break
+		}
+	}
+	ev.Str("run_id", run.ID).Str(logger.FieldStatus, status).Str("trigger", string(run.Trigger)).
 		Str(logger.FieldNote, fmt.Sprintf("%d probed • %d broken • %d repaired", run.Stats.Probed, run.Stats.Broken, run.Stats.Repaired)).
-		Msgf("Repair sweep %s", run.Status)
+		Msgf("Repair %s %s", kind, run.Status)
 }
 
 func notificationEventFor(status storage.RepairRunStatus) config.NotificationEvent {

@@ -925,6 +925,15 @@ func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
 	return total
 }
 
+// EntryExists reports whether nzbID has an overlay directory on disk.
+func (s *Store) EntryExists(nzbID string) bool {
+	if s == nil || nzbID == "" {
+		return false
+	}
+	_, err := os.Stat(s.entryDir(nzbID))
+	return err == nil
+}
+
 // DeleteEntry removes nzbID's entire overlay directory (manifest + every
 // patch blob). Called wherever a stored NZB record is torn down - keyed by
 // nzbID (unique), avoiding the name-twin hazard the DFS cache has.

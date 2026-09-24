@@ -57,8 +57,7 @@ func (m *Manager) ReapOverlay(nzbID, file string, execute bool) (OverlayReapResu
 		result.Mode = ReapModeReapedEntry
 		// OverlayDeleteEntry reports no removed signal of its own (it's an
 		// unconditional RemoveAll), so check what's there first.
-		manifest, _ := u.OverlayManifest(nzbID)
-		result.Removed = manifest != nil
+		result.Removed = u.OverlayEntryExists(nzbID)
 		if err := u.OverlayDeleteEntry(nzbID); err != nil {
 			return result, err
 		}

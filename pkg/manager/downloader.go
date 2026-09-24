@@ -278,10 +278,9 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 		// OverlayDeleteEntry is an unconditional RemoveAll with no removed
 		// signal of its own, so probe the manifest first to only log when
 		// there was actually an overlay dir to reap (mirrors ReapOverlay).
-		hadOverlay := false
-		if m, _ := d.manager.usenet.OverlayManifest(entry.InfoHash); m != nil {
-			hadOverlay = true
-		}
+		// OverlayManifest is non-nil even with no directory (a missing
+		// manifest loads fresh), so ask about the directory itself.
+		hadOverlay := d.manager.usenet.OverlayEntryExists(entry.InfoHash)
 		if err := d.manager.usenet.OverlayDeleteEntry(entry.InfoHash); err != nil {
 			d.logger.Warn().Err(err).Str("entry", entry.Name).Str("infohash", entry.InfoHash).
 				Msg("Import: failed to remove overlay dir for rejected import")

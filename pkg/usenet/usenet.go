@@ -1020,6 +1020,15 @@ func (u *Usenet) OverlayDeleteFile(nzoID, filename string) (removed bool, err er
 // (nil error) if the overlay store is unavailable. Used by the overlay
 // management API's orphan GC when nzoID's backing entry no longer exists at
 // all, as opposed to OverlayDeleteFile's narrower per-file scope.
+// OverlayEntryExists reports whether nzoID has an overlay directory on disk.
+// (OverlayManifest cannot tell: a missing manifest loads as a fresh one.)
+func (u *Usenet) OverlayEntryExists(nzoID string) bool {
+	if u.overlay == nil {
+		return false
+	}
+	return u.overlay.EntryExists(nzoID)
+}
+
 func (u *Usenet) OverlayDeleteEntry(nzoID string) error {
 	if u.overlay == nil {
 		return nil
