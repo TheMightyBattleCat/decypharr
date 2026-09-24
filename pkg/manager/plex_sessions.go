@@ -13,6 +13,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -77,11 +78,18 @@ func (f *flexInt64) UnmarshalJSON(b []byte) error {
 		*f = 0
 		return nil
 	}
-	n, err := strconv.ParseInt(string(b), 10, 64)
-	if err != nil {
-		return fmt.Errorf("flexInt64: %q: %w", string(b), err)
+	if n, err := strconv.ParseInt(string(b), 10, 64); err == nil {
+		*f = flexInt64(n)
+		return nil
 	}
-	*f = flexInt64(n)
+	// A float or exponent form ("443142.0", 2.7e6) is truncated. Anything
+	// else - a bool, an out-of-range number, garbage - is 0, as documented:
+	// failing here fails the whole response it sits in.
+	if v, err := strconv.ParseFloat(string(b), 64); err == nil && !math.IsNaN(v) && v >= math.MinInt64 && v < math.MaxInt64 {
+		*f = flexInt64(int64(v))
+		return nil
+	}
+	*f = 0
 	return nil
 }
 
@@ -93,9 +101,9 @@ func (f *flexInt64) UnmarshalJSON(b []byte) error {
 type plexSessionsResponse struct {
 	MediaContainer struct {
 		Metadata []struct {
-			RatingKey  string    `json:"ratingKey"`
-			ViewOffset flexInt64 `json:"viewOffset"`
-			Duration   flexInt64 `json:"duration"`
+			RatingKey  flexString `json:"ratingKey"`
+			ViewOffset flexInt64  `json:"viewOffset"`
+			Duration   flexInt64  `json:"duration"`
 			Player     struct {
 				State string `json:"state"`
 			} `json:"Player"`
@@ -309,8 +317,8 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSession
 		if len(files) == before && meta.RatingKey != "" {
 			mctx, mcancel := context.WithTimeout(context.Background(), plexSessionFetchTimeout)
 			var detail plexSessionsResponse
-			if err := c.plexGET(mctx, cfg, "/library/metadata/"+meta.RatingKey, &detail); err != nil {
-				c.logger.Debug().Err(err).Str("ratingKey", meta.RatingKey).Msg("plex: transcode-session metadata lookup failed; leaving title ungated this cycle")
+			if err := c.plexGET(mctx, cfg, "/library/metadata/"+string(meta.RatingKey), &detail); err != nil {
+				c.logger.Debug().Err(err).Str("ratingKey", string(meta.RatingKey)).Msg("plex: transcode-session metadata lookup failed; leaving title ungated this cycle")
 			} else {
 				for _, media := range detail.MediaContainer.Metadata {
 					for _, part := range media.Media {

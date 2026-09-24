@@ -389,7 +389,7 @@ func (p *plexLibrary) PlayingRatingKeys(ctx context.Context) (map[string]bool, e
 	keys := make(map[string]bool, len(r.MediaContainer.Metadata))
 	for _, m := range r.MediaContainer.Metadata {
 		if m.RatingKey != "" {
-			keys[m.RatingKey] = true
+			keys[string(m.RatingKey)] = true
 		}
 	}
 	return keys, nil
