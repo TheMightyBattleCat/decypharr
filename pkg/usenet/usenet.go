@@ -588,13 +588,18 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 		return nil, key, err
 	}
 
+	// Published already holding our reference: stored with refCount 0 and
+	// lastAccessed 0, the janitor could claim the entry (refCount 0, idle
+	// since the epoch) between the store and the increment and tear it
+	// down under us.
+	newEntry.refCount.Store(1)
+	newEntry.lastAccessed.Store(utils.NowUnix())
+
 	// Atomically store only if key doesn't exist (prevents race condition)
 	for {
 		actual, loaded := u.fs.LoadOrStore(key, newEntry)
 		if !loaded {
 			// We won the race - use our new entry
-			newEntry.refCount.Add(1)
-			newEntry.lastAccessed.Store(utils.NowUnix())
 			return newEntry, key, nil
 		}
 		// Another goroutine created the entry first - use theirs.
