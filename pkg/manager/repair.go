@@ -174,7 +174,7 @@ type Repair struct {
 // NewRepair builds the repair service for the given manager. Call
 // Repair.Start to register the recurring sweep with the scheduler.
 func NewRepair(m *Manager) *Repair {
-	return &Repair{
+	r := &Repair{
 		manager:     m,
 		scheduler:   m.scheduler,
 		logger:      logger.New("repair"),
@@ -183,6 +183,10 @@ func NewRepair(m *Manager) *Repair {
 		regrabGuard: newRegrabGuard(),
 		arrRefs:     newArrRefsCache(),
 	}
+	if m.storage != nil {
+		r.regrabGuard.attach(m.storage, r.logger)
+	}
+	return r
 }
 
 func (r *Repair) cfg() config.RepairConfig { return config.Get().Repair }

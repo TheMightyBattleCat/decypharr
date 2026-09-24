@@ -1212,6 +1212,24 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 			Msg("Repair: sweep leaving a broken file for the next pass; it is being streamed")
 		return
 	}
+	// Every broken file assembled wrong at import means the heal re-grabs
+	// the SAME release (keepEntryForReGrab). Re-importing that NZB rebuilds
+	// the same fault, so after one such re-grab another is pointless: on
+	// a production install 8-Bit Midwinter was re-grabbed every night for five nights,
+	// each import byte-identical. (With any file damaged in the posting the
+	// grab is blocklisted and a different release comes instead.)
+	keepRelease := keepEntryForReGrab(h.BrokenFiles)
+	if keepRelease {
+		for _, bf := range h.BrokenFiles {
+			identity := regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name)
+			if r.regrabGuard.keepReleaseRepeated(identity, name) {
+				r.logger.Warn().Str("entry", name).Str("file", bf.FileName).Str("reason", bf.Reason).
+					Msg("Repair: not re-grabbing again; an automatic re-grab of this same release already ran and it is still assembled wrong")
+				r.markRegrabGuardTripped(name, bf.FileName, h, keepReleaseRepeatReason)
+				return
+			}
+		}
+	}
 	for _, bf := range h.BrokenFiles {
 		identity := regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name)
 		if allowed, guardReason, firstTrip := r.regrabGuard.checkAndRecord(identity, name); !allowed {
@@ -1225,6 +1243,11 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 				r.markRegrabGuardTripped(name, bf.FileName, h, guardReason)
 			}
 			return
+		}
+	}
+	if keepRelease {
+		for _, bf := range h.BrokenFiles {
+			r.regrabGuard.recordKeepRelease(regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name), name)
 		}
 	}
 	r.healBrokenEntry(ctx, run, statsMu, name, h, bulkOverride)

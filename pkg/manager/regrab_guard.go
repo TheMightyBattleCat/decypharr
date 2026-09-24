@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 const (
@@ -42,13 +46,43 @@ const (
 	// genuinely different dead candidate always strikes, no matter how soon
 	// after the last one it arrives.
 	regrabDedupeWindow = playbackRepairCooldown
+
+	// keepReleaseRetryWindow is how long a re-grab that KEPT a release (a
+	// file assembled wrong at import - see keepReleaseReason) blocks another
+	// automatic keep-release re-grab of that same release for the same file.
+	// Re-importing the same NZB reproduces the same assembly: on a production install
+	// 8-Bit Midwinter was re-grabbed every night for five nights, each import
+	// byte-identical with the same zero-filled region. regrabGuardWindow
+	// cannot stop that - its 24 h window equals the sweep's period, so every
+	// night's attempt lands just after the previous one expired. A fix to
+	// import assembly reaches such a file through a manual Replace, which
+	// clears the guard.
+	keepReleaseRetryWindow = 30 * 24 * time.Hour
+
+	// regrabGuardTerminalTTL is how long a tripped guard stays tripped. It
+	// used to last only until the next restart; persisted, it needs a bound
+	// of its own, so a release posted later can still be grabbed without a
+	// manual action.
+	regrabGuardTerminalTTL = 7 * 24 * time.Hour
+
+	// keepReleaseRepeatReason is surfaced when the keep-release check refuses.
+	keepReleaseRepeatReason = "re-grabbing this release reproduced the same import fault; replace it by hand"
 )
+
+// regrabGuardStore persists the guard's records (storage.Storage in
+// production) so a restart doesn't wipe a loop's history.
+type regrabGuardStore interface {
+	SaveRegrabGuardRecord(*storage.RegrabGuardRecord) error
+	DeleteRegrabGuardRecord(identity string) error
+	ForEachRegrabGuardRecord(func(*storage.RegrabGuardRecord)) error
+}
 
 // regrabAttemptRecord is one logical file's automatic re-grab history.
 type regrabAttemptRecord struct {
-	attempts []time.Time
-	terminal bool
-	reason   string
+	attempts   []time.Time
+	terminal   bool
+	terminalAt time.Time
+	reason     string
 	// loggedTerminal is true once the terminal transition has been logged
 	// at WARN - every later call while still terminal only needs a quiet
 	// DEBUG, not a repeat of the same warning on every subsequent playback
@@ -61,6 +95,26 @@ type regrabAttemptRecord struct {
 	// normal; it just doesn't consume a fresh strike, since it's the same
 	// evidence already counted rather than a new distinct dead candidate.
 	recentReleases map[string]time.Time
+	// keepRelease records, per release name, when a keep-release re-grab of
+	// it went ahead - see keepReleaseRetryWindow.
+	keepRelease map[string]time.Time
+}
+
+func (rec *regrabAttemptRecord) toStorage(identity string) *storage.RegrabGuardRecord {
+	return &storage.RegrabGuardRecord{
+		Identity:       identity,
+		Attempts:       rec.attempts,
+		Terminal:       rec.terminal,
+		TerminalAt:     rec.terminalAt,
+		Reason:         rec.reason,
+		RecentReleases: rec.recentReleases,
+		KeepRelease:    rec.keepRelease,
+	}
+}
+
+// empty reports whether rec holds nothing worth keeping.
+func (rec *regrabAttemptRecord) empty() bool {
+	return len(rec.attempts) == 0 && !rec.terminal && len(rec.keepRelease) == 0
 }
 
 // regrabGuard tracks automatic re-grab attempts per stable logical-file
@@ -76,13 +130,122 @@ type regrabGuard struct {
 	mu      sync.Mutex
 	records map[string]*regrabAttemptRecord
 	nowFn   func() time.Time
+	store   regrabGuardStore
+	logger  zerolog.Logger
 }
 
 func newRegrabGuard() *regrabGuard {
 	return &regrabGuard{
 		records: make(map[string]*regrabAttemptRecord),
 		nowFn:   time.Now,
+		logger:  zerolog.Nop(),
 	}
+}
+
+// attach loads every persisted record from st and persists every later
+// change to it. Records with nothing left inside their windows are dropped.
+func (g *regrabGuard) attach(st regrabGuardStore, logger zerolog.Logger) {
+	if st == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.store = st
+	g.logger = logger
+	now := g.nowFn()
+	var stale []string
+	err := st.ForEachRegrabGuardRecord(func(sr *storage.RegrabGuardRecord) {
+		rec := &regrabAttemptRecord{
+			terminal:       sr.Terminal && now.Sub(sr.TerminalAt) < regrabGuardTerminalTTL,
+			terminalAt:     sr.TerminalAt,
+			reason:         sr.Reason,
+			loggedTerminal: sr.Terminal,
+
+			recentReleases: sr.RecentReleases,
+			keepRelease:    sr.KeepRelease,
+		}
+		for _, t := range sr.Attempts {
+			if now.Sub(t) < regrabGuardWindow {
+				rec.attempts = append(rec.attempts, t)
+			}
+		}
+		for name, t := range rec.keepRelease {
+			if now.Sub(t) >= keepReleaseRetryWindow {
+				delete(rec.keepRelease, name)
+			}
+		}
+		if rec.empty() {
+			stale = append(stale, sr.Identity)
+			return
+		}
+		g.records[sr.Identity] = rec
+	})
+	if err != nil {
+		logger.Warn().Err(err).Msg("Repair: could not load the re-grab guard's history; starting empty")
+	}
+	for _, id := range stale {
+		_ = st.DeleteRegrabGuardRecord(id)
+	}
+}
+
+// persist writes identity's record (or removes it when empty). Called with
+// g.mu held.
+func (g *regrabGuard) persist(identity string, rec *regrabAttemptRecord) {
+	if g.store == nil {
+		return
+	}
+	var err error
+	if rec == nil || rec.empty() {
+		err = g.store.DeleteRegrabGuardRecord(identity)
+	} else {
+		err = g.store.SaveRegrabGuardRecord(rec.toStorage(identity))
+	}
+	if err != nil {
+		g.logger.Warn().Err(err).Str("identity", identity).Msg("Repair: could not persist the re-grab guard")
+	}
+}
+
+// keepReleaseRepeated reports whether a keep-release re-grab of releaseName
+// for identity already went ahead inside keepReleaseRetryWindow - another
+// one would re-import the same NZB into the same fault. Records nothing.
+func (g *regrabGuard) keepReleaseRepeated(identity, releaseName string) bool {
+	if identity == "" || releaseName == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rec, ok := g.records[identity]
+	if !ok {
+		return false
+	}
+	last, seen := rec.keepRelease[releaseName]
+	return seen && g.nowFn().Sub(last) < keepReleaseRetryWindow
+}
+
+// recordKeepRelease notes that a keep-release re-grab of releaseName for
+// identity is going ahead.
+func (g *regrabGuard) recordKeepRelease(identity, releaseName string) {
+	if identity == "" || releaseName == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rec, ok := g.records[identity]
+	if !ok {
+		rec = &regrabAttemptRecord{}
+		g.records[identity] = rec
+	}
+	now := g.nowFn()
+	if rec.keepRelease == nil {
+		rec.keepRelease = make(map[string]time.Time)
+	}
+	for name, t := range rec.keepRelease {
+		if now.Sub(t) >= keepReleaseRetryWindow {
+			delete(rec.keepRelease, name)
+		}
+	}
+	rec.keepRelease[releaseName] = now
+	g.persist(identity, rec)
 }
 
 // regrabIdentityKey builds a stable identity for a broken file's underlying
@@ -124,11 +287,14 @@ func (g *regrabGuard) checkAndRecord(identity, releaseName string) (allowed bool
 		rec = &regrabAttemptRecord{}
 		g.records[identity] = rec
 	}
+	now := g.nowFn()
+	if rec.terminal && now.Sub(rec.terminalAt) >= regrabGuardTerminalTTL {
+		rec.terminal, rec.reason, rec.loggedTerminal = false, "", false
+		rec.attempts = nil
+	}
 	if rec.terminal {
 		return false, rec.reason, false
 	}
-
-	now := g.nowFn()
 
 	if releaseName != "" {
 		if last, seen := rec.recentReleases[releaseName]; seen && now.Sub(last) < regrabDedupeWindow {
@@ -147,8 +313,10 @@ func (g *regrabGuard) checkAndRecord(identity, releaseName string) (allowed bool
 
 	if len(rec.attempts) >= regrabGuardMaxAttempts {
 		rec.terminal = true
+		rec.terminalAt = now
 		rec.reason = regrabGuardTerminalReason
 		rec.loggedTerminal = true
+		g.persist(identity, rec)
 		return false, rec.reason, true
 	}
 
@@ -167,6 +335,7 @@ func (g *regrabGuard) checkAndRecord(identity, releaseName string) (allowed bool
 		}
 		rec.recentReleases[releaseName] = now
 	}
+	g.persist(identity, rec)
 	return true, "", false
 }
 
@@ -181,6 +350,7 @@ func (g *regrabGuard) clear(identity string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.records, identity)
+	g.persist(identity, nil)
 }
 
 // state returns identity's current attempt count and terminal status, for
