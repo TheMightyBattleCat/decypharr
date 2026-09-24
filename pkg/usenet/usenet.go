@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2662,15 +2663,17 @@ func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 // SaveNZBPar2Match persists the posted-file -> PAR2 FileDesc match cache for
 // nzoID (see storage.Par2MatchRef / NZB.Par2Match). Write-once: it is a
 // no-op if refs is empty or a non-empty cache is already stored, so a later
-// repair attempt never rewrites it. Concurrency matches BackfillPar2Refs -
-// GetNZB/modify/AddNZB, safe here because at most one repair pass runs per
-// nzbID at a time (see Par2Repair.running).
-func (u *Usenet) SaveNZBPar2Match(nzoID string, refs []storage.Par2MatchRef) error {
+// repair attempt never rewrites it - except refused, a stored cache the
+// caller could not use (par2MatchFromCache rejected it, e.g. one pairing a
+// FileID twice from before 0e4f177). Left in place, a refused cache made
+// every pass redo the MD5-16k tie-break; it is replaced only while it is
+// still exactly the one refused. Runs under NZBStorage.Update's lock.
+func (u *Usenet) SaveNZBPar2Match(nzoID string, refs, refused []storage.Par2MatchRef) error {
 	if len(refs) == 0 {
 		return nil
 	}
 	err := u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
-		if len(nzb.Par2Match) > 0 {
+		if len(nzb.Par2Match) > 0 && (len(refused) == 0 || !slices.Equal(nzb.Par2Match, refused)) {
 			return false, nil
 		}
 		nzb.Par2Match = refs

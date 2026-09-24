@@ -206,3 +206,13 @@ func TestExactSegGeometry_SingleSegment(t *testing.T) {
 		t.Errorf("bases = %v, want [0]", bases)
 	}
 }
+
+// A zero or garbage final bytes= estimate left the scaled accumulate's last
+// segment with size <= 0 (review G-N4); a segment is never empty.
+func TestExactSegGeometry_ScaledLastNeverEmpty(t *testing.T) {
+	segs := []storage.Par2SegmentRef{{Bytes: 1000}, {Bytes: 1000}, {Bytes: 0}}
+	_, sizes := exactSegGeometry(segs, 2000, zerolog.Nop())
+	if sizes[2] < 1 {
+		t.Fatalf("last segment size = %d, want >= 1", sizes[2])
+	}
+}

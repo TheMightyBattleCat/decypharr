@@ -761,6 +761,13 @@ func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
 		return false, "nzb record not found"
 	}
 	if len(nzb.Par2Source) == 0 || len(nzb.Par2Files) == 0 {
+		// BackfillPar2Refs rebuilds only a record that kept neither list.
+		// With one retained (typically the source files of a release posted
+		// without PAR2 files) it does nothing and the pass ends "no PAR2 data
+		// available": not usable, so the policy re-grabs instead.
+		if len(nzb.Par2Source) > 0 || len(nzb.Par2Files) > 0 {
+			return false, "no PAR2 files retained for this release"
+		}
 		if nzb.Path == "" {
 			return false, "no par2 metadata retained and source nzb no longer on disk"
 		}
@@ -1310,7 +1317,8 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	for _, segs := range pending {
 		deadSegments += len(segs)
 	}
-	p.logger.Info().Str("entry", entryName).Str("lane", lane.String()).Int("dead_segments", deadSegments).Msg("par2 repair queued")
+	// Logged as the pass starts (after claimRun), not when it was queued.
+	p.logger.Info().Str("entry", entryName).Str("lane", lane.String()).Int("dead_segments", deadSegments).Msg("par2 repair started")
 
 	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
@@ -1990,7 +1998,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return fmt.Errorf("match posted files: %w", err)
 		}
 		if ref := par2MatchToCache(nzb.Par2Source, matches, skipped); ref != nil {
-			if serr := u.SaveNZBPar2Match(nzbID, ref); serr != nil {
+			// A cache is only here unused because par2MatchFromCache refused
+			// it: replace it rather than redo this matching every pass.
+			if serr := u.SaveNZBPar2Match(nzbID, ref, nzb.Par2Match); serr != nil {
 				p.logger.Warn().Err(serr).Str("entry", entryName).
 					Msg("par2 repair: failed to persist posted-file match cache")
 			} else {
@@ -3779,8 +3789,10 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerol
 				sizes[i] = int64(math.Round(float64(s.Bytes) * scale))
 				off += sizes[i]
 			}
-			// Absorb rounding residual into the last segment
-			sizes[len(segs)-1] = trueLen - bases[len(segs)-1]
+			// Absorb rounding residual into the last segment. A zero or
+			// garbage final bytes= estimate can leave nothing for it; a
+			// segment is never empty, so keep at least one byte.
+			sizes[len(segs)-1] = max(1, trueLen-bases[len(segs)-1])
 		} else {
 			var off int64
 			for i, s := range segs {

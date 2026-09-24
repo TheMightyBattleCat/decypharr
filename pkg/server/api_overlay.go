@@ -654,7 +654,9 @@ func (s *Server) par2RefsBackfillEligible(nzbID string) bool {
 	if err != nil {
 		return false
 	}
-	if len(nzb.Par2Source) > 0 && len(nzb.Par2Files) > 0 {
+	// BackfillPar2Refs rebuilds only a record that kept neither list; with
+	// one retained, "Repair now" answered queued and then failed terminal.
+	if len(nzb.Par2Source) > 0 || len(nzb.Par2Files) > 0 {
 		return false
 	}
 	if nzb.Path == "" {
