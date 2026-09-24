@@ -91,6 +91,10 @@ type Manager struct {
 	// its file is replaced.
 	plexReaper *PlexReaper
 
+	// wantedSearch sends each Arr's scheduled "search all missing" (see
+	// wanted_search.go).
+	wantedSearch *WantedSearch
+
 	// Debrid speed test results storage
 	debridSpeedTestResults *xsync.Map[string, debridTypes.SpeedTestResult]
 
@@ -292,6 +296,9 @@ func (m *Manager) init() {
 	// Plex stale-version reaper (see plex_reap.go), consulting one Arr per
 	// distinct host so an Arr configured under two names is asked once.
 	m.plexReaper = NewPlexReaper(m.arr.DistinctByHost)
+
+	// Scheduled per-Arr wanted search; registers its jobs in StartWorker.
+	m.wantedSearch = NewWantedSearch(m.scheduler, m.arr.Get)
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
@@ -539,6 +546,10 @@ func (m *Manager) Stop() error {
 
 	if m.plexReaper != nil {
 		m.plexReaper.Stop()
+	}
+
+	if m.wantedSearch != nil {
+		m.wantedSearch.Stop()
 	}
 
 	// Close usenet connection manager if active

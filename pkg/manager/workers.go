@@ -219,6 +219,14 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		m.plexReaper.Start(ctx)
 	}
 
+	// Register each Arr's scheduled wanted search. A bad schedule only skips
+	// that Arr's job; settings saves reject one before it gets here.
+	if m.wantedSearch != nil {
+		if err := m.wantedSearch.Start(ctx); err != nil {
+			m.logger.Warn().Err(err).Msg("Some wanted searches were not scheduled")
+		}
+	}
+
 	// Start the scheduler
 	m.scheduler.Start()
 	m.cetScheduler.Start()

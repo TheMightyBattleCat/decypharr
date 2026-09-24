@@ -69,6 +69,14 @@ func (m *Manager) PlexReaper() *PlexReaper {
 	return m.plexReaper
 }
 
+// WantedSearch returns the scheduled per-Arr wanted-search service.
+func (m *Manager) WantedSearch() *WantedSearch {
+	if m == nil {
+		return nil
+	}
+	return m.wantedSearch
+}
+
 func (m *Manager) Arr() *arr.Storage {
 	return m.arr
 }

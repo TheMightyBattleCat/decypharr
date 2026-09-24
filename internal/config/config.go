@@ -80,10 +80,26 @@ type Arr struct {
 	DownloadUncached *bool  `json:"download_uncached,omitempty"`
 	SelectedDebrid   string `json:"selected_debrid,omitempty"`
 	Source           string `json:"source,omitempty"` // The source of the arr, e.g. "auto", "config", "". Auto means it was automatically detected from the arr
+	// WantedSearch schedules the Arr's own "search all missing" - see
+	// ArrWantedSearch. Read from the live config when the job fires, not
+	// from pkg/arr, so a download-client handshake can't drop it.
+	WantedSearch ArrWantedSearch `json:"wanted_search,omitzero"`
 }
 
 func (a Arr) IsZero() bool {
-	return a.Name == "" && a.Host == "" && a.Token == "" && !a.SkipRepair && a.DownloadUncached == nil && a.SelectedDebrid == "" && a.Source == ""
+	return a.Name == "" && a.Host == "" && a.Token == "" && !a.SkipRepair && a.DownloadUncached == nil && a.SelectedDebrid == "" && a.Source == "" && a.WantedSearch == (ArrWantedSearch{})
+}
+
+// ArrWantedSearch asks a Sonarr/Radarr to search for every monitored item it
+// is missing (its Wanted -> Missing -> Search All) on Schedule. Arrs listed
+// more than once with the same API key get one search per firing - see
+// pkg/manager.WantedSearch.
+type ArrWantedSearch struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// Schedule is a clock time ("12:00") or a cron expression ("0 3 * * *"),
+	// in the server's time zone. Intervals are refused: see
+	// utils.ConvertToClockOrCronJobDef.
+	Schedule string `json:"schedule,omitempty"`
 }
 
 // QueueCleanup is the global policy that drives CleanupQueue. It maps

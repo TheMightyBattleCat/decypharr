@@ -46,6 +46,8 @@ func (s *Server) WebRoutes() http.Handler {
 		r.Route("/api", func(r chi.Router) {
 			// Arr management
 			r.Get("/arrs", s.handleGetArrs)
+			r.Get("/arrs/wanted-search", s.handleWantedSearchStatus)
+			r.Post("/arrs/wanted-search/run", s.handleWantedSearchRun)
 			r.Post("/add", s.handleAddContent)
 
 			// Repair / health-checker operations

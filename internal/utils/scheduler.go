@@ -16,14 +16,8 @@ func ConvertToJobDef(interval string) (gocron.JobDefinition, error) {
 	// Interval could be in the format "1h", "30m", "15s" or "1h30m" or "04:05"
 	var jd gocron.JobDefinition
 
-	if t, ok := parseClockTime(interval); ok {
-		return gocron.DailyJob(1, gocron.NewAtTimes(
-			gocron.NewAtTime(uint(t.Hour()), uint(t.Minute()), uint(t.Second())),
-		)), nil
-	}
-
-	if _, err := cron.ParseStandard(interval); err == nil {
-		return gocron.CronJob(interval, false), nil
+	if jd, ok := clockOrCronJobDef(interval); ok {
+		return jd, nil
 	}
 
 	if dur, err := ParseDuration(interval); err == nil {
@@ -31,6 +25,33 @@ func ConvertToJobDef(interval string) (gocron.JobDefinition, error) {
 	}
 
 	return jd, fmt.Errorf("invalid interval format: %s", interval)
+}
+
+// ConvertToClockOrCronJobDef is ConvertToJobDef without intervals: schedule
+// must be a clock time ("12:00") or a cron expression ("0 3 * * *"). An
+// interval ("6h", "@every 6h") counts from when the job is registered, and
+// jobs are re-registered on every settings save and restart, so one could
+// keep restarting and never fire.
+func ConvertToClockOrCronJobDef(schedule string) (gocron.JobDefinition, error) {
+	s := strings.TrimSpace(schedule)
+	if !strings.HasPrefix(s, "@every") {
+		if jd, ok := clockOrCronJobDef(s); ok {
+			return jd, nil
+		}
+	}
+	return nil, fmt.Errorf("%q is not a time (12:00) or a cron expression (0 3 * * *)", schedule)
+}
+
+func clockOrCronJobDef(s string) (gocron.JobDefinition, bool) {
+	if t, ok := parseClockTime(s); ok {
+		return gocron.DailyJob(1, gocron.NewAtTimes(
+			gocron.NewAtTime(uint(t.Hour()), uint(t.Minute()), uint(t.Second())),
+		)), true
+	}
+	if _, err := cron.ParseStandard(s); err == nil {
+		return gocron.CronJob(s, false), true
+	}
+	return nil, false
 }
 
 func parseClockTime(s string) (time.Time, bool) {

@@ -51,6 +51,26 @@ class ConfigManager {
 
         const addRuleBtn = document.getElementById('addQueueCleanupRuleBtn');
         if (addRuleBtn) addRuleBtn.addEventListener('click', () => this.addQueueCleanupCustomRow());
+
+        // Arr cards: the wanted-search toggle, Run now, and the same-API-key note
+        this.refs.arrConfigs.addEventListener('change', (e) => {
+            const card = e.target.closest('.arr-config');
+            if (card && e.target.name && e.target.name.endsWith('.wanted_search_enabled')) {
+                this.syncWantedSearchFields(card.getAttribute('data-index'));
+            }
+        });
+        this.refs.arrConfigs.addEventListener('input', (e) => {
+            if (e.target.name && /\.(token|name)$/.test(e.target.name)) this.updateWantedSearchDupes();
+        });
+        this.refs.arrConfigs.addEventListener('click', (e) => {
+            const runBtn = e.target.closest('[data-action="wanted-run"]');
+            if (runBtn) {
+                this.runWantedSearch(runBtn);
+                return;
+            }
+            // A card's delete button removes it in its own onclick, before this runs.
+            if (e.target.closest('.btn-error')) this.updateWantedSearchDupes();
+        });
     }
 
     // Display labels for the built-in queue-cleanup catalog. IDs MUST match
@@ -121,6 +141,8 @@ class ConfigManager {
         if (config.arrs && Array.isArray(config.arrs)) {
             config.arrs.forEach(arr => this.addArrConfig(arr));
         }
+        this.updateWantedSearchDupes();
+        this.loadWantedSearchStatus();
 
         // Load queue cleanup rules
         this.populateQueueCleanup(config.queue_cleanup);
@@ -996,6 +1018,116 @@ class ConfigManager {
                 }
             }
         });
+
+        // wanted_search is an object, so the flat loop above can't reach it.
+        const wanted = data.wanted_search || {};
+        const enabledInput = document.querySelector(`[name="arr[${index}].wanted_search_enabled"]`);
+        const scheduleInput = document.querySelector(`[name="arr[${index}].wanted_search_schedule"]`);
+        if (enabledInput) enabledInput.checked = !!wanted.enabled;
+        if (scheduleInput) scheduleInput.value = wanted.schedule || '';
+        this.syncWantedSearchFields(index);
+    }
+
+    syncWantedSearchFields(index) {
+        const card = this.refs.arrConfigs.querySelector(`.arr-config[data-index="${index}"]`);
+        if (!card) return;
+        const on = !!card.querySelector(`[name="arr[${index}].wanted_search_enabled"]`)?.checked;
+        card.querySelector('[data-role="wanted-fields"]')?.classList.toggle('hidden', !on);
+    }
+
+    arrCardName(card) {
+        const index = card.getAttribute('data-index');
+        return (card.querySelector(`[name="arr[${index}].name"]`)?.value || '').trim();
+    }
+
+    // Arrs with the same API key are one instance to the wanted search: say so
+    // on each of them, so it's clear the search is sent once.
+    updateWantedSearchDupes() {
+        const cards = Array.from(this.refs.arrConfigs.querySelectorAll('.arr-config'));
+        const tokenOf = (card) => (card.querySelector(`[name="arr[${card.getAttribute('data-index')}].token"]`)?.value || '').trim();
+        const byToken = new Map();
+        cards.forEach((card) => {
+            const token = tokenOf(card);
+            if (!token) return;
+            if (!byToken.has(token)) byToken.set(token, []);
+            byToken.get(token).push(card);
+        });
+        cards.forEach((card) => {
+            const note = card.querySelector('[data-role="wanted-dupe"]');
+            if (!note) return;
+            const others = (byToken.get(tokenOf(card)) || [])
+                .filter((other) => other !== card)
+                .map((other) => `"${this.arrCardName(other) || 'unnamed'}"`);
+            note.textContent = others.length
+                ? `Same API key as ${others.join(', ')}: the wanted search is sent once to each Sonarr or Radarr with this key.`
+                : '';
+            note.classList.toggle('hidden', others.length === 0);
+        });
+    }
+
+    async loadWantedSearchStatus() {
+        try {
+            const response = await window.decypharrUtils.fetcher('/api/arrs/wanted-search');
+            if (!response.ok) return;
+            const status = await response.json();
+            this.wantedSearchStatus = new Map((status.arrs || []).map((a) => [a.name, a]));
+            this.renderWantedSearchStatus();
+        } catch (_) {
+            // The cards work without it; only next/last run go unshown.
+        }
+    }
+
+    renderWantedSearchStatus() {
+        this.refs.arrConfigs.querySelectorAll('.arr-config').forEach((card) => {
+            const el = card.querySelector('[data-role="wanted-status"]');
+            if (!el) return;
+            const st = this.wantedSearchStatus?.get(this.arrCardName(card));
+            const parts = [];
+            if (st?.enabled && st.next_run_text) parts.push(`Next: ${st.next_run_text}`);
+            if (st?.last) parts.push(`Last: ${this.describeWantedResult(st.last, true)}`);
+            el.textContent = parts.join(' · ');
+        });
+    }
+
+    describeWantedResult(r, withTime) {
+        let what;
+        if (r.sent) {
+            const cmd = r.command_id ? ` (command ${r.command_id}${r.command_status ? `, ${r.command_status}` : ''})` : '';
+            what = `sent to ${r.app || 'the Arr'}${cmd}`;
+        } else if (r.error) {
+            what = `failed: ${r.error}`;
+        } else {
+            what = `skipped: ${r.skipped || 'nothing to do'}`;
+        }
+        return withTime && r.at ? `${new Date(r.at).toLocaleString()}, ${what}` : what;
+    }
+
+    async runWantedSearch(btn) {
+        const name = this.arrCardName(btn.closest('.arr-config'));
+        const esc = window.decypharrUtils.escapeHtml;
+        if (!name) {
+            window.decypharrUtils.createToast('Give this Arr a name and save it first', 'warning');
+            return;
+        }
+        btn.disabled = true;
+        try {
+            const response = await window.decypharrUtils.fetcher('/api/arrs/wanted-search/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name})
+            });
+            if (!response.ok) {
+                throw new Error((await response.text()) || 'Request failed');
+            }
+            const result = await response.json();
+            const type = result.sent ? 'success' : (result.error ? 'error' : 'warning');
+            window.decypharrUtils.createToast(`${esc(name)}: wanted search ${esc(this.describeWantedResult(result, false))}`, type);
+        } catch (error) {
+            window.decypharrUtils.createToast(`${esc(name)}: wanted search failed: ${esc(error.message)}`, 'error');
+        } finally {
+            btn.disabled = false;
+            this.loadWantedSearchStatus();
+        }
     }
 
     getArrTemplate(index, data = {}) {
@@ -1087,6 +1219,31 @@ class ConfigManager {
                             </label>
                         </div>
                     </div>
+
+                    <div class="rounded-box border border-base-300 p-3 grid gap-2">
+                        <label class="label cursor-pointer justify-start gap-3 p-0">
+                            <input type="checkbox" class="toggle toggle-primary"
+                                   name="arr[${index}].wanted_search_enabled" id="arr[${index}].wanted_search_enabled">
+                            <span class="font-medium">Scheduled wanted search</span>
+                        </label>
+                        <span class="text-sm opacity-70">At the time below, asks this Arr to search for every monitored item it is missing, the same as Wanted → Missing → Search All in Sonarr or Radarr. Sonarr and Radarr only. If another Arr here has the same API key, the search is sent once.</span>
+                        <div class="grid gap-2 hidden" data-role="wanted-fields">
+                            <div>
+                                <label class="label" for="arr[${index}].wanted_search_schedule">
+                                    <span class="font-medium">Schedule</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="arr[${index}].wanted_search_schedule" id="arr[${index}].wanted_search_schedule"
+                                       placeholder="e.g. 12:00 or 0 3 * * *">
+                                <span class="text-sm opacity-70">A time (12:00) or a cron expression, in the server's time zone.</span>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button type="button" class="btn btn-xs btn-outline" data-action="wanted-run">Run now</button>
+                                <span class="text-sm opacity-70" data-role="wanted-status"></span>
+                            </div>
+                        </div>
+                        <span class="text-sm text-warning hidden" data-role="wanted-dupe"></span>
+                    </div>
                 </div>
             </div>
         `;
@@ -1145,6 +1302,7 @@ class ConfigManager {
                 this.loadedRepairEnabled = !!config.repair?.enabled;
                 window.decypharrUtils.createToast('Configuration saved and applied.', 'success');
                 this.refs.loadingOverlay.classList.add('hidden');
+                this.loadWantedSearchStatus();
             }
 
         } catch (error) {
@@ -1172,6 +1330,10 @@ class ConfigManager {
 
             if (arr.host && !this.isValidUrl(arr.host)) {
                 errors.push(`Arr service #${index + 1}: Invalid host URL format`);
+            }
+
+            if (arr.wanted_search?.enabled && !arr.wanted_search.schedule) {
+                errors.push(`Arr service #${index + 1}: Scheduled wanted search needs a schedule (e.g. 12:00)`);
             }
         });
 
@@ -1422,6 +1584,8 @@ class ConfigManager {
             const downloadUncachedInput = getField('download_uncached');
             const selectedDebridInput = getField('selected_debrid');
             const sourceInput = getField('source');
+            const wantedEnabledInput = getField('wanted_search_enabled');
+            const wantedScheduleInput = getField('wanted_search_schedule');
 
             if (!nameInput || !hostInput || !tokenInput || !skipRepairInput || !downloadUncachedInput || !selectedDebridInput || !sourceInput) {
                 return;
@@ -1436,6 +1600,14 @@ class ConfigManager {
                 selected_debrid: selectedDebridInput.value,
                 source: sourceInput.value
             };
+            // Left out when the card has no such inputs, so the save keeps
+            // the live value instead of switching it off.
+            if (wantedEnabledInput && wantedScheduleInput) {
+                arr.wanted_search = {
+                    enabled: wantedEnabledInput.checked,
+                    schedule: wantedScheduleInput.value.trim()
+                };
+            }
 
             if (arr.name && arr.host) {
                 arrs.push(arr);

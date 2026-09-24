@@ -581,6 +581,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Precache/Repair preserves above.
 	newConfig.Plex = currentConfig.Plex
 
+	keepUnsentArrWantedSearch(body, currentConfig.Arrs, newConfig.Arrs)
+	if err := validateArrWantedSearch(newConfig.Arrs); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
 	for _, a := range newConfig.Arrs {
@@ -610,10 +616,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		go s.Restart()
 	} else {
 		config.Get().ApplyRuntime(&newConfig)
-		// Reschedule/reapply the repair sweep if its settings changed.
+		// Reschedule the repair sweep from the saved settings. A sweep already
+		// running carries on (see Repair.ApplyConfig); the new settings apply
+		// from the next sweep.
 		if svc := s.manager.Repair(); svc != nil {
 			if err := svc.ApplyConfig(); err != nil {
 				s.logger.Warn().Err(err).Msg("Failed to apply repair config after live update")
+			}
+		}
+		// Re-register each Arr's scheduled wanted search.
+		if ws := s.manager.WantedSearch(); ws != nil {
+			if err := ws.ApplyConfig(); err != nil {
+				s.logger.Warn().Err(err).Msg("Failed to schedule a wanted search after live update")
 			}
 		}
 	}
