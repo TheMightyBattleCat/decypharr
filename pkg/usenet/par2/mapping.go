@@ -123,14 +123,22 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 			hashed[pi] = true
 		}
 
+		// One posted file per FileDesc and one FileDesc per posted file. Two
+		// posted copies of the same file (the same upload under two
+		// subjects) share length and MD5-16k; pairing both with one FileDesc
+		// made the repair index one copy's article geometry with the
+		// other's positions and panic. The first copy is kept.
+		claimed := make(map[int]bool, len(postedIdxs))
 		for _, fid := range fileIDs {
 			fd := idx.Files[fid]
 			for _, pi := range postedIdxs {
 				sum, ok := md5ByPosted[pi]
-				if !ok || sum != fd.MD5_16k {
+				if !ok || sum != fd.MD5_16k || claimed[pi] {
 					continue
 				}
 				matches = append(matches, newMatch(idx, posted, pi, fid))
+				claimed[pi] = true
+				break
 			}
 		}
 	}

@@ -1508,12 +1508,16 @@ func par2MatchFromCache(idx *par2.Index, par2Source []storage.PostedFileRef, cac
 		nameToIdx[par2Source[i].Name] = i
 	}
 	seen := make([]bool, len(par2Source))
+	// A FileID paired twice (two posted copies of one file, cached before
+	// MatchFiles kept one per FileID) is refused, so matching runs again.
+	seenFID := make(map[[16]byte]bool, len(cache))
 	out := make([]par2.Match, 0, len(cache))
 	for _, m := range cache {
 		pi, ok := nameToIdx[m.PostedName]
-		if !ok || seen[pi] {
+		if !ok || seen[pi] || seenFID[m.FileID] {
 			return nil, false
 		}
+		seenFID[m.FileID] = true
 		if _, ok := idx.Files[m.FileID]; !ok {
 			return nil, false
 		}
@@ -1537,12 +1541,14 @@ func par2MatchToCache(par2Source []storage.PostedFileRef, matches []par2.Match, 
 		return nil
 	}
 	seen := make([]bool, len(par2Source))
+	seenFID := make(map[[16]byte]bool, len(matches))
 	out := make([]storage.Par2MatchRef, 0, len(matches))
 	for _, m := range matches {
-		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) || seen[m.PostedIndex] {
+		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) || seen[m.PostedIndex] || seenFID[m.FileID] {
 			return nil
 		}
 		seen[m.PostedIndex] = true
+		seenFID[m.FileID] = true
 		out = append(out, storage.Par2MatchRef{
 			PostedName:   par2Source[m.PostedIndex].Name,
 			FileID:       m.FileID,
