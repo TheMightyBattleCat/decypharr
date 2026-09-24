@@ -249,7 +249,15 @@ func availabilityThenPar2Refs(
 		}
 		segment := group.Files[0].Segments[0]
 		if statErr := statSegment(ctx, segment.Id); statErr != nil {
-			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w: %w", group.ActualFilename, segment.Id, statErr, ErrReleaseUnavailable)
+			// Only a 430 says the release is gone. A cancelled request (the
+			// Arr's add times out at 100s), a timeout, a refused connection
+			// or every provider at its quota says nothing about the posting,
+			// and tagging it would mark the content dead and have the Arr
+			// blocklist a release that may be fine.
+			if nntp.IsArticleNotFoundError(statErr) {
+				return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w: %w", group.ActualFilename, segment.Id, statErr, ErrReleaseUnavailable)
+			}
+			return nil, nil, fmt.Errorf("could not check segment %s <%s>: %w", group.ActualFilename, segment.Id, statErr)
 		}
 		checked = true
 		break
