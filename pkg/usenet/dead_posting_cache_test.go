@@ -39,6 +39,23 @@ func TestDeadPostingCacheExpires(t *testing.T) {
 	}
 }
 
+// A posting never checked again used to stay in the map for the life of the
+// process (review N5): Mark sweeps out expired entries.
+func TestDeadPostingCacheMarkPrunesExpired(t *testing.T) {
+	c := newDeadPostingCache()
+	c.entries.Store("old", time.Now().Add(-(deadPostingTTL + time.Minute)))
+	c.entries.Store("recent", time.Now())
+	c.Mark("new")
+	if _, ok := c.entries.Load("old"); ok {
+		t.Fatal("expired entry survived a Mark")
+	}
+	for _, k := range []string{"recent", "new"} {
+		if !c.Check(k) {
+			t.Fatalf("live entry %q was pruned", k)
+		}
+	}
+}
+
 // TestDeadPostingCacheNilSafe proves a nil *deadPostingCache (the zero value
 // of a struct field that failed to initialize) never panics - Mark/Check
 // degrade to no-op/miss instead.

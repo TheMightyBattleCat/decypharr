@@ -31,7 +31,23 @@ func ContextWithDeadSignal(ctx context.Context, sig *DeadSegmentSignal) context.
 // it up when it recognises the internal bearer token and attaches it to the
 // request context the fetcher sees (see webdav.handleDownload). The fetcher
 // trips it on a confirmed-dead segment; the caller then reads Detected().
-var deadSignalRegistry sync.Map // map[string]*DeadSegmentSignal
+//
+// Two probes of one file can overlap (a manual recheck during the sweep, an
+// import-gate retry). Keyed by file alone, the second probe's signal replaced
+// the first's, so the first probe's later reads tripped nothing and it could
+// pass a file whose dead segment it had read. So the reads get a per-file hub
+// signal that trips every probe registered for the file; a probe that
+// registers after the hub tripped starts tripped, since the dead segment is a
+// fact about the file.
+var (
+	deadSignalMu       sync.Mutex
+	deadSignalRegistry = map[string]*deadSignalShare{}
+)
+
+type deadSignalShare struct {
+	hub     *DeadSegmentSignal
+	members map[*DeadSegmentSignal]struct{}
+}
 
 func deadSignalKey(infoHash, fileName string) string {
 	return infoHash + "\x00" + fileName
@@ -43,26 +59,57 @@ func registerDeadSignal(infoHash, fileName string, sig *DeadSegmentSignal) {
 	if sig == nil || infoHash == "" {
 		return
 	}
-	deadSignalRegistry.Store(deadSignalKey(infoHash, fileName), sig)
+	key := deadSignalKey(infoHash, fileName)
+	deadSignalMu.Lock()
+	defer deadSignalMu.Unlock()
+	share := deadSignalRegistry[key]
+	if share == nil {
+		share = &deadSignalShare{members: make(map[*DeadSegmentSignal]struct{})}
+		share.hub = usenet.NewForwardingDeadSegmentSignal(func() {
+			deadSignalMu.Lock()
+			defer deadSignalMu.Unlock()
+			for m := range share.members {
+				m.Trip()
+			}
+		})
+		deadSignalRegistry[key] = share
+	}
+	share.members[sig] = struct{}{}
+	if share.hub.Detected() {
+		sig.Trip()
+	}
 }
 
-// unregisterDeadSignal removes sig once the read finishes. CompareAndDelete so
-// a concurrent probe of the same file that registered its own signal is left
-// untouched.
+// unregisterDeadSignal removes sig once the read finishes, leaving any other
+// probe of the same file registered.
 func unregisterDeadSignal(infoHash, fileName string, sig *DeadSegmentSignal) {
 	if sig == nil || infoHash == "" {
 		return
 	}
-	deadSignalRegistry.CompareAndDelete(deadSignalKey(infoHash, fileName), sig)
+	key := deadSignalKey(infoHash, fileName)
+	deadSignalMu.Lock()
+	defer deadSignalMu.Unlock()
+	share := deadSignalRegistry[key]
+	if share == nil {
+		return
+	}
+	delete(share.members, sig)
+	if len(share.members) == 0 {
+		delete(deadSignalRegistry, key)
+	}
 }
 
-// DeadSignalForVerificationRead returns the signal a probe caller registered
-// for infoHash/fileName, or nil. Called by the WebDAV handler on an
+// DeadSignalForVerificationRead returns the signal a verification read of
+// infoHash/fileName carries - tripping it trips every probe registered for
+// the file - or nil when none is. Called by the WebDAV handler on an
 // internal-bearer (ffprobe verification) read.
 func DeadSignalForVerificationRead(infoHash, fileName string) *DeadSegmentSignal {
-	v, _ := deadSignalRegistry.Load(deadSignalKey(infoHash, fileName))
-	sig, _ := v.(*DeadSegmentSignal)
-	return sig
+	deadSignalMu.Lock()
+	defer deadSignalMu.Unlock()
+	if share := deadSignalRegistry[deadSignalKey(infoHash, fileName)]; share != nil {
+		return share.hub
+	}
+	return nil
 }
 
 // sweepVerifyRegistry marks the files the repair sweep is probing, joined to

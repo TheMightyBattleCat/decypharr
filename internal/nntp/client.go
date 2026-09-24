@@ -1526,23 +1526,28 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 		Results:    allResults,
 		TotalCount: len(messageIDs),
 	}
-	for _, r := range allResults {
-		if r.Available {
-			result.FoundCount++
-			continue
-		}
-		if r.Error == nil {
-			continue
-		}
-		// Article-not-found doesn't count as an error for the caller's
-		// availability decision; only true connection/protocol failures do.
-		var nntpErr *Error
-		if errors.As(r.Error, &nntpErr) && nntpErr.Type == ErrorTypeArticleNotFound {
-			continue
-		}
-		result.ErrorCount++
-	}
+	result.FoundCount, result.ErrorCount = tallyStatResults(allResults)
 	return result, nil
+}
+
+// tallyStatResults counts found results and errors. Article-not-found is not
+// an error for the caller's availability decision (TotalCount - Found -
+// Error is its missing count); every other failure is. So is a result with
+// neither Available nor an Error: nothing produces one today, but read as
+// missing it would reject a release on no evidence.
+func tallyStatResults(results []StatResult) (found, errs int) {
+	for _, r := range results {
+		if r.Available {
+			found++
+			continue
+		}
+		var nntpErr *Error
+		if r.Error != nil && errors.As(r.Error, &nntpErr) && nntpErr.Type == ErrorTypeArticleNotFound {
+			continue
+		}
+		errs++
+	}
+	return found, errs
 }
 
 // batchStatAcrossProviders STATs one chunk: on home first, then whatever is

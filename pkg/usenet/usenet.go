@@ -1824,6 +1824,12 @@ type DeadSegmentSignal = reader.DeadSegmentSignal
 // NewDeadSegmentSignal returns a fresh, untripped signal.
 func NewDeadSegmentSignal() *DeadSegmentSignal { return reader.NewDeadSegmentSignal() }
 
+// NewForwardingDeadSegmentSignal returns a signal that also calls onTrip the
+// first time it trips - see reader.NewForwardingDeadSegmentSignal.
+func NewForwardingDeadSegmentSignal(onTrip func()) *DeadSegmentSignal {
+	return reader.NewForwardingDeadSegmentSignal(onTrip)
+}
+
 // ContextWithDeadSignal attaches sig to ctx so the segment fetcher trips it on
 // a confirmed-dead segment during this read - see reader.ContextWithDeadSignal.
 func ContextWithDeadSignal(ctx context.Context, sig *DeadSegmentSignal) context.Context {

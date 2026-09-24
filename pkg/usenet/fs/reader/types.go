@@ -426,15 +426,23 @@ func burstNoFill(ctx context.Context) bool {
 // file healthy. Goroutine-safe; safe to call every method on a nil receiver.
 type DeadSegmentSignal struct {
 	detected atomic.Bool
+	onTrip   func()
 }
 
 // NewDeadSegmentSignal returns a fresh, untripped signal.
 func NewDeadSegmentSignal() *DeadSegmentSignal { return &DeadSegmentSignal{} }
 
+// NewForwardingDeadSegmentSignal returns a signal that also calls onTrip,
+// once, the first time it trips - for handing one signal to a read that
+// several probes are waiting on.
+func NewForwardingDeadSegmentSignal(onTrip func()) *DeadSegmentSignal {
+	return &DeadSegmentSignal{onTrip: onTrip}
+}
+
 // Trip latches the signal. No-op on a nil receiver.
 func (s *DeadSegmentSignal) Trip() {
-	if s != nil {
-		s.detected.Store(true)
+	if s != nil && s.detected.CompareAndSwap(false, true) && s.onTrip != nil {
+		s.onTrip()
 	}
 }
 

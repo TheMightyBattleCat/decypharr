@@ -94,7 +94,17 @@ func (c *deadPostingCache) Mark(hash string) {
 	if c == nil || hash == "" {
 		return
 	}
-	c.entries.Store(hash, time.Now())
+	// Check prunes only the hash it is asked about, so a posting never
+	// seen again stayed for the life of the process. Sweep expired entries
+	// here; the map holds at most the postings marked within the TTL.
+	now := time.Now()
+	c.entries.Range(func(k string, at time.Time) bool {
+		if now.Sub(at) > deadPostingTTL {
+			c.entries.Delete(k)
+		}
+		return true
+	})
+	c.entries.Store(hash, now)
 }
 
 // Check reports whether hash was marked dead within deadPostingTTL. An
