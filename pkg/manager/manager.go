@@ -919,6 +919,7 @@ func (m *Manager) notifyOverlayFileFailed(nzoID, file string) {
 	// Called with the overlay's lock held, and repair reads the overlay:
 	// off this goroutine.
 	go m.repairStreamedFailure(nzoID, entryName, file)
+	go m.markHealthDirty(nzoID, "overlay_failed")
 	if m.Notifications == nil {
 		return
 	}

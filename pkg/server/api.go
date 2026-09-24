@@ -1204,7 +1204,39 @@ func (s *Server) handleGetEntryHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Entry health not found", http.StatusNotFound)
 		return
 	}
-	utils.JSONResponse(w, state, http.StatusOK)
+	utils.JSONResponse(w, s.healthWithLiveDamage(state), http.StatusOK)
+}
+
+// entryHealthView is a health record as served, with the overlay's live
+// damage for the entry beside it.
+type entryHealthView struct {
+	*storage.EntryHealth
+	PendingDeadSegments int  `json:"pending_dead_segments,omitempty"`
+	Par2Terminal        bool `json:"par2_terminal,omitempty"`
+}
+
+// healthWithLiveDamage returns state as served. A record is written only by
+// a probe, and nothing a read pads or PAR2 decides updates it, so a file
+// that took damage since reads "healthy" until the next probe, days later.
+// While the overlay holds unrepaired damage for the entry, a stored
+// "healthy" is served as "stale" with the pending count; the stored record
+// is unchanged.
+func (s *Server) healthWithLiveDamage(state *storage.EntryHealth) any {
+	if state == nil {
+		return state
+	}
+	return healthView(state, s.manager.EntryDamage(state.EntryName))
+}
+
+func healthView(state *storage.EntryHealth, d manager.EntryDamage) any {
+	if d.PendingDeadSegments == 0 {
+		return state
+	}
+	view := *state
+	if view.Status == storage.HealthHealthy {
+		view.Status = storage.HealthStale
+	}
+	return entryHealthView{EntryHealth: &view, PendingDeadSegments: d.PendingDeadSegments, Par2Terminal: d.Par2Terminal}
 }
 
 func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
@@ -1284,7 +1316,7 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Entry health not found: the recheck removed it", http.StatusNotFound)
 				return
 			}
-			utils.JSONResponse(w, final, http.StatusOK)
+			utils.JSONResponse(w, s.healthWithLiveDamage(final), http.StatusOK)
 			return
 		}
 		utils.JSONResponse(w, state, http.StatusAccepted)

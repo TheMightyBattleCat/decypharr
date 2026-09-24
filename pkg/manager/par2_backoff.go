@@ -298,5 +298,8 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDisc
 	if serr := p.manager.storage.SavePar2RepairState(state); serr != nil {
 		p.logger.Debug().Err(serr).Str("entry", nzbID).Msg("par2 repair: failed to persist repair state")
 	}
+	if class.terminal {
+		p.manager.markHealthDirty(nzbID, "par2_terminal")
+	}
 	return class
 }
