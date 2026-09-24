@@ -2547,9 +2547,18 @@ func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 		return fmt.Errorf("re-parsed NZB has no PAR2/source file data for %s: %w", nzoID, ErrBackfillImpossible)
 	}
 
-	nzb.Par2Files = reparsed.Par2Files
-	nzb.Par2Source = reparsed.Par2Source
-	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+	// The re-parse ran without the storage lock (it hits the network); the
+	// write re-reads under it, so it neither re-creates a record deleted
+	// meanwhile nor overwrites refs another writer stored.
+	err = u.nzbStorage.Update(nzoID, func(cur *storage.NZB) (bool, error) {
+		if len(cur.Par2Files) > 0 || len(cur.Par2Source) > 0 {
+			return false, nil
+		}
+		cur.Par2Files = reparsed.Par2Files
+		cur.Par2Source = reparsed.Par2Source
+		return true, nil
+	})
+	if err != nil {
 		return fmt.Errorf("failed to save backfilled PAR2 refs: %w", err)
 	}
 	return nil
@@ -2565,15 +2574,14 @@ func (u *Usenet) SaveNZBPar2Match(nzoID string, refs []storage.Par2MatchRef) err
 	if len(refs) == 0 {
 		return nil
 	}
-	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	err := u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
+		if len(nzb.Par2Match) > 0 {
+			return false, nil
+		}
+		nzb.Par2Match = refs
+		return true, nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to load NZB: %w", err)
-	}
-	if len(nzb.Par2Match) > 0 {
-		return nil
-	}
-	nzb.Par2Match = refs
-	if err := u.nzbStorage.AddNZB(nzb); err != nil {
 		return fmt.Errorf("failed to save par2 match cache: %w", err)
 	}
 	return nil

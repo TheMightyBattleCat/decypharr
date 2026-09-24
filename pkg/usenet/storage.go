@@ -117,7 +117,39 @@ func (s *NZBStorage) recalculateStatsLocked() error {
 func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.addNZBLocked(nzb)
+}
 
+// ErrNZBGone is Update's answer for a record that no longer exists.
+var ErrNZBGone = errors.New("nzb record no longer exists")
+
+// Update reads id's record, applies fn, and writes it back if fn reports a
+// change - all under the storage lock, so a Delete (or any other writer)
+// cannot land between the read and the write. A read-then-AddNZB did:
+// the write re-created the .meta of a deleted entry, or lost the other
+// writer's update. Fails with ErrNZBGone when the record does not exist.
+func (s *NZBStorage) Update(id string, fn func(*storage.NZB) (changed bool, err error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s: %w", id, ErrNZBGone)
+		}
+		return fmt.Errorf("failed to read NZB meta file: %w", err)
+	}
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return err
+	}
+	changed, err := fn(nzb)
+	if err != nil || !changed {
+		return err
+	}
+	return s.addNZBLocked(nzb)
+}
+
+func (s *NZBStorage) addNZBLocked(nzb *storage.NZB) error {
 	data, err := encodeNZBV2(nzb)
 	if err != nil {
 		return fmt.Errorf("failed to encode NZB: %w", err)
