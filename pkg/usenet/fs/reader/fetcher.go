@@ -136,6 +136,13 @@ type SegmentFetcher struct {
 	// without asking any provider - see servePatch.
 	patched []atomic.Uint64
 
+	// padded has one bit per segment whose cached bytes are the overlay's
+	// zero-fill rather than the article: set by handleConfirmedMissing's pad,
+	// cleared when a real fetch or a patch refills the slot. The reader is
+	// shared by playback and verification reads, so a slot one read padded
+	// must not be handed to a read that may not see padding - see padUnfit.
+	padded []atomic.Uint64
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -177,11 +184,11 @@ func NewSegmentFetcher(
 	}
 
 	sf := &SegmentFetcher{
-		client:     client,
-		cache:      cache,
-		config:     config,
-		logger:     logger.With().Str("component", "fetcher").Logger(),
-		stats:      stats,
+		client:        client,
+		cache:         cache,
+		config:        config,
+		logger:        logger.With().Str("component", "fetcher").Logger(),
+		stats:         stats,
 		semaphore:     make(chan struct{}, semCap),
 		inFlight:      make(map[int]*fetchPromise),
 		timeoutStreak: make(map[int]int),
@@ -191,6 +198,7 @@ func NewSegmentFetcher(
 		// 400 KiB for one atomic.Bool per segment.
 		prefetchQueued: make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
 		patched:        make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
+		padded:         make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -216,6 +224,7 @@ func NewSegmentFetcher(
 // Fetch downloads a segment synchronously, with deduplication.
 // Multiple goroutines calling Fetch for the same segment will share the download.
 func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
+retry:
 	// Fast path: already cached, or wait out an in-progress eviction so we
 	// don't dedup/fetch against a segment whose disk range is mid-punch.
 	for {
@@ -228,7 +237,7 @@ func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
 		}
 		switch state {
 		case StateOnDisk:
-			return nil
+			return sf.padUnfit(ctx, segIdx)
 		case StateFailed:
 			if sf.recoverFailedForPlayback(ctx, segIdx) {
 				return nil
@@ -251,10 +260,20 @@ func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
 	sf.inFlightMu.Lock()
 	if promise, ok := sf.inFlight[segIdx]; ok {
 		sf.inFlightMu.Unlock()
-		// Wait for existing fetch
+		// Wait for existing fetch. The leader fetched under its own ctx: a
+		// pad it was allowed is not one this read may use, and a
+		// cancellation of its ctx is not this read's.
 		select {
 		case <-promise.done:
-			return promise.err
+			err := promise.err
+			if err == nil {
+				return sf.padUnfit(ctx, segIdx)
+			}
+			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) &&
+				ctx.Err() == nil && sf.ctx.Err() == nil {
+				goto retry
+			}
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-sf.ctx.Done():
@@ -293,15 +312,18 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		state := sf.cache.GetState(segIdx)
 		switch state {
 		case StateOnDisk:
-			return nil
+			return sf.padUnfit(ctx, segIdx)
 		case StateFailed:
 			if sf.recoverFailedForPlayback(ctx, segIdx) {
-				return nil
+				return sf.padUnfit(ctx, segIdx)
 			}
 			return sf.cache.GetError(segIdx)
 		case StateFetching:
 			// Wait for the other fetcher
-			return sf.cache.WaitForSegment(ctx, segIdx)
+			if err := sf.cache.WaitForSegment(ctx, segIdx); err != nil {
+				return err
+			}
+			return sf.padUnfit(ctx, segIdx)
 		case StateEvicting:
 			// An evictor grabbed the slot between Fetch's check and here.
 			// Wait for the punch to finish, then retry the fetch into the
@@ -312,6 +334,8 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			return sf.doFetch(ctx, segIdx)
 		}
 	}
+	// This fetch refills the slot: whatever it held is gone.
+	sf.setPadded(segIdx, false)
 
 	if sf.servePatch(segIdx) {
 		sf.stats.Downloads.Add(1)
@@ -570,6 +594,7 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 			sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
 			return false
 		}
+		sf.setPadded(segIdx, false)
 		return true
 	}
 
@@ -614,10 +639,19 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 			Msg("segment padded")
 	}
 
+	sf.setPadded(segIdx, true)
 	if err := sf.cache.Put(segIdx, make([]byte, logicalLen)); err != nil {
+		sf.setPadded(segIdx, false)
 		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write zero-fill padding into cache")
 		return false
 	}
+	// A repair can land between the patch check above and this pad: its
+	// RefetchSegments marks the slot patched, but its invalidate finds the
+	// slot still Fetching and leaves it, so the pad would be served - and
+	// persisted by the DFS re-forget - after a successful repair. The patched
+	// bit is set before that invalidate, so seeing it here means the patch
+	// exists: lay it over the pad.
+	sf.servePatch(segIdx)
 	return true
 }
 
@@ -670,6 +704,46 @@ func (sf *SegmentFetcher) isPatched(segIdx int) bool {
 	return sf.patched[segIdx>>6].Load()&(uint64(1)<<uint(segIdx&63)) != 0
 }
 
+func (sf *SegmentFetcher) setPadded(segIdx int, on bool) {
+	w := segIdx >> 6
+	if segIdx < 0 || w >= len(sf.padded) {
+		return
+	}
+	bit := uint64(1) << uint(segIdx&63)
+	if on {
+		sf.padded[w].Or(bit)
+	} else {
+		sf.padded[w].And(^bit)
+	}
+}
+
+func (sf *SegmentFetcher) isPadded(segIdx int) bool {
+	w := segIdx >> 6
+	if segIdx < 0 || w >= len(sf.padded) {
+		return false
+	}
+	return sf.padded[w].Load()&(uint64(1)<<uint(segIdx&63)) != 0
+}
+
+// padUnfit returns the article-not-found a read that may not see padding
+// (ContextWithoutPadding: ffprobe verification) must get for a slot another
+// read on this shared reader zero-filled, tripping its dead-segment signal
+// and the sweep's dead latch the way doFetch does for a live 430. nil when
+// the read may use the slot.
+func (sf *SegmentFetcher) padUnfit(ctx context.Context, segIdx int) error {
+	if !paddingDisabled(ctx) || !sf.isPadded(segIdx) || sf.cache.GetState(segIdx) != StateOnDisk {
+		return nil
+	}
+	sf.logger.Debug().Int("segment", segIdx).Msg("segment holds padding; refused to a verification read")
+	if sig := DeadSignalFromContext(ctx); sig != nil {
+		sig.Trip()
+	}
+	if sf.config.Overlay != nil {
+		sf.config.Overlay.MarkSweepDead()
+	}
+	return &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: fmt.Sprintf("segment %d holds padding for a missing article", segIdx)}
+}
+
 // servePatch puts segIdx's PAR2 patch in the cache, for a segment marked
 // patched, and reports whether it did. A patch is the segment's recovered
 // bytes, so it needs no provider: before this, every read of a patched
@@ -690,6 +764,7 @@ func (sf *SegmentFetcher) servePatch(segIdx int) bool {
 		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
 		return false
 	}
+	sf.setPadded(segIdx, false)
 	sf.clearDownloadTimeout(segIdx)
 	return true
 }
@@ -794,10 +869,15 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 func (sf *SegmentFetcher) EnsureSegments(ctx context.Context, startSeg, endSeg int) error {
 	for i := startSeg; i <= endSeg; i++ {
 		state := sf.cache.GetState(i)
-		if state != StateOnDisk {
-			if err := sf.fetchWithRetry(ctx, i); err != nil {
+		if state == StateOnDisk {
+			// Cached - unless it is another read's pad this read may not use.
+			if err := sf.padUnfit(ctx, i); err != nil {
 				return err
 			}
+			continue
+		}
+		if err := sf.fetchWithRetry(ctx, i); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -820,13 +900,19 @@ func (sf *SegmentFetcher) EnsureSegments(ctx context.Context, startSeg, endSeg i
 // window is still probed.
 func (sf *SegmentFetcher) EnsureSegmentsConcurrent(ctx context.Context, startSeg, endSeg int) error {
 	var needed []int
+	// padErr is a cached slot this read may not use (another read's pad):
+	// a dead segment already known, returned ahead of any fetch error once
+	// the rest of the window has been probed.
+	var padErr error
 	for i := startSeg; i <= endSeg; i++ {
 		if sf.cache.GetState(i) != StateOnDisk {
 			needed = append(needed, i)
+		} else if err := sf.padUnfit(ctx, i); err != nil && padErr == nil {
+			padErr = err
 		}
 	}
 	if len(needed) == 0 {
-		return nil
+		return padErr
 	}
 
 	workers := sf.config.MaxConnections
@@ -874,6 +960,9 @@ func (sf *SegmentFetcher) EnsureSegmentsConcurrent(ctx context.Context, startSeg
 	}
 	wg.Wait()
 
+	if padErr != nil {
+		return padErr
+	}
 	return firstErr
 }
 

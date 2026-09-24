@@ -402,7 +402,13 @@ func (sc *SegmentCache) Put(segIdx int, data []byte) error {
 		return fmt.Errorf("write segment %d: %w", segIdx, err)
 	}
 
-	sc.curDisk.Add(int64(len(data)))
+	// Overwriting a slot already on disk (a patch replacing its zero-fill)
+	// replaces its bytes in the accounting rather than adding to them.
+	var prev int64
+	if SegmentState(sc.states[segIdx].Load()) == StateOnDisk {
+		prev = sc.segLengths[segIdx].Load()
+	}
+	sc.curDisk.Add(int64(len(data)) - prev)
 	sc.segLengths[segIdx].Store(int64(len(data)))
 	sc.states[segIdx].Store(uint32(StateOnDisk))
 	sc.touchSegment(segIdx)
