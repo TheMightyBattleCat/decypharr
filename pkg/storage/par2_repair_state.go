@@ -17,6 +17,11 @@ type Par2RepairState struct {
 	NzbID        string    `json:"nzb_id"`
 	LastAttempt  time.Time `json:"last_attempt"`
 	AttemptCount int       `json:"attempt_count"`
+	// SuspectCount counts the suspect failures (see
+	// pkg/manager.par2FailureClass.suspect) among those attempts. Only it
+	// decides when a recurring suspect failure turns terminal: counting
+	// every failure let two timeouts make the first suspect one terminal.
+	SuspectCount int `json:"suspect_count,omitempty"`
 	LastError    string    `json:"last_error,omitempty"`
 
 	// Terminal, once true, means the last failure was classified as one no

@@ -261,8 +261,12 @@ func (p *Par2Repair) par2ShouldAutoEnqueue(nzbID string) bool {
 // par2OutcomeClass), which is what the persisted state records.
 func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDiscovered int) par2FailureClass {
 	if err == nil {
-		if derr := p.manager.storage.DeletePar2RepairState(nzbID); derr != nil {
-			p.logger.Debug().Err(derr).Str("entry", nzbID).Msg("par2 repair: failed to clear repair state after success")
+		// Only clear a state that exists: a first-attempt success has none,
+		// and deleting it logged "key not found" on every one.
+		if st, gerr := p.manager.storage.GetPar2RepairState(nzbID); gerr == nil && st != nil {
+			if derr := p.manager.storage.DeletePar2RepairState(nzbID); derr != nil {
+				p.logger.Debug().Err(derr).Str("entry", nzbID).Msg("par2 repair: failed to clear repair state after success")
+			}
 		}
 		return par2FailureClass{}
 	}
@@ -275,8 +279,13 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDisc
 	state.AttemptCount++
 	state.LastError = err.Error()
 	state.DeadSegmentsDiscovered = deadSegmentsDiscovered
+	if classifyPar2Failure(err).suspect {
+		state.SuspectCount++
+	}
 
-	class := par2OutcomeClass(err, state.AttemptCount)
+	// The suspect limit counts suspect failures only: a transient failure
+	// (a timeout) says nothing about whether the suspect cause recurs.
+	class := par2OutcomeClass(err, state.SuspectCount)
 	state.Terminal = class.terminal
 	if class.terminal {
 		state.TerminalReason = class.reason
