@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/par2"
 )
@@ -119,30 +120,15 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	if err != nil || len(pending) == 0 {
 		return false
 	}
-	if cfg.Par2RepairMode == config.Par2RepairModeAutoThreshold {
-		deadSegments := 0
-		for _, segs := range pending {
-			deadSegments += len(segs)
-		}
-		if deadSegments < cfg.Par2RepairMinSegments {
-			return false
-		}
-	}
+	// No par2_repair_min_segments gate here. The threshold saves bandwidth
+	// on automatic passes; this one reads intact data from the local cache,
+	// and the alternative when it declines is the sweep's full re-grab and
+	// blocklist - so turning away the smallest damage cost more, not less.
 
 	preflightCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout*4)
 	defer cancel()
 
-	// Recovery-alive STAT: confirm every article the retained Par2Files
-	// point at (index + recovery volumes) is still fetchable right now,
-	// before spending any more effort on this entry. Anything short of
-	// every segment confirmed present is treated as not alive - an
-	// ambiguous STAT error is not a reason to gamble a real pass on it.
-	avail, err := u.RecoveryAvailability(preflightCtx, nzbID)
-	if err != nil || avail.TotalSegments == 0 || avail.MissingSegments != 0 || avail.ErrorSegments != 0 {
-		return false
-	}
-
-	_, indexFiles := censusPar2Volumes(nzb.Par2Files)
+	allVols, indexFiles := censusPar2Volumes(nzb.Par2Files)
 	if len(indexFiles) == 0 {
 		return false
 	}
@@ -157,7 +143,8 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	if len(sources) == 0 {
 		return false
 	}
-	idx, err := par2.ParseIndexSet(sources, choosePar2Set(sources, nil, nzb.Par2Source, pending).setID)
+	setChoice := choosePar2Set(sources, allVols, nzb.Par2Source, pending)
+	idx, err := par2.ParseIndexSet(sources, setChoice.setID)
 	if err != nil {
 		return false
 	}
@@ -247,6 +234,16 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 		return false
 	}
 
+	// Enough live recovery data for this damage: the recovery slices of
+	// volumes whose every article STATs present must cover the damaged
+	// slices. This used to require every article of every retained PAR2
+	// file alive, so one expired article in a volume the pass would never
+	// read disabled the pass and sent the file to a re-grab.
+	alive, aerr := aliveRecoverySlices(preflightCtx, u.StatSegments, setChoice.vols)
+	if aerr != nil || alive < uint32(len(damagedSet)) {
+		return false
+	}
+
 	// The 100% warm gate: every slice par2.Repair's streaming pass would
 	// read as "intact" (i.e. every slice NOT in damagedSet) must be fully
 	// servable from the local cache alone, clamped to the posted file's
@@ -291,4 +288,45 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 		p.repair.handlers.Set(nzbID, handlerRegrab)
 	}
 	return completed
+}
+
+// aliveRecoverySlices STATs every article of vols and returns the recovery
+// slices of the volumes whose articles are all confirmed present. A volume
+// with any article gone or unanswered counts for nothing: the gate this
+// feeds decides whether to try a pass instead of re-grabbing, and must not
+// promise recovery data it has not seen.
+func aliveRecoverySlices(ctx context.Context, stat func(context.Context, []string) ([]nntp.StatResult, error), vols []par2Volume) (uint32, error) {
+	var ids []string
+	for _, v := range vols {
+		for _, seg := range v.ref.Segments {
+			ids = append(ids, seg.MessageID)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	results, err := stat(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	present := make(map[string]bool, len(results))
+	for _, r := range results {
+		if r.Available {
+			present[r.MessageID] = true
+		}
+	}
+	var alive uint32
+	for _, v := range vols {
+		whole := len(v.ref.Segments) > 0
+		for _, seg := range v.ref.Segments {
+			if !present[seg.MessageID] {
+				whole = false
+				break
+			}
+		}
+		if whole {
+			alive += v.count
+		}
+	}
+	return alive, nil
 }
