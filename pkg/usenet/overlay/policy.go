@@ -132,6 +132,10 @@ func (s *Store) decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
+	// Again under the lock (see RecordDead).
+	if s.isRejected(nzbID) {
+		return DecisionFail, VerdictFailed
+	}
 
 	m, err := s.loadManifestLocked(nzbID)
 	if err != nil {

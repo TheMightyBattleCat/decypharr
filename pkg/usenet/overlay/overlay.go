@@ -16,6 +16,7 @@ package overlay
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -291,6 +292,10 @@ func (s *Store) ClearRejected(nzbID string) {
 	}
 	s.rejected.Delete(nzbID)
 }
+
+// ErrEntryRejected is WritePatch's answer for an nzbID whose entry was torn
+// down (MarkRejected) while a repair was still running for it.
+var ErrEntryRejected = errors.New("overlay: entry was deleted; patch not written")
 
 // isRejected reports whether MarkRejected was called for nzbID.
 func (s *Store) isRejected(nzbID string) bool {
@@ -613,6 +618,11 @@ func (s *Store) RecordDead(nzbID, file string, segIndex int, msgID string, bytes
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
+	// Again under the lock: a fetcher that passed the check above while the
+	// teardown held this lock would otherwise re-create the manifest.
+	if s.isRejected(nzbID) {
+		return nil
+	}
 
 	m, err := s.loadManifestLocked(nzbID)
 	if err != nil {
@@ -695,6 +705,11 @@ func (s *Store) WritePatch(nzbID, file string, segIndex int, data []byte) error 
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
+	// A PAR2 pass keeps running after its entry is deleted; its patch must
+	// not re-create the torn-down overlay directory.
+	if s.isRejected(nzbID) {
+		return ErrEntryRejected
+	}
 
 	// Validate BEFORE writing anything. The patch's length comes from the
 	// repair's segment geometry (Par2SegmentRef.Bytes, anchored on
@@ -773,6 +788,9 @@ func (s *Store) SetCoverageFraction(nzbID, file string, frac float64) error {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return nil
+	}
 
 	m, err := s.loadManifestLocked(nzbID)
 	if err != nil {
@@ -915,10 +933,9 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	mu.Lock()
 	err := os.RemoveAll(s.entryDir(nzbID))
 	mu.Unlock()
-
-	s.locksMu.Lock()
-	delete(s.locks, nzbID)
-	s.locksMu.Unlock()
+	// The mutex stays in s.locks: goroutines may still hold or wait on it,
+	// and deleting it let a later lockFor mint a second mutex for the same
+	// nzbID, so writers under the two could lose each other's updates.
 
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("overlay: delete entry: %w", err)
