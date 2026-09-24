@@ -695,10 +695,13 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 		return false, fmt.Sprintf("%d damaged segments exceeds the %d-slice repair cap", needed, par2.MaxRepairSlices)
 	}
 
-	vols, _ := censusPar2Volumes(nzb.Par2Files)
+	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
 	var available uint32
 	for _, v := range vols {
 		available += v.count
+	}
+	if len(vols) == 0 {
+		available = estimateUnnamedRecovery(indexFiles)
 	}
 	if available < needed {
 		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
@@ -1793,6 +1796,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	earlyIdx, earlyErr := par2.ParseIndexSet(sources, par2Set)
 	if earlyErr != nil {
 		earlyIdx = nil
+	}
+	// Recovery volumes whose names carry no .volN+M marker (obfuscated
+	// postings) were census-ed as index files and fetched in full above: the
+	// recovery slices they hold are already here. Count them, or "no PAR2
+	// recovery volumes retained" goes terminal on data in hand.
+	if earlyIdx != nil && uint32(len(earlyIdx.Recovery)) > available {
+		available = uint32(len(earlyIdx.Recovery))
 	}
 	if available == 0 {
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
@@ -4173,4 +4183,46 @@ func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, p
 			}
 		}
 	}
+}
+
+// estimateUnnamedRecovery estimates the recovery slices held by PAR2 files
+// whose names carry no volume marker (an obfuscated posting: every .par2
+// census-ed as an index file), for the network-free coverage check. The
+// smallest file is the index; a file at least twice its size is a recovery
+// volume, holding (size - index) / step slices, where step is the smallest
+// such difference - a posting's smallest volume holds one slice. Files under
+// twice the index size are other index files (one set per episode in a
+// season pack), not volumes. 0 when nothing qualifies. runRepair counts the
+// real slices once it has parsed them.
+func estimateUnnamedRecovery(files []storage.Par2FileRef) uint32 {
+	base := int64(-1)
+	for _, f := range files {
+		if f.Size > 0 && (base < 0 || f.Size < base) {
+			base = f.Size
+		}
+	}
+	if base <= 0 {
+		return 0
+	}
+	step := int64(0)
+	for _, f := range files {
+		if f.Size >= 2*base {
+			if d := f.Size - base; step == 0 || d < step {
+				step = d
+			}
+		}
+	}
+	if step == 0 {
+		return 0
+	}
+	var n int64
+	for _, f := range files {
+		if f.Size >= 2*base {
+			n += (f.Size - base + step/2) / step
+		}
+	}
+	if n > int64(^uint32(0)) {
+		n = int64(^uint32(0))
+	}
+	return uint32(n)
 }
