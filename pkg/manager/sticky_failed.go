@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -102,6 +103,13 @@ func (r *Repair) reconcileStickyFailed(ctx context.Context, c *candidate, entry 
 	}
 	nzbID := entry.InfoHash
 	if r.manager.usenet.OverlayVerdict(nzbID, name) != overlay.VerdictFailed {
+		return res, false
+	}
+	// Failed with every dead segment patched: PAR2 already repaired it, so
+	// there is nothing to sample and nothing to re-grab.
+	if cleared, err := r.manager.usenet.OverlayUnfailRepaired(nzbID); err == nil && slices.Contains(cleared, name) {
+		r.logger.Info().Str("entry", entry.Name).Str("file", name).
+			Msg("Repair: sticky-failed file has every dead segment patched; cleared the failed verdict")
 		return res, false
 	}
 

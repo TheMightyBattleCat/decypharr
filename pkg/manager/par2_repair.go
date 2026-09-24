@@ -1302,6 +1302,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		return
 	}
 	if len(pending) == 0 {
+		p.unfailRepaired(nzbID, entryName)
 		progress.SetPhase(Par2PhaseCompleted) // nothing pending - not a failure, just nothing to do
 		return
 	}
@@ -1400,7 +1401,27 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		SegmentsPatched: deadSegments,
 	})
 	p.recordPar2Outcome(nzbID, nil, 0)
+	p.unfailRepaired(nzbID, entryName)
 	p.notifyCompleted(entryName, deadSegments, time.Since(start))
+}
+
+// unfailRepaired clears the Failed verdict of nzbID's files the pass left
+// with every recorded segment patched (see Usenet.OverlayUnfailRepaired).
+// Left Failed, the next escalation for such a file found nothing pending,
+// so par2Usable said no and the playback policy re-grabbed it.
+func (p *Par2Repair) unfailRepaired(nzbID, entryName string) {
+	if p.manager.usenet == nil {
+		return
+	}
+	cleared, err := p.manager.usenet.OverlayUnfailRepaired(nzbID)
+	if err != nil {
+		p.logger.Warn().Err(err).Str("entry", entryName).Msg("par2 repair: could not clear the failed verdict of repaired files")
+		return
+	}
+	if len(cleared) > 0 {
+		p.logger.Info().Str("entry", entryName).Strs("files", cleared).
+			Msg("par2 repair: every dead segment is patched; the file is no longer failed")
+	}
 }
 
 // recordAttempt persists a to the compact PAR2 repair-attempt history the

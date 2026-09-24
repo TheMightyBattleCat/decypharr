@@ -892,12 +892,36 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 	// Decode just those (no numeric columns, no NZBSegment structs, no other
 	// files) so a full sweep doesn't hold whole segment maps in memory.
 	samplePercent := config.Get().Usenet.AvailabilitySamplePercent
+	if patched := u.patchedSegmentSet(nzoID, filename); patched != nil {
+		return u.checkFileSkippingPatched(ctx, nzoID, filename, samplePercent, patched)
+	}
 	messageIDs, err := u.nzbStorage.SampleFileMessageIDs(nzoID, filename, samplePercent)
 	if err != nil {
 		return fmt.Errorf("failed to sample file segments: %w", err)
 	}
 	if len(messageIDs) == 0 {
 		return fmt.Errorf("file has no Segments: %s", filename)
+	}
+	return u.checkAvailability(ctx, filename, messageIDs)
+}
+
+// checkFileSkippingPatched is CheckFile for a file with PAR2 patches: it
+// decodes the file's segment list (the sampled-ids fast path has no indices
+// to match patches against) and leaves the patched segments out of the
+// sample - see withoutPatched.
+func (u *Usenet) checkFileSkippingPatched(ctx context.Context, nzoID, filename string, samplePercent int, patched map[int]struct{}) error {
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	if err != nil {
+		return fmt.Errorf("failed to sample file segments: %w", err)
+	}
+	file := nzb.GetFileByName(filename)
+	if file == nil || len(file.Segments) == 0 {
+		return fmt.Errorf("file has no Segments: %s", filename)
+	}
+	idx := withoutPatched(sampleIndices(len(file.Segments), samplePercent), patched)
+	messageIDs := make([]string, len(idx))
+	for i, j := range idx {
+		messageIDs[i] = file.Segments[j].MessageID
 	}
 	return u.checkAvailability(ctx, filename, messageIDs)
 }
@@ -1001,6 +1025,55 @@ func (u *Usenet) OverlayClearFileDamage(nzoID, filename string) (patchesPreserve
 		return false, nil
 	}
 	return u.overlay.ClearFileDamage(nzoID, filename)
+}
+
+// OverlayUnfailRepaired clears the Failed verdict of each of nzoID's files
+// whose recorded damage is all patched (see overlay.Store.UnfailRepaired)
+// and un-poisons them in the permanent-failure cache. Returns the files it
+// cleared.
+func (u *Usenet) OverlayUnfailRepaired(nzoID string) ([]string, error) {
+	if u.overlay == nil {
+		return nil, nil
+	}
+	cleared, err := u.overlay.UnfailRepaired(nzoID)
+	for _, file := range cleared {
+		u.ClearFailedFile(nzoID, file)
+	}
+	return cleared, err
+}
+
+// patchedSegmentSet returns the indices of filename's segments the overlay
+// holds a PAR2 patch for, or nil when it holds none.
+func (u *Usenet) patchedSegmentSet(nzoID, filename string) map[int]struct{} {
+	if u.overlay == nil {
+		return nil
+	}
+	idx := u.overlay.PatchedSegments(nzoID, filename)
+	if len(idx) == 0 {
+		return nil
+	}
+	set := make(map[int]struct{}, len(idx))
+	for _, i := range idx {
+		set[i] = struct{}{}
+	}
+	return set
+}
+
+// withoutPatched drops the patched indices from idx. A patched segment's
+// article is dead - that is why PAR2 rebuilt it - but reads serve the patch,
+// so an availability check that counted it missing re-grabbed a file PAR2
+// had just repaired.
+func withoutPatched(idx []int, patched map[int]struct{}) []int {
+	if len(patched) == 0 {
+		return idx
+	}
+	out := make([]int, 0, len(idx))
+	for _, i := range idx {
+		if _, ok := patched[i]; !ok {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // OverlayDeleteFile removes filename's overlay record and patch blobs from
@@ -1173,22 +1246,30 @@ func (u *Usenet) RunDamageSample(ctx context.Context, nzoID, filename string, op
 		return SampleResult{Verdict: VerdictInconclusive}, fmt.Errorf("file %s has no segments", filename)
 	}
 
-	segments := make([]SegmentRef, len(file.Segments))
-	for i, seg := range file.Segments {
-		segments[i] = SegmentRef{Index: i, MessageID: seg.MessageID}
-	}
-
 	var recordedDead []int
+	patched := make(map[int]struct{})
 	if u.overlay != nil {
 		if m, merr := u.overlay.GetManifest(nzoID); merr == nil {
 			if fe := m.Files[filename]; fe != nil {
 				for _, d := range fe.DeadSegments {
-					if d.Status != overlay.StatusPatched {
+					if d.Status == overlay.StatusPatched {
+						patched[d.Index] = struct{}{}
+					} else {
 						recordedDead = append(recordedDead, d.Index)
 					}
 				}
 			}
 		}
+	}
+
+	// Patched segments are left out of the sample: their articles are dead,
+	// but reads serve the patch (see withoutPatched).
+	segments := make([]SegmentRef, 0, len(file.Segments))
+	for i, seg := range file.Segments {
+		if _, ok := patched[i]; ok {
+			continue
+		}
+		segments = append(segments, SegmentRef{Index: i, MessageID: seg.MessageID})
 	}
 
 	fetchBody := func(ctx context.Context, seg SegmentRef) error {
@@ -1323,7 +1404,7 @@ func (u *Usenet) CheckFileDetailed(ctx context.Context, nzoID, filename string) 
 	}
 
 	samplePercent := config.Get().Usenet.AvailabilitySamplePercent
-	idx := sampleIndices(len(file.Segments), samplePercent)
+	idx := withoutPatched(sampleIndices(len(file.Segments), samplePercent), u.patchedSegmentSet(nzoID, filename))
 	if len(idx) == 0 {
 		return nil, nil
 	}

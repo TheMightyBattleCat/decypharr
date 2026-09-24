@@ -998,6 +998,52 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	return true, s.saveManifestLocked(nzbID, m)
 }
 
+// UnfailRepaired clears the Failed verdict of every file of nzbID whose
+// recorded damage is now all patched, and returns those files.
+// recomputeVerdictLocked keeps Failed through WritePatch, so a file PAR2 had
+// fully repaired stayed Failed; with nothing pending, par2Usable then says
+// no, and the playback policy re-grabbed the file PAR2 had just fixed. A file
+// with any segment still dead or padded keeps its verdict.
+func (s *Store) UnfailRepaired(nzbID string) ([]string, error) {
+	if s == nil {
+		return nil, nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return nil, nil
+	}
+
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return nil, err
+	}
+	var cleared []string
+	for name, fe := range m.Files {
+		if fe.Verdict != VerdictFailed || len(fe.DeadSegments) == 0 {
+			continue
+		}
+		allPatched := true
+		for _, d := range fe.DeadSegments {
+			if d.Status != StatusPatched {
+				allPatched = false
+				break
+			}
+		}
+		if !allPatched {
+			continue
+		}
+		fe.Verdict = VerdictClean
+		cleared = append(cleared, name)
+	}
+	if len(cleared) == 0 {
+		return nil, nil
+	}
+	sort.Strings(cleared)
+	return cleared, s.saveManifestLocked(nzbID, m)
+}
+
 // DeleteFile removes file's overlay record (dead segments + verdict) from
 // nzbID's manifest and every patch blob written for it, without touching any
 // other file recorded against the same nzbID. If file was the manifest's

@@ -2445,6 +2445,17 @@ func (r *Repair) handleAutoDamage(ctx context.Context, source RepairSource, entr
 		par2Usable, _ = r.manager.par2Repair.par2Usable(nzbID)
 	}
 	verdict := r.manager.usenet.OverlayVerdict(nzbID, fileName)
+	if verdict == overlay.VerdictFailed {
+		// A file PAR2 repaired completely can still read Failed (a pass that
+		// predates the verdict clearing, or damage patched outside a pass).
+		// Nothing is pending for it, so par2Usable is false and the policy
+		// below would re-grab a file that plays fine.
+		if cleared, uerr := r.manager.usenet.OverlayUnfailRepaired(nzbID); uerr == nil && slices.Contains(cleared, fileName) {
+			r.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Str("file", fileName).Str("source", string(source)).
+				Msg("auto repair: every dead segment is patched; cleared the failed verdict instead of re-grabbing")
+			verdict = r.manager.usenet.OverlayVerdict(nzbID, fileName)
+		}
+	}
 
 	switch decideAutoRepairAction(source, par2Usable, verdict) {
 	case autoActionRegrab:
