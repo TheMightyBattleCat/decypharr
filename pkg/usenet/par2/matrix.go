@@ -1,6 +1,9 @@
 package par2
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // maxInputSlices is the PAR2 v2.0 spec's limit on the number of input
 // slices a single recovery set may protect, a consequence of how
@@ -29,8 +32,26 @@ func inputConstant(i int64) uint16 {
 		// guard anyway rather than silently returning a bogus constant.
 		panic(fmt.Sprintf("par2: input slice index %d out of range [0, %d)", i, maxInputSlices))
 	}
-	e := nthValidExponent(int(i) + 1)
-	return gfPow(2, uint32(e))
+	inputConstantsOnce.Do(buildInputConstants)
+	return inputConstants[i]
+}
+
+// inputConstants caches C_i for every input slice. nthValidExponent is O(i),
+// and repair asks for a constant per intact slice and k² more for the
+// matrix: near the slice limit that was ~1e9 loop steps per pass.
+var (
+	inputConstantsOnce sync.Once
+	inputConstants     [maxInputSlices]uint16
+)
+
+func buildInputConstants() {
+	i := 0
+	for v := 1; i < maxInputSlices; v++ {
+		if isValidExponentCandidate(v) {
+			inputConstants[i] = gfPow(2, uint32(v))
+			i++
+		}
+	}
 }
 
 // nthValidExponent returns the n-th (1-indexed) positive integer not

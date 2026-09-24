@@ -75,9 +75,20 @@ type Match struct {
 // matches, and the call still succeeds. A hard error is returned only for
 // a genuinely malformed input.
 func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
-	// Group FileDescs and posted files by length.
+	// Group FileDescs and posted files by length. Only files in the recovery
+	// set (FileOrder) can be matched: a FileDesc outside it has no slices, so
+	// a length match to one ended in SliceBase failing, reported as a
+	// terminal "map dead segment". An index with no Main packet keeps every
+	// FileDesc, as before.
+	inSet := make(map[[16]byte]bool, len(idx.FileOrder))
+	for _, id := range idx.FileOrder {
+		inSet[id] = true
+	}
 	byLength := make(map[int64][][16]byte)
 	for id, fd := range idx.Files {
+		if len(inSet) > 0 && !inSet[id] {
+			continue
+		}
 		byLength[fd.Length] = append(byLength[fd.Length], id)
 	}
 	postedByLength := make(map[int64][]int)

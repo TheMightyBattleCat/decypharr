@@ -183,12 +183,18 @@ func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 	return idx, nil
 }
 
+// maxSliceSize bounds a Main packet's slice size. Real sets use at most tens
+// of MB, and repair's accumulator cap (maxAccumulatorMemory) refuses anything
+// near this anyway; the bound keeps k*SliceSize from overflowing past that
+// cap for a garbage or crafted packet whose MD5 still verifies.
+const maxSliceSize = 1 << 30
+
 func (idx *Index) parseMain(body []byte) error {
 	if len(body) < 12 {
 		return fmt.Errorf("truncated Main packet")
 	}
 	sliceSize := int64(binary.LittleEndian.Uint64(body[0:8]))
-	if sliceSize <= 0 || sliceSize%4 != 0 {
+	if sliceSize <= 0 || sliceSize%4 != 0 || sliceSize > maxSliceSize {
 		return fmt.Errorf("invalid Main packet slice size %d", sliceSize)
 	}
 	numFiles := binary.LittleEndian.Uint32(body[8:12])
@@ -339,6 +345,11 @@ func (idx *Index) sliceLocation(globalIdx int64) (fileID [16]byte, local int64, 
 // fileID. A slice with any damaged byte is treated as fully damaged - PAR2
 // repair always operates at whole-slice granularity.
 func (idx *Index) DamagedSlices(fileID [16]byte, byteStart, byteEnd int64) ([]int64, error) {
+	// A range past the file's end would otherwise run into the next file's
+	// slices.
+	if fd := idx.Files[fileID]; fd != nil && byteEnd > fd.Length {
+		byteEnd = fd.Length
+	}
 	if byteEnd <= byteStart {
 		return nil, nil
 	}
