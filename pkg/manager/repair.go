@@ -270,7 +270,8 @@ func (r *Repair) decodeVerifyTTL() time.Duration {
 // Start registers the recurring sweep with the scheduler if repair is
 // enabled. It also reconciles any orphaned state left by a previous process:
 // runs marked running flip to cancelled; entries stuck on `repairing` revert
-// to their previous status. Idempotent.
+// to their previous status. Call it once per process - ApplyConfig is the
+// live-config path, since reconciling would mark a live sweep as orphaned.
 func (r *Repair) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -279,6 +280,16 @@ func (r *Repair) Start(ctx context.Context) error {
 	r.reconcileOrphans()
 	// Deferred deletes finish whether or not the sweep is enabled.
 	r.resumeIdleDeletes()
+
+	return r.scheduleLocked()
+}
+
+// scheduleLocked (re)registers the sweep and stop-schedule jobs from the live
+// config, leaving a running sweep alone. Caller holds r.mu.
+func (r *Repair) scheduleLocked() error {
+	r.scheduler.RemoveByTags(repairSchedulerTag, repairStopSchedulerTag)
+	r.scheduled = false
+	r.stopScheduled = false
 
 	cfg := r.cfg()
 	if !cfg.Enabled {
@@ -294,7 +305,6 @@ func (r *Repair) Start(ctx context.Context) error {
 		return fmt.Errorf("invalid repair schedule %q: %w", cfg.Schedule, err)
 	}
 
-	r.scheduler.RemoveByTags(repairSchedulerTag)
 	if _, err := r.scheduler.NewJob(jd,
 		gocron.NewTask(func() {
 			if _, err := r.runSweep(storage.RepairTriggerScheduled, RepairRunOptions{}); err != nil {
@@ -308,8 +318,6 @@ func (r *Repair) Start(ctx context.Context) error {
 	r.scheduled = true
 	r.logger.Info().Str("schedule", cfg.Schedule).Msg("Repair sweep scheduled")
 
-	r.scheduler.RemoveByTags(repairStopSchedulerTag)
-	r.stopScheduled = false
 	if stopSchedule := strings.TrimSpace(cfg.StopSchedule); stopSchedule != "" {
 		stopJD, err := utils.ConvertToJobDef(stopSchedule)
 		if err != nil {
@@ -364,7 +372,9 @@ func (r *Repair) Stop() {
 }
 
 // ApplyConfig reconciles the scheduler with the latest repair config. Called
-// after /api/repair/config is updated.
+// after every settings save (the general Settings form and the Repair page).
+// It only reschedules: a sweep already running keeps running, unless the save
+// turned Repair off.
 func (r *Repair) ApplyConfig() error {
 	if r.manager.usenet != nil {
 		// Padding caps (PadMaxRunSegments/PadMaxTotalSegments/PadMaxByteRatio)
@@ -373,8 +383,17 @@ func (r *Repair) ApplyConfig() error {
 		// ApplyConfig reconciles.
 		r.manager.usenet.ApplyOverlayPolicy()
 	}
-	r.Stop()
-	return r.Start(r.parentCtx)
+	r.mu.Lock()
+	wasScheduled := r.scheduled
+	err := r.scheduleLocked()
+	turnedOff := wasScheduled && !r.cfg().Enabled
+	r.mu.Unlock()
+	if turnedOff {
+		if stopErr := r.stopRun("repair turned off"); stopErr == nil {
+			r.logger.Info().Msg("Repair turned off; stopped the running sweep")
+		}
+	}
+	return err
 }
 
 // RunNow triggers a manual sweep. Returns the new run ID.
@@ -418,6 +437,11 @@ func (r *Repair) ClearDecodeVerification() (int, error) {
 // flipped to cancelled in storage immediately so the UI sees the stop on the
 // next poll, even before the goroutine unwinds.
 func (r *Repair) StopRun() error {
+	return r.stopRun("stopped by user")
+}
+
+// stopRun cancels the active sweep, recording reason on its run record.
+func (r *Repair) stopRun(reason string) error {
 	r.mu.Lock()
 	cancel := r.cancelRun
 	id := r.activeRunID
@@ -430,7 +454,7 @@ func (r *Repair) StopRun() error {
 		if run, err := r.manager.storage.GetRepairRun(id); err == nil && run != nil && run.Status == storage.RepairRunRunning {
 			run.Status = storage.RepairRunCancelled
 			run.Stage = storage.RepairStageDone
-			run.CancelReason = "stopped by user"
+			run.CancelReason = reason
 			run.CompletedAt = time.Now()
 			if err := r.manager.storage.SaveRepairRun(run); err != nil {
 				r.logger.Warn().Err(err).Str("run_id", id).Msg("Stop: failed to persist optimistic cancel")
