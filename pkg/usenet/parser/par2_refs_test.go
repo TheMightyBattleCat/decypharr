@@ -346,9 +346,14 @@ func TestBuildPar2RefsReusesPostingSizeForPar2Files(t *testing.T) {
 	if c.Size != 970+wantCLast || len(c.Segments) != 2 || c.Segments[1].Bytes != wantCLast {
 		t.Errorf("a.vol01+02.par2 = %+v, want segBytes=[970 %d] (shared size + per-file-ratio-estimated last segment)", c, wantCLast)
 	}
+	// A size borrowed from another file is never Real: only a file's own
+	// probe measures it (the repair then measures an unprobed file itself).
 	for _, f := range []storage.Par2FileRef{b, c} {
-		if !f.Segments[0].Real || f.Segments[len(f.Segments)-1].Real {
-			t.Errorf("%s Real flags = %+v, want interior Real and the estimated final segment not", f.Name, f.Segments)
+		for _, s := range f.Segments {
+			if s.Real {
+				t.Errorf("%s Real flags = %+v, want none Real (size borrowed from the seed)", f.Name, f.Segments)
+				break
+			}
 		}
 	}
 }
@@ -440,8 +445,9 @@ func TestBuildPar2RefsFailedPostedProbeKeepsEstimateUnreal(t *testing.T) {
 		}
 	}
 	wantLast := int64(float64(600) * 0.97)
-	if len(b.Segments) != 2 || b.Segments[0].Bytes != 970 || !b.Segments[0].Real || b.Segments[1].Bytes != wantLast || b.Segments[1].Real {
-		t.Fatalf("a.r00 = %+v, want [970 Real, %d not Real]", b, wantLast)
+	// The seed's size is borrowed, not measured for this file: no ref Real.
+	if len(b.Segments) != 2 || b.Segments[0].Bytes != 970 || b.Segments[0].Real || b.Segments[1].Bytes != wantLast || b.Segments[1].Real {
+		t.Fatalf("a.r00 = %+v, want [970, %d], neither Real", b, wantLast)
 	}
 }
 

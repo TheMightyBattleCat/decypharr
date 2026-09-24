@@ -607,16 +607,22 @@ func par2SegmentRefsFromPostingSize(segs nzbparser.NzbSegments, postingSegmentSi
 	refs := make([]storage.Par2SegmentRef, n)
 	var total int64
 	for i, seg := range segs {
-		b, real := postingSegmentSize, true
+		// Never Real: the size is borrowed from another posted file (the
+		// seed), accepted after only a loose XML-size check, and a posting
+		// can mix article sizes (a fill, a second poster). Marked Real, the
+		// repair's fetcher trusted it as measured geometry and never measured
+		// it, so every boundary after the first could be off - the path to a
+		// patch cut at the wrong offset. As an estimate, resolveGeometry
+		// measures the file's own first article instead.
+		b := postingSegmentSize
 		if i == n-1 {
-			real = false
 			if n == seedSegCount && seedLastSegBytes > 0 {
 				b = seedLastSegBytes // the seed's final article: right only for a file the seed's size
 			} else {
 				b = int64(float64(seg.Bytes) * residualOverhead) // residual: consistent-but-different-count geometry
 			}
 		}
-		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b, Real: real}
+		refs[i] = storage.Par2SegmentRef{MessageID: seg.Id, Bytes: b}
 		total += b
 	}
 	return refs, total
