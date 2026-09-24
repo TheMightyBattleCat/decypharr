@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "par2_repair_attempts", "par2_repair_state", "regrab_guard"}
+var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "par2_repair_attempts", "par2_repair_state", "regrab_guard", "pending_deletes"}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -29,6 +29,7 @@ type Storage struct {
 	par2Repairs     *hybrid.Store
 	par2RepairState *hybrid.Store
 	regrabGuard     *hybrid.Store
+	pendingDeletes  *hybrid.Store
 	dir             string
 	logger          zerolog.Logger
 
@@ -98,6 +99,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 		par2Repairs:     itemStores["par2_repair_attempts"],
 		par2RepairState: itemStores["par2_repair_state"],
 		regrabGuard:     itemStores["regrab_guard"],
+		pendingDeletes:  itemStores["pending_deletes"],
 		dir:             dbPath,
 		logger:          log,
 	}
@@ -113,7 +115,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard}
+	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard, s.pendingDeletes}
 	for _, store := range stores {
 		if store == nil {
 			continue
@@ -131,7 +133,7 @@ func (s *Storage) Close() error {
 // DiskSize returns the total on-disk size of all stores (O(1), no filesystem walk).
 func (s *Storage) DiskSize() int64 {
 	var size int64
-	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard} {
+	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard, s.pendingDeletes} {
 		if store != nil {
 			size += store.DiskSize()
 		}
@@ -176,6 +178,7 @@ func (s *Storage) copyFrom(other *Storage) error {
 		{"par2_repair_attempts", other.par2Repairs, s.par2Repairs},
 		{"par2_repair_state", other.par2RepairState, s.par2RepairState},
 		{"regrab_guard", other.regrabGuard, s.regrabGuard},
+		{"pending_deletes", other.pendingDeletes, s.pendingDeletes},
 	}
 
 	for _, p := range pairs {

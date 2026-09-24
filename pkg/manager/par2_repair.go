@@ -1292,7 +1292,16 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	go p.watchIdle(timeoutCtx, jobCancel, progress)
 
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
-	if err != nil || len(pending) == 0 {
+	if err != nil {
+		// Unknown is not "nothing to do": Completed here made the sweep's
+		// PAR2 attempt report success and drop the file from its broken
+		// list with nothing repaired.
+		p.logger.Warn().Err(err).Str("entry", entryName).Msg("par2 repair: could not read the overlay's pending damage")
+		progress.SetPhase(Par2PhaseFailed)
+		progress.SetLastError("read overlay state: " + err.Error())
+		return
+	}
+	if len(pending) == 0 {
 		progress.SetPhase(Par2PhaseCompleted) // nothing pending - not a failure, just nothing to do
 		return
 	}

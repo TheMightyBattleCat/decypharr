@@ -497,7 +497,15 @@ const (
 func (p *Precache) recordReadiness(ref walkIdentity, entry *storage.Entry, filename string, fileSize int64) {
 	row := EpisodeReadiness{EntryName: entry.Name, InfoHash: entry.InfoHash, Filename: filename, ReadyAt: time.Now()}
 	n, ok := p.overlayPendingCount(entry, filename)
-	if !ok || n <= 0 {
+	if !ok {
+		// The overlay could not be read: unknown, not clean. Record the
+		// row without a verdict and send no "cached, clean" notification.
+		p.logger.Debug().Str("entry", entry.Name).Str("file", filename).
+			Msg("next-episode pre-cache: overlay unreadable; readiness left unverified")
+		p.storeReadiness(row)
+		return
+	}
+	if n <= 0 {
 		row.Clean = true
 		p.storeReadiness(row)
 		p.notifyReadiness(entry, row)

@@ -277,6 +277,8 @@ func (r *Repair) Start(ctx context.Context) error {
 	r.parentCtx = ctx
 
 	r.reconcileOrphans()
+	// Deferred deletes finish whether or not the sweep is enabled.
+	r.resumeIdleDeletes()
 
 	cfg := r.cfg()
 	if !cfg.Enabled {

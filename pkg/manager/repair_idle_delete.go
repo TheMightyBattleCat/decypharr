@@ -3,6 +3,8 @@ package manager
 import (
 	"context"
 	"time"
+
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 var (
@@ -29,10 +31,42 @@ func (r *Repair) deleteEntryWhenIdle(hash, name string) (deleted bool, err error
 	if _, pending := r.idleDeletes.LoadOrStore(hash, struct{}{}); pending {
 		return false, nil
 	}
+	// Persisted so a restart during the wait still deletes it (see
+	// resumeIdleDeletes): the Arr file row and the broken record are gone
+	// by now, so nothing else would ever come back for it.
+	if st := r.manager.storage; st != nil {
+		if err := st.SavePendingDelete(&storage.PendingDelete{InfoHash: hash, Name: name, Since: time.Now()}); err != nil {
+			r.logger.Warn().Err(err).Str("entry", name).Msg("Repair: could not persist a deferred delete")
+		}
+	}
 	r.logger.Info().Str("entry", name).Str("infohash", hash).
 		Msg("Repair: entry is being streamed; deleting it once the stream closes")
 	go r.awaitIdleDelete(hash, name)
 	return false, nil
+}
+
+// resumeIdleDeletes replays the deferred deletes a restart interrupted: each
+// still-stored entry is deleted now, or once its stream closes.
+func (r *Repair) resumeIdleDeletes() {
+	st := r.manager.storage
+	if st == nil {
+		return
+	}
+	var pending []*storage.PendingDelete
+	_ = st.ForEachPendingDelete(func(pd *storage.PendingDelete) { pending = append(pending, pd) })
+	for _, pd := range pending {
+		if e, err := r.manager.GetEntry(pd.InfoHash); err != nil || e == nil {
+			_ = st.DeletePendingDelete(pd.InfoHash) // already gone
+			continue
+		}
+		r.logger.Info().Str("entry", pd.Name).Str("infohash", pd.InfoHash).
+			Msg("Repair: resuming a deferred delete interrupted by a restart")
+		if deleted, err := r.deleteEntryWhenIdle(pd.InfoHash, pd.Name); err != nil {
+			r.logger.Warn().Err(err).Str("entry", pd.Name).Msg("Repair: resumed deferred delete failed")
+		} else if deleted {
+			_ = st.DeletePendingDelete(pd.InfoHash)
+		}
+	}
 }
 
 func (r *Repair) awaitIdleDelete(hash, name string) {
@@ -51,7 +85,10 @@ func (r *Repair) awaitIdleDelete(hash, name string) {
 	}
 	if err := r.deleteNow(hash); err != nil {
 		r.logger.Warn().Err(err).Str("entry", name).Str("infohash", hash).Msg("Repair: deferred delete failed")
-		return
+		return // kept persisted: the next start retries it
+	}
+	if st := r.manager.storage; st != nil {
+		_ = st.DeletePendingDelete(hash)
 	}
 	r.logger.Info().Str("entry", name).Str("infohash", hash).Msg("Repair: deleted entry after its stream closed")
 }
