@@ -2406,6 +2406,42 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		u.ClearFailedFile(nzbID, dr.file)
 		written = append(written, dr)
 	}
+
+	// Articles this pass itself found gone or corrupt everywhere: their
+	// slices were just rebuilt, so record and patch them too instead of
+	// discarding the work. Best-effort - one that cannot be placed or
+	// written is logged and left, never failing a pass that repaired what
+	// it was asked to.
+	discovered, _ := splitPlaceableDeadRefs(fetchers, discoveredDeadRefs(nzb, matches, fetchers, msgIDRange, deadRefs))
+	patchedDiscovered := 0
+	for _, dr := range discovered {
+		start, end, werr := readerPatchWindow(nzb, dr)
+		if werr != nil {
+			continue
+		}
+		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, start, end)
+		if err != nil {
+			continue // a covering slice was not rebuilt
+		}
+		if err := u.RecordOverlayDead(nzbID, dr.file, dr.seg.Index, dr.seg.MessageID, dr.seg.Bytes); err != nil {
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: could not record an article the pass found dead")
+			continue
+		}
+		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: could not patch an article the pass found dead")
+			continue
+		}
+		u.ClearFailedFile(nzbID, dr.file)
+		written = append(written, dr)
+		patchedDiscovered++
+	}
+	if patchedDiscovered > 0 {
+		p.logger.Info().Str("entry", entryName).Int("articles", patchedDiscovered).
+			Msg("par2 repair: also patched articles the pass found missing or corrupt on every provider")
+	}
+
 	// Segments whose boundaries were never measured stay recorded dead, and
 	// the pass reports them rather than claiming a full repair.
 	return unplaced
@@ -3550,6 +3586,9 @@ type postedFileFetcher struct {
 	// geometryErr is why resolveGeometry could not measure the article
 	// boundaries (the last probe's error), nil when it did or never ran.
 	geometryErr error
+	// badArticles holds the segment indexes whose fetch failed as missing
+	// (430) or corrupt on every provider during this pass: int -> struct{}.
+	badArticles sync.Map
 	logger      zerolog.Logger
 
 	// cacheSource, when non-nil, is tried before every Usenet fetch below -
@@ -3978,6 +4017,11 @@ func (f *postedFileFetcher) readRange(start, length int64, allowCache bool) (out
 
 		data, err := f.segmentData(segIdx)
 		if err != nil {
+			if nntp.IsArticleNotFoundError(err) || nntp.IsCorruptArticleError(err) {
+				// Gone, or corrupt on every provider: the solve rebuilds its
+				// slices, and runRepair patches it (patchDiscoveredDead).
+				f.badArticles.Store(segIdx, struct{}{})
+			}
 			return nil, usedCache, fmt.Errorf("fetch segment %d: %w", segIdx, err)
 		}
 		avail := int64(len(data)) - withinSeg

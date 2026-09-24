@@ -93,6 +93,16 @@ func (sf *SegmentFetcher) clearDownloadTimeout(segIdx int) {
 	delete(sf.timeoutStreak, segIdx)
 }
 
+// articleUnservable reports whether err means no provider can serve the
+// article: missing everywhere (430), or every provider's copy corrupt (the
+// failover returns the decode error once it has tried them all). Either way
+// the overlay decides - pad and queue a repair - instead of failing the
+// read: a corrupt-everywhere article used to fail playback on every read and
+// never reach the overlay or a repair.
+func articleUnservable(err error) bool {
+	return nntp.IsArticleNotFoundError(err) || nntp.IsCorruptArticleError(err)
+}
+
 // escalateTimeoutStreak counts a fetch that ran out of time against segIdx
 // and, once the same segment has burned maxDownloadTimeoutStreak consecutive
 // windows, returns the confirmed-missing error in err's place so doFetch pads
@@ -530,7 +540,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// must observe the real failure so a broken import/sweep candidate
 		// can never look healthy by way of the padding that makes it
 		// playable.
-		if sf.config.Overlay != nil && nntp.IsArticleNotFoundError(err) && !paddingDisabled(ctx) {
+		if sf.config.Overlay != nil && articleUnservable(err) && !paddingDisabled(ctx) {
 			// An entry under a sweep probe is treated exactly like a
 			// verification read: no padding, so the real 430 propagates up,
 			// ffprobe sees the corruption and the sweep re-grabs. Scoped to
@@ -688,7 +698,7 @@ func (sf *SegmentFetcher) recoverFailedForPlayback(ctx context.Context, segIdx i
 		return false
 	}
 	cached := sf.cache.GetError(segIdx)
-	if cached == nil || !nntp.IsArticleNotFoundError(cached) {
+	if cached == nil || !articleUnservable(cached) {
 		return false
 	}
 	seg := sf.cache.GetSegment(segIdx)
