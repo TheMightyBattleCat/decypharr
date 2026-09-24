@@ -75,10 +75,18 @@ var errWarmSweepNoFetch = errors.New("warm sweep preflight: article fetch disabl
 // leaves everything - including a job RunNow may have started, which keeps
 // running independently - exactly as if this function had never been
 // called.
-func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) bool {
+func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (passed bool) {
 	if p == nil || nzbID == "" || p.manager.usenet == nil {
 		return false
 	}
+	// stage names the check a declined pass stopped at: every exit below used
+	// to be silent, so nothing showed the warm pass was considered at all.
+	stage := "config"
+	defer func() {
+		if !passed {
+			p.logger.Debug().Str("entry", nzbID).Str("stage", stage).Msg("par2 warm sweep pass declined; the sweep re-grabs")
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -99,6 +107,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 
 	u := p.manager.usenet
 
+	stage = "entry lookup"
 	entry, err := p.manager.GetEntry(nzbID)
 	if err != nil || entry == nil {
 		return false
@@ -111,11 +120,13 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	// cache item.
 	entryName := entry.Name
 
+	stage = "no PAR2 data in the NZB record"
 	nzb, err := u.GetNZB(nzbID)
 	if err != nil || len(nzb.Par2Source) == 0 || len(nzb.Par2Files) == 0 {
 		return false
 	}
 
+	stage = "no pending damage"
 	pending, err := u.OverlayPendingRepair(nzbID)
 	if err != nil || len(pending) == 0 {
 		return false
@@ -128,6 +139,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	preflightCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout*4)
 	defer cancel()
 
+	stage = "PAR2 index fetch/parse"
 	allVols, indexFiles := censusPar2Volumes(nzb.Par2Files)
 	if len(indexFiles) == 0 {
 		return false
@@ -149,6 +161,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 		return false
 	}
 
+	stage = "posted-file match"
 	posted := make([]par2.PostedFile, len(nzb.Par2Source))
 	for i, f := range nzb.Par2Source {
 		f := f
@@ -172,6 +185,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 		return false
 	}
 
+	stage = "no mount cache"
 	var cacheReader dfsCacheRangeReader
 	if mgr := p.manager.MountManager(); mgr != nil {
 		cacheReader, _ = mgr.(dfsCacheRangeReader)
@@ -214,6 +228,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	// Map every pending dead segment to the damaged slice set, exactly as
 	// runRepair does - anything not mappable means this preflight can't
 	// reason about the entry's real damage, so it must not proceed.
+	stage = "damage not mappable to slices, or over the repair cap"
 	damagedSet := make(map[int64]struct{})
 	for _, segs := range pending {
 		for _, seg := range segs {
@@ -239,6 +254,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	// slices. This used to require every article of every retained PAR2
 	// file alive, so one expired article in a volume the pass would never
 	// read disabled the pass and sent the file to a re-grab.
+	stage = "not enough live recovery data"
 	alive, aerr := aliveRecoverySlices(preflightCtx, u.StatSegments, setChoice.vols)
 	if aerr != nil || alive < uint32(len(damagedSet)) {
 		return false
@@ -249,6 +265,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	// servable from the local cache alone, clamped to the posted file's
 	// real length exactly like ReadRange itself clamps (see its doc
 	// comment) - a single miss anywhere fails the whole gate.
+	stage = "intact data not fully cached"
 	for s := int64(0); s < idx.NumSlices(); s++ {
 		if _, damaged := damagedSet[s]; damaged {
 			continue
@@ -283,6 +300,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 		kind, terminal, exists := p.repair.handlers.State(nzbID)
 		priorKind, priorLive = kind, exists && !terminal
 	}
+	stage = "pass ran but did not complete"
 	completed := p.runNowAndWait(ctx, nzbID)
 	if !completed && priorLive && priorKind == handlerRegrab && ctx.Err() == nil {
 		p.repair.handlers.Set(nzbID, handlerRegrab)

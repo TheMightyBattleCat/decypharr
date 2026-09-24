@@ -83,6 +83,9 @@ const (
 	par2JobTimeout = 20 * time.Minute
 	// par2JobTimeoutMax caps par2JobTimeoutFor.
 	par2JobTimeoutMax = 4 * time.Hour
+	// par2RefusalLogInterval bounds how often AutoEnqueue logs a threshold
+	// refusal for one entry.
+	par2RefusalLogInterval = 30 * time.Minute
 	// par2JobPassFloor is the throughput par2JobTimeoutFor allows each full
 	// read of the release at, and par2JobPasses how many reads it allows
 	// for: a discovery pass, the solve, and one more round.
@@ -261,6 +264,10 @@ type Par2Repair struct {
 	manager *Manager
 	repair  *Repair
 	logger  zerolog.Logger
+
+	// refusalLogged rate-limits AutoEnqueue's threshold-refusal line: nzbID
+	// -> when it was last logged.
+	refusalLogged sync.Map
 
 	// BATCH lane: unchanged from the original single-lane worker.
 	mu     sync.Mutex
@@ -466,6 +473,17 @@ func (p *Par2Repair) AutoEnqueue(nzbID string, deadSegments int) {
 	}
 	watched := p.manager.Streaming(nzbID, "")
 	if !autoEnqueueAllowed(cfg.Par2RepairMode, cfg.Par2RepairMinSegments, deadSegments, watched) {
+		// Used to return silently: 53 pads in 5.5 days and no automatic pass,
+		// with nothing in the log to say the threshold was why. Once per
+		// entry per par2RefusalLogInterval, so a burst of pads is one line.
+		if now := time.Now(); cfg.Par2RepairMode == config.Par2RepairModeAutoThreshold {
+			if last, ok := p.refusalLogged.Load(nzbID); !ok || now.Sub(last.(time.Time)) >= par2RefusalLogInterval {
+				p.refusalLogged.Store(nzbID, now)
+				p.logger.Info().Str("entry", nzbID).Int("dead_segments", deadSegments).
+					Int("min_segments", cfg.Par2RepairMinSegments).Bool("watched", watched).
+					Msg("par2 repair not queued: damage below the automatic repair threshold; left padded")
+			}
+		}
 		return
 	}
 	// This entry is currently under an ffprobe sweep probe, which is already
@@ -1298,6 +1316,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
+			Str("class", class.name()).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
 			Msg("par2 repair unavailable")
 		progress.SetPhase(Par2PhaseFailed)

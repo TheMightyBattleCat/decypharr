@@ -52,6 +52,22 @@ func par2BackoffDuration(attemptCount int) time.Duration {
 	return d
 }
 
+// name is the class for the log: transient, suspect, terminal, or
+// terminal_after_suspect (a suspect failure that recurred past
+// par2SuspectAttemptLimit).
+func (c par2FailureClass) name() string {
+	switch {
+	case c.terminal && c.suspect:
+		return "terminal_after_suspect"
+	case c.terminal:
+		return "terminal"
+	case c.suspect:
+		return "suspect"
+	default:
+		return "transient"
+	}
+}
+
 // par2FailureClass is the outcome of classifyPar2Failure.
 type par2FailureClass struct {
 	// terminal means retrying can never succeed without external state

@@ -84,6 +84,12 @@ type fileResult struct {
 	broken   bool
 	reason   string // populated only when broken or unknown
 
+	// pendingDamage counts the dead segments the overlay has recorded for
+	// this file and PAR2 has not repaired yet. The STAT probe passes such a
+	// file (a backup provider still holds its sampled articles); this keeps
+	// the recorded damage visible in the sweep's verdict line.
+	pendingDamage int
+
 	// decodeConclusive is true when this file's ffprobe frame-decode pass
 	// actually ran to a verdict this probe (clean, or a concrete decode
 	// error) rather than being cut short by a timeout or context
@@ -859,6 +865,13 @@ func (r *Repair) logFileVerdict(entryName, file string, size int64, budget *Veri
 	if took > 0 {
 		ev = ev.Dur(logger.FieldTook, took)
 	}
+	if res.pendingDamage > 0 && !res.broken {
+		// Passed its checks, but the overlay holds damage PAR2 has not
+		// repaired (below the threshold, or not yet run): not "clean".
+		ev.Str(logger.FieldStatus, logger.StatusWarn).Int("pending_dead_segments", res.pendingDamage).
+			Str(logger.FieldNote, fmt.Sprintf("%d dead segments awaiting repair", res.pendingDamage)).Msg("healthy")
+		return
+	}
 	switch {
 	case res.broken:
 		ev.Str(logger.FieldStatus, logger.StatusFail).Str("reason", res.reason).Msg("broken")
@@ -894,6 +907,9 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 			return r.routeAutoRepair(entry, res)
 		}
 		res.healthy = true
+		if pending, perr := r.manager.usenet.OverlayPendingRepair(entry.InfoHash); perr == nil {
+			res.pendingDamage = len(pending[name])
+		}
 		return res
 	}
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
