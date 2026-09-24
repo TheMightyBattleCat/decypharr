@@ -2487,6 +2487,9 @@ func (u *Usenet) markAsFailed(nzb *storage.NZB, err error) error {
 	return nil
 }
 
+// ErrBackfillImpossible marks a BackfillPar2Refs failure no retry can fix.
+var ErrBackfillImpossible = errors.New("PAR2 refs cannot be backfilled")
+
 // BackfillPar2Refs re-derives Par2Files/Par2Source for an NZB record whose
 // stored meta blob predates those fields, by re-parsing the raw .nzb source
 // file on disk (nzb.Path - see pkg/manager/stale_nzb.go for this location
@@ -2503,6 +2506,9 @@ func (u *Usenet) markAsFailed(nzb *storage.NZB, err error) error {
 // to re-derive from; it simply never gets PAR2 repair and falls straight to
 // the legacy re-grab path, exactly like "no par2 available" does for any
 // other entry.
+//
+// An error wrapping ErrBackfillImpossible means no retry can succeed (no
+// source NZB, or it holds no PAR2 data); any other is transient.
 func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
@@ -2512,10 +2518,13 @@ func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 		return nil
 	}
 	if nzb.Path == "" {
-		return fmt.Errorf("source NZB file is no longer on disk; cannot backfill PAR2 refs for %s", nzoID)
+		return fmt.Errorf("source NZB file is no longer on disk; cannot backfill PAR2 refs for %s: %w", nzoID, ErrBackfillImpossible)
 	}
 	content, err := os.ReadFile(nzb.Path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("source NZB file is gone: %w: %w", err, ErrBackfillImpossible)
+		}
 		return fmt.Errorf("failed to read source NZB file: %w", err)
 	}
 
@@ -2525,7 +2534,7 @@ func (u *Usenet) BackfillPar2Refs(ctx context.Context, nzoID string) error {
 		return fmt.Errorf("failed to re-parse source NZB file: %w", err)
 	}
 	if len(reparsed.Par2Files) == 0 && len(reparsed.Par2Source) == 0 {
-		return fmt.Errorf("re-parsed NZB has no PAR2/source file data for %s", nzoID)
+		return fmt.Errorf("re-parsed NZB has no PAR2/source file data for %s: %w", nzoID, ErrBackfillImpossible)
 	}
 
 	nzb.Par2Files = reparsed.Par2Files

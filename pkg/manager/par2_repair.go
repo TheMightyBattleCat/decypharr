@@ -1701,8 +1701,20 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		return data, err
 	}
+	// transportFails counts PAR2 article fetches that failed without a 430
+	// (a timeout, a reset): each can drop a whole recovery volume for this
+	// pass, so a recovery shortfall that follows one says nothing about
+	// whether the recovery data exists - see recoveryShortfall.
+	var transportFails atomic.Int32
 	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
-		return fetchPosted(fctx, messageID, nil)
+		data, err := fetchPosted(fctx, messageID, nil)
+		if err != nil && !nntp.IsArticleNotFoundError(err) && fctx.Err() == nil {
+			transportFails.Add(1)
+		}
+		return data, err
+	}
+	recoveryShortfall := func(damaged, got int) error {
+		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()))
 	}
 
 	nzb, err := u.GetNZB(nzbID)
@@ -1711,7 +1723,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
 		if err := u.BackfillPar2Refs(ctx, nzbID); err != nil {
-			return fmt.Errorf("no PAR2 data and backfill failed: %w", err)
+			if errors.Is(err, usenet.ErrBackfillImpossible) {
+				return fmt.Errorf("no PAR2 data and backfill failed: %w", err)
+			}
+			// A read/re-parse/save failure: a later attempt can succeed.
+			return fmt.Errorf("PAR2 refs backfill did not complete: %w (transient: backfill can be retried)", err)
 		}
 		nzb, err = u.GetNZB(nzbID)
 		if err != nil {
@@ -1900,7 +1916,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
 			Msg("par2: no recovery slices fetched, skipping file matching")
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource,
-			fmt.Errorf("%d damaged slices but only 0 recovery slices fetched/available", deadCount))
+			recoveryShortfall(deadCount, 0))
 	}
 
 	// Match every posted file in the release (not just the ones with dead
@@ -1939,6 +1955,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 	if len(matches) == 0 {
+		if len(skipped) > 0 {
+			// Matching skipped files because their bytes failed to fetch:
+			// a retry can match them.
+			return fmt.Errorf("no posted file matched the PAR2 recovery set (transient: %d posted file(s) failed to fetch/hash during matching)", len(skipped))
+		}
 		return fmt.Errorf("no posted file matched the PAR2 recovery set")
 	}
 
@@ -2198,7 +2219,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return err
 		}
 		if k > len(idx.Recovery) {
-			return fmt.Errorf("%d damaged slices but only %d recovery slices fetched/available", k, len(idx.Recovery))
+			return recoveryShortfall(k, len(idx.Recovery))
 		}
 
 		recovery := make([]par2.RecoverySlice, k)
