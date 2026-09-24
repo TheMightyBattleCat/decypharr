@@ -1110,6 +1110,23 @@ func (p *Par2Repair) readyToRun() bool {
 	return config.Get().Repair.Par2RepairEnabled() && p.repair.repairWindowOpen()
 }
 
+// par2ErrWithJobCtx attaches the job context's error to a runRepair failure
+// that happened after the context ended (deadline, idle watchdog, shutdown).
+// Whatever runRepair reported then - a recovery shortfall, no PAR2 file
+// fetched, no posted file matched - is a consequence of being cut off, not
+// evidence about the data; carrying the context error makes
+// classifyPar2Failure back off instead of going terminal (and, on the urgent
+// lane, regrabbing).
+func par2ErrWithJobCtx(err error, jobCtx context.Context) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := jobCtx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		return fmt.Errorf("%w (job context ended: %w)", err, ctxErr)
+	}
+	return err
+}
+
 // runJob runs one NZB's PAR2 repair pass end to end in the given lane. Every
 // exit path either leaves the overlay state as-is (nothing to do, a genuine
 // "can't tell yet" error worth retrying later, or a BATCH pass preempted by
@@ -1239,6 +1256,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
 			return
 		}
+		err = par2ErrWithJobCtx(err, timeoutCtx)
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
@@ -3261,6 +3279,12 @@ func fetchMoreVolumes(
 		Uint32("needed", needed).
 		Msg("par2: recovery volume fetch complete")
 
+	// A job that ran out of time or was stopped mid-fetch leaves the batch
+	// short for a reason that says nothing about the recovery data. Say so,
+	// or the caller's "only M recovery slices" shortfall reads as terminal.
+	if err := ctx.Err(); err != nil && fetchedSlices < needed {
+		return nextVolIdx, fetchedSlices, sources, added, err
+	}
 	return nextVolIdx, fetchedSlices, sources, added, nil
 }
 

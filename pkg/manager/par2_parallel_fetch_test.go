@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -296,8 +297,10 @@ func TestFetchMoreVolumes_PreCancelledCtx(t *testing.T) {
 		ctx, parallelFetchNopLogger, fetch, vols, 0, 1, 0, nil, "test-entry", 4,
 	)
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// A cut-off fetch reports why it came back short, so the caller's
+	// shortfall is classified transient rather than terminal.
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if added != 0 || fetched != 0 || len(sources) != 0 {
 		t.Fatalf("got added=%d fetched=%d sources=%d, want 0/0/0", added, fetched, len(sources))
