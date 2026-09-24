@@ -81,7 +81,12 @@ func TestPar2ErrWithJobCtx(t *testing.T) {
 
 	for name, mk := range map[string]func() context.Context{
 		"cancelled": func() context.Context { c, cancel := context.WithCancel(live); cancel(); return c },
-		"deadline":  func() context.Context { c, cancel := context.WithTimeout(live, 0); defer cancel(); <-c.Done(); return c },
+		"deadline": func() context.Context {
+			c, cancel := context.WithTimeout(live, 0)
+			defer cancel()
+			<-c.Done()
+			return c
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := mk()
