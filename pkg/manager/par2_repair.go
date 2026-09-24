@@ -1623,6 +1623,15 @@ func earlyDamagedSliceCheck(
 			continue
 		}
 
+		// Only files whose persisted geometry is exact count. On estimated
+		// refs an article whose real bytes sit inside one slice can straddle
+		// two in the estimate, so its count would be an OVER-estimate - and
+		// this gate declares a release unrepairable before fetching any
+		// recovery. Skipping keeps the result a lower bound; the in-loop gate
+		// judges these files once resolveGeometry has measured them.
+		if !segGeometryExact(src.Segments, fd.Length) {
+			continue
+		}
 		// Replicate newPostedFileFetcher's network-free geometry: per-segment
 		// byte bases/sizes from persisted Par2SegmentRef.Bytes anchored to
 		// FileDesc.Length.
