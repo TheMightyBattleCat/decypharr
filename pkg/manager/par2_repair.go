@@ -1986,24 +1986,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// skipped for a transient fetch/hash failure, or is present but
 	// unmatched for a length/tie reason, is retryable.
 	classifyMiss := func(fileID [16]byte) (reason string, terminal bool) {
-		fd := idx.Files[fileID]
-		if fd == nil {
-			return "unknown FileDesc", true
-		}
-		for i := range nzb.Par2Source {
-			ps := nzb.Par2Source[i]
-			if ps.Size != fd.Length && ps.Name != fd.Name {
-				continue
-			}
-			if skipErr, ok := transientUnmatch[ps.Name]; ok {
-				if nntp.IsArticleNotFoundError(skipErr) {
-					return fmt.Sprintf("posted file %q: backing article confirmed missing across all providers", ps.Name), true
-				}
-				return fmt.Sprintf("posted file %q failed to fetch/hash during matching", ps.Name), false
-			}
-			return fmt.Sprintf("posted file %q retained but unmatched (length/tie)", ps.Name), false
-		}
-		return fmt.Sprintf("no retained posted file for FileDesc %q (len %d)", fd.Name, fd.Length), true
+		return classifyPar2Miss(idx, fileID, nzb.Par2Source, transientUnmatch)
 	}
 
 	// STAT every article of every matched posted file up front, so the full
@@ -2137,37 +2120,18 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if cerr != nil {
 		return fmt.Errorf("pre-solve coverage check: %w", cerr)
 	}
-	var folded int
-	for _, fid := range uncov {
-		reason, terminal := classifyMiss(fid)
-		if terminal {
-			p.logger.Warn().Str("entry", entryName).Int("files", len(uncov)).
-				Msg("par2 repair: intact slices have no posted-file fetcher - aborting before solve (0 bytes read)")
-			return missingFetcherErr(fid, classifyMiss)
-		}
-		// Transient miss: fold this file's slices into the damaged set so
-		// the solver reconstructs them from parity instead of aborting.
-		// Cost: one recovery slice per file slice - almost always tiny
-		// (.nfo, one dead .rar part). The round-loop recovery-cap check
-		// escalates to a genuine terminal verdict if the enlarged damage
-		// exceeds the recovery budget.
-		fd := idx.Files[fid]
-		if fd == nil {
-			return missingFetcherErr(fid, classifyMiss)
-		}
-		fs, ferr := idx.DamagedSlices(fid, 0, fd.Length)
-		if ferr != nil {
-			return fmt.Errorf("fold uncovered file %x: %w", fid, ferr)
-		}
-		for _, s := range fs {
-			if _, ok := damagedSet[s]; !ok {
-				damagedSet[s] = struct{}{}
-				folded++
-			}
-		}
-		p.logger.Info().Str("entry", entryName).Str("file", fd.Name).
-			Str("reason", reason).Int("slices", len(fs)).
-			Msg("par2 repair: folding transiently-uncovered posted file into damaged set for reconstruction")
+	// Fold each uncovered file's slices into the damaged set so the solver
+	// rebuilds them from parity - whether the miss is transient (its match
+	// needed bytes that failed to fetch) or structural (a small file the PAR2
+	// set describes but the NZB never posted: an .nfo, an .sfv). Its slices
+	// are only reconstructed to run the solve, never patched. Cost: one
+	// recovery slice per file slice. Only a file that does not fit the
+	// recovery budget still fails the job, and then as the miss's own kind:
+	// a transient miss must not become the terminal "more damage than
+	// recorded" of the round-loop gate.
+	folded, ferr := foldUncoveredFiles(p.logger, entryName, idx, uncov, damagedSet, min(par2.MaxRepairSlices, int(available)), classifyMiss)
+	if ferr != nil {
+		return ferr
 	}
 	if folded > 0 {
 		damaged = damaged[:0]
