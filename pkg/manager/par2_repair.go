@@ -1354,6 +1354,15 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		// replaces the sweep backstop above, only races ahead of it.
 		if class.terminal {
 			terminal = true
+			// Articles confirmed missing on every provider: the posting is
+			// dead, and another indexer's NZB for it must not be imported
+			// again right after the re-grab (Under Reef S11E06 was, 4 s
+			// after its blocklist). Marked before the re-grab goes out.
+			if nntp.IsArticleNotFoundError(err) && p.manager.usenet != nil {
+				if marked, merr := p.manager.usenet.MarkPostingDeadByNZBID(nzbID); merr != nil || !marked {
+					p.logger.Debug().Err(merr).Str("entry", entryName).Msg("par2 repair: posting not marked dead (no persisted identity)")
+				}
+			}
 			if lane == laneUrgent {
 				p.regrabOnTerminal(entry, entryName, pending)
 			}

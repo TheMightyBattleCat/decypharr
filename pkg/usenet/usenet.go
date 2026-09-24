@@ -733,7 +733,10 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 	// under a fresh grab ID (the FLUX/ETHEL/Kitsune/RAWR cycling this cache
 	// exists to stop).
 	contentHash := hashNZBContent(content)
-	if u.deadPostings.Check(contentHash) {
+	// The posting identity also catches another indexer's NZB for the same
+	// upload; the byte hash still covers records stored before it existed.
+	postingKey := postingKeyFromNZB(content)
+	if u.deadPostings.Check(contentHash) || u.deadPostings.Check(postingKey) {
 		return nil, nil, fmt.Errorf("%q: %w (confirmed unavailable within the last %s)", name, parser.ErrReleaseUnavailable, deadPostingTTL)
 	}
 
@@ -745,6 +748,7 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 	if err != nil {
 		if errors.Is(err, parser.ErrReleaseUnavailable) {
 			u.deadPostings.Mark(contentHash)
+			u.deadPostings.Mark(postingKey)
 		}
 		return nil, nil, err
 	}
@@ -752,7 +756,13 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 		nzb.ID = id
 	}
 
+	// Persisted for the later dead-posting marks (Process's availability
+	// gate, MarkPostingDeadByNZBID): the posting identity when the XML
+	// yields one, so they cover every re-listing of the upload.
 	nzb.ContentHash = contentHash
+	if postingKey != "" {
+		nzb.ContentHash = postingKey
+	}
 	nzb.Category = category
 	nzb.Status = NZBStatusParsing
 	// Save NZB file to disk

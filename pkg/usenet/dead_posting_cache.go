@@ -1,11 +1,16 @@
 package usenet
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
+	"golang.org/x/net/html/charset"
 )
 
 // deadPostingTTL bounds how long a confirmed-damaged NZB's content hash
@@ -38,6 +43,49 @@ func newDeadPostingCache() *deadPostingCache {
 func hashNZBContent(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
+}
+
+// postingKeyFromNZB derives a deadPostingCache key from the posting the NZB
+// describes rather than its bytes: the first article's Message-ID of every
+// <file>, sorted and hashed. Another indexer's NZB for the same upload -
+// different bytes, same articles - shares it, so a posting proven dead is
+// refused however it is re-listed (Under Reef S11E06 came back 4 s after
+// its blocklist through another indexer's copy). "" when the XML does not
+// decode or lists no articles; the caller falls back to hashNZBContent.
+func postingKeyFromNZB(content []byte) string {
+	var doc struct {
+		Files []struct {
+			Segments []struct {
+				Number int    `xml:"number,attr"`
+				ID     string `xml:",chardata"`
+			} `xml:"segments>segment"`
+		} `xml:"file"`
+	}
+	dec := xml.NewDecoder(bytes.NewReader(content))
+	dec.CharsetReader = charset.NewReaderLabel
+	dec.Strict = false
+	if err := dec.Decode(&doc); err != nil {
+		return ""
+	}
+	var ids []string
+	for _, f := range doc.Files {
+		first, best := "", 0
+		for _, s := range f.Segments {
+			id := strings.TrimSpace(s.ID)
+			if id != "" && (first == "" || s.Number < best) {
+				first, best = id, s.Number
+			}
+		}
+		if first != "" {
+			ids = append(ids, first)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
+	return "posting:" + hex.EncodeToString(sum[:])
 }
 
 // Mark records hash as a confirmed-unavailable posting, starting a fresh
