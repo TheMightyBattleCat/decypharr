@@ -157,7 +157,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	if len(sources) == 0 {
 		return false
 	}
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndexSet(sources, choosePar2Set(sources, nil, nzb.Par2Source, pending).setID)
 	if err != nil {
 		return false
 	}

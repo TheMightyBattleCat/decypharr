@@ -865,7 +865,13 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 	if len(sources) == 0 {
 		return false, "", fmt.Errorf("failed to fetch any par2 index file")
 	}
-	idx, err := par2.ParseIndex(sources)
+	// Several recovery sets (a season pack): parse the one protecting this file.
+	var verifySet [16]byte
+	if len(posted.Segments) > 0 {
+		verifySet = choosePar2Set(sources, nil, nzb.Par2Source,
+			map[string][]overlay.DeadSegment{file: {{MessageID: posted.Segments[0].MessageID}}}).setID
+	}
+	idx, err := par2.ParseIndexSet(sources, verifySet)
 	if err != nil {
 		return false, "", fmt.Errorf("parse par2 index: %w", err)
 	}
@@ -1617,7 +1623,7 @@ func earlyDamagedSliceCheck(
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, deadDiscovered *int, progress *par2JobProgressState) error {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, deadDiscovered *int, progress *par2JobProgressState) (retErr error) {
 	u := p.manager.usenet
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 
@@ -1717,6 +1723,34 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		sources = append(sources, par2.Source{Name: f.Name, Data: data})
 	}
 
+	// A release with several PAR2 sets (one per episode of a season pack):
+	// work on the set protecting the damaged files, and leave damage another
+	// set protects for the next pass. See choosePar2Set.
+	setChoice := choosePar2Set(sources, vols, nzb.Par2Source, pending)
+	par2Set := setChoice.setID
+	if par2Set != ([16]byte{}) {
+		sources, vols, pending = setChoice.sources, setChoice.vols, setChoice.pending
+		available = 0
+		for _, v := range vols {
+			available += v.count
+		}
+		p.logger.Info().Str("entry", entryName).Int("volumes", len(vols)).Int("deferred_dead_segments", setChoice.deferred).
+			Msg("par2: release carries several recovery sets; repairing the one protecting the damaged files")
+		if len(pending) == 0 {
+			return fmt.Errorf("every dead segment is in another PAR2 set (transient: chosen set has none)")
+		}
+	}
+	if setChoice.deferred > 0 {
+		// A pass that repaired this set still leaves the other set's damage:
+		// report it (transient) so the entry is retried soon rather than
+		// recorded as fully repaired.
+		defer func() {
+			if retErr == nil {
+				retErr = fmt.Errorf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", setChoice.deferred)
+			}
+		}()
+	}
+
 	// Early arithmetic-impossibility gate. The Main/FileDesc/IFSC packets are
 	// duplicated into every PAR2 file, so the index (non-volume) files alone
 	// yield SliceSize + every FileDesc.Length - enough to parse a usable
@@ -1727,7 +1761,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// only be worse: skip the entire recovery-volume fetch (many minutes of
 	// 430s for a large release) and declare terminal now. The authoritative
 	// exact gate in the solve loop below is unchanged.
-	earlyIdx, earlyErr := par2.ParseIndex(sources)
+	earlyIdx, earlyErr := par2.ParseIndexSet(sources, par2Set)
 	if earlyErr != nil {
 		earlyIdx = nil
 	}
@@ -1768,7 +1802,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return fmt.Errorf("failed to fetch any PAR2 file")
 	}
 
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndexSet(sources, par2Set)
 	if err != nil {
 		return fmt.Errorf("parse PAR2 index: %w", err)
 	}
@@ -3165,7 +3199,7 @@ func topUpParsedRecovery(
 		if added == 0 {
 			break
 		}
-		idx, err = par2.ParseIndex(sources)
+		idx, err = par2.ParseIndexSet(sources, idx.SetID)
 		if err != nil {
 			return idx, nextVolIdx, sources, fmt.Errorf("parse PAR2 index: %w", err)
 		}

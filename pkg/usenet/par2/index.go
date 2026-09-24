@@ -90,6 +90,37 @@ type Source struct {
 // are never copied - only their location is recorded (RecoverySliceRef) -
 // so scanning even a source that includes large recovery volumes stays cheap.
 func ParseIndex(sources []Source) (*Index, error) {
+	return parseIndex(sources, nil)
+}
+
+// ParseIndexSet is ParseIndex restricted to one recovery set: packets of any
+// other set are ignored rather than failing the parse. A release that carries
+// several PAR2 sets (a season pack posted as one PAR2 set per episode) has
+// them all in its source list; ParseIndex refuses such a mix outright. A zero
+// setID behaves exactly like ParseIndex.
+func ParseIndexSet(sources []Source, setID [16]byte) (*Index, error) {
+	if setID == ([16]byte{}) {
+		return parseIndex(sources, nil)
+	}
+	return parseIndex(sources, &setID)
+}
+
+// SourceSetIDs returns the recovery set of each source's first valid packet
+// (zero when the source has none), in source order.
+func SourceSetIDs(sources []Source) [][16]byte {
+	out := make([][16]byte, len(sources))
+	for i, src := range sources {
+		_ = walkPackets(src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+			out[i] = h.RecoverySetID
+			return errStopWalk
+		})
+	}
+	return out
+}
+
+var errStopWalk = fmt.Errorf("par2: stop walk")
+
+func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 	idx := &Index{
 		Files:  make(map[[16]byte]*FileDesc),
 		Slices: make(map[[16]byte][]SliceChecksum),
@@ -106,6 +137,9 @@ func ParseIndex(sources []Source) (*Index, error) {
 			})
 		}
 		err := walkPackets(src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
+			if want != nil && h.RecoverySetID != *want {
+				return nil // another recovery set in the same release
+			}
 			if !haveSetID {
 				idx.SetID = h.RecoverySetID
 				haveSetID = true
