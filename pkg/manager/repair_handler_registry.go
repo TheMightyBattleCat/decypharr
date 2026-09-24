@@ -76,9 +76,85 @@ func (reg *repairHandlerRegistry) reapIfStaleLocked(nzbID string) {
 	if reg.ttl <= 0 {
 		return
 	}
-	if reg.nowFn().Sub(e.since) >= reg.ttl {
+	ttl := reg.ttl
+	if e.kind == handlerPar2Running && ttl < par2RunningClaimTTL {
+		// A pass may run for up to par2JobTimeoutMax; its claim must outlive
+		// it, or the sweep re-grabs and deletes under a running pass.
+		ttl = par2RunningClaimTTL
+	}
+	if reg.nowFn().Sub(e.since) >= ttl {
 		delete(reg.entries, nzbID)
 	}
+}
+
+// par2RunningClaimTTL is the stale-claim bound for a running PAR2 pass.
+const par2RunningClaimTTL = par2JobTimeoutMax + 30*time.Minute
+
+func isPar2Claim(kind repairHandlerKind) bool {
+	return kind == handlerPar2Queued || kind == handlerPar2Running
+}
+
+// ClaimPar2Queued claims nzbID for a queued automatic PAR2 pass. An existing
+// PAR2 claim is kept, and a terminal mark is taken over (the caller's
+// storage-backed gate already allowed the pass). It fails only when a live
+// non-PAR2 claim - an in-flight re-grab - owns the entry: that re-grab
+// replaces the release, so a pass on it would only race the delete.
+func (reg *repairHandlerRegistry) ClaimPar2Queued(nzbID string) bool {
+	if nzbID == "" {
+		return false
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.reapIfStaleLocked(nzbID)
+	if e, exists := reg.entries[nzbID]; exists && !e.terminal {
+		return isPar2Claim(e.kind)
+	}
+	reg.entries[nzbID] = &repairHandlerState{kind: handlerPar2Queued, since: reg.nowFn()}
+	return true
+}
+
+// EnsurePar2Running marks nzbID's claim as a running PAR2 pass, claiming it
+// if the queued claim was lost (reaped while waiting). A live foreign claim
+// or a terminal mark is left alone.
+func (reg *repairHandlerRegistry) EnsurePar2Running(nzbID string) {
+	if nzbID == "" {
+		return
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.reapIfStaleLocked(nzbID)
+	e, exists := reg.entries[nzbID]
+	if exists && (e.terminal || !isPar2Claim(e.kind)) {
+		return
+	}
+	reg.entries[nzbID] = &repairHandlerState{kind: handlerPar2Running, since: reg.nowFn()}
+}
+
+// ReleasePar2 clears nzbID's claim only if it is a PAR2 claim: a pass that
+// ends must not free a re-grab another caller claimed meanwhile.
+func (reg *repairHandlerRegistry) ReleasePar2(nzbID string) {
+	if nzbID == "" {
+		return
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if e, ok := reg.entries[nzbID]; ok && !e.terminal && isPar2Claim(e.kind) {
+		delete(reg.entries, nzbID)
+	}
+}
+
+// MarkTerminalPar2 is MarkTerminal for a PAR2 pass's own outcome: it does not
+// overwrite a live claim another caller holds.
+func (reg *repairHandlerRegistry) MarkTerminalPar2(nzbID string) {
+	if nzbID == "" {
+		return
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if e, ok := reg.entries[nzbID]; ok && !e.terminal && !isPar2Claim(e.kind) {
+		return
+	}
+	reg.entries[nzbID] = &repairHandlerState{kind: handlerNone, since: reg.nowFn(), terminal: true}
 }
 
 // TryAcquire claims nzbID for kind if nothing else currently owns it (no

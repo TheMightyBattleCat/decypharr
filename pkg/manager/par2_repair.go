@@ -973,6 +973,14 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 	if !p.par2ShouldAutoEnqueue(nzbID) {
 		return
 	}
+	// Claim the entry for the pass, as Enqueue does: without a claim the
+	// sweep's re-grab could delete the entry under a queued or running pass.
+	// A live re-grab already owns it: it replaces the release, so a pass
+	// would only race its delete.
+	if p.repair != nil && p.repair.handlers != nil && !p.repair.handlers.ClaimPar2Queued(nzbID) {
+		p.logger.Debug().Str("entry", nzbID).Msg("par2 repair: not queued; a re-grab is already handling this entry")
+		return
+	}
 
 	p.runningMu.Lock()
 	if job, ok := p.running[nzbID]; ok && job.lane == laneBatch {
@@ -1052,7 +1060,7 @@ func (p *Par2Repair) urgentWorker() {
 			// run and would otherwise strand a handler claim inherited from a
 			// preempted batch job. Free it so the entry is not blocked until TTL.
 			if p.repair != nil && p.repair.handlers != nil {
-				p.repair.handlers.Release(nzbID)
+				p.repair.handlers.ReleasePar2(nzbID)
 			}
 			continue
 		}
@@ -1184,10 +1192,10 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 
 	if p.repair != nil && p.repair.handlers != nil {
 		// Normally already par2_queued (from Enqueue/EnqueueUrgent) or
-		// par2_running (RunNow's manual override already Set it) - Transition
-		// is a no-op if neither claim exists, which should not happen on the
-		// normal enqueue path but is harmless if it ever does.
-		p.repair.handlers.Transition(nzbID, handlerPar2Running)
+		// par2_running (RunNow's manual override already Set it). A queued
+		// claim reaped while it waited is taken again; a live foreign claim
+		// (a re-grab) is left alone.
+		p.repair.handlers.EnsurePar2Running(nzbID)
 	}
 	// terminal decides, in the deferred release below, whether this job's
 	// outcome sticks the handler registry's terminal mark (blocking further
@@ -1201,13 +1209,15 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		}
 		switch {
 		case terminal:
-			p.repair.handlers.MarkTerminal(nzbID)
+			p.repair.handlers.MarkTerminalPar2(nzbID)
 		case preempted:
 			// Superseded by an urgent-lane job for the same entry, which will
 			// claim and release the handler slot itself. Releasing here would
 			// briefly hand the entry back to another caller mid-flight.
 		default:
-			p.repair.handlers.Release(nzbID)
+			// Only this pass's own (PAR2) claim: a re-grab another caller
+			// claimed meanwhile is theirs to release.
+			p.repair.handlers.ReleasePar2(nzbID)
 		}
 	}()
 

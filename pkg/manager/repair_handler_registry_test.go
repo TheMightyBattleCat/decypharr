@@ -103,7 +103,9 @@ func TestRepairHandlerRegistryTTLReleasesStaleClaims(t *testing.T) {
 	reg := newRepairHandlerRegistry(10 * time.Minute)
 	reg.nowFn = func() time.Time { return now }
 
-	if !reg.TryAcquire("nzb1", handlerPar2Running) {
+	// A queued claim: a running PAR2 claim is held to the longer
+	// par2RunningClaimTTL (see TestRunningPar2ClaimOutlivesDefaultTTL).
+	if !reg.TryAcquire("nzb1", handlerPar2Queued) {
 		t.Fatalf("TryAcquire should succeed")
 	}
 	if reg.TryAcquire("nzb1", handlerRegrab) {

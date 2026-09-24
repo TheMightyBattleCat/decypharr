@@ -275,5 +275,20 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) b
 	// Waits for the pass to end, however long it takes. This used to give
 	// up after 5 minutes and return false, and the caller then re-grabbed -
 	// deleting the entry while the still-running pass wrote its patches.
-	return p.runNowAndWait(ctx, nzbID)
+	//
+	// RunNow claims the entry for the pass, overwriting the sweep's re-grab
+	// claim, and the pass releases it. When the pass does not fix the file
+	// the sweep re-grabs next, so put that claim back (as the cold path
+	// does) rather than re-grab unclaimed.
+	var priorKind repairHandlerKind
+	var priorLive bool
+	if p.repair != nil && p.repair.handlers != nil {
+		kind, terminal, exists := p.repair.handlers.State(nzbID)
+		priorKind, priorLive = kind, exists && !terminal
+	}
+	completed := p.runNowAndWait(ctx, nzbID)
+	if !completed && priorLive && priorKind == handlerRegrab && ctx.Err() == nil {
+		p.repair.handlers.Set(nzbID, handlerRegrab)
+	}
+	return completed
 }
