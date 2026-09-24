@@ -160,6 +160,11 @@ type Repair struct {
 	// articles (a posting dead at the source). See regrab_guard.go.
 	regrabGuard *regrabGuard
 
+	// postingID returns the posting identity of an entry's NZB (see
+	// nzbPostingIdentity), "" when it can't be told. A field so tests can
+	// stand in for the NZB store.
+	postingID func(infoHash string) string
+
 	// arrRefs caches the overlay orphan filter's Arr lookup
 	// (BuildArrReferencedSet). Read only by the overlay path; see
 	// arr_refs_cache.go.
@@ -186,6 +191,7 @@ func NewRepair(m *Manager) *Repair {
 	if m.storage != nil {
 		r.regrabGuard.attach(m.storage, r.logger)
 	}
+	r.postingID = r.lookupPostingIdentity
 	return r
 }
 

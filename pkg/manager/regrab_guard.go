@@ -1,7 +1,11 @@
 package manager
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,10 +51,12 @@ const (
 	// after the last one it arrives.
 	regrabDedupeWindow = playbackRepairCooldown
 
-	// keepReleaseRetryWindow is how long a re-grab that KEPT a release (a
-	// file assembled wrong at import - see keepReleaseReason) blocks another
-	// automatic keep-release re-grab of that same release for the same file.
-	// Re-importing the same NZB reproduces the same assembly: on a production install
+	// keepReleaseRetryWindow is how long a posting that stayed assembled
+	// wrong after an automatic keep-release re-grab away from it (see
+	// keepReleaseReason) is refused another one for the same file. Keyed on
+	// the posting (nzbPostingIdentity), not the title, so a same-titled
+	// posting built differently still gets its own re-grab. Re-importing the
+	// same posting reproduces the same assembly: on a production install
 	// 8-Bit Midwinter was re-grabbed every night for five nights, each import
 	// byte-identical with the same zero-filled region. regrabGuardWindow
 	// cannot stop that - its 24 h window equals the sweep's period, so every
@@ -66,7 +72,7 @@ const (
 	regrabGuardTerminalTTL = 7 * 24 * time.Hour
 
 	// keepReleaseRepeatReason is surfaced when the keep-release check refuses.
-	keepReleaseRepeatReason = "re-grabbing this release reproduced the same import fault; replace it by hand"
+	keepReleaseRepeatReason = "the re-grab brought back the same posting, still assembled wrong; replace it by hand"
 )
 
 // regrabGuardStore persists the guard's records (storage.Storage in
@@ -95,9 +101,10 @@ type regrabAttemptRecord struct {
 	// normal; it just doesn't consume a fresh strike, since it's the same
 	// evidence already counted rather than a new distinct dead candidate.
 	recentReleases map[string]time.Time
-	// keepRelease records, per release name, when a keep-release re-grab of
-	// it went ahead - see keepReleaseRetryWindow.
-	keepRelease map[string]time.Time
+	// keepRelease records, per posting (nzbPostingIdentity), when an
+	// automatic keep-release re-grab away from it went ahead - see
+	// keepReleaseRetryWindow.
+	keepRelease map[string]storage.KeepReleaseMark
 }
 
 func (rec *regrabAttemptRecord) toStorage(identity string) *storage.RegrabGuardRecord {
@@ -169,8 +176,8 @@ func (g *regrabGuard) attach(st regrabGuardStore, logger zerolog.Logger) {
 				rec.attempts = append(rec.attempts, t)
 			}
 		}
-		for name, t := range rec.keepRelease {
-			if now.Sub(t) >= keepReleaseRetryWindow {
+		for name, m := range rec.keepRelease {
+			if now.Sub(m.At) >= keepReleaseRetryWindow {
 				delete(rec.keepRelease, name)
 			}
 		}
@@ -205,11 +212,14 @@ func (g *regrabGuard) persist(identity string, rec *regrabAttemptRecord) {
 	}
 }
 
-// keepReleaseRepeated reports whether a keep-release re-grab of releaseName
-// for identity already went ahead inside keepReleaseRetryWindow - another
-// one would re-import the same NZB into the same fault. Records nothing.
-func (g *regrabGuard) keepReleaseRepeated(identity, releaseName string) bool {
-	if identity == "" || releaseName == "" {
+// keepReleaseRepeated reports whether an automatic keep-release re-grab away
+// from posting already went ahead for identity inside keepReleaseRetryWindow
+// AND currentNZB is a newer import of it: the Arr brought the same posting
+// back, and re-importing it rebuilt the same fault. The entry the re-grab
+// was away from still being there (the replacement has not landed) is not a
+// repeat. Records nothing.
+func (g *regrabGuard) keepReleaseRepeated(identity, posting, currentNZB string) bool {
+	if identity == "" || posting == "" {
 		return false
 	}
 	g.mu.Lock()
@@ -218,14 +228,14 @@ func (g *regrabGuard) keepReleaseRepeated(identity, releaseName string) bool {
 	if !ok {
 		return false
 	}
-	last, seen := rec.keepRelease[releaseName]
-	return seen && g.nowFn().Sub(last) < keepReleaseRetryWindow
+	mark, seen := rec.keepRelease[posting]
+	return seen && mark.FromNZB != currentNZB && g.nowFn().Sub(mark.At) < keepReleaseRetryWindow
 }
 
-// recordKeepRelease notes that a keep-release re-grab of releaseName for
-// identity is going ahead.
-func (g *regrabGuard) recordKeepRelease(identity, releaseName string) {
-	if identity == "" || releaseName == "" {
+// recordKeepRelease notes that an automatic keep-release re-grab away from
+// posting (imported as fromNZB) is going ahead for identity.
+func (g *regrabGuard) recordKeepRelease(identity, posting, fromNZB string) {
+	if identity == "" || posting == "" {
 		return
 	}
 	g.mu.Lock()
@@ -237,14 +247,14 @@ func (g *regrabGuard) recordKeepRelease(identity, releaseName string) {
 	}
 	now := g.nowFn()
 	if rec.keepRelease == nil {
-		rec.keepRelease = make(map[string]time.Time)
+		rec.keepRelease = make(map[string]storage.KeepReleaseMark)
 	}
-	for name, t := range rec.keepRelease {
-		if now.Sub(t) >= keepReleaseRetryWindow {
+	for name, m := range rec.keepRelease {
+		if now.Sub(m.At) >= keepReleaseRetryWindow {
 			delete(rec.keepRelease, name)
 		}
 	}
-	rec.keepRelease[releaseName] = now
+	rec.keepRelease[posting] = storage.KeepReleaseMark{At: now, FromNZB: fromNZB}
 	g.persist(identity, rec)
 }
 
@@ -363,4 +373,48 @@ func (g *regrabGuard) state(identity string) (attempts int, terminal bool, reaso
 		return 0, false, ""
 	}
 	return len(rec.attempts), rec.terminal, rec.reason
+}
+
+// nzbPostingIdentity identifies the posting an NZB describes, independent of
+// its release title and of the NZB file's own bytes: the first article's
+// Message-ID of every posted file, sorted and hashed. Postings sharing a
+// title - another indexer's upload, rarred or not, split differently - carry
+// different articles and so different identities; two NZBs of the same
+// posting (the same upload listed by two indexers) share one. "" when the
+// record holds no articles.
+func nzbPostingIdentity(nzb *storage.NZB) string {
+	if nzb == nil {
+		return ""
+	}
+	var ids []string
+	for _, pf := range nzb.Par2Source {
+		if len(pf.Segments) > 0 && pf.Segments[0].MessageID != "" {
+			ids = append(ids, pf.Segments[0].MessageID)
+		}
+	}
+	if len(ids) == 0 {
+		for _, f := range nzb.Files {
+			if len(f.Segments) > 0 && f.Segments[0].MessageID != "" {
+				ids = append(ids, f.Segments[0].MessageID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
+	return "posting:" + hex.EncodeToString(sum[:12])
+}
+
+// lookupPostingIdentity is the production Repair.postingID.
+func (r *Repair) lookupPostingIdentity(infoHash string) string {
+	if infoHash == "" || r.manager == nil || r.manager.usenet == nil {
+		return ""
+	}
+	nzb, err := r.manager.usenet.GetNZB(infoHash)
+	if err != nil {
+		return ""
+	}
+	return nzbPostingIdentity(nzb)
 }

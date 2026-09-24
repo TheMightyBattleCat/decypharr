@@ -60,9 +60,9 @@ func TestRegrabGuardClearRemovesPersisted(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	now := time.Now()
 	g := newPersistedGuard(t, st, now)
-	g.recordKeepRelease("id", "Rel")
+	g.recordKeepRelease("id", "posting:p", "nzb-1")
 	g.clear("id")
-	if newPersistedGuard(t, st, now).keepReleaseRepeated("id", "Rel") {
+	if newPersistedGuard(t, st, now).keepReleaseRepeated("id", "posting:p", "nzb-2") {
 		t.Fatal("cleared record came back after a restart")
 	}
 }
@@ -74,49 +74,115 @@ func TestKeepReleaseRepeatedAcrossRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	night1 := time.Date(2026, 9, 18, 23, 11, 47, 0, time.UTC)
-	const id, rel = "arr:radarr:7:0", "8-Bit-Midwinter.2021.REPACK.1080p.WEB.H264-PECULATE"
+	const id, posting = "arr:radarr:7:0", "posting:p"
 
 	g := newPersistedGuard(t, st, night1)
-	if g.keepReleaseRepeated(id, rel) {
+	if g.keepReleaseRepeated(id, posting, "nzb-1") {
 		t.Fatal("first keep-release re-grab refused")
 	}
-	g.recordKeepRelease(id, rel)
+	g.recordKeepRelease(id, posting, "nzb-1")
 
 	// The next night's sweep, just over 24 h later, after a restart.
 	night2 := newPersistedGuard(t, st, night1.Add(24*time.Hour+3*time.Second))
-	if !night2.keepReleaseRepeated(id, rel) {
-		t.Fatal("second keep-release re-grab of the same release allowed")
+	if !night2.keepReleaseRepeated(id, posting, "nzb-2") {
+		t.Fatal("a new import of the same posting was allowed another re-grab")
 	}
-	if night2.keepReleaseRepeated(id, "Another.Release") {
-		t.Fatal("a different release was refused")
+	if night2.keepReleaseRepeated(id, posting, "nzb-1") {
+		t.Fatal("the original entry (replacement not landed yet) was refused")
 	}
-	if newPersistedGuard(t, st, night1.Add(keepReleaseRetryWindow+time.Hour)).keepReleaseRepeated(id, rel) {
+	if night2.keepReleaseRepeated(id, "posting:q", "nzb-2") {
+		t.Fatal("a different posting was refused")
+	}
+	if newPersistedGuard(t, st, night1.Add(keepReleaseRetryWindow+time.Hour)).keepReleaseRepeated(id, posting, "nzb-2") {
 		t.Fatal("keep-release record did not expire")
 	}
 }
 
-// The sweep path: night 1 re-grabbed the release keeping it; after a restart,
-// night 2 finds the same fault and must mark the entry for a manual replace
-// instead of re-grabbing the same release again.
-func TestSweepDoesNotRepeatKeepReleaseRegrab(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+func testNZB(msgIDs ...string) *storage.NZB {
+	nzb := &storage.NZB{}
+	for _, id := range msgIDs {
+		nzb.Par2Source = append(nzb.Par2Source, storage.PostedFileRef{Segments: []storage.Par2SegmentRef{{MessageID: id}, {MessageID: id + "-2"}}})
+	}
+	return nzb
+}
+
+// The posting identity follows the articles, not the title or file order.
+func TestNZBPostingIdentity(t *testing.T) {
+	p := nzbPostingIdentity(testNZB("<a@x>", "<b@x>"))
+	if p == "" {
+		t.Fatal("empty identity")
+	}
+	if nzbPostingIdentity(testNZB("<b@x>", "<a@x>")) != p {
+		t.Error("identity depends on file order")
+	}
+	if nzbPostingIdentity(testNZB("<a@x>", "<c@x>")) == p {
+		t.Error("a differently built posting shares the identity")
+	}
+	// Logical files are the fallback when no posted-file layout was kept.
+	logical := &storage.NZB{Files: []storage.NZBFile{{Segments: []storage.NZBSegment{{MessageID: "<a@x>"}}}}}
+	if nzbPostingIdentity(logical) == "" {
+		t.Error("no identity from logical files")
+	}
+	if nzbPostingIdentity(&storage.NZB{}) != "" || nzbPostingIdentity(nil) != "" {
+		t.Error("identity for an NZB with no articles")
+	}
+}
+
+// The sweep path: night 1 re-grabbed away from posting P keeping the release;
+// after a restart, night 2 finds the entry still assembled wrong.
+func TestSweepKeepReleaseRegrabByPosting(t *testing.T) {
 	const name = "8-Bit-Midwinter.2021.REPACK.1080p.WEB.H264-PECULATE"
-	bf := storage.BrokenFile{FileName: "8bit.mkv", Reason: reasonSplicedVolumes, ArrName: "radarr", MediaID: 7}
-	identity := regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name)
+	identity := regrabIdentityKey("radarr", 7, 0, name)
+	postingP := nzbPostingIdentity(testNZB("<p1@x>", "<p2@x>"))
+	postingQ := nzbPostingIdentity(testNZB("<q1@x>", "<q2@x>")) // same title, another upload
 
-	night1 := NewRepair(m)
-	night1.regrabGuard.recordKeepRelease(identity, name)
+	// night2 runs the second night's heal for an entry imported as nzbID,
+	// whose posting is current.
+	night2 := func(t *testing.T, nzbID, current string) (*Repair, *storage.EntryHealth, *Manager) {
+		m, _ := newTestManagerForReap(t)
+		night1 := NewRepair(m)
+		night1.regrabGuard.recordKeepRelease(identity, postingP, "nzb-night1")
 
-	night2 := NewRepair(m) // a restart: the guard reloads from storage
-	h := &storage.EntryHealth{EntryName: name, Status: storage.HealthBroken, FileCount: 1, BrokenFiles: []storage.BrokenFile{bf}}
-	run := &storage.RepairRun{}
-	night2.healBrokenEntryGuarded(context.Background(), run, &sync.Mutex{}, name, h, false)
-
-	got, err := m.storage.GetEntryHealth(name)
-	if err != nil {
-		t.Fatalf("health not saved: %v", err)
+		r := NewRepair(m) // a restart: the guard reloads from storage
+		r.postingID = func(string) string { return current }
+		bf := storage.BrokenFile{FileName: "8bit.mkv", Reason: reasonSplicedVolumes, ArrName: "radarr", MediaID: 7, InfoHash: nzbID}
+		h := &storage.EntryHealth{EntryName: name, Status: storage.HealthBroken, FileCount: 1, BrokenFiles: []storage.BrokenFile{bf}}
+		r.healBrokenEntryGuarded(context.Background(), &storage.RepairRun{}, &sync.Mutex{}, name, h, false)
+		return r, h, m
 	}
-	if got.FailureReason != keepReleaseRepeatReason {
-		t.Fatalf("FailureReason = %q, want %q", got.FailureReason, keepReleaseRepeatReason)
-	}
+
+	t.Run("same posting re-imported: refused", func(t *testing.T) {
+		_, _, m := night2(t, "nzb-night2", postingP)
+		got, err := m.storage.GetEntryHealth(name)
+		if err != nil {
+			t.Fatalf("health not saved: %v", err)
+		}
+		if got.FailureReason != keepReleaseRepeatReason {
+			t.Fatalf("FailureReason = %q, want %q", got.FailureReason, keepReleaseRepeatReason)
+		}
+	})
+
+	t.Run("same title, different posting: re-grabbed", func(t *testing.T) {
+		r, h, _ := night2(t, "nzb-night2", postingQ)
+		if h.FailureReason == keepReleaseRepeatReason {
+			t.Fatal("a differently built posting of the same title was refused")
+		}
+		if !r.regrabGuard.keepReleaseRepeated(identity, postingQ, "nzb-night3") {
+			t.Fatal("the re-grab away from posting Q was not recorded")
+		}
+	})
+
+	t.Run("original entry still there (replacement not landed): not refused", func(t *testing.T) {
+		_, h, _ := night2(t, "nzb-night1", postingP)
+		if h.FailureReason == keepReleaseRepeatReason {
+			t.Fatal("refused although the Arr has not brought anything back yet")
+		}
+	})
+
+	t.Run("posting unknown: check does not apply", func(t *testing.T) {
+		_, h, _ := night2(t, "nzb-night2", "")
+		if h.FailureReason == keepReleaseRepeatReason {
+			t.Fatal("refused without knowing the posting")
+		}
+	})
 }

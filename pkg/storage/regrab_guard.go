@@ -18,9 +18,16 @@ type RegrabGuardRecord struct {
 	TerminalAt     time.Time            `json:"terminal_at,omitempty"`
 	Reason         string               `json:"reason,omitempty"`
 	RecentReleases map[string]time.Time `json:"recent_releases,omitempty"`
-	// KeepRelease records, per release name, when a re-grab that kept the
-	// release (a file assembled wrong at import) was last allowed.
-	KeepRelease map[string]time.Time `json:"keep_release,omitempty"`
+	// KeepRelease records, per posting identity, when an automatic re-grab
+	// away from that posting (a file assembled wrong at import, re-grabbed
+	// without blocklisting) was last allowed.
+	KeepRelease map[string]KeepReleaseMark `json:"keep_release,omitempty"`
+}
+
+// KeepReleaseMark is one keep-release re-grab: when, and from which entry.
+type KeepReleaseMark struct {
+	At      time.Time `json:"at"`
+	FromNZB string    `json:"from_nzb,omitempty"`
 }
 
 func (s *Storage) SaveRegrabGuardRecord(rec *RegrabGuardRecord) error {

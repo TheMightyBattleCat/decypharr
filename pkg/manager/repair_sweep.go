@@ -1213,18 +1213,28 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 		return
 	}
 	// Every broken file assembled wrong at import means the heal re-grabs
-	// the SAME release (keepEntryForReGrab). Re-importing that NZB rebuilds
-	// the same fault, so after one such re-grab another is pointless: on
-	// a production install 8-Bit Midwinter was re-grabbed every night for five nights,
-	// each import byte-identical. (With any file damaged in the posting the
+	// without blocklisting (keepEntryForReGrab): the Arr searches again and
+	// may land the very same posting, and re-importing it rebuilds the same
+	// fault - on a production install 8-Bit Midwinter came back byte-identical five
+	// nights running. So a posting that is still assembled wrong after an
+	// automatic keep-release re-grab away from it is not re-grabbed again.
+	// Keyed on the posting (its articles), not the title: a same-titled
+	// posting built differently (another upload, rarred or not) is a new
+	// candidate and still gets its re-grab. Unidentifiable (no NZB record):
+	// the check does not apply. (With any file damaged in the posting the
 	// grab is blocklisted and a different release comes instead.)
 	keepRelease := keepEntryForReGrab(h.BrokenFiles)
-	if keepRelease {
+	var posting, currentNZB string
+	if keepRelease && r.postingID != nil {
+		currentNZB = h.BrokenFiles[0].InfoHash
+		posting = r.postingID(currentNZB)
+	}
+	if posting != "" {
 		for _, bf := range h.BrokenFiles {
 			identity := regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name)
-			if r.regrabGuard.keepReleaseRepeated(identity, name) {
-				r.logger.Warn().Str("entry", name).Str("file", bf.FileName).Str("reason", bf.Reason).
-					Msg("Repair: not re-grabbing again; an automatic re-grab of this same release already ran and it is still assembled wrong")
+			if r.regrabGuard.keepReleaseRepeated(identity, posting, currentNZB) {
+				r.logger.Warn().Str("entry", name).Str("file", bf.FileName).Str("reason", bf.Reason).Str("posting", posting).
+					Msg("Repair: not re-grabbing again; the Arr brought back the same posting and it is still assembled wrong")
 				r.markRegrabGuardTripped(name, bf.FileName, h, keepReleaseRepeatReason)
 				return
 			}
@@ -1245,9 +1255,9 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 			return
 		}
 	}
-	if keepRelease {
+	if posting != "" {
 		for _, bf := range h.BrokenFiles {
-			r.regrabGuard.recordKeepRelease(regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name), name)
+			r.regrabGuard.recordKeepRelease(regrabIdentityKey(bf.ArrName, bf.MediaID, bf.EpisodeID, name), posting, currentNZB)
 		}
 	}
 	r.healBrokenEntry(ctx, run, statsMu, name, h, bulkOverride)
