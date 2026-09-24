@@ -45,6 +45,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -1162,6 +1163,24 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 
 	start := time.Now()
 	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
+
+	// A panic in a pass must not take the process down with it: every PAR2
+	// worker (batch loop, urgent lane, RunNow) runs its jobs through here on
+	// a bare goroutine, and runRepair is hundreds of lines of index
+	// arithmetic over release-supplied data. Registered after the claim and
+	// progress record so it runs first: the pass is marked failed and backed
+	// off (transient), then the deferred releases below still run. Panics in
+	// goroutines runRepair starts itself are not caught here.
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("par2 repair panicked: %v (transient: internal error)", r)
+			p.logger.Error().Str("entry", nzbID).Str("lane", lane.String()).Interface("panic", r).
+				Bytes("stack", debug.Stack()).Msg("par2 repair: pass panicked; recovered")
+			progress.SetPhase(Par2PhaseFailed)
+			progress.SetLastError(err.Error())
+			p.recordPar2Outcome(nzbID, err, 0)
+		}
+	}()
 
 	if p.repair != nil && p.repair.handlers != nil {
 		// Normally already par2_queued (from Enqueue/EnqueueUrgent) or
