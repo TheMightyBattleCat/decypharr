@@ -1,6 +1,7 @@
 package usenet
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -214,10 +215,14 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 
 	if isCodecV2(data) {
 		ids, _, err := decodeFileMessageIDsSampled(data, filename, percent)
-		return ids, err
+		if !errors.Is(err, errSampleAmbiguousName) {
+			return ids, err
+		}
+		// Same-name records: sample the one streaming serves, below.
 	}
 
-	// Legacy proto: full decode then sample in memory.
+	// Legacy proto, or same-name records: full decode then sample the
+	// record GetFileByName picks - the one streaming serves.
 	nzb, err := decodeNZB(data)
 	if err != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package usenet
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -904,6 +905,11 @@ func decodeSegments(nzb *storage.NZB, counts []int, segMeta, msgIDs []byte) erro
 	return nil
 }
 
+// errSampleAmbiguousName is decodeFileMessageIDsSampled's answer when more
+// than one live record has the file's name; the caller decodes in full and
+// samples the record GetFileByName picks.
+var errSampleAmbiguousName = errors.New("nzbcodec: several records share this file name")
+
 // decodeFileMessageIDsSampled decodes only the sampled message ids of a single
 // file. It decompresses just the header and the message-id region (never the
 // numeric segMeta), builds no NZBSegment structs, and returns owned copies of
@@ -928,15 +934,27 @@ func decodeFileMessageIDsSampled(data []byte, filename string, percent int) (ids
 	// Locate the requested (non-deleted) file and its segment range.
 	target := -1
 	before := 0
+	live := 0
 	for i := range nzb.Files {
 		if nzb.Files[i].Name == filename && !nzb.Files[i].IsDeleted {
-			target = i
-			break
+			live++
+			if target == -1 {
+				target = i
+				before = 0
+				for j := 0; j < i; j++ {
+					before += counts[j]
+				}
+			}
 		}
-		before += counts[i]
 	}
 	if target == -1 {
 		return nil, -1, nil
+	}
+	if live > 1 {
+		// Streaming serves the record NZB.GetFileByName picks among
+		// same-name records, which needs segment data this path never
+		// decodes. Sampling the first could STAT a record nobody reads.
+		return nil, 0, errSampleAmbiguousName
 	}
 	c := counts[target]
 	if c == 0 {
