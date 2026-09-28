@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"strings"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -21,6 +22,11 @@ type par2SetChoice struct {
 	// deferred counts dead segments whose posted file another set protects;
 	// they are left for the next pass.
 	deferred int
+	// unattributed is the number of recovery sets when there are several but
+	// no damaged posted file belongs to exactly one of them, so no set can be
+	// chosen; zero otherwise. ParseIndex over every set at once always fails,
+	// so the caller reports this instead of attempting the pass.
+	unattributed int
 }
 
 // choosePar2Set picks the recovery set for this pass. sources are the index
@@ -28,7 +34,11 @@ type par2SetChoice struct {
 // FileDescs has the posted file's name (case-insensitively); only when no set
 // matches by name does an exact size match claim it. A file claimed by more
 // than one set counts for none. The set claiming the most damaged posted files
-// wins; with no clear winner, or a single set, nothing changes.
+// wins. Sets that claim equally many are ordered by set ID, so every pass makes
+// the same choice: a season pack with one damaged episode in each of two sets
+// repairs one set, defers the other's damage, and the next pass (where the
+// repaired episode no longer has pending damage) repairs the other. A single
+// set leaves everything unchanged.
 func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) par2SetChoice {
 	unchanged := par2SetChoice{sources: sources, vols: vols, pending: pending}
 
@@ -114,16 +124,14 @@ func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.Po
 		}
 	}
 	var best [16]byte
-	bestScore, tie := 0, false
+	bestScore := 0
 	for id, sc := range score {
-		switch {
-		case sc > bestScore:
-			best, bestScore, tie = id, sc, false
-		case sc == bestScore:
-			tie = true
+		if sc > bestScore || (sc == bestScore && bytes.Compare(id[:], best[:]) < 0) {
+			best, bestScore = id, sc
 		}
 	}
-	if bestScore == 0 || tie {
+	if bestScore == 0 {
+		unchanged.unattributed = len(sets)
 		return unchanged
 	}
 

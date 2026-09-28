@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
@@ -108,20 +109,62 @@ func TestChoosePar2SetPicksTheDamagedFilesSet(t *testing.T) {
 	}
 }
 
-func TestChoosePar2SetLeavesAmbiguousOrSingleSetAlone(t *testing.T) {
-	sources, _, _, vols, posted := multisetFixture(t)
+func TestChoosePar2SetBreaksTiesAndLeavesSingleSetAlone(t *testing.T) {
+	sources, set1, set2, vols, posted := multisetFixture(t)
 
-	// One damaged file in each set: a tie, nothing changes.
+	// One damaged file in each set: a tie. The lower set ID wins, the same way
+	// on every pass, and the other set's damage waits for the next pass.
+	// Before, a tie handed every set to one ParseIndex, which fails ("belongs
+	// to a different recovery set") and was terminal.
+	want, other := set1, set2
+	if bytes.Compare(set2[:], set1[:]) < 0 {
+		want, other = set2, set1
+	}
 	tie := map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}, {MessageID: "<e02-1>"}}}
-	if c := choosePar2Set(sources, vols, posted, tie); c.setID != ([16]byte{}) || len(c.sources) != 2 || len(c.vols) != 3 {
-		t.Fatalf("tie changed the choice: %+v", c)
+	for pass := 0; pass < 3; pass++ {
+		c := choosePar2Set(sources, vols, posted, tie)
+		if c.setID != want || c.deferred != 1 || c.unattributed != 0 {
+			t.Fatalf("pass %d: tie chose %x (deferred %d, unattributed %d), want %x with 1 deferred", pass, c.setID, c.deferred, c.unattributed, want)
+		}
+		if _, err := par2.ParseIndexSet(c.sources, c.setID); err != nil {
+			t.Fatalf("ParseIndexSet on the chosen set: %v", err)
+		}
+	}
+
+	// The next pass, with the chosen set's damage repaired, picks the other.
+	var left map[string][]overlay.DeadSegment
+	if want == set2 {
+		left = map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}}}
+	} else {
+		left = map[string][]overlay.DeadSegment{"x": {{MessageID: "<e02-1>"}}}
+	}
+	if c := choosePar2Set(sources, vols, posted, left); c.setID != other || c.deferred != 0 {
+		t.Fatalf("second pass chose %x (deferred %d), want %x", c.setID, c.deferred, other)
 	}
 
 	// A single set: unchanged.
 	single := sources[1:]
 	c := choosePar2Set(single, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}}})
-	if c.setID != ([16]byte{}) || len(c.sources) != 1 || len(c.vols) != 3 {
+	if c.setID != ([16]byte{}) || len(c.sources) != 1 || len(c.vols) != 3 || c.unattributed != 0 {
 		t.Fatalf("single set changed: %+v", c)
+	}
+}
+
+// Damage in no set's files leaves no set to repair with: the choice says so,
+// and runRepair's error for it is terminal.
+func TestChoosePar2SetReportsUnattributedDamage(t *testing.T) {
+	sources, _, _, vols, posted := multisetFixture(t)
+	c := choosePar2Set(sources, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: "<not-in-any-posted-file>"}}})
+	if c.unattributed != 2 || c.setID != ([16]byte{}) {
+		t.Fatalf("unattributed = %d, setID %x; want 2 sets and no choice", c.unattributed, c.setID)
+	}
+	err := par2FetchShortfall("the damaged files could not be tied to one of the release's 2 PAR2 recovery sets", 0)
+	if class := classifyPar2Failure(err); !class.terminal {
+		t.Fatalf("%v classified %+v, want terminal", err, class)
+	}
+	err = par2FetchShortfall("the damaged files could not be tied to one of the release's 2 PAR2 recovery sets", 1)
+	if class := classifyPar2Failure(err); class.terminal || class.suspect {
+		t.Fatalf("with a transport failure %v classified %+v, want transient", err, class)
 	}
 }
 

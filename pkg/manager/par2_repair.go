@@ -1850,6 +1850,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// work on the set protecting the damaged files, and leave damage another
 	// set protects for the next pass. See choosePar2Set.
 	setChoice := choosePar2Set(sources, vols, nzb.Par2Source, pending)
+	if setChoice.unattributed > 0 {
+		return par2FetchShortfall(fmt.Sprintf("the damaged files could not be tied to one of the release's %d PAR2 recovery sets", setChoice.unattributed),
+			int(transportFails.Load()))
+	}
 	par2Set := setChoice.setID
 	if par2Set != ([16]byte{}) {
 		sources, vols, pending = setChoice.sources, setChoice.vols, setChoice.pending

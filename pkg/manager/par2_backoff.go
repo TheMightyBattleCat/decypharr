@@ -119,6 +119,10 @@ var par2TerminalSubstrings = []string{
 	"recovery slices fetched/available",
 	"recovery slice",
 	"parse PAR2 index",
+	// A release with several recovery sets where no damaged file belongs to
+	// exactly one of them (see choosePar2Set): no pass can pick a set to
+	// repair with, so retrying cannot help.
+	"could not be tied to one of the release's",
 	// An intact slice confirmed missing across every provider (a hard 430,
 	// not a timeout) pushed the damaged set beyond what recovery data can
 	// cover - see runRepair's retry loop. No amount of retrying fixes a
