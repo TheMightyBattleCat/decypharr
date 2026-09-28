@@ -25,3 +25,4 @@ node_modules/
 docs/handovers/
 review-logs/
 *-logs.txt
+scripts/deploy.env
