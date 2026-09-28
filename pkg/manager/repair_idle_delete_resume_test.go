@@ -67,3 +67,32 @@ func TestDeferredDeleteSurvivesRestart(t *testing.T) {
 		t.Fatalf("%d pending delete record(s) left after the resume", n)
 	}
 }
+
+// A deferred delete persisted more than a week ago is dropped at startup
+// rather than carried out: the hash may have been grabbed again since, and
+// deleting it would remove the new grab.
+func TestStaleDeferredDeleteIsDroppedNotReplayed(t *testing.T) {
+	m, strg := newTestManagerForReapVerdict(t)
+	m.logger = zerolog.Nop()
+	m.activeStreams = xsync.NewMap[string, *ActiveStream]()
+	e := &storage.Entry{InfoHash: "h", Name: "Show.S01E01", Protocol: config.ProtocolTorrent,
+		Files: map[string]*storage.File{"e.mkv": {Name: "e.mkv", InfoHash: "h", Size: 1, AddedOn: time.Now()}}}
+	if err := strg.AddOrUpdate(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := strg.SavePendingDelete(&storage.PendingDelete{InfoHash: "h", Name: e.Name, Since: time.Now().Add(-pendingDeleteMaxAge - time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deleted := false
+	r := &Repair{manager: m, logger: zerolog.Nop(), parentCtx: context.Background(), deleteEntryFn: func(string) error { deleted = true; return nil }}
+	m.repair = r
+	r.resumeIdleDeletes()
+	if deleted {
+		t.Fatal("a week-old deferred delete was carried out")
+	}
+	n := 0
+	_ = strg.ForEachPendingDelete(func(*storage.PendingDelete) { n++ })
+	if n != 0 {
+		t.Fatalf("%d stale pending delete record(s) kept", n)
+	}
+}

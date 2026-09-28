@@ -15,6 +15,14 @@ var (
 	// idleDeleteMaxWait bounds the wait, in case a stream record is never
 	// cleared; the entry is then deleted anyway.
 	idleDeleteMaxWait = 12 * time.Hour
+
+	// pendingDeleteMaxAge is how old a persisted deferred delete may be and
+	// still be carried out at startup. It exists for a restart during the
+	// wait, which comes within hours. An older record belongs to a delete
+	// that kept failing, and the hash it names may since have been grabbed
+	// again (the same torrent re-added): deleting it then would remove the
+	// new grab, so it is dropped instead.
+	pendingDeleteMaxAge = 7 * 24 * time.Hour
 )
 
 // deleteEntryWhenIdle deletes a re-grabbed or superseded entry - now if no
@@ -57,6 +65,12 @@ func (r *Repair) resumeIdleDeletes() {
 	for _, pd := range pending {
 		if e, err := r.manager.GetEntry(pd.InfoHash); err != nil || e == nil {
 			_ = st.DeletePendingDelete(pd.InfoHash) // already gone
+			continue
+		}
+		if !pd.Since.IsZero() && time.Since(pd.Since) > pendingDeleteMaxAge {
+			r.logger.Warn().Str("entry", pd.Name).Str("infohash", pd.InfoHash).Time("deferred_at", pd.Since).
+				Msg("Repair: dropping a deferred delete older than a week instead of deleting whatever holds that hash now")
+			_ = st.DeletePendingDelete(pd.InfoHash)
 			continue
 		}
 		r.logger.Info().Str("entry", pd.Name).Str("infohash", pd.InfoHash).
