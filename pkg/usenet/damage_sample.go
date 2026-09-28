@@ -11,8 +11,8 @@ import (
 type SampleVerdict string
 
 const (
-	VerdictClean       SampleVerdict = "clean"
-	VerdictBroken      SampleVerdict = "broken"
+	VerdictClean        SampleVerdict = "clean"
+	VerdictBroken       SampleVerdict = "broken"
 	VerdictInconclusive SampleVerdict = "inconclusive"
 )
 
@@ -44,20 +44,20 @@ func (o SampleOpts) withDefaults() SampleOpts {
 type AbortReason string
 
 const (
-	AbortNone           AbortReason = ""
-	AbortFailureLimit   AbortReason = "failure_limit"
+	AbortNone            AbortReason = ""
+	AbortFailureLimit    AbortReason = "failure_limit"
 	AbortCleanStreakDead AbortReason = "clean_streak_with_dead_recovered"
 )
 
 type SampleResult struct {
-	Verdict              SampleVerdict
-	SegmentsSampled      int
-	SegmentsFailed       int
-	SegmentsPassed       int
+	Verdict               SampleVerdict
+	SegmentsSampled       int
+	SegmentsFailed        int
+	SegmentsPassed        int
 	RecordedDeadRecovered int
 	ExtrapolatedDeadCount int
-	CoverageFraction     float64
-	EarlyAbortReason     AbortReason
+	CoverageFraction      float64
+	EarlyAbortReason      AbortReason
 }
 
 // SampleFileDamage probes a file's segment health by fetching a stratified
@@ -356,4 +356,3 @@ func selectSample(segments []SegmentRef, recordedDead []int, sampleSize int) []S
 
 	return append(deadPart, spreadPart...)
 }
-

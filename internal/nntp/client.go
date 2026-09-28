@@ -505,7 +505,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			// immediately on a fresh connection — exponential backoff just adds
 			// visible stalls during playback and wasted wall-clock during burst
 			// precache with no corresponding benefit.
-			retry.Delay(10 * time.Millisecond),
+			retry.Delay(10*time.Millisecond),
 			retry.DelayType(retry.FixedDelay),
 			retry.LastErrorOnly(true),
 		)

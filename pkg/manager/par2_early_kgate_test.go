@@ -159,8 +159,8 @@ func TestEarlyDamagedSliceCheck(t *testing.T) {
 			{"b.rar", 400}, // tied with c.rar
 			{"c.rar", 400}, // tied with b.rar
 		})
-		srcA := postedFile("a.rar", 100, 50, 2)  // 3 slices
-		srcB := postedFile("b.rar", 100, 0, 4)   // 4 slices, but tied -> skipped
+		srcA := postedFile("a.rar", 100, 50, 2) // 3 slices
+		srcB := postedFile("b.rar", 100, 0, 4)  // 4 slices, but tied -> skipped
 		pending := map[string][]overlay.DeadSegment{
 			"a.rar": deadAt("a.rar", 0, 1, 2),
 			"b.rar": deadAt("b.rar", 0, 1, 2, 3),

@@ -30,10 +30,10 @@ func TestMain(m *testing.M) {
 // fakeNNTP is a plain-TCP NNTP server that answers STAT after a fixed delay.
 type fakeNNTP struct {
 	ln        net.Listener
-	delay     time.Duration   // before a 223
-	missDelay time.Duration   // before a 430 (real providers answer misses far slower)
-	missing   map[string]bool // message IDs (without brackets) answered 430
-	dropAfter int64           // close each connection after this many STATs (0: never)
+	delay     time.Duration     // before a 223
+	missDelay time.Duration     // before a 430 (real providers answer misses far slower)
+	missing   map[string]bool   // message IDs (without brackets) answered 430
+	dropAfter int64             // close each connection after this many STATs (0: never)
 	bodies    map[string]string // message ID -> wire body for BODY, without the ".\r\n" terminator
 	stats     atomic.Int64
 	bodyReqs  atomic.Int64

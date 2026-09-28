@@ -55,7 +55,7 @@ func (f *FileInfo) ByteRange() *[2]int64 { return f.byteRange }
 func NewFileInfoForTest(parent, name string, size int64) *FileInfo {
 	return &FileInfo{name: name, parent: parent, size: size}
 }
-func (f *FileInfo) InfoHash() string     { return f.infohash }
+func (f *FileInfo) InfoHash() string { return f.infohash }
 
 // GetTorrentMountPath returns the full mount path for a torrent
 // Returns the path based on the new unified mount structure
