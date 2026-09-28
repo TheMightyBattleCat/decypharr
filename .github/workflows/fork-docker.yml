@@ -6,13 +6,18 @@ name: Fork Docker Build
 # for:
 #   image: ghcr.io/themightybattlecat/decypharr:latest
 #
-# The existing config.json is read as-is. Most new features are off until
-# enabled in Settings; these usenet safeguards are on unless the config turns
-# them off: filling short gaps in a stream so playback continues
-# (repair.playback_padding), repairing damaged files from their PAR2 files
-# (repair.par2_repair), checking a download's articles still exist before
-# import (repair.import_availability_check) and sending usenet reads to the
-# faster servers first (usenet.prefer_faster_servers).
+# The existing config.json is read as-is. Settings this build does not know
+# (upstream beta's virtual folders, STRM, NFS/SMB shares and share cache,
+# among others) are ignored, and the first save from the Settings page
+# writes config.json without them, so keep a copy to switch back.
+#
+# Most new features are off until enabled in Settings; these usenet
+# safeguards are on unless the config turns them off: filling short gaps in
+# a stream so playback continues (repair.playback_padding), repairing
+# damaged files from their PAR2 files (repair.par2_repair), checking a
+# download's articles still exist before import
+# (repair.import_availability_check) and sending usenet reads to the faster
+# servers first (usenet.prefer_faster_servers).
 #
 # The data folder is only compatible with images built before August 2026.
 # Upstream beta images from August onwards store their database in a newer
