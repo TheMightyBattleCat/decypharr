@@ -747,6 +747,9 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		if c > maxSegmentsPerFile {
+			return nil, nil, fmt.Errorf("nzbcodec: file %d segment count %d exceeds %d", i, c, maxSegmentsPerFile)
+		}
 		counts[i] = int(c)
 	}
 
@@ -866,10 +869,21 @@ func readPar2Segments(r *byteReader) ([]storage.Par2SegmentRef, error) {
 // decodeSegments fills nzb.Files[*].Segments from the columnar segMeta and the
 // aliased msgIDs buffer. All segments share one backing array; each file takes
 // a sub-slice. msgIDs must remain alive for the lifetime of the NZB.
+// maxSegmentsPerFile bounds a file's decoded segment count. The count sizes
+// the segment slice (and the sample of message IDs the sweep reads), so a
+// corrupt one near 2^63 panicked makeslice. A real file never comes close:
+// 4M articles of the usual ~700 KB is nearly 3 TB.
+const maxSegmentsPerFile = 1 << 22
+
 func decodeSegments(nzb *storage.NZB, counts []int, segMeta, msgIDs []byte) error {
 	total := 0
 	for _, c := range counts {
 		total += c
+	}
+	// Every segment's number and size take at least a byte each in segMeta,
+	// so a total beyond its length is corrupt: refuse it before the make.
+	if total > len(segMeta) {
+		return fmt.Errorf("nzbcodec: %d segments cannot fit in %d bytes of segment data", total, len(segMeta))
 	}
 
 	r := &byteReader{buf: segMeta}
