@@ -271,6 +271,19 @@ func (w *WantedSearch) arrFor(name string) *arr.Arr {
 func (w *WantedSearch) runScheduled(key wantedJobKey) {
 	names := w.groups()[key]
 	if len(names) == 0 {
+		// No Arr has this job's API key any more: the key changed in place
+		// (an auto-detected Arr picks up a new key from its download-client
+		// login) without a settings save. Re-register the jobs from the
+		// current Arrs so the next run happens on schedule; left alone, this
+		// job fired forever and searched nothing. On its own goroutine, so a
+		// job never removes itself from inside its own run.
+		w.logger.Warn().Str("schedule", key.schedule).
+			Msg("Wanted search: no Arr has this job's API key any more; rescheduling from the current Arrs")
+		go func() {
+			if err := w.ApplyConfig(); err != nil {
+				w.logger.Warn().Err(err).Msg("Wanted search: rescheduling after an API key change failed")
+			}
+		}()
 		return
 	}
 	w.search(names, "scheduled", false)

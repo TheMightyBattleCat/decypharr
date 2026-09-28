@@ -7,9 +7,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 )
 
 // fakeArr answers system/status as appName and records every command POST.
@@ -229,5 +231,58 @@ func TestWantedSearchApplyConfigReportsBadSchedule(t *testing.T) {
 	}
 	if n := len(w.scheduler.Jobs()); n != 1 {
 		t.Fatalf("jobs = %d, want radarr's only", n)
+	}
+}
+
+// An auto-detected Arr picks up a new API key from its download-client login
+// without a settings save. Its job, registered under the old key, used to
+// fire and search nothing forever; now it re-registers from the current
+// Arrs, so a job exists under the new key.
+func TestWantedSearchReschedulesAfterAnAPIKeyChange(t *testing.T) {
+	fake := newFakeArr(t, "Sonarr")
+	config.SetConfigPath(t.TempDir())
+	live := config.Get()
+	saved := live.Arrs
+	t.Cleanup(func() { config.Get().Arrs = saved })
+	live.Arrs = []config.Arr{wantedArr("tv", fake.url, "k1", "12:00", "auto")}
+
+	la := arr.New("tv", fake.url, "k1", false, nil, "", "auto")
+	sched, err := gocron.NewScheduler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sched.Shutdown() })
+	w := NewWantedSearch(sched, func(n string) *arr.Arr {
+		if n == "tv" {
+			return la
+		}
+		return nil
+	})
+	if err := w.ApplyConfig(); err != nil {
+		t.Fatal(err)
+	}
+	var old wantedJobKey
+	w.mu.Lock()
+	for k := range w.jobs {
+		old = k
+	}
+	w.mu.Unlock()
+
+	la.Token = "k2"
+	w.runScheduled(old)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		w.mu.Lock()
+		_, stale := w.jobs[old]
+		n := len(w.jobs)
+		w.mu.Unlock()
+		if !stale && n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("jobs not re-registered under the new key (stale job kept: %v, jobs: %d)", stale, n)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
