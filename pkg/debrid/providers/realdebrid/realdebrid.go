@@ -32,6 +32,12 @@ const (
 	profileCacheDuration = 1 * time.Hour
 )
 
+// retryStatuses are the HTTP replies Real-Debrid requests are retried on.
+// 502 and 504 are gateway errors, usually a brief outage, and failing on the
+// first one can mark an entry bad in the middle of a re-insert. Other 5xx
+// replies are returned at once so Real-Debrid's error body can be read.
+var retryStatuses = []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusGatewayTimeout}
+
 type RealDebrid struct {
 	Host string `json:"host"`
 
@@ -69,7 +75,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		request.WithHeaders(headers),
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRateLimiter(ratelimits["main"]),
-		request.WithRetryableStatus(http.StatusTooManyRequests),
+		request.WithRetryableStatus(retryStatuses...),
 		request.WithProxy(dc.Proxy),
 	}
 
@@ -77,7 +83,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		request.WithHeaders(headers),
 		request.WithLogger(_log),
 		request.WithMaxRetries(4),
-		request.WithRetryableStatus(429),
+		request.WithRetryableStatus(retryStatuses...),
 		request.WithRateLimiter(ratelimits["repair"]),
 		request.WithProxy(dc.Proxy),
 	}
