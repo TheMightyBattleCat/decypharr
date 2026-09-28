@@ -3650,7 +3650,8 @@ type postedFileFetcher struct {
 	// them - rather than scaled estimates.
 	exact bool
 	// geometryErr is why resolveGeometry could not measure the article
-	// boundaries (the last probe's error), nil when it did or never ran.
+	// boundaries (a 430 only when every probe got one, otherwise the last
+	// other error), nil when it did or never ran.
 	geometryErr error
 	// badArticles holds the segment indexes whose fetch failed as missing
 	// (430) or corrupt on every provider during this pass: int -> struct{}.
@@ -3855,15 +3856,26 @@ func (f *postedFileFetcher) resolveGeometry() {
 	if n > 1 {
 		candidates = min(n-1, geometryProbeArticles) // never the last: it is short
 	}
-	var lastErr error
+	// A 430 here makes the unplaced dead segments terminal downstream (see
+	// splitPlaceableDeadRefs), so it is reported only when every probe got
+	// one. A probe that failed any other way - a timeout, a reset - might
+	// measure the article on the next pass, so its error is the one kept and
+	// the pass backs off instead of giving up on the release.
+	var lastErr, retryableErr error
 	for idx := 0; idx < candidates; idx++ {
 		seed, size, err := f.measureArticle(idx)
 		if err != nil {
 			lastErr = err
+			if !nntp.IsArticleNotFoundError(err) {
+				retryableErr = err
+			}
 			continue
 		}
 		f.applyUniformGeometry(seed, size)
 		return
+	}
+	if retryableErr != nil {
+		lastErr = retryableErr
 	}
 	f.geometryErr = lastErr
 	f.logger.Warn().Err(lastErr).Int("articles_tried", candidates).

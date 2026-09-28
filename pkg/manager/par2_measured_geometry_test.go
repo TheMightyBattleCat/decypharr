@@ -175,6 +175,51 @@ func TestResolveGeometryMeasuresFromALaterArticleWhenTheFirstIsDead(t *testing.T
 	}
 }
 
+// The first two articles time out and the third (itself a dead segment) is a
+// 430: no article was measured, but only because of the timeouts, so the
+// unplaced dead segment must back off rather than end the repair for good.
+// Keeping only the last probe's error made it the 430, which is terminal.
+func TestResolveGeometryTimeoutsStayTransientBesideA430(t *testing.T) {
+	content, articles, ref := estimatedFixture()
+	f := &yencFetcher{articles: articles, calls: map[string]int{}}
+	fetch := func(ctx context.Context, id string, check usenet.ArticleCheck) ([]byte, error) {
+		switch id {
+		case ref.Segments[0].MessageID, ref.Segments[1].MessageID:
+			return nil, &nntp.Error{Type: nntp.ErrorTypeTimeout, Message: "read timeout"}
+		case ref.Segments[2].MessageID:
+			return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "no such article"}
+		}
+		return f.fetch(ctx, id, check)
+	}
+	pf := newPostedFileFetcher(context.Background(), fetch, ref, nil, int64(len(content)), zerolog.Nop())
+	pf.resolveGeometry()
+	if pf.exact {
+		t.Fatal("precondition: no article should have been measured")
+	}
+	id := [16]byte{0x0b}
+	dr := par2DeadRef{file: ref.Name, seg: overlay.DeadSegment{Index: 2, MessageID: ref.Segments[2].MessageID},
+		rng: postedRange{fileID: id, start: pf.base[2], end: pf.base[2] + pf.segSizes[2]}}
+	_, err := splitPlaceableDeadRefs(map[[16]byte]*postedFileFetcher{id: pf}, []par2DeadRef{dr})
+	if err == nil {
+		t.Fatal("an unmeasured file must leave the dead segment unplaced")
+	}
+	if class := classifyPar2Failure(err); class.terminal {
+		t.Fatalf("%v classified terminal; timeouts decide, so it must back off", err)
+	}
+
+	// Every probe a 430: that is still terminal.
+	all430 := func(context.Context, string, usenet.ArticleCheck) ([]byte, error) {
+		return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "no such article"}
+	}
+	pf = newPostedFileFetcher(context.Background(), all430, ref, nil, int64(len(content)), zerolog.Nop())
+	pf.resolveGeometry()
+	dr.rng.start, dr.rng.end = pf.base[2], pf.base[2]+pf.segSizes[2]
+	_, err = splitPlaceableDeadRefs(map[[16]byte]*postedFileFetcher{id: pf}, []par2DeadRef{dr})
+	if class := classifyPar2Failure(err); !class.terminal {
+		t.Fatalf("%v classified %+v; every probe a 430 should stay terminal", err, class)
+	}
+}
+
 // An .sfv recorded at 3300 bytes that really holds 2900: MD5-16k hashes the
 // whole real file, not the estimate zero-padded or a short read.
 func TestComputeMD5_16kUsesYencFileSize(t *testing.T) {
