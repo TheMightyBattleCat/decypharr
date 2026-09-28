@@ -689,6 +689,13 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 			entryName := item.Name()
 			fullPath := filepath.Join(dirPath, entryName)
 
+			if item.IsDir() {
+				if err := checkDirectory(fullPath); err != nil {
+					return err
+				}
+				continue
+			}
+
 			if file, exists := remainingFiles[entryName]; exists {
 				fileSymlinkPath := filepath.Join(symlinkDir, file.Name)
 				if err := os.Symlink(fullPath, fileSymlinkPath); err != nil && !os.IsExist(err) {
@@ -700,12 +707,6 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 				d.logger.Info().Str("entry", entry.GetFolder()).Str(logger.FieldSubject, file.Name).
 					Str(logger.FieldStatus, logger.StatusOK).Msg("File is ready")
 				continue
-			}
-
-			if item.IsDir() {
-				if err := checkDirectory(fullPath); err != nil {
-					return err
-				}
 			}
 		}
 		return nil
