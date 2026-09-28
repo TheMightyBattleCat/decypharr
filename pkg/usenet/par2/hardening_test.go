@@ -71,3 +71,21 @@ func TestMatchFilesIgnoresFileDescsOutsideRecoverySet(t *testing.T) {
 		t.Fatalf("matches = %+v, want only a.rar -> the recovery-set file", matches)
 	}
 }
+
+// A panic on one of accumulateSlice's worker goroutines comes back to the
+// caller's goroutine, where the repair job's recover can catch it. Raised on
+// the worker itself it could not be recovered and stopped the process.
+func TestAccumulateSliceRaisesWorkerPanicOnCaller(t *testing.T) {
+	recovery := make([]RecoverySlice, accumParallelMinK*2)
+	accum := make([][]byte, len(recovery))
+	for j := range accum {
+		accum[j] = make([]byte, 8)
+	}
+	accum[len(accum)-1] = make([]byte, 4) // length mismatch: regionMulXOR panics
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected the worker's panic to reach the caller")
+		}
+	}()
+	accumulateSlice(accum, make([]byte, 8), 2, recovery, 4)
+}

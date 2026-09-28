@@ -2341,8 +2341,21 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		var intactRead int64
 		intactTotal := int64(len(intactOrder))
-		trackedFetch := func(i int64) ([]byte, error) {
-			data, err := jobSource.ReadSlice(i)
+		trackedFetch := func(i int64) (data []byte, err error) {
+			// The slice source calls this on its own worker goroutines,
+			// outside runJob's recover, and ReadSlice does the offset
+			// arithmetic over release data that has panicked before on
+			// unusual postings. Turn a panic into this slice's error (tagged
+			// transient, like runJob's own) so it fails the pass instead of
+			// stopping the process.
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error().Str("entry", entryName).Int64("slice", i).Interface("panic", r).
+						Bytes("stack", debug.Stack()).Msg("par2 repair: reading an intact slice panicked; recovered")
+					data, err = nil, fmt.Errorf("reading PAR2 slice %d panicked: %v (transient: internal error)", i, r)
+				}
+			}()
+			data, err = jobSource.ReadSlice(i)
 			progress.AddIntactRead(1)
 			if atomic.AddInt64(&intactRead, 1) == intactTotal {
 				progress.SetPhase(Par2PhaseSolving)

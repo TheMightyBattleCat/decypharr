@@ -325,6 +325,12 @@ func accumulateSlice(accum [][]byte, data []byte, ci uint16, recovery []Recovery
 	}
 	per := (k + workers - 1) / workers
 	var wg sync.WaitGroup
+	// A panic on a worker goroutine cannot be recovered by the caller, so it
+	// would stop the process. Each worker hands its panic back instead, and
+	// the first one is raised again here, on the caller's goroutine, where
+	// the repair job's own recover handles it.
+	var panicOnce sync.Once
+	var workerPanic any
 	for w := 0; w < workers; w++ {
 		lo := w * per
 		if lo >= k {
@@ -337,10 +343,18 @@ func accumulateSlice(accum [][]byte, data []byte, ci uint16, recovery []Recovery
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicOnce.Do(func() { workerPanic = r })
+				}
+			}()
 			for j := lo; j < hi; j++ {
 				regionMulXOR(accum[j], data, gfPow(ci, recovery[j].Exponent))
 			}
 		}(lo, hi)
 	}
 	wg.Wait()
+	if workerPanic != nil {
+		panic(workerPanic)
+	}
 }
