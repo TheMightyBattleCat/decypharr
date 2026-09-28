@@ -140,6 +140,11 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	autoRepair := cfg.AutoRepair
 	if opts.AutoRepair != nil {
 		autoRepair = *opts.AutoRepair
+	} else {
+		// Taken from the settings: re-checked before each heal, so turning
+		// Auto-repair off stops this sweep deleting and re-searching (see
+		// autoRepairStillOn).
+		ctx = context.WithValue(ctx, autoRepairFollowsConfigKey{}, true)
 	}
 
 	log.Info().Str("source", string(cfg.Source)).Msg("Sweep: selecting candidates")
@@ -259,7 +264,7 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 	log.Info().Bool("auto_repair", autoRepair).Msg("Repair sweep: stop schedule fired; finishing run")
 
-	if autoRepair && len(names) > 0 {
+	if r.autoRepairStillOn(ctx, autoRepair) && len(names) > 0 {
 		// Use a fresh, un-cancelled context for the final repair pass: the
 		// probe pass was cut short, but the repair pass over what's already
 		// known-broken is a short, bounded set of Arr calls and should be
@@ -339,8 +344,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			// Arr delete + re-search for just this entry, and release any
 			// regrab claim routeAutoRepair took while probing.
 			if h.Status == storage.HealthBroken {
-				r.finalizeBrokenEntry(gctx, run, &runMu, name, h, autoRepair)
-				if autoRepair {
+				healNow := r.autoRepairStillOn(gctx, autoRepair)
+				r.finalizeBrokenEntry(gctx, run, &runMu, name, h, healNow)
+				if healNow {
 					run.MarkHealed(name)
 				}
 			}
@@ -507,7 +513,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		// cancelled context.
 		return &storage.EntryHealth{EntryName: h.EntryName, Status: storage.HealthUnknown}, entryDecode{skipped: true}
 	}
-	if autoRepair {
+	if r.autoRepairStillOn(ctx, autoRepair) {
 		r.autoHealResults(ctx, results, heal)
 	}
 
@@ -1433,7 +1439,10 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 			return
 		}
 		a := r.manager.arr.Get(arrName)
-		if a == nil {
+		// SkipRepair is checked again here, on the Arr as it is now: the
+		// sweep chose its Arrs when it started, and a settings save no longer
+		// restarts a running sweep.
+		if a == nil || a.SkipRepair {
 			continue
 		}
 		actioned, cancelled := r.repairArrFiles(ctx, run, statsMu, a, files, keepRelease[arrName])
@@ -1487,6 +1496,29 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 // releaseRegrabClaims itself only releases handlerRegrab claims, so this is
 // always a safe no-op for torrent-protocol brokens that never went through
 // routeAutoRepair.
+// autoRepairFollowsConfigKey marks a sweep context whose auto-repair setting
+// came from the settings rather than a per-run override.
+type autoRepairFollowsConfigKey struct{}
+
+// autoRepairStillOn reports whether a sweep that started with autoRepair may
+// heal now. A sweep reads Auto-repair once when it starts, and a settings save
+// no longer restarts a running sweep, so without this check unticking
+// Auto-repair mid-sweep left an hours-long sweep deleting and re-searching
+// until it finished. When the value came from the settings it is re-read
+// here; a per-run override ("Run now" with auto-repair on) is honoured as
+// given.
+func (r *Repair) autoRepairStillOn(ctx context.Context, autoRepair bool) bool {
+	if !autoRepair {
+		return false
+	}
+	if ctx != nil {
+		if follows, _ := ctx.Value(autoRepairFollowsConfigKey{}).(bool); follows {
+			return r.cfg().AutoRepair
+		}
+	}
+	return true
+}
+
 func (r *Repair) finalizeBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, autoRepair bool) {
 	if autoRepair {
 		r.healBrokenEntryGuarded(ctx, run, statsMu, name, h, false)

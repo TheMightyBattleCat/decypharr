@@ -90,3 +90,31 @@ func TestApplyConfigDisableStopsRunningSweep(t *testing.T) {
 		t.Fatalf("scheduled jobs = %d, want 0", n)
 	}
 }
+
+// A settings save no longer restarts a running sweep, so the sweep must
+// re-check Auto-repair itself: unticking it mid-sweep stops further deletes
+// and re-searches. A "Run now" that asked for auto-repair keeps it.
+func TestSweepRechecksAutoRepairBeforeHealing(t *testing.T) {
+	m, _ := newTestManagerForReapVerdict(t)
+	r := &Repair{manager: m, logger: zerolog.Nop(), parentCtx: context.Background()}
+	live := config.Get()
+	saved := live.Repair
+	t.Cleanup(func() { config.Get().Repair = saved })
+
+	fromSettings := context.WithValue(context.Background(), autoRepairFollowsConfigKey{}, true)
+	live.Repair.AutoRepair = true
+	if !r.autoRepairStillOn(fromSettings, true) {
+		t.Fatal("auto-repair on in the settings: the sweep should heal")
+	}
+	live.Repair.AutoRepair = false
+	if r.autoRepairStillOn(fromSettings, true) {
+		t.Fatal("auto-repair turned off mid-sweep: the sweep kept healing")
+	}
+	// A per-run override is honoured as given.
+	if !r.autoRepairStillOn(context.Background(), true) {
+		t.Fatal("a Run now override for auto-repair was dropped")
+	}
+	if r.autoRepairStillOn(context.Background(), false) || r.autoRepairStillOn(nil, false) {
+		t.Fatal("a sweep that started without auto-repair must never heal")
+	}
+}
