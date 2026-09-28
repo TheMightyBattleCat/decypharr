@@ -10,7 +10,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
 // withLiveArrs sets the live config's Arrs for one test and builds a server
@@ -30,7 +29,7 @@ func withLiveArrs(t *testing.T, arrs ...config.Arr) *Server {
 	if err := live.Save(); err != nil {
 		t.Fatal(err)
 	}
-	return &Server{logger: zerolog.Nop(), manager: manager.New()}
+	return &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
 }
 
 // liveConfigBody is the live config as a settings save would post it, with

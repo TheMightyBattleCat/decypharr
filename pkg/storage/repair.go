@@ -12,8 +12,8 @@ import (
 
 	json "github.com/bytedance/sonic"
 	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/sirrobot01/appendstore"
 	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 )
 
 // RepairStrategy controls how the probe groups files for a single entry.
@@ -378,7 +378,9 @@ func (s *Storage) SaveEntryHealth(state *EntryHealth) error {
 	}
 	// Index the status so CountEntryHealthByStatus can build its histogram
 	// straight from the in-memory index without decoding every record.
-	return s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: string(state.Status)})
+	return s.repairState.Put(state.EntryName, data, &appendstore.PutOptions{Attributes: map[string]string{
+		attributeStatus: string(state.Status),
+	}})
 }
 
 func (s *Storage) GetEntryHealth(entryName string) (*EntryHealth, error) {
@@ -555,15 +557,14 @@ func (s *Storage) CountEntryHealthByStatus() map[HealthStatus]int {
 
 	counts := make(map[HealthStatus]int)
 	// Fast path: read the status straight from the index (no disk read, no
-	// JSON decode). Records persisted before the status was indexed have an
-	// empty meta.Status; collect those and decode them after the iteration so
-	// we never call Get (which RLocks) while ForEachMeta holds the read lock.
+	// JSON decode). Records persisted before the status was indexed have no
+	// status attribute; collect those and decode them after the iteration.
 	// This self-heals: the next SaveEntryHealth (every sweep) populates the
 	// index, so the fallback set shrinks to zero.
 	var needDecode []string
-	_ = s.repairState.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
-		if meta.Status != "" {
-			counts[HealthStatus(meta.Status)]++
+	_ = s.repairState.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
+		if status := meta.Attribute(attributeStatus); status != "" {
+			counts[HealthStatus(status)]++
 		} else {
 			needDecode = append(needDecode, key)
 		}

@@ -19,10 +19,14 @@ name: Fork Docker Build
 # (repair.import_availability_check) and sending usenet reads to the faster
 # servers first (usenet.prefer_faster_servers).
 #
-# The data folder is only compatible with images built before August 2026.
-# Upstream beta images from August onwards store their database in a newer
-# format that this build cannot open, so testers coming from one of those
-# need a fresh /app data folder (keep the old one to switch back).
+# The database in the /app data folder is read whichever image wrote it:
+# upstream beta's current format directly, and the older format of earlier
+# images (including earlier builds of this fork) by upgrading it in place on
+# first start. Each database file is copied beside itself (a .v3.bak file)
+# before it is upgraded; images that predate the upgrade cannot read the
+# upgraded files, so restore those copies, or keep a copy of /app, to switch
+# back. Upstream beta's per-file IDs are not kept by this build, so .strm
+# files written by upstream beta may need writing again after switching back.
 #
 # NOTE: the Dockerfile embeds the web UI from the COMMITTED
 # pkg/server/assets/build/** (no npm stage), so regenerate + commit those

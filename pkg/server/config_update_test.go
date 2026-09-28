@@ -13,6 +13,16 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
+// newTestManager builds a manager for one test and stops it when the test
+// ends, which closes its storage. The storage locks its database files, so
+// the next test's manager cannot open them while an earlier one holds them.
+func newTestManager(t *testing.T) *manager.Manager {
+	t.Helper()
+	m := manager.New()
+	t.Cleanup(func() { _ = m.Stop() })
+	return m
+}
+
 // TestHandleUpdateConfig_PreservesWebhookToken guards against the config
 // save wiping webhook_token: the settings form has no field for it, so a
 // PUT /api/config that omits it decodes to an empty string unless
@@ -31,7 +41,7 @@ func TestHandleUpdateConfig_PreservesWebhookToken(t *testing.T) {
 
 	s := &Server{
 		logger:  zerolog.Nop(),
-		manager: manager.New(),
+		manager: newTestManager(t),
 	}
 
 	// A payload shaped like what the current settings form actually submits:
@@ -92,7 +102,7 @@ func TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend(t *testing.T) 
 	live.Repair.Par2UrgentConcurrency = 5
 	live.Repair.Par2RepairOnSweep = true
 
-	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
 	body := `{"bind_address":"0.0.0.0","port":"8282","download_folder":"/tmp/downloads",
 		"repair":{"enabled":false,"schedule":"23:10","workers":3,"auto_repair":true}}`
 	rec := httptest.NewRecorder()
@@ -121,7 +131,7 @@ func TestHandleUpdateRepairConfig_PartialBodyKeepsOtherRepairSettings(t *testing
 	live.Repair.AutoRepair = true
 	live.Repair.FFProbePath = "/opt/ffmpeg/ffprobe"
 
-	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
 	body := `{"playback_padding":true,"par2_repair":true,"pad_max_run_segments":4,"par2_repair_mode":"auto_threshold","par2_repair_min_segments":32}`
 	rec := httptest.NewRecorder()
 	s.handleUpdateRepairConfig(rec, httptest.NewRequest(http.MethodPut, "/api/repair/config", strings.NewReader(body)))
@@ -151,7 +161,7 @@ func TestHandleUpdatePrecacheConfig_PartialBodyKeepsOtherSettings(t *testing.T) 
 	live.Precache.PrecacheEvictAfterWatched = true
 	live.Precache.PrecacheMaxBytes = &capBytes
 
-	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
 	body := `{"precache_threshold_percent":20,"precache_whole_season":false,"precache_next_episodes":3}`
 	rec := httptest.NewRecorder()
 	s.handleUpdatePrecacheConfig(rec, httptest.NewRequest(http.MethodPut, "/api/precache/config", strings.NewReader(body)))
@@ -192,7 +202,7 @@ func TestHandleUpdateConfig_PreferFasterServersAppliesWithoutRestart(t *testing.
 		t.Fatalf("normalizing the live config: %v", err)
 	}
 
-	s := &Server{logger: zerolog.Nop(), manager: manager.New()}
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
 	for _, on := range []bool{false, true} {
 		body := `{"usenet":{"prefer_faster_servers":false}}`
 		if on {
