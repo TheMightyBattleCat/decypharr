@@ -53,8 +53,12 @@ LABEL org.opencontainers.image.title="decypharr"
 LABEL org.opencontainers.image.authors="sirrobot01"
 LABEL org.opencontainers.image.documentation="https://github.com/sirrobot01/decypharr/blob/main/README.md"
 
-# Install dependencies including rclone (from binary)
-RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata && \
+# Install dependencies including rclone (from binary).
+# ffmpeg provides /usr/bin/ffprobe for the optional ffprobe checks at import
+# and during repair sweeps (they find it on PATH). Those checks need ffprobe
+# 6.0 or newer: older releases decode only the first of several sample
+# windows, so damage later in a file goes unseen.
+RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata ffmpeg && \
     echo "user_allow_other" >> /etc/fuse.conf && \
     case "$(uname -m)" in \
         x86_64) ARCH=amd64 ;; \
