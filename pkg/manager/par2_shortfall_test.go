@@ -18,6 +18,10 @@ func TestPar2TransientShortfallsStayTransient(t *testing.T) {
 	}{
 		{"shortfall, recovery gone", par2RecoveryShortfall(2, 0, 0), true},
 		{"shortfall after a timed-out article", par2RecoveryShortfall(2, 0, 1), false},
+		{"no recovery volumes, none failed", par2FetchShortfall("no PAR2 recovery volumes retained", 0), true},
+		{"no recovery volumes after timeouts", par2FetchShortfall("no PAR2 recovery volumes retained", 3), false},
+		{"no PAR2 file fetched, none failed", par2FetchShortfall("failed to fetch any PAR2 file", 0), true},
+		{"no PAR2 file fetched after timeouts", par2FetchShortfall("failed to fetch any PAR2 file", 2), false},
 		{"no posted file matched", errors.New("no posted file matched the PAR2 recovery set"), true},
 		{"no posted file matched, files skipped", errors.New("no posted file matched the PAR2 recovery set (transient: 2 posted file(s) failed to fetch/hash during matching)"), false},
 		{"backfill impossible", fmt.Errorf("no PAR2 data and backfill failed: %w", fmt.Errorf("gone: %w", usenet.ErrBackfillImpossible)), true},

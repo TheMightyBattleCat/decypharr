@@ -1897,7 +1897,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	if available == 0 {
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
-			fmt.Errorf("no PAR2 recovery volumes retained"))
+			par2FetchShortfall("no PAR2 recovery volumes retained", int(transportFails.Load())))
 	}
 	if earlyIdx != nil {
 		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, nzb.Par2Match, p.logger); earlyK > 0 {
@@ -1929,7 +1929,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	progress.SetRecoveryVolsFetched(nextVolIdx)
 	progress.SetRecoverySlices(int(fetchedSlices), int(needed))
 	if len(sources) == 0 {
-		return fmt.Errorf("failed to fetch any PAR2 file")
+		return par2FetchShortfall("failed to fetch any PAR2 file", int(transportFails.Load()))
 	}
 
 	idx, err := par2.ParseIndexSet(sources, par2Set)
