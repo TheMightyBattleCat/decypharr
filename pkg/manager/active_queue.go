@@ -111,8 +111,34 @@ func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
 		return nil, fmt.Errorf("usenet is not configured")
 	}
 	sourcePath := entry.Magnet
-	if meta, err := m.usenet.GetNZBHeader(entry.InfoHash); err == nil && meta != nil && meta.Path != "" {
+	meta, err := m.usenet.GetNZBHeader(entry.InfoHash)
+	if err == nil && meta != nil && meta.Path != "" {
 		sourcePath = meta.Path
+	} else if entry.Magnet != "" {
+		// A staged NZB that was never parsed: hand it to the job unparsed,
+		// so it is parsed under the same rules as a new add (a parse error
+		// that may pass is retried, a confirmed-dead release is rejected for
+		// the Arr to blocklist) rather than failed on its first error here.
+		name := entry.OriginalFilename
+		if name == "" {
+			name = entry.Name
+		}
+		req := NewNZBRequest(
+			name,
+			downloadFolderForEntry(m.config.DownloadFolder, entry),
+			nil,
+			m.arr.GetOrCreate(entry.Category),
+			entry.Action,
+			entry.CallbackURL,
+			ImportTypeSABnzbd,
+			entry.SkipMultiSeason,
+		)
+		req.Id = entry.InfoHash
+		req.Status = "queued"
+		job := NewJob(JobTypeNZB, req)
+		job.ID = entry.InfoHash
+		job.Entry = entry
+		return job, nil
 	}
 	content, err := os.ReadFile(sourcePath)
 	if err != nil {
