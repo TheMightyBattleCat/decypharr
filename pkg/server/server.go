@@ -151,8 +151,9 @@ func New(mgr *manager.Manager) *Server {
 			})
 		})
 
-		//webhooks
-		r.Post("/webhooks/tautulli", s.handleTautulli)
+		// Webhooks. Tautulli goes through the normal auth or the webhook token;
+		// the Arr webhook checks its optional ?token= itself.
+		r.With(s.tautulliAuth).Post("/webhooks/tautulli", s.handleTautulli)
 		r.Post("/webhooks/arr", s.handleArrWebhook)
 	})
 	s.router = r

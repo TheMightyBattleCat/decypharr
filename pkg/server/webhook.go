@@ -2,6 +2,7 @@ package server
 
 import (
 	"cmp"
+	"crypto/subtle"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -19,11 +20,6 @@ import (
 // "media-id-scoped repair job". When no media id is supplied the webhook
 // falls back to a full manual sweep.
 func (s *Server) handleTautulli(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var payload struct {
 		Topic   string `json:"topic"`
 		Arr     string `json:"arr,omitempty"`
@@ -172,6 +168,33 @@ func (p *arrWebhookPayload) file() *arrWebhookFile {
 	return p.MovieFile
 }
 
+// webhookTokenMatches reports whether the request's ?token= query parameter
+// equals the configured webhook_token, compared in constant time. It is false
+// when no webhook_token is configured.
+func webhookTokenMatches(r *http.Request) bool {
+	token := config.Get().WebhookToken
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(token)) == 1
+}
+
+// tautulliAuth guards /webhooks/tautulli, which can start a repair sweep. It
+// accepts the webhook_token as ?token= (the same credential /webhooks/arr
+// takes, for callers that cannot set headers); anything else goes through the
+// normal authMiddleware (API token as "Authorization: Bearer <token>", or a
+// web session).
+func (s *Server) tautulliAuth(next http.Handler) http.Handler {
+	protected := s.authMiddleware(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if webhookTokenMatches(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		protected.ServeHTTP(w, r)
+	})
+}
+
 // arrWebhookWarnOnce logs the unauthenticated-endpoint warning at most once
 // per process, the first time the endpoint is actually hit with no token
 // configured - not at startup, since config can change without a restart via
@@ -224,7 +247,7 @@ func (s *Server) refreshWebhookToken() (string, error) {
 //
 // This endpoint is entirely optional: Sonarr/Radarr have no obligation to
 // call it, and decypharr's existing scheduled cleanup is completely
-// unaffected by whether it's configured. Like handleTautulli, it is
+// unaffected by whether it's configured. It is
 // registered outside the auth-required route group (see server.go) since
 // Sonarr/Radarr's Webhook connection type can't supply decypharr's normal
 // session/API-token auth - only an optional ?token= query parameter, checked
@@ -236,7 +259,7 @@ func (s *Server) handleArrWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if token := config.Get().WebhookToken; token != "" {
-		if r.URL.Query().Get("token") != token {
+		if !webhookTokenMatches(r) {
 			http.Error(w, "Invalid or missing token", http.StatusUnauthorized)
 			return
 		}
