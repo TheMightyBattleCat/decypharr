@@ -2,11 +2,17 @@ package usenet
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 )
+
+// ErrInvalidNZB marks a parse that failed on the NZB itself (empty, or not
+// NZB XML). Parsing the same content again cannot help, unlike a provider or
+// connection error during the parse.
+var ErrInvalidNZB = errors.New("invalid NZB content")
 
 // ValidateNZB performs basic validation on NZB content
 func validateNZB(content []byte) error {

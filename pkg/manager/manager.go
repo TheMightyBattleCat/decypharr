@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -371,7 +372,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	}
 
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, errJobSettled) {
 			return
 		}
 		if isTooManyActiveDownloads(err) {

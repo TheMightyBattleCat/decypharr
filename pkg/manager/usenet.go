@@ -4,18 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
-// AddNewNZB parses an NZB before entering the active-download queue.
+// AddNewNZB persists an NZB and returns as soon as it enters the active-download queue.
 func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, error) {
 	if m.usenet == nil {
 		return "", fmt.Errorf("usenet not configured")
@@ -34,33 +35,21 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		Str(logger.FieldNote, req.Arr.Name).
 		Msg("Adding new NZB to usenet")
 
-	meta, groups, err := m.usenet.ParseWithID(ctx, req.Id, req.Name, req.NZBContent, req.Arr.Name)
+	stagedPath, err := m.usenet.StageNZB(req.Id, req.NZBContent)
 	if err != nil {
-		if errors.Is(err, parser.ErrReleaseUnavailable) {
-			// A confirmed-damaged release (missing segments, or the
-			// negative cache already knows this exact content is dead)
-			// still needs an Arr-visible outcome, or Sonarr just retries the
-			// identical grab forever (observed: FLUX/ETHEL/Kitsune/RAWR
-			// cycling every ~60s with no blocklist, since a bare error here
-			// never gave the Arr anything to poll). Queue it pre-failed
-			// instead of erroring the add outright, so it flows through the
-			// same queue-status propagation an availability-check failure
-			// during Process already relies on to get blocklisted.
-			return m.rejectDamagedNZB(req, err)
-		}
-		return "", fmt.Errorf("usenet parse failed: %w", err)
+		return "", err
 	}
+	req.NZBContent = nil
 
 	entry := &storage.Entry{
-		InfoHash:         meta.ID,
-		Name:             meta.Name,
-		OriginalFilename: meta.Name,
-		Size:             meta.TotalSize,
+		InfoHash:         req.Id,
+		Name:             req.Name,
+		OriginalFilename: req.Name,
 		Protocol:         config.ProtocolNZB,
-		Bytes:            meta.TotalSize,
+		Magnet:           stagedPath,
 		Category:         req.Arr.Name,
 		SavePath:         filepath.Join(req.DownloadFolder, req.Arr.Name),
-		Status:           debridTypes.TorrentStatusDownloading,
+		Status:           debridTypes.TorrentStatusQueued,
 		State:            storage.EntryStateDownloading,
 		Progress:         0,
 		Action:           req.Action,
@@ -75,64 +64,81 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 	}
 
 	entry.ContentPath = entry.DownloadPath()
-	entry.ActiveProvider = "usenet"
-	_ = entry.AddUsenetProvider(meta)
 	if err := m.queue.Add(entry); err != nil {
+		m.usenet.RemoveStagedNZB(stagedPath)
 		return "", fmt.Errorf("failed to add nzb to queue: %w", err)
 	}
 
-	req.Status = "started"
+	req.Status = "queued"
 	job := NewJob(JobTypeNZB, req)
 	job.ID = entry.InfoHash
 	job.Entry = entry
-	job.NZBMeta = meta
-	job.NZBGroups = groups
 	if err := m.SubmitJob(job); err != nil {
+		m.usenet.RemoveStagedNZB(stagedPath)
 		entry.MarkAsError(err)
 		_ = m.queue.Update(entry)
 		return "", fmt.Errorf("failed to queue NZB: %w", err)
 	}
-	return meta.ID, nil
+	return req.Id, nil
 }
 
-// rejectDamagedNZB records a confirmed-damaged NZB (see AddNewNZB) as an
-// already-errored queue entry, rather than failing the add outright. Both
-// outcomes end with the Arr informed, but only this one gets there: SABnzbd
-// download clients only surface failures the Arr can see via a tracked
-// queue/history item, and a bare error from the add call itself creates no
-// such item, so the Arr has nothing to blocklist and just retries the
-// identical grab on its next cycle. No job is submitted - there's nothing to
-// process for a release that never actually parsed - so this is a
-// synchronous terminal record, not an active download.
-func (m *Manager) rejectDamagedNZB(req *ImportRequest, cause error) (string, error) {
-	id := req.Id
-	if id == "" {
-		id = uuid.New().String()
-	}
-	entry := &storage.Entry{
-		InfoHash:         id,
-		Name:             req.Name,
-		OriginalFilename: req.Name,
-		Protocol:         config.ProtocolNZB,
-		Category:         req.Arr.Name,
-		SavePath:         filepath.Join(req.DownloadFolder, req.Arr.Name),
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
-		AddedOn:          time.Now(),
-		Providers:        make(map[string]*storage.ProviderEntry),
-		Files:            make(map[string]*storage.File),
-		Tags:             []string{},
-	}
+const (
+	// nzbParseMaxAttempts bounds how often a queued NZB is parsed before a
+	// parse error fails the download. A failed download is what the Arr
+	// blocklists, so a transient provider error must not end a good release
+	// on its first try.
+	nzbParseMaxAttempts = 3
+	// nzbParseRetryDelay is the wait before the second parse; it doubles for
+	// each later one.
+	nzbParseRetryDelay = 30 * time.Second
+)
+
+// errJobSettled tells processJob that the job already recorded its outcome
+// (failed the entry, or scheduled itself again), so there is nothing left to
+// log, mark or wait for.
+var errJobSettled = errors.New("job outcome already recorded")
+
+// rejectDamagedNZB fails a queued NZB whose parse found the release confirmed
+// unavailable (missing segments, or the negative cache already knows this
+// exact content is dead). The failed queue entry is what the Arr sees in the
+// SABnzbd history, so it blocklists the release and searches again. Without a
+// tracked failed item it has nothing to blocklist and retries the identical
+// grab forever (observed: FLUX/ETHEL/Kitsune/RAWR cycling every ~60s).
+func (m *Manager) rejectDamagedNZB(job *Job, cause error) {
+	entry := job.Entry
 	entry.MarkAsError(cause)
-	if err := m.queue.Add(entry); err != nil {
-		return "", fmt.Errorf("usenet parse failed (%v) and failed to record the rejection: %w", cause, err)
+	if err := m.queue.Update(entry); err != nil {
+		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Failed to record a rejected NZB")
 	}
 	m.logger.Warn().
-		Str("name", req.Name).
-		Str("category", req.Arr.Name).
+		Str("name", entry.Name).
+		Str("category", entry.Category).
 		Err(cause).
 		Msg("NZB rejected: release confirmed unavailable; queued as failed so the Arr blocklists and re-searches")
-	return id, nil
+}
+
+// retryNZBParse schedules another parse of a queued NZB after a parse error
+// that may pass (a provider or connection error), until nzbParseMaxAttempts.
+// It reports false when the error should fail the download now: the release
+// is confirmed dead, the NZB itself is invalid, the attempts are used up, or
+// the manager is stopping.
+func (m *Manager) retryNZBParse(ctx context.Context, job *Job, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, parser.ErrReleaseUnavailable) || errors.Is(err, usenet.ErrInvalidNZB) {
+		return false
+	}
+	if job.ParseAttempts+1 >= nzbParseMaxAttempts {
+		return false
+	}
+	job.ParseAttempts++
+	delay := nzbParseRetryDelay << (job.ParseAttempts - 1)
+	m.logger.Warn().
+		Err(err).
+		Str("name", job.Entry.Name).
+		Int("attempt", job.ParseAttempts).
+		Dur("retry_in", delay).
+		Msg("NZB parse failed; parsing it again before failing the download")
+	m.jobQueue.Retry(job, delay)
+	return true
 }
 
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
@@ -147,7 +153,36 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 			m.waitForDownloadCompletion(ctx, job.Entry)
 			return nil
 		}
-		return fmt.Errorf("parsed NZB metadata missing")
+		content, err := os.ReadFile(job.Entry.Magnet)
+		if err != nil {
+			return fmt.Errorf("read staged NZB: %w", err)
+		}
+		meta, groups, err := m.usenet.ParseWithID(ctx, job.Entry.InfoHash, job.Request.Name, content, job.Request.Arr.Name)
+		if err != nil {
+			if errors.Is(err, parser.ErrReleaseUnavailable) {
+				m.rejectDamagedNZB(job, err)
+				return errJobSettled
+			}
+			if m.retryNZBParse(ctx, job, err) {
+				return errJobSettled
+			}
+			return fmt.Errorf("usenet parse failed: %w", err)
+		}
+
+		m.usenet.RemoveStagedNZB(job.Entry.Magnet)
+		job.Entry.Magnet = ""
+		job.NZBMeta = meta
+		job.NZBGroups = groups
+		job.Entry.Name = meta.Name
+		job.Entry.OriginalFilename = meta.Name
+		job.Entry.Size = meta.TotalSize
+		job.Entry.Bytes = meta.TotalSize
+		job.Entry.Status = debridTypes.TorrentStatusDownloading
+		job.Entry.ActiveProvider = "usenet"
+		_ = job.Entry.AddUsenetProvider(meta)
+		if err := m.queue.Update(job.Entry); err != nil {
+			return fmt.Errorf("update queued NZB: %w", err)
+		}
 	}
 	if job.Request != nil {
 		job.Request.Status = "started"
