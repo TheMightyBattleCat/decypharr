@@ -119,6 +119,9 @@ func NewDownloadManager(manager *Manager) *Downloader {
 }
 
 func (d *Downloader) download(torrent *storage.Entry) error {
+	if err := d.operationContext().Err(); err != nil {
+		return err
+	}
 	// Mark as in-flight up front so the queue scheduler skips this entry while
 	// we're iterating seasons / creating symlinks (processSymlink only flips
 	// this flag after its own directory scan, which is too late for the parent
@@ -137,11 +140,17 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 	if isMultiSeason {
 		seasonResults := convertToMultiSeason(torrent, seasons)
 		for _, result := range seasonResults {
+			if saved, err := d.manager.queue.GetTorrent(result.InfoHash); err == nil && saved.IsComplete {
+				continue
+			}
 			if err := d.manager.queue.Add(result); err != nil {
 				d.logger.Error().Err(err).Msgf("Failed to save season torrent")
 				continue
 			}
 			if err := d.process(result, torrentMountPath); err != nil {
+				if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
+					return err
+				}
 				d.markAsError(result, err)
 			}
 		}
@@ -150,6 +159,9 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		// (It has no active files of its own by this point, so the ffprobe
 		// import gate in completeEntry is a no-op here regardless.)
 		if err := d.completeEntry(torrent); err != nil {
+			if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
+				return err
+			}
 			d.markAsError(torrent, err)
 		}
 		return nil
@@ -237,6 +249,14 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 	if err := d.paddingImportGate(entry); err != nil {
 		// Same cleanup rationale as the gates above.
 		d.cleanupRejectedImport(entry)
+		return err
+	}
+	// The gates read under the manager's context and let an import through
+	// when a check is cut short. A shutdown cancels that context, so a check
+	// it cut short says nothing: stop here instead of reporting the import
+	// done, and processAction keeps the entry to import and check again after
+	// the restart.
+	if err := d.operationContext().Err(); err != nil {
 		return err
 	}
 	d.markAsCompleted(entry)
@@ -1062,8 +1082,6 @@ func (d *Downloader) processUsenetDownload(entry *storage.Entry) error {
 	err := p.Wait()
 
 	if err != nil {
-		entry.MarkAsError(err)
-		_ = d.manager.queue.Update(entry)
 		return fmt.Errorf("NZB download failed: %w", err)
 	}
 

@@ -21,6 +21,9 @@ func (m *Manager) restoreActiveDownloadJobs() {
 	// Clear flags left by interrupted local processing. Active downloads remain
 	// in storage for processQueuedEntries. Only unfinished imports need workers.
 	for _, entry := range entries {
+		if m.ctx.Err() != nil {
+			return
+		}
 		if entry.IsDownloading {
 			entry.IsDownloading = false
 			if err := m.queue.Update(entry); err != nil {
@@ -33,6 +36,9 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		}
 		job, err := m.rebuildQueuedJob(entry)
 		if err != nil {
+			if m.ctx.Err() != nil {
+				return
+			}
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 			continue
@@ -42,6 +48,9 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		}
 		_ = m.queue.Update(entry)
 		if err := m.SubmitJob(job); err != nil {
+			if m.ctx.Err() != nil {
+				return
+			}
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 		}
