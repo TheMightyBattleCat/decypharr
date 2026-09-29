@@ -13,6 +13,7 @@ import (
 	json "github.com/bytedance/sonic"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
@@ -172,7 +173,7 @@ func (p *plexLibrary) do(ctx context.Context, method, path string, out any, head
 	if out == nil {
 		return nil
 	}
-	return json.ConfigDefault.NewDecoder(resp.Body).Decode(out)
+	return request.DecodeJSON(resp, out)
 }
 
 // Sections lists the library sections.

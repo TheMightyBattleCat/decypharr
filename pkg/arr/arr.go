@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -116,13 +117,12 @@ func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload a
 		return nil, err
 	}
 
-	// Parse success result if provided. Stream-decode directly from the
-	// response body so large payloads (e.g. full Sonarr series lists) don't
-	// sit on the heap as raw bytes alongside the decoded object graph.
+	// Parse success result if provided. Read the body, then unmarshal: a
+	// streaming decode of a full Sonarr series list costs quadratic
+	// allocation. See request.DecodeJSON.
 	if res != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		defer resp.Body.Close()
-		dec := json.ConfigDefault.NewDecoder(resp.Body)
-		if err := dec.Decode(res); err != nil && err != io.EOF {
+		if err := request.DecodeJSON(resp, res); err != nil && !errors.Is(err, io.EOF) {
 			return resp, fmt.Errorf("failed to decode response: %w", err)
 		}
 	}
