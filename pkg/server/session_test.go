@@ -103,3 +103,34 @@ func TestSessionWithoutVersionIsRefused(t *testing.T) {
 		t.Fatalf("status = %d, want 401", response.Code)
 	}
 }
+
+// Only a credential change logs sessions out; an ordinary settings save must
+// not, since it does not save auth.json.
+func TestSettingsSaveKeepsBrowserSession(t *testing.T) {
+	cfg := useTestAuth(t, "password", "token")
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t), cookie: sessions.NewCookieStore([]byte(cfg.SecretKey()))}
+
+	login := httptest.NewRecorder()
+	s.LoginHandler(login, httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"admin","password":"password"}`)))
+	if login.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d", login.Code)
+	}
+	cookie := login.Result().Cookies()[0]
+
+	save := httptest.NewRecorder()
+	body := `{"bind_address":"0.0.0.0","port":"8282","download_folder":"/tmp/downloads"}`
+	s.handleUpdateConfig(save, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+	if save.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", save.Code, save.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/test", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("session after a settings save: status = %d, want 204", response.Code)
+	}
+}
