@@ -38,7 +38,7 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.verifyAuth(credentials.Username, credentials.Password) {
+	if config.VerifyAuth(credentials.Username, credentials.Password) {
 		session, _ := s.cookie.Get(r, "auth-session")
 		session.Values["authenticated"] = true
 		session.Values["username"] = credentials.Username
@@ -66,6 +66,18 @@ func (s *Server) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
+
+	// Registration exists only to set the first credential. Once one is
+	// stored, or auth is off, it stays closed; otherwise anyone who can reach
+	// the port could overwrite the stored username and password.
+	if !cfg.NeedsAuth() {
+		if r.Method == http.MethodPost {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	authCfg := cfg.GetAuth()
 
 	if r.Method == "GET" {
@@ -85,6 +97,10 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	password := r.FormValue("password")
 	confirmPassword := r.FormValue("confirmPassword")
 
+	if username == "" || password == "" {
+		http.Error(w, "Username and password are required", http.StatusBadRequest)
+		return
+	}
 	if password != confirmPassword {
 		http.Error(w, "Passwords do not match", http.StatusBadRequest)
 		return
