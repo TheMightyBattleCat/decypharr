@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
@@ -103,7 +104,9 @@ func Start(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			// graceful shutdown
+			// graceful shutdown. Cancel downloads and imports while the HTTP
+			// server is still up: an import's ffprobe reads through it.
+			mgr.StopDownloads(downloadStopTimeout)
 			cancelSvc() // propagate to services
 			<-done      // wait for them to finish
 			_log.Info().Msg("Decypharr has been stopped gracefully.")
@@ -111,6 +114,7 @@ func Start(ctx context.Context) error {
 			return nil
 
 		case <-restartCh:
+			mgr.StopDownloads(downloadStopTimeout)
 			cancelSvc() // tell existing services to shut down
 			_log.Info().Msg("Restarting Decypharr...")
 			<-done // wait for them to finish
@@ -121,6 +125,10 @@ func Start(ctx context.Context) error {
 		}
 	}
 }
+
+// downloadStopTimeout bounds how long shutdown waits for cancelled downloads
+// and imports to end before the HTTP server stops.
+const downloadStopTimeout = 30 * time.Second
 
 func createMountManager(mgr *manager.Manager, cfg *config.Config) manager.MountManager {
 	switch cfg.Mount.Type {

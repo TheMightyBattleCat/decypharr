@@ -531,15 +531,41 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the manager and cleans up all resources
-func (m *Manager) Stop() error {
-	m.logger.Info().Msg("Stopping manager")
+// cancelDownloadTasks stops new download tasks from starting and cancels the
+// context the running ones (downloads and their imports) use.
+func (m *Manager) cancelDownloadTasks() {
 	m.downloadMu.Lock()
 	m.downloadsStopped = true
 	if m.cancelDownloads != nil {
 		m.cancelDownloads()
 	}
 	m.downloadMu.Unlock()
+}
+
+// StopDownloads cancels downloads and imports, then waits up to timeout for
+// their tasks to end. It must run before the HTTP server stops: an import's
+// ffprobe check reads the file through this process's WebDAV, and with the
+// server gone it fails with "connection refused" and the release is judged
+// unreadable and blocklisted. Cancelled first, the check is inconclusive and
+// the import is kept for the next start. Stop does the rest.
+func (m *Manager) StopDownloads(timeout time.Duration) {
+	m.cancelDownloadTasks()
+	done := make(chan struct{})
+	go func() {
+		m.downloadTasks.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		m.logger.Warn().Dur("timeout", timeout).Msg("Downloads still running after cancel; stopping the server anyway")
+	}
+}
+
+// Stop stops the manager and cleans up all resources
+func (m *Manager) Stop() error {
+	m.logger.Info().Msg("Stopping manager")
+	m.cancelDownloadTasks()
 
 	// Stop schedulers
 	if m.scheduler != nil {
