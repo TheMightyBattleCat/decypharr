@@ -1025,7 +1025,7 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 		return res
 	}
 	if opts.UnrestrictLink {
-		return r.probeTorrentFileByUnrestrict(entry, file, name, res, client)
+		return r.probeTorrentFileByUnrestrict(ctx, entry, file, name, res, client)
 	}
 	if !client.SupportsCheck() {
 		res.reason = "provider_check_unsupported"
@@ -1051,7 +1051,7 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 	return res
 }
 
-func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storage.File, name string, res fileResult, client debrid.Client) fileResult {
+func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, client debrid.Client) fileResult {
 	placement := entry.GetActiveProvider()
 	if placement == nil {
 		res.reason = "placement_not_found"
@@ -1077,7 +1077,7 @@ func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storag
 		ByteRange: file.ByteRange,
 		Deleted:   file.Deleted,
 	}
-	downloadLink, err := client.GetDownloadLink(placement.ID, debridFile)
+	downloadLink, err := client.GetDownloadLink(ctx, placement.ID, debridFile)
 	if err == nil && !downloadLink.Empty() {
 		res.healthy = true
 		return res

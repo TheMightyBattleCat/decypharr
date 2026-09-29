@@ -155,12 +155,21 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 }
 
 func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.Entry, dl types.DownloadLink, attempt int) (types.DownloadLink, error) {
-	if errors.Is(err, customerror.HosterUnavailableError) {
+	// A provider that no longer serves the file (or hands back no link) is
+	// repaired by re-inserting the entry. Other errors - an outage, a rate or
+	// traffic limit - are returned as they are: a re-insert during an outage
+	// can fail, mark the entry Bad, and send it to a blocklisting re-grab.
+	hosterGone := errors.Is(err, customerror.HosterUnavailableError)
+	if hosterGone || errors.Is(err, types.EmptyDownloadLinkError) {
+		reason := "empty_link"
+		if hosterGone {
+			reason = "hoster_unavailable"
+		}
 		if entry.Bad {
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
 		}
 		if attempt >= MaxReinsertionAttempt {
-			s.markEntryBad(entry, dl.Filename, attempt, "hoster_unavailable")
+			s.markEntryBad(entry, dl.Filename, attempt, reason)
 			return emptyDownloadLink, fmt.Errorf("entry %s file %s still unresolvable after %d re-insertion attempts", entry.GetFolder(), dl.Filename, attempt)
 		}
 		if err := s.repairer(ctx, entry); err != nil {
@@ -249,7 +258,7 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 	}
 
 	// This uses account-level caching internally
-	downloadLink, err := client.GetDownloadLink(placement.ID, debridFile)
+	downloadLink, err := client.GetDownloadLink(ctx, placement.ID, debridFile)
 	if err != nil {
 		return downloadLink, err
 	}
