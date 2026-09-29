@@ -255,14 +255,11 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 		magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
 	}
 
-	arr := m.arr.GetOrCreate(entry.Category)
-
 	debridTorrent := &debridTypes.Torrent{
 		Id:               placement.ID,
 		InfoHash:         entry.InfoHash,
 		Magnet:           magnet,
 		Name:             magnet.Name,
-		Arr:              arr,
 		Size:             entry.Size,
 		Files:            make(map[string]debridTypes.File),
 		DownloadUncached: entry.DownloadUncached,
@@ -415,7 +412,6 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		InfoHash: importRequest.Magnet.InfoHash,
 		Magnet:   importRequest.Magnet,
 		Name:     importRequest.Magnet.Name,
-		Arr:      importRequest.Arr,
 		Size:     importRequest.Magnet.Size,
 		Files:    make(map[string]debridTypes.File),
 	}
@@ -456,7 +452,6 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			errs = append(errs, err)
 			continue
 		}
-		dbt.Arr = importRequest.Arr
 		_logger.Info().Str("id", dbt.Id).Msgf("Entry: %s submitted to %s", dbt.Name, db.Config().Name)
 
 		torrent, err := db.CheckStatus(dbt)
