@@ -117,18 +117,18 @@ func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, e
 				break
 			}
 		}
-		a = arr.New(category, username, password, false, downloadUncached, "", "auto")
+		a = arr.New(category, "", "", false, downloadUncached, "", string(arr.SourceAuto))
 	}
-	arrValidated := false // This is a flag to indicate if arr validation was successful
 	if (username == "" || password == "") && cfg.UseAuth {
 		return nil, fmt.Errorf("unauthorized: Host and token are required for authentication(you've enabled authentication)")
 	}
-	if a.Source == "auto" {
-		a.Host = username
-		a.Token = password
-	}
-	if err := a.Validate(); err == nil {
-		arrValidated = true
+
+	// Validate the sent credentials on a candidate: the stored Arr is shared,
+	// so it must not change unless the candidate validates.
+	arrValidated := false
+	if username != "" && password != "" {
+		candidate := arr.New(category, username, password, a.SkipRepair, a.DownloadUncached, a.SelectedDebrid, string(arr.SourceAuto))
+		arrValidated = candidate.Validate() == nil
 	}
 
 	if !arrValidated && cfg.UseAuth {
@@ -137,8 +137,12 @@ func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, e
 			return nil, fmt.Errorf("unauthorized: invalid credentials")
 		}
 	}
-	if username != "" && password != "" {
-		s.manager.Arr().AddOrUpdate(a)
+	if arrValidated && a.Source == arr.SourceAuto {
+		updated := *a
+		updated.Host = username
+		updated.Token = password
+		s.manager.Arr().AddOrUpdate(&updated)
+		a = &updated
 	}
 	return a, nil
 }
