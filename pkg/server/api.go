@@ -287,7 +287,6 @@ func (s *Server) handlePurgeMountCache(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
-	// Parse query parameters for server-side filtering, sorting, and pagination
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -311,16 +310,13 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 		sortOrder = "desc"
 	}
 
-	// GetReader all torrents
 	allTorrents := s.manager.Queue().ListFilter("", config.ProtocolAll, "", nil, "added_on", false)
 	for _, t := range allTorrents {
 		t.Sanitize()
 	}
 
-	// Apply filters
 	filteredTorrents := make([]*storage.Entry, 0)
 	for _, t := range allTorrents {
-		// Search filter - search in name and hash
 		if search != "" {
 			searchIn := strings.ToLower(t.Name + " " + t.InfoHash)
 			if !strings.Contains(searchIn, search) {
@@ -328,12 +324,10 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Category filter
 		if category != "" && t.Category != category {
 			continue
 		}
 
-		// State filter
 		if state != "" && t.State != storage.TorrentState(state) {
 			continue
 		}
@@ -341,15 +335,12 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 		filteredTorrents = append(filteredTorrents, t)
 	}
 
-	// Apply sorting
 	sortQueuedTorrents(filteredTorrents, sortBy, sortOrder)
 
-	// Calculate pagination
 	total := len(filteredTorrents)
 	totalPages := (total + limit - 1) / limit
 	offset := (page - 1) * limit
 
-	// Apply pagination
 	var paginatedTorrents []*storage.Entry
 	if offset < total {
 		end := min(offset+limit, total)
@@ -358,7 +349,6 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 		paginatedTorrents = []*storage.Entry{}
 	}
 
-	// GetReader unique categories
 	categorySet := make(map[string]bool)
 	for _, t := range allTorrents {
 		if t.Category != "" {
@@ -383,7 +373,6 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 	}, http.StatusOK)
 }
 
-// sortQueuedTorrents sorts torrents based on the given field and order
 func sortQueuedTorrents(torrents []*storage.Entry, sortBy, sortOrder string) {
 	if len(torrents) == 0 {
 		return
