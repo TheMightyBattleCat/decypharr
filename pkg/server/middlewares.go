@@ -36,11 +36,15 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Fall back to session authentication
-		session, _ := s.cookie.Get(r, "auth-session")
+		// Fall back to session authentication. A session is valid only for
+		// the credentials it logged in under: saving the credentials again (a
+		// new password, a new API token) changes their session version.
+		session, err := s.cookie.Get(r, "auth-session")
 		auth, ok := session.Values["authenticated"].(bool)
+		version, hasVersion := session.Values["auth_version"].(string)
+		currentAuth := cfg.GetAuth()
 
-		if !ok || !auth {
+		if err != nil || !ok || !auth || !hasVersion || currentAuth == nil || version != currentAuth.SessionVersion {
 			if isAPI {
 				s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
 			} else {

@@ -191,9 +191,13 @@ type CustomFolders struct {
 }
 
 type Auth struct {
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	APIToken string `json:"api_token,omitempty"`
+	// SessionVersion changes on every save of the credentials. A browser
+	// session remembers the version it logged in under, and stops working once
+	// the credentials change.
+	SessionVersion string `json:"session_version,omitempty"`
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	APIToken       string `json:"api_token,omitempty"`
 }
 
 // RepairSource selects where the health checker enumerates entries from.
@@ -488,6 +492,10 @@ func (r RepairConfig) FFProbeDecodeCheckEnabled() bool {
 }
 
 type Config struct {
+	// SessionSecret signs the web session cookie and the qBittorrent login
+	// cookie. It is generated once per install and saved with the config.
+	SessionSecret string `json:"session_secret,omitempty"`
+
 	// server
 	BindAddress string `json:"bind_address,omitempty"`
 	URLBase     string `json:"url_base,omitempty"`
@@ -606,9 +614,19 @@ func (c *Config) loadConfig() error {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return fmt.Errorf("error parsing config JSON: %w", err)
 	}
+	hadSessionSecret := c.SessionSecret != ""
 
 	// Set defaults for any missing values
 	c.setDefaults()
+
+	// Save a newly generated session secret so sessions and qBittorrent
+	// login cookies stay valid after a restart. This runs before the
+	// environment overrides so none of them is written to config.json.
+	if !hadSessionSecret {
+		if err := c.Save(); err != nil {
+			return err
+		}
+	}
 
 	// Apply environment variable overrides
 	c.applyEnvOverrides()
@@ -690,7 +708,7 @@ func (c *Config) GetMaxFileSize() int64 {
 }
 
 func (c *Config) SecretKey() string {
-	return cmp.Or(getEnv("SECRET_KEY"), "\"wqj(v%lj*!-+kf@4&i95rhh_!5_px5qnuwqbr%cjrvrozz_r*(\"")
+	return cmp.Or(getEnv("SECRET_KEY"), c.SessionSecret)
 }
 
 func (c *Config) GetAuth() *Auth {
@@ -709,13 +727,26 @@ func (c *Config) GetAuth() *Auth {
 	return c.Auth
 }
 
+// SaveAuth stores auth in auth.json (owner-only) with a new session version,
+// so browser sessions from before the change must log in again.
 func (c *Config) SaveAuth(auth *Auth) error {
-	c.Auth = auth
-	data, err := json.Marshal(auth)
+	if auth == nil {
+		return errors.New("authentication settings are required")
+	}
+	updated := *auth
+	updated.SessionVersion = rand.Text()
+	data, err := json.Marshal(&updated)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.AuthFile(), data, 0644)
+	if err := os.Chmod(c.AuthFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.WriteFile(c.AuthFile(), data, 0600); err != nil {
+		return err
+	}
+	c.Auth = &updated
+	return nil
 }
 
 func (c *Config) NeedsAuth() bool {
@@ -784,6 +815,11 @@ func (c *Config) migrateNotifications() {
 }
 
 func (c *Config) setDefaults() {
+	if c.SessionSecret == "" {
+		var key [32]byte
+		_, _ = rand.Read(key[:])
+		c.SessionSecret = hex.EncodeToString(key[:])
+	}
 	// Migrate deprecated fields to Manager (backward compatibility)
 	c.migrateQBitTorrentToManager()
 	c.migrateNotifications()
@@ -1070,7 +1106,10 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.JsonFile(), data, 0644); err != nil {
+	if err := os.Chmod(c.JsonFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.WriteFile(c.JsonFile(), data, 0600); err != nil {
 		fmt.Printf("Failed to write config file: %v\n", err)
 		return err
 	}

@@ -69,6 +69,34 @@ func TestAuthenticateDiscoversValidatedArrCredentials(t *testing.T) {
 	}
 }
 
+func TestPreferencesRequireAuthentication(t *testing.T) {
+	q := newAuthenticationTestQBit(t)
+	cfg := config.Get()
+	cfg.UseAuth = true
+	cfg.Auth = &config.Auth{Username: "admin", Password: "not-a-bcrypt-hash", APIToken: "api-token"}
+	routes := q.Routes()
+	for _, token := range []string{"", "wrong", "api-token"} {
+		req := httptest.NewRequest(http.MethodGet, "/app/preferences", nil)
+		if token != "" {
+			req.SetBasicAuth("client", token)
+		}
+		response := httptest.NewRecorder()
+		routes.ServeHTTP(response, req)
+		want := http.StatusUnauthorized
+		if token == "api-token" {
+			want = http.StatusOK
+		}
+		if response.Code != want {
+			t.Fatalf("token %q: status = %d, want %d", token, response.Code, want)
+		}
+	}
+	response := httptest.NewRecorder()
+	routes.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/app/version", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("public version status = %d, want 200", response.Code)
+	}
+}
+
 // TestDecodeAuthHeader covers the fix for the slice-bounds-out-of-range panic
 // at pkg/server/qbit/context.go:60-62. When the base64-decoded payload contains
 // no colon, strings.LastIndex returns -1 and the subsequent slice expression

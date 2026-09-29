@@ -2,6 +2,7 @@ package sabnzbd
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
@@ -106,7 +107,8 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, error) {
 	cfg := config.Get()
 	a := s.manager.Arr().Get(category)
-	if a == nil {
+	known := a != nil
+	if !known {
 		// Arr is not yet in runtime storage — look for a matching config entry
 		// so we inherit its download_uncached setting. If no config match,
 		// leave nil so SendToDebrid falls back to the debrid provider's setting.
@@ -119,8 +121,20 @@ func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, e
 		}
 		a = arr.New(category, "", "", false, downloadUncached, "", string(arr.SourceAuto))
 	}
-	if (username == "" || password == "") && cfg.UseAuth {
-		return nil, fmt.Errorf("unauthorized: Host and token are required for authentication(you've enabled authentication)")
+	if cfg.UseAuth {
+		// With auth on, the caller must prove who it is: the web login, the
+		// API token as the password, or the exact host and API key of an Arr
+		// configured in Settings. An auto-detected Arr's host and key came from
+		// an earlier caller, so they are not a credential. Nothing is probed or
+		// stored here, so the stored Arr keeps its own host and key.
+		if config.VerifyAuth(username, password) || config.VerifyToken(password) {
+			return a, nil
+		}
+		if known && a.Source != arr.SourceAuto && username == a.Host && password != "" &&
+			subtle.ConstantTimeCompare([]byte(password), []byte(a.Token)) == 1 {
+			return a, nil
+		}
+		return nil, fmt.Errorf("unauthorized: invalid credentials")
 	}
 
 	// Validate the sent credentials on a candidate: the stored Arr is shared,
@@ -131,12 +145,6 @@ func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, e
 		arrValidated = candidate.Validate() == nil
 	}
 
-	if !arrValidated && cfg.UseAuth {
-		// If arr validation failed, try to use user auth validation
-		if !config.VerifyAuth(username, password) {
-			return nil, fmt.Errorf("unauthorized: invalid credentials")
-		}
-	}
 	if arrValidated && a.Source == arr.SourceAuto {
 		updated := *a
 		updated.Host = username

@@ -42,6 +42,7 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		session, _ := s.cookie.Get(r, "auth-session")
 		session.Values["authenticated"] = true
 		session.Values["username"] = credentials.Username
+		session.Values["auth_version"] = sessionVersion(cfg)
 		if err := session.Save(r, w); err != nil {
 			http.Error(w, "Error saving session", http.StatusInternalServerError)
 			return
@@ -126,12 +127,22 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	session, _ := s.cookie.Get(r, "auth-session")
 	session.Values["authenticated"] = true
 	session.Values["username"] = username
+	session.Values["auth_version"] = sessionVersion(cfg)
 	if err := session.Save(r, w); err != nil {
 		http.Error(w, "Error saving session", http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// sessionVersion is the version of the stored credentials that a new browser
+// session records; authMiddleware refuses the session once it changes.
+func sessionVersion(cfg *config.Config) string {
+	if auth := cfg.GetAuth(); auth != nil {
+		return auth.SessionVersion
+	}
+	return ""
 }
 
 func (s *Server) IndexHandler(w http.ResponseWriter, r *http.Request) {
