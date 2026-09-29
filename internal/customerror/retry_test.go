@@ -36,3 +36,26 @@ func TestRetryClassificationUsesWrappedMetadata(t *testing.T) {
 		})
 	}
 }
+
+// A debrid link error that only needs a new link or another try is not
+// permanent, even when its text matches a permanent pattern; one that says
+// it is permanent still is.
+func TestRefetchableLinkErrorIsNotPermanent(t *testing.T) {
+	refresh := link.NewRefetchableError(fmt.Errorf("failed to refresh entry: %w", errors.New("torrent not found")), "refresh_failed")
+	retry := link.NewRetryableError(errors.New("HTTP 404 from a mirror"), "503")
+	gone := link.NewPermanentError(link.Err404, "404")
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"refetchable":         {refresh, false},
+		"wrapped refetchable": {fmt.Errorf("read chunk: %w", refresh), false},
+		"retryable":           {retry, false},
+		"permanent 404":       {gone, true},
+		"plain not found":     {errors.New("file not found"), true},
+	} {
+		if got := customerror.IsPermanentError(tc.err); got != tc.want {
+			t.Errorf("%s: IsPermanentError(%q) = %t, want %t", name, tc.err, got, tc.want)
+		}
+	}
+}

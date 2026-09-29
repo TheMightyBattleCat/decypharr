@@ -167,6 +167,23 @@ func IsPermanentError(err error) bool {
 		return true
 	}
 
+	// An error that says it only needs a new link, or another try, is not
+	// permanent, whatever its text: a debrid link error such as
+	// "refresh_failed: ... not found" would otherwise match the patterns
+	// below and trip the mount's read breaker before the link is refetched.
+	if r, ok := errors.AsType[interface {
+		error
+		ShouldRefetch() bool
+	}](err); ok && r.ShouldRefetch() {
+		return false
+	}
+	if r, ok := errors.AsType[interface {
+		error
+		ShouldRetry() bool
+	}](err); ok && r.ShouldRetry() {
+		return false
+	}
+
 	errStr := strings.ToLower(err.Error())
 	for _, pattern := range permanentErrorStrings {
 		if strings.Contains(errStr, pattern) {
