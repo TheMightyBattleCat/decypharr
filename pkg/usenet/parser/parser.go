@@ -319,7 +319,7 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 				file.Name = nzb.Name
 			}
 		}
-		if err := cfg.IsFileAllowed(file.Name, file.Size); err != nil {
+		if err := cfg.ValidateFileAllowed(file.Name, file.Size); err != nil {
 			skippedFiles++
 			skippedErr = err
 			continue

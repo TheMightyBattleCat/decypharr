@@ -206,7 +206,7 @@ func (dl *DebridLink) GetTorrent(torrentId string) (*types.Torrent, error) {
 	}
 	cfg := config.Get()
 	for _, f := range t.Files {
-		if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+		if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 			continue
 		}
 		file := types.File{
@@ -267,7 +267,7 @@ func (dl *DebridLink) UpdateTorrent(t *types.Torrent) error {
 	cfg := config.Get()
 	now := time.Now()
 	for _, f := range data.Files {
-		if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+		if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 			continue
 		}
 		file := types.File{
@@ -583,7 +583,7 @@ func (dl *DebridLink) getTorrents(page, perPage int) ([]*types.Torrent, error) {
 		cfg := config.Get()
 		now := time.Now()
 		for _, f := range t.Files {
-			if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+			if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 				continue
 			}
 			file := types.File{
