@@ -356,10 +356,6 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
 		return
 	}
-	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
-		m.waitForDownloadCompletion(ctx, job.Entry)
-		return
-	}
 
 	var err error
 	switch job.Type {
@@ -398,6 +394,11 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		return
 	}
 
+	// A new download keeps its worker slot until the entry leaves the
+	// downloading state, which includes processAction's symlink and ffprobe
+	// import check, so max_active_downloads also bounds how many import
+	// verifications read at once. Restored entries get no such job (see
+	// restoreActiveDownloadJobs).
 	m.waitForDownloadCompletion(ctx, job.Entry)
 }
 
@@ -426,7 +427,6 @@ func (m *Manager) migrate() {
 	if err == nil && !status.Running && status.Completed > 0 {
 		m.logger.Info().
 			Int("completed", status.Completed).
-			Int("errors", status.Errors).
 			Msg("Migration already completed previously")
 		return
 	}
