@@ -156,6 +156,17 @@ func IsPermanentError(err error) bool {
 		return false
 	}
 
+	// An error that says it is permanent is. "Not retryable" is not read as
+	// permanent: *nntp.Error reports yEnc decode, protocol and pool errors as
+	// not retryable, and a permanent verdict during playback deletes and
+	// re-searches the release (see vfs downloaders).
+	if p, ok := errors.AsType[interface {
+		error
+		IsPermanent() bool
+	}](err); ok && p.IsPermanent() {
+		return true
+	}
+
 	errStr := strings.ToLower(err.Error())
 	for _, pattern := range permanentErrorStrings {
 		if strings.Contains(errStr, pattern) {
