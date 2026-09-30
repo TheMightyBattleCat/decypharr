@@ -1379,6 +1379,11 @@ func (c *Client) Stats() map[string]any {
 			// primaries (body_routing.go). 0 until measured.
 			"body_mib_s":    float64(pp.body.bytesPerSec.Load()) / (1 << 20),
 			"body_deferred": c.bodyRoutingOn() && pp.body.slow.Load(),
+			// Per-STAT latency BatchStat routing judges by (stat_routing.go),
+			// 0 until measured, and how many pipelined STAT windows were
+			// discarded because their replies did not line up.
+			"stat_ms":      float64(pp.stat.nsPerStat.Load()) / 1e6,
+			"stat_desyncs": pp.stat.desyncs.Load(),
 		}
 
 		// Add speed test result if available
@@ -1794,66 +1799,74 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 	return results, nil
 }
 
-// batchStatOnProvider STATs messageIDs one at a time on a single connection to
-// provider, and records the provider's per-STAT latency for routing. Only found
-// articles are timed: providers answer "no such article" 40-100x slower than a
-// hit (a production install: eweka ~450 ms, newshosting ~1.2 s, against ~10 ms), so misses
-// - and every fall-through chunk is all misses - would make a fast provider look
-// slow. A connection that can't be had or breaks mid-chunk records
-// statErrorPenalty.
-func (c *Client) batchStatOnProvider(ctx context.Context, provider config.UsenetProvider, messageIDs []string) ([]StatResult, error) {
-	conn, providerCfg, err := c.getConnectionFromProvider(ctx, provider)
-	if err != nil {
-		if ctx.Err() == nil {
-			c.recordStatSample(provider, statErrorPenalty)
-		}
-		return nil, err
-	}
+// statPipelineDepth is how many STATs share one write and one connection
+// checkout. The connection goes back to the pool after every window, so a
+// playback read arriving while every slot is busy waits for at most one
+// window, not a whole chunk.
+const statPipelineDepth = 16
 
+// batchStatOnProvider STATs messageIDs on provider, statPipelineDepth at a
+// time in pipelined windows (Connection.StatBatch), and records the
+// provider's per-STAT latency for routing. Only found articles are timed:
+// providers answer "no such article" 40-100x slower than a hit (a production
+// install: eweka ~450 ms, newshosting ~1.2 s, against ~10 ms), so misses - and
+// every fall-through chunk is all misses - would make a fast provider look
+// slow. A connection that can't be had or a window that fails records
+// statErrorPenalty. Windows already read are kept when a later one fails.
+func (c *Client) batchStatOnProvider(ctx context.Context, provider config.UsenetProvider, messageIDs []string) ([]StatResult, error) {
 	var hitTime time.Duration
 	hits := 0
-	results := make([]StatResult, len(messageIDs))
-	for i, msgID := range messageIDs {
-		results[i].MessageID = msgID
-		if ctx.Err() != nil {
+	results := make([]StatResult, 0, len(messageIDs))
+	for start := 0; start < len(messageIDs); start += statPipelineDepth {
+		if err := ctx.Err(); err != nil {
 			c.recordStatHits(provider, hitTime, hits)
-			results[i].Available = false
-			results[i].Error = ctx.Err()
+			return results, err
+		}
+		end := min(start+statPipelineDepth, len(messageIDs))
+		conn, providerCfg, err := c.getConnectionFromProvider(ctx, provider)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.recordStatSample(provider, statErrorPenalty)
+			} else {
+				c.recordStatHits(provider, hitTime, hits)
+			}
+			return results, err
+		}
+
+		// A cancelled sweep closes the connection to unblock the reads.
+		stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		window, windowHitTime, statErr := conn.StatBatch(messageIDs[start:end])
+		stopCancel()
+		if statErr != nil {
 			c.release(conn)
-			return results, ctx.Err()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				c.recordStatHits(provider, hitTime, hits)
+				for i := range window {
+					window[i].Error = ctxErr
+				}
+				return append(results, window...), ctxErr
+			}
+			if errors.Is(statErr, errStatDesync) {
+				if pp, ok := c.pools[provider.Host]; ok {
+					pp.stat.desyncs.Add(1)
+				}
+				c.logger.Warn().Err(statErr).Str("provider", provider.Host).Int("window", end-start).
+					Msg("STAT pipeline replies did not line up; discarded the window and closed the connection")
+			}
+			c.recordStatSample(provider, statErrorPenalty)
+			return append(results, window...), statErr
 		}
-
-		sent := time.Now()
-		_, _, statErr := conn.Stat(msgID)
-		if statErr == nil {
-			hitTime += time.Since(sent)
-			hits++
-			results[i].Available = true
-			continue
+		for _, r := range window {
+			if r.Available {
+				hits++
+			}
 		}
-
-		results[i].Available = false
-		results[i].Error = statErr
-
-		var nntpErr *Error
-		if errors.As(statErr, &nntpErr) && nntpErr.Type != ErrorTypeConnection && nntpErr.Type != ErrorTypeTimeout {
-			continue
-		}
-
-		connErr := NewConnectionError(fmt.Errorf("failed to STAT %s at %d/%d: %w", msgID, i+1, len(messageIDs), statErr))
-		results[i].Error = connErr
-		for j := i + 1; j < len(messageIDs); j++ {
-			results[j].MessageID = messageIDs[j]
-			results[j].Available = false
-			results[j].Error = connErr
-		}
-		c.recordStatSample(provider, statErrorPenalty)
-		c.release(conn)
-		return results, connErr
+		hitTime += windowHitTime
+		results = append(results, window...)
+		c.returnOrReleaseConn(conn, providerCfg)
 	}
 
 	c.recordStatHits(provider, hitTime, hits)
-	c.returnOrReleaseConn(conn, providerCfg)
 	return results, nil
 }
 

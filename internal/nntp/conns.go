@@ -802,7 +802,10 @@ func (c *Connection) Stat(messageID string) (articleNumber int, echoedID string,
 	if err != nil {
 		return 0, "", NewConnectionError(fmt.Errorf("failed to read STAT response: %w", err))
 	}
+	return parseStatResponse(resp)
+}
 
+func parseStatResponse(resp Response) (articleNumber int, echoedID string, err error) {
 	if resp.Code != 223 {
 		return 0, "", classifyNNTPError(resp.Code, resp.Message)
 	}
@@ -818,6 +821,90 @@ func (c *Connection) Stat(messageID string) (articleNumber int, echoedID string,
 	echoedID = fields[1]
 
 	return articleNumber, echoedID, nil
+}
+
+// errStatDesync marks a STAT pipeline whose replies did not line up with its
+// commands. Every result in that window is untrusted.
+var errStatDesync = errors.New("STAT pipeline replies out of step with commands")
+
+// StatBatch sends every STAT in one write, followed by a DATE, and reads the
+// replies in order. It returns the time charged to found articles: each hit
+// is charged the time since the previous reply (the first since the write),
+// so a slow 430 is not billed to the hit behind it.
+//
+// Replies carry no command tag, so a server that drops or adds one line
+// shifts every later reply onto the wrong message ID, turning a present
+// article into a false 430. The DATE is the check: its 111 must come exactly
+// after the last STAT reply. A 111 in a STAT slot, anything but 111 after the
+// last one, bytes left over after it, a reply that is neither 223 nor
+// not-found, or a transport error fails the whole window as a connection
+// error. The connection is then unusable and the caller must release it.
+func (c *Connection) StatBatch(messageIDs []string) ([]StatResult, time.Duration, error) {
+	results := make([]StatResult, len(messageIDs))
+	for i, id := range messageIDs {
+		results[i].MessageID = id
+	}
+	if len(messageIDs) == 0 {
+		return results, 0, nil
+	}
+	fail := func(err error) ([]StatResult, time.Duration, error) {
+		connErr := NewConnectionError(err)
+		for i := range results {
+			results[i].Available = false
+			results[i].Error = connErr
+		}
+		return results, 0, connErr
+	}
+
+	_ = c.conn.SetWriteDeadline(utils.Now().Add(timeouts.HandshakeTimeout))
+	var werr error
+	for _, id := range messageIDs {
+		if werr = c.writeCommandArg("STAT", FormatMessageID(id)); werr != nil {
+			break
+		}
+	}
+	if werr == nil {
+		werr = c.writeCommandArg("DATE", "")
+	}
+	if werr == nil {
+		werr = c.writer.Flush()
+	}
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		return fail(fmt.Errorf("write STAT pipeline of %d: %w", len(messageIDs), werr))
+	}
+
+	var hitTime time.Duration
+	prev := time.Now()
+	for i := range results {
+		resp, err := c.readResponseWithDeadline(timeouts.StreamBodyTimeout)
+		if err != nil {
+			return fail(fmt.Errorf("read STAT pipeline at %d/%d: %w", i+1, len(results), err))
+		}
+		now := time.Now()
+		_, _, statErr := parseStatResponse(resp)
+		switch {
+		case statErr == nil:
+			results[i].Available = true
+			hitTime += now.Sub(prev)
+		case IsArticleNotFoundError(statErr):
+			results[i].Error = statErr
+		default:
+			return fail(fmt.Errorf("%w: reply %d/%d was %d %q", errStatDesync, i+1, len(results), resp.Code, resp.Message))
+		}
+		prev = now
+	}
+	resp, err := c.readResponseWithDeadline(timeouts.StreamBodyTimeout)
+	if err != nil {
+		return fail(fmt.Errorf("read STAT pipeline DATE check: %w", err))
+	}
+	if resp.Code != 111 {
+		return fail(fmt.Errorf("%w: expected 111 after %d replies, got %d %q", errStatDesync, len(results), resp.Code, resp.Message))
+	}
+	if n := c.reader.Buffered(); n > 0 {
+		return fail(fmt.Errorf("%w: %d unexpected bytes after the DATE check", errStatDesync, n))
+	}
+	return results, hitTime, nil
 }
 
 // SelectGroup selects a newsgroup and returns group information

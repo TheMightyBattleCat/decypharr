@@ -35,7 +35,11 @@ type fakeNNTP struct {
 	missing   map[string]bool   // message IDs (without brackets) answered 430
 	dropAfter int64             // close each connection after this many STATs (0: never)
 	bodies    map[string]string // message ID -> wire body for BODY, without the ".\r\n" terminator
+	noReply   map[string]bool   // message IDs whose STAT gets no reply at all (a dropped line)
+	extraLine map[string]bool   // message IDs whose STAT reply is followed by a stray line
+	denied    map[string]bool   // message IDs whose STAT is answered 502
 	stats     atomic.Int64
+	maxQueued atomic.Int64 // most command bytes already waiting when a STAT was answered
 	bodyReqs  atomic.Int64
 	wg        sync.WaitGroup
 }
@@ -91,14 +95,27 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 			}
 			served++
 			s.stats.Add(1)
+			if q := int64(r.Buffered()); q > s.maxQueued.Load() {
+				s.maxQueued.Store(q)
+			}
 			id := strings.Trim(strings.TrimPrefix(line, "STAT "), "<>")
-			if s.missing[id] {
+			switch {
+			case s.noReply[id]:
+				continue
+			case s.denied[id]:
+				_, _ = w.WriteString("502 access denied\r\n")
+			case s.missing[id]:
 				time.Sleep(s.missDelay)
 				_, _ = w.WriteString("430 no such article\r\n")
-			} else {
+			default:
 				time.Sleep(s.delay)
 				_, _ = w.WriteString("223 0 <" + id + ">\r\n")
 			}
+			if s.extraLine[id] {
+				_, _ = w.WriteString("223 0 <stray@test>\r\n")
+			}
+		case line == "DATE":
+			_, _ = w.WriteString("111 20260930120000\r\n")
 		case strings.HasPrefix(line, "BODY "):
 			s.bodyReqs.Add(1)
 			id := strings.Trim(strings.TrimPrefix(line, "BODY "), "<>")

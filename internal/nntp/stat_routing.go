@@ -58,6 +58,7 @@ type statLatency struct {
 	sampledAt atomic.Int64 // unix nanoseconds of the latest sample
 	exploring atomic.Bool  // an ineligible home has a worker out re-measuring it
 	eligible  atomic.Bool  // last eligibility a worker saw, for transition logs
+	desyncs   atomic.Int64 // pipelined STAT windows discarded as out of step
 }
 
 // record folds one per-STAT latency sample into the average. The first sample,
