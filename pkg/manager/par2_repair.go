@@ -723,16 +723,23 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 
 // errMoreDamageThanRecorded is the terminal error for a damaged set too big to
 // repair. It names only the limit that was actually exceeded: too few recovery
-// slices retained in the posting, the per-repair slice cap, or both. The
-// "more damage than recorded" prefix is what classifyPar2Failure matches.
-func errMoreDamageThanRecorded(damaged int, available uint32) error {
+// slices retained in the posting, the per-repair limit (the slice cap, or the
+// repair memory limit for large slices), or both. The "more damage than
+// recorded" prefix is what classifyPar2Failure matches.
+func errMoreDamageThanRecorded(damaged int, available uint32, sliceSize int64) error {
+	limit := par2.MaxRepairSlicesFor(sliceSize)
+	limitText := fmt.Sprintf("the %d-slice repair cap", limit)
+	if limit < par2.MaxRepairSlices {
+		limitText = fmt.Sprintf("the %d-slice limit for %.1f MiB slices (%d MiB repair memory)",
+			limit, float64(sliceSize)/(1<<20), par2.MaxAccumulatorMemory>>20)
+	}
 	overRetained := uint32(damaged) > available
-	overCap := damaged > par2.MaxRepairSlices
+	overLimit := damaged > limit
 	switch {
-	case overRetained && overCap:
-		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained (also over the %d-slice repair cap)", damaged, available, par2.MaxRepairSlices)
-	case overCap:
-		return fmt.Errorf("more damage than recorded; %d damaged slices is over the %d-slice repair cap (%d recovery slices retained)", damaged, par2.MaxRepairSlices, available)
+	case overRetained && overLimit:
+		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained (also over %s)", damaged, available, limitText)
+	case overLimit:
+		return fmt.Errorf("more damage than recorded; %d damaged slices is over %s (%d recovery slices retained)", damaged, limitText, available)
 	default:
 		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained", damaged, available)
 	}
@@ -1922,15 +1929,16 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	if earlyIdx != nil {
 		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, nzb.Par2Match, p.logger); earlyK > 0 {
-			if earlyK > par2.MaxRepairSlices || uint32(earlyK) > available {
+			if earlyK > par2.MaxRepairSlicesFor(earlyIdx.SliceSize) || uint32(earlyK) > available {
 				p.logger.Info().
 					Int("early_k", earlyK).
-					Int("max_repair_slices", par2.MaxRepairSlices).
+					Int("max_repair_slices", par2.MaxRepairSlicesFor(earlyIdx.SliceSize)).
+					Int64("slice_size", earlyIdx.SliceSize).
 					Uint32("available", available).
 					Str("entry", entryName).
 					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
 				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
-					errMoreDamageThanRecorded(earlyK, available))
+					errMoreDamageThanRecorded(earlyK, available, earlyIdx.SliceSize))
 			}
 		}
 	}
@@ -2239,7 +2247,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// recovery budget still fails the job, and then as the miss's own kind:
 	// a transient miss must not become the terminal "more damage than
 	// recorded" of the round-loop gate.
-	folded, ferr := foldUncoveredFiles(p.logger, entryName, idx, uncov, damagedSet, min(par2.MaxRepairSlices, int(available)), classifyMiss)
+	folded, ferr := foldUncoveredFiles(p.logger, entryName, idx, uncov, damagedSet, min(par2.MaxRepairSlicesFor(idx.SliceSize), int(available)), classifyMiss)
 	if ferr != nil {
 		return ferr
 	}
@@ -2273,8 +2281,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if k == 0 {
 			return fmt.Errorf("no damaged slices resolved (nothing to repair)")
 		}
-		if k > par2.MaxRepairSlices || uint32(k) > available {
-			return errMoreDamageThanRecorded(k, available)
+		if k > par2.MaxRepairSlicesFor(idx.SliceSize) || uint32(k) > available {
+			return errMoreDamageThanRecorded(k, available, idx.SliceSize)
 		}
 
 		// Top up recovery slice DATA until we hold at least k PARSED recovery
@@ -2390,7 +2398,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// recovery slices left over: the next round would need more than
 		// are retained, so the rest of the read only confirms the verdict
 		// (Under Reef S11E06 read 2 GB to find 45 against 5 retained).
-		spare := min(int(available), par2.MaxRepairSlices) - k
+		spare := min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize)) - k
 		var checksumBad []int64 // intact slices whose bytes failed their IFSC this round
 		repaired, repairErr = par2.RepairWith(idx, damaged, recovery, sliceSource, par2.RepairOptions{
 			MaxUnavailable:     max(0, spare),
@@ -2446,7 +2454,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the short-read case, and one that made a geometry bug on intact data
 		// indistinguishable from genuine provider damage.
 		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
-		if par2RoundShouldStop(len(newlyDamaged), round, k, int(available)) {
+		if par2RoundShouldStop(len(newlyDamaged), round, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize))) {
 			return par2RoundCapError(confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr)
 		}
 		p.logger.Info().
@@ -2546,15 +2554,16 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 // par2RoundShouldStop decides whether runRepair's round loop ends with the
 // cause-labelled error instead of folding newly unreadable slices in and
 // trying again: nothing new was found, the round cap is reached, or the
-// enlarged damaged set cannot fit the recovery budget. The last case is the
+// enlarged damaged set cannot fit the recovery budget (retained recovery
+// slices, capped by par2.MaxRepairSlicesFor the set's slice size). The last case is the
 // one an early-stopped pass always hits. Without it the loop went round
 // again and the next round's opening capacity gate returned "more damage
 // than recorded" - terminal - so a short-read or checksum-bad pass, which
 // classifyPar2Failure treats as suspect, went terminal on its first attempt.
-func par2RoundShouldStop(newlyDamaged, round, k, available int) bool {
+func par2RoundShouldStop(newlyDamaged, round, k, budget int) bool {
 	return newlyDamaged == 0 ||
 		round >= maxIntactRepairRounds-1 ||
-		k+newlyDamaged > min(available, par2.MaxRepairSlices)
+		k+newlyDamaged > budget
 }
 
 // par2RoundCapError names why intact slices were unreadable when the round

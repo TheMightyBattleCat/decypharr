@@ -245,7 +245,7 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 			}
 		}
 	}
-	if len(damagedSet) == 0 || len(damagedSet) > par2.MaxRepairSlices {
+	if len(damagedSet) == 0 || len(damagedSet) > par2.MaxRepairSlicesFor(idx.SliceSize) {
 		return false
 	}
 

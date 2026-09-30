@@ -113,9 +113,10 @@ func TestClassifyPar2FailureUnknownDefaultsTransient(t *testing.T) {
 
 func TestClassifyPar2FailureMoreDamageThanRecordedIsTerminal(t *testing.T) {
 	for _, err := range []error{
-		errMoreDamageThanRecorded(12, 8),
-		errMoreDamageThanRecorded(par2.MaxRepairSlices+1, par2.MaxRepairSlices+10),
-		errMoreDamageThanRecorded(319, 25),
+		errMoreDamageThanRecorded(12, 8, 1<<20),
+		errMoreDamageThanRecorded(par2.MaxRepairSlices+1, par2.MaxRepairSlices+10, 1<<20),
+		errMoreDamageThanRecorded(319, 25, 1<<20),
+		errMoreDamageThanRecorded(120, 200, 10<<20),
 	} {
 		if class := classifyPar2Failure(err); !class.terminal {
 			t.Errorf("classifyPar2Failure(%q).terminal = false, want true", err)
@@ -127,19 +128,39 @@ func TestClassifyPar2FailureMoreDamageThanRecordedIsTerminal(t *testing.T) {
 // recovery data doesn't read as a repair-cap problem.
 func TestErrMoreDamageThanRecordedNamesTheBindingLimit(t *testing.T) {
 	maxSlices := par2.MaxRepairSlices
+	const mib = 1 << 20
+	tenMiBLimit := par2.MaxRepairSlicesFor(10 * mib)
+	memMiB := par2.MaxAccumulatorMemory >> 20
 	cases := []struct {
 		damaged   int
 		available uint32
+		sliceSize int64
 		want      string
 	}{
-		{48, 31, "more damage than recorded; 48 damaged slices, only 31 recovery slices retained"},
-		{maxSlices + 1, uint32(maxSlices + 10), fmt.Sprintf("more damage than recorded; %d damaged slices is over the %d-slice repair cap (%d recovery slices retained)", maxSlices+1, maxSlices, maxSlices+10)},
-		{319, 25, fmt.Sprintf("more damage than recorded; 319 damaged slices, only 25 recovery slices retained (also over the %d-slice repair cap)", maxSlices)},
+		{48, 31, mib, "more damage than recorded; 48 damaged slices, only 31 recovery slices retained"},
+		{maxSlices + 1, uint32(maxSlices + 10), mib, fmt.Sprintf("more damage than recorded; %d damaged slices is over the %d-slice repair cap (%d recovery slices retained)", maxSlices+1, maxSlices, maxSlices+10)},
+		{319, 25, mib, fmt.Sprintf("more damage than recorded; 319 damaged slices, only 25 recovery slices retained (also over the %d-slice repair cap)", maxSlices)},
+		// A 10 MiB REMUX slice is bound by repair memory, not the slice cap.
+		{tenMiBLimit + 1, 200, 10 * mib, fmt.Sprintf("more damage than recorded; %d damaged slices is over the %d-slice limit for 10.0 MiB slices (%d MiB repair memory) (200 recovery slices retained)", tenMiBLimit+1, tenMiBLimit, memMiB)},
 	}
 	for _, c := range cases {
-		if got := errMoreDamageThanRecorded(c.damaged, c.available).Error(); got != c.want {
-			t.Errorf("errMoreDamageThanRecorded(%d, %d) = %q, want %q", c.damaged, c.available, got, c.want)
+		if got := errMoreDamageThanRecorded(c.damaged, c.available, c.sliceSize).Error(); got != c.want {
+			t.Errorf("errMoreDamageThanRecorded(%d, %d, %d) = %q, want %q", c.damaged, c.available, c.sliceSize, got, c.want)
 		}
+	}
+}
+
+// Large slices are bound by repair memory before the slice cap.
+func TestMaxRepairSlicesForBindsOnMemory(t *testing.T) {
+	const mib = 1 << 20
+	if got := par2.MaxRepairSlicesFor(mib); got != par2.MaxRepairSlices {
+		t.Errorf("MaxRepairSlicesFor(1 MiB) = %d, want the slice cap %d", got, par2.MaxRepairSlices)
+	}
+	if got, want := par2.MaxRepairSlicesFor(10*mib), int(par2.MaxAccumulatorMemory/(10*mib)); got != want {
+		t.Errorf("MaxRepairSlicesFor(10 MiB) = %d, want %d", got, want)
+	}
+	if got := par2.MaxRepairSlicesFor(0); got != par2.MaxRepairSlices {
+		t.Errorf("MaxRepairSlicesFor(0) = %d, want the slice cap %d", got, par2.MaxRepairSlices)
 	}
 }
 

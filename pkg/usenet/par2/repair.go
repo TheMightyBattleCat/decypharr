@@ -45,6 +45,21 @@ func IsIntactChecksumAbort(err error) bool {
 // census).
 const MaxRepairSlices = maxRepairSlices
 
+// MaxAccumulatorMemory is the exported form of maxAccumulatorMemory.
+const MaxAccumulatorMemory = maxAccumulatorMemory
+
+// MaxRepairSlicesFor is how many damaged slices one Repair call accepts at
+// this slice size: MaxRepairSlices, or fewer where k x sliceSize would pass
+// MaxAccumulatorMemory. Large-slice sets (10 MiB is a common REMUX posting)
+// are bound by memory, not by the slice cap. Callers use it to fail before
+// fetching recovery data that Repair would refuse anyway.
+func MaxRepairSlicesFor(sliceSize int64) int {
+	if sliceSize <= 0 {
+		return maxRepairSlices
+	}
+	return int(min(int64(maxRepairSlices), maxAccumulatorMemory/sliceSize))
+}
+
 const (
 	// maxRepairSlices caps how many damaged slices a single Repair call will
 	// attempt to reconstruct. Cost grows with k: accumulation is linear in k,
@@ -55,11 +70,12 @@ const (
 	maxRepairSlices = 128
 
 	// maxAccumulatorMemory caps total accumulator memory (k recovery slices
-	// x SliceSize bytes each, held for the whole streaming pass). At 512MB
-	// this only binds ahead of the 128-slice cap once SliceSize exceeds 4MB -
-	// large-slice REMUX recovery sets whose damaged set the short-segment
-	// reclassification (ErrSegmentShort) can push wide.
-	maxAccumulatorMemory = 512 << 20 // 512MB
+	// x SliceSize bytes each, held for the whole streaming pass). At 1GiB it
+	// binds ahead of the 128-slice cap once SliceSize exceeds 8MiB, which
+	// covers most REMUX postings (10MiB slices allow 102). A repair's real
+	// peak is about three to four times this: the fetched recovery volumes,
+	// Repair's working copy of the chosen slices, and the rebuilt output.
+	maxAccumulatorMemory = 1 << 30 // 1GiB
 
 	// maxIntactChecksumMismatches is the "small threshold" of confirmed-
 	// intact slices allowed to fail their own IFSC checksum during the
