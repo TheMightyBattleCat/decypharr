@@ -68,6 +68,9 @@ type bodyReader struct {
 func (b *bodyReader) Read(p []byte) (int, error) {
 	n, err := b.c.reader.Read(p)
 	if n > 0 {
+		if b.c.firstReadNS == 0 {
+			b.c.firstReadNS = nanotimeNow()
+		}
 		b.reads++
 		if b.reads >= progressUpdateStride {
 			b.reads = 0
@@ -261,6 +264,15 @@ type Connection struct {
 	lastProgressNS atomic.Int64
 	idleNS         atomic.Int64
 	shortIdle      time.Duration
+
+	// Fetch timing (fetch_timing.go). timing is the owning pool's recorder,
+	// nil outside a client pool. firstReadNS is when the current body's
+	// first byte arrived, checkedOutNS and releasedNS when the connection
+	// last left and went back to its pool; all nanotimeNow, 0 when unset.
+	timing       *providerTiming
+	firstReadNS  int64
+	checkedOutNS int64
+	releasedNS   int64
 
 	// onBody receives each successful article body's decoded size and how
 	// long it took from sending BODY to the end of the body, for the owning
@@ -487,6 +499,8 @@ func (c *Connection) GetArticle(messageID string) (*Article, error) {
 // the wire no longer agree on where the next response starts.
 func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc.BodyResult, error) {
 	messageID = FormatMessageID(messageID)
+	sentNS := nanotimeNow()
+	c.firstReadNS = 0
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
 		return nntpyenc.BodyResult{}, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
 	}
@@ -509,6 +523,11 @@ func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc
 		putBodyBuf(res.Data)
 		res.Data = nil
 		return res, classifyNNTPError(res.StatusCode, res.Message)
+	}
+	if c.timing != nil && c.firstReadNS > 0 {
+		doneNS := nanotimeNow()
+		c.timing.latency.observe(time.Duration(c.firstReadNS - sentNS))
+		c.timing.transfer.observe(time.Duration(doneNS - c.firstReadNS))
 	}
 	return res, nil
 }

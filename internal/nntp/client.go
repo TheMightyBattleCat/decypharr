@@ -35,6 +35,7 @@ type ProviderPool struct {
 	activeConns sync.Map       // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
 	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
 	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
+	timing      providerTiming // per-article phase durations (fetch_timing.go)
 
 	// Dial cooldown: consecutive createConnection failures open a backoff
 	// window in which checkouts go to another provider instead of paying a
@@ -127,6 +128,8 @@ type Client struct {
 	// quotas so a provider that hits its daily/weekly/monthly cap is skipped
 	// (handing off to lower-priority/backup providers) until it resets.
 	bw *BandwidthTracker
+
+	timing clientTiming // fetch phase durations (fetch_timing.go)
 }
 
 // SpeedTestResult holds the result of a provider speed test
@@ -285,6 +288,7 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
 	}
 	cm.preferFaster = func() bool { return config.Get().Usenet.PreferFasterServersEnabled() }
+	cm.timing.since = time.Now()
 	// bw first: repair-pool workers read it (statHomeBlocked) from the moment
 	// they start.
 	cm.bw = newBandwidthTracker(providers, cm.logger)
@@ -324,6 +328,10 @@ func (c *Client) put(conn *Connection, provider config.UsenetProvider) {
 	}
 
 	entry := acquireConnectionEntry(conn, provider, utils.Now())
+	conn.releasedNS = nanotimeNow()
+	if conn.checkedOutNS > 0 {
+		pp.timing.hold.observe(time.Duration(conn.releasedNS - conn.checkedOutNS))
+	}
 
 	pp.mu.Lock()
 	// Cap stack size (shouldn't happen with semaphore, but be safe)
@@ -452,7 +460,11 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			return ctx.Err()
 		}
 
+		checkoutStart := nanotimeNow()
 		conn, connProvider, err := c.getAnyAvailableConnection(ctx, exclusions)
+		if err == nil {
+			c.timing.checkout.observe(time.Duration(nanotimeNow() - checkoutStart))
+		}
 		if err != nil {
 			// Not an answer about the article: keep the last provider's
 			// verdict. Once every provider is excluded this is "no eligible
@@ -1081,6 +1093,10 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 			if healthy {
 				conn := entry.conn
 				releaseConnectionEntry(entry)
+				conn.checkedOutNS = nanotimeNow()
+				if conn.releasedNS > 0 {
+					pp.timing.idle.observe(time.Duration(conn.checkedOutNS - conn.releasedNS))
+				}
 				pp.activeConns.Store(conn, struct{}{}) // Register as active (checked-out)
 				return conn, nil
 			}
@@ -1111,6 +1127,7 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 		return nil, err
 	}
 	pp.noteDialSuccess()
+	conn.checkedOutNS = nanotimeNow()
 	pp.activeConns.Store(conn, struct{}{}) // Register as active (checked-out)
 	return conn, nil
 }
@@ -1232,6 +1249,9 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		onBody: func(n int64, d time.Duration) {
 			c.recordBody(provider.Host, n, d)
 		},
+	}
+	if pp, ok := c.pools[provider.Host]; ok {
+		conn.timing = &pp.timing
 	}
 
 	// Set deadline for handshake (greeting + auth)
@@ -1400,6 +1420,7 @@ func (c *Client) Stats() map[string]any {
 
 	stats["pool"] = poolStats
 	stats["providers"] = providers
+	stats["fetch_timing"] = c.timingSnapshot()
 
 	return stats
 }

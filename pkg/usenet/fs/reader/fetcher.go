@@ -406,9 +406,11 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	}
 
 	// Acquire connection slot
+	waitStart := time.Now()
 	select {
 	case sf.semaphore <- struct{}{}:
 		defer func() { <-sf.semaphore }()
+		sf.client.ObserveSegmentWait(time.Since(waitStart))
 	case <-ctx.Done():
 		sf.cache.ReleaseFetching(segIdx)
 		return ctx.Err()
