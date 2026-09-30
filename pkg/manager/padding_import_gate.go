@@ -62,12 +62,13 @@ func (d *Downloader) paddingImportGate(entry *storage.Entry) (err error) {
 		return nil
 	}
 
+	largest := largestVideoSize(entry)
 	for _, file := range entry.GetActiveFiles() {
 		if ctx.Err() != nil {
 			// Cancellation (shutdown) is inconclusive, never a rejection.
 			return nil
 		}
-		if file == nil || file.Size < ffprobeImportMinSize || !config.IsVideoFile(file.Name) {
+		if !importChecksFile(file, largest) {
 			continue
 		}
 		segs := pending[file.Name]
@@ -145,12 +146,13 @@ func (d *Downloader) statImportGate(entry *storage.Entry) (err error) {
 		ctx = context.Background()
 	}
 
+	largest := largestVideoSize(entry)
 	for _, file := range entry.GetActiveFiles() {
 		if ctx.Err() != nil {
 			// Cancellation (shutdown) is inconclusive, never a rejection.
 			return nil
 		}
-		if file == nil || file.Size < ffprobeImportMinSize || !config.IsVideoFile(file.Name) {
+		if !importChecksFile(file, largest) {
 			continue
 		}
 

@@ -54,10 +54,17 @@ const (
 	localDownloadMaxAttempts    = 4
 	defaultFileDownloadWorkers  = 5
 
-	// ffprobeImportMinSize skips ffprobe validation for files smaller than
-	// this at import time, so junk sample clips bundled in an otherwise good
-	// release can't fail the whole grab.
+	// ffprobeImportMinSize: a video file at least this size is always
+	// checked at import. A smaller one is checked only when it is at least
+	// 1/importSmallFileShare of the entry's largest video (see
+	// importChecksFile), so an SD episode is checked while a clip bundled
+	// with a film is not.
 	ffprobeImportMinSize = 100 * 1024 * 1024 // 100 MiB
+
+	// importSmallFileShare: a video under ffprobeImportMinSize is part of the
+	// release's content, and checked at import, when it is at least 1/4 of
+	// the entry's largest video.
+	importSmallFileShare = 4
 
 	// ffprobeImportInconclusiveRetries bounds how many extra ffprobe passes a
 	// single file gets while it keeps coming back ok-but-inconclusive (a
@@ -412,12 +419,13 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 	budgetCtx, cancelBudget := context.WithTimeout(ctx, ffprobeImportEntryBudget)
 	defer cancelBudget()
 
+	largest := largestVideoSize(entry)
 	for _, file := range entry.GetActiveFiles() {
 		if ctx.Err() != nil {
 			// Cancellation (shutdown) is inconclusive, never a rejection.
 			return nil
 		}
-		if file == nil || file.Size < ffprobeImportMinSize || !config.IsVideoFile(file.Name) {
+		if !importChecksFile(file, largest) {
 			continue
 		}
 		infoHash := file.InfoHash
