@@ -186,6 +186,10 @@ Use `availability_sample_percent` for repair checks and
 - `10`: Check 10% (fast but may miss issues)
 - `1`: Quick import check (default)
 
+A segment check is a STAT, which asks the server whether an article exists without downloading it. Checks are sent 16 at a time on one connection, followed by a `DATE` command whose reply must come straight after the last STAT reply. If the replies don't line up (the server dropped or added a line), nothing in that batch counts as found or missing, the connection is closed, and the segments are checked on the next provider. The provider stats show each provider's measured time per found article (`stat_ms`) and how many batches were thrown away this way (`stat_desyncs`, normally 0).
+
+The import checks (availability, STAT census, padding and ffprobe) cover every video file of 100 MiB or more, and smaller video files that are at least a quarter of the size of the release's largest video. A lone SD episode or a pack of small episodes is checked; a small extra bundled with a film is not. Files named as samples are dropped when the NZB is added unless `allow_samples` is on. The repair sweep checks every library file whatever its size.
+
 ## Disk Buffer
 
 ```json
@@ -227,6 +231,8 @@ See [Sabnzbd Integration](./sabnzbd/) for details.
 1. Increase `max_connections` per provider
 2. Increase global `max_connections`
 3. Increase `read_ahead` buffer
+
+`GET /debug/stats` shows where download time goes under `usenet.fetch_timing`, counted since start: `segment_wait` (a read waiting for a slot in its own connection limit), `checkout` (waiting for a connection from the pool), and per provider `latency` (request sent to first byte back), `transfer` (first byte to article decoded), `hold` (connection checked out to returned) and `idle` (returned to next use). Each has a count, mean, 50th/90th/99th percentile, raw bucket counts and summed time, so two readings taken around a test can be subtracted. Take them while no repair sweep is running, since sweep checks add their own samples. High `latency` with little `idle` means connections wait on the server; long `idle` with short `checkout` waits means reads aren't keeping connections busy.
 
 ### Processing Timeouts
 
