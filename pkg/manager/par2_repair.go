@@ -721,6 +721,23 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 	return true, ""
 }
 
+// errMoreDamageThanRecorded is the terminal error for a damaged set too big to
+// repair. It names only the limit that was actually exceeded: too few recovery
+// slices retained in the posting, the per-repair slice cap, or both. The
+// "more damage than recorded" prefix is what classifyPar2Failure matches.
+func errMoreDamageThanRecorded(damaged int, available uint32) error {
+	overRetained := uint32(damaged) > available
+	overCap := damaged > par2.MaxRepairSlices
+	switch {
+	case overRetained && overCap:
+		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained (also over the %d-slice repair cap)", damaged, available, par2.MaxRepairSlices)
+	case overCap:
+		return fmt.Errorf("more damage than recorded; %d damaged slices is over the %d-slice repair cap (%d recovery slices retained)", damaged, par2.MaxRepairSlices, available)
+	default:
+		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained", damaged, available)
+	}
+}
+
 // par2Usable reports whether PAR2 is genuinely usable for nzbID right now -
 // the input decideAutoRepairAction's policy consults for source=playback
 // (see repair_policy.go). Unlike the config toggle alone, this also accounts
@@ -1913,7 +1930,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 					Str("entry", entryName).
 					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
 				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
-					fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", earlyK, par2.MaxRepairSlices, available))
+					errMoreDamageThanRecorded(earlyK, available))
 			}
 		}
 	}
@@ -2257,7 +2274,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return fmt.Errorf("no damaged slices resolved (nothing to repair)")
 		}
 		if k > par2.MaxRepairSlices || uint32(k) > available {
-			return fmt.Errorf("more damage than recorded; %d slices unrecoverable (recovery cap %d, %d slices retained)", k, par2.MaxRepairSlices, available)
+			return errMoreDamageThanRecorded(k, available)
 		}
 
 		// Top up recovery slice DATA until we hold at least k PARSED recovery

@@ -112,9 +112,34 @@ func TestClassifyPar2FailureUnknownDefaultsTransient(t *testing.T) {
 }
 
 func TestClassifyPar2FailureMoreDamageThanRecordedIsTerminal(t *testing.T) {
-	err := fmt.Errorf("more damage than recorded; 12 slices unrecoverable (recovery cap 64, 8 slices retained)")
-	if class := classifyPar2Failure(err); !class.terminal {
-		t.Errorf("classifyPar2Failure(more damage than recorded).terminal = false, want true")
+	for _, err := range []error{
+		errMoreDamageThanRecorded(12, 8),
+		errMoreDamageThanRecorded(par2.MaxRepairSlices+1, par2.MaxRepairSlices+10),
+		errMoreDamageThanRecorded(319, 25),
+	} {
+		if class := classifyPar2Failure(err); !class.terminal {
+			t.Errorf("classifyPar2Failure(%q).terminal = false, want true", err)
+		}
+	}
+}
+
+// The message names only the limit that was exceeded, so a posting short of
+// recovery data doesn't read as a repair-cap problem.
+func TestErrMoreDamageThanRecordedNamesTheBindingLimit(t *testing.T) {
+	maxSlices := par2.MaxRepairSlices
+	cases := []struct {
+		damaged   int
+		available uint32
+		want      string
+	}{
+		{48, 31, "more damage than recorded; 48 damaged slices, only 31 recovery slices retained"},
+		{maxSlices + 1, uint32(maxSlices + 10), fmt.Sprintf("more damage than recorded; %d damaged slices is over the %d-slice repair cap (%d recovery slices retained)", maxSlices+1, maxSlices, maxSlices+10)},
+		{319, 25, fmt.Sprintf("more damage than recorded; 319 damaged slices, only 25 recovery slices retained (also over the %d-slice repair cap)", maxSlices)},
+	}
+	for _, c := range cases {
+		if got := errMoreDamageThanRecorded(c.damaged, c.available).Error(); got != c.want {
+			t.Errorf("errMoreDamageThanRecorded(%d, %d) = %q, want %q", c.damaged, c.available, got, c.want)
+		}
 	}
 }
 
