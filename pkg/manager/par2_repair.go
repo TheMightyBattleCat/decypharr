@@ -3769,7 +3769,7 @@ func exactSegGeometry(segs []storage.Par2SegmentRef, trueLen int64, logger zerol
 	// final segment makes readRange demand more bytes than the article holds,
 	// which surfaces as ErrSegmentShort and gets folded into the damaged set
 	// as if the posting were truncated - reconstructing intact data from
-	// parity, inflating k toward the 64-slice cap, and potentially reaching a
+	// parity, inflating k toward the repair cap, and potentially reaching a
 	// terminal "unrepairable" verdict on a healthy release. Fall back to the
 	// scaled accumulate, which anchors on trueLen without assuming uniformity.
 	if exact && lastSeg > seedSeg {

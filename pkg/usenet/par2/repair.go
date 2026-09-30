@@ -47,13 +47,16 @@ const MaxRepairSlices = maxRepairSlices
 
 const (
 	// maxRepairSlices caps how many damaged slices a single Repair call will
-	// attempt to reconstruct: k damaged slices need a k×k GF(2^16) matrix
-	// inversion (O(k^3)) and k recovery slices held fully in memory.
-	maxRepairSlices = 64
+	// attempt to reconstruct. Cost grows with k: accumulation is linear in k,
+	// and applying the solved k×k matrix to every word of the output is k²
+	// per word, so doubling k from 64 to 128 made BenchmarkRepair about 3x
+	// slower. A repair under the cap costs the same whatever the cap is, so
+	// the cap only decides whether a larger one runs slowly or is re-grabbed.
+	maxRepairSlices = 128
 
 	// maxAccumulatorMemory caps total accumulator memory (k recovery slices
 	// x SliceSize bytes each, held for the whole streaming pass). At 512MB
-	// this only binds ahead of the 64-slice cap once SliceSize exceeds 8MB -
+	// this only binds ahead of the 128-slice cap once SliceSize exceeds 4MB -
 	// large-slice REMUX recovery sets whose damaged set the short-segment
 	// reclassification (ErrSegmentShort) can push wide.
 	maxAccumulatorMemory = 512 << 20 // 512MB

@@ -114,7 +114,7 @@ const (
 // + matrix solve + IFSC verification) with in-memory sources, so the number
 // is pure CPU with no network. SetBytes is the total input data streamed.
 func BenchmarkRepair(b *testing.B) {
-	for _, k := range []int{32, 64} {
+	for _, k := range []int{64, 128} {
 		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
 			f := getBenchFixture(b, benchSliceSize, benchNumSlices, k)
 			src := benchSliceSource{data: f.data}
@@ -141,7 +141,7 @@ func BenchmarkRepair(b *testing.B) {
 // total-recovery-set bytes AND with k. SetBytes is the input data streamed
 // once (k is the multiplier on top).
 func BenchmarkGFAccumulate(b *testing.B) {
-	for _, k := range []int{32, 64} {
+	for _, k := range []int{64, 128} {
 		f := getBenchFixture(b, benchSliceSize, benchNumSlices, k)
 		accum := make([][]byte, k)
 		for j := range accum {
@@ -190,7 +190,7 @@ func BenchmarkRegionMulXOR(b *testing.B) {
 // BenchmarkGFSolve isolates the matrix phase: invert the k*k Vandermonde
 // system and apply it across every 16-bit word position of a slice.
 func BenchmarkGFSolve(b *testing.B) {
-	for _, k := range []int{32, 64} {
+	for _, k := range []int{64, 128} {
 		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
 			f := getBenchFixture(b, benchSliceSize, benchNumSlices, k)
 			// Build M[j][d] = C_damaged[d]^{e_j}, same as Repair.
