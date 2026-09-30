@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	github.com/Tensai75/nzbparser v0.1.0
-	github.com/Tensai75/rapidyenc v0.0.1
 	github.com/Tensai75/subjectparser v0.1.0
 	github.com/anacrolix/torrent v1.55.0
 	github.com/bytedance/sonic v1.15.0
@@ -17,6 +16,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/javi11/sevenzip v1.6.2-0.20251026160715-ca961b7f1239
 	github.com/klauspost/compress v1.18.0
+	github.com/mnightingale/rapidyenc v0.0.0-20260606125752-cdd7bcd89529
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.33.0
@@ -28,7 +28,7 @@ require (
 	go4.org v0.0.0-20200411211856-f5505b9728dd
 	golang.org/x/crypto v0.42.0
 	golang.org/x/net v0.43.0
-	golang.org/x/sync v0.18.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.38.0
 	google.golang.org/protobuf v1.36.7
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1

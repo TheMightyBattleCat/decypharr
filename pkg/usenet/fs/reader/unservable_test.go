@@ -1,20 +1,17 @@
-//go:build cgo
-
 package reader
 
 import (
 	"errors"
 	"testing"
 
-	"github.com/Tensai75/rapidyenc"
-
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
 )
 
 // An article every provider serves corrupt reaches the overlay (pad + repair)
 // like a 430, instead of failing the read on every attempt.
 func TestArticleUnservable(t *testing.T) {
-	corrupt := &nntp.Error{Type: nntp.ErrorTypeYencDecode, Message: "crc", Err: rapidyenc.ErrCrcMismatch}
+	corrupt := &nntp.Error{Type: nntp.ErrorTypeYencDecode, Message: "crc", Err: nntpyenc.ErrCrcMismatch}
 	if !articleUnservable(corrupt) {
 		t.Error("corrupt on every provider not treated as unservable")
 	}
