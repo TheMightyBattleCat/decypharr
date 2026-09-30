@@ -184,9 +184,6 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 			// A transient timeout is neither: it must not be counted at all.
 			return nil, context.DeadlineExceeded
 		case 4:
-			if corruptErr == nil {
-				return nil, context.DeadlineExceeded // no CRC-checking decoder in this build
-			}
 			return nil, corruptErr
 		}
 		return []byte{byte(idx)}, nil
@@ -197,10 +194,7 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 	}
 
 	confirmedMissing, shortRead, corrupt := src.DeadCauseCounts()
-	wantCorrupt, wantTotal := 0, 2
-	if corruptErr != nil {
-		wantCorrupt, wantTotal = 1, 3
-	}
+	wantCorrupt, wantTotal := 1, 3
 	if corrupt != wantCorrupt {
 		t.Errorf("corrupt = %d, want %d (only the every-provider CRC failure)", corrupt, wantCorrupt)
 	}
