@@ -315,7 +315,13 @@ func (c *Connection) ping() error {
 	_ = c.conn.SetDeadline(utils.Now().Add(timeouts.PingTimeout))
 	defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
 
-	if err := c.sendCommand("DATE"); err != nil {
+	// Write without sendCommandArg: it would swap the PingTimeout write
+	// deadline for HandshakeTimeout, so a peer that stopped reading held
+	// this 1.5 s check for 10 s (upstream cabeb8a3).
+	if err := c.writeCommandArg("DATE", ""); err != nil {
+		return NewConnectionError(err)
+	}
+	if err := c.writer.Flush(); err != nil {
 		return NewConnectionError(err)
 	}
 	resp, err := c.readResponse()
@@ -337,6 +343,15 @@ func (c *Connection) sendCommandArg(command, arg string) error {
 	_ = c.conn.SetWriteDeadline(utils.Now().Add(timeouts.HandshakeTimeout))
 	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 
+	if err := c.writeCommandArg(command, arg); err != nil {
+		return err
+	}
+	return c.writer.Flush()
+}
+
+// writeCommandArg buffers one command line without flushing it or touching
+// the connection's deadlines.
+func (c *Connection) writeCommandArg(command, arg string) error {
 	if _, err := c.writer.WriteString(command); err != nil {
 		return err
 	}
@@ -348,10 +363,8 @@ func (c *Connection) sendCommandArg(command, arg string) error {
 			return err
 		}
 	}
-	if _, err := c.writer.WriteString("\r\n"); err != nil {
-		return err
-	}
-	return c.writer.Flush()
+	_, err := c.writer.WriteString("\r\n")
+	return err
 }
 
 // readResponse reads a response from the NNTP server

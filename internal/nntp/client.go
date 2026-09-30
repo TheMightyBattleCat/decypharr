@@ -35,6 +35,55 @@ type ProviderPool struct {
 	activeConns sync.Map       // *Connection → struct{}; tracks checked-out connections for force-close on shutdown
 	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
 	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
+
+	// Dial cooldown: consecutive createConnection failures open a backoff
+	// window in which checkouts go to another provider instead of paying a
+	// full dial and handshake timeout each. A provider that accepts TCP but
+	// never greets would otherwise add HandshakeTimeout to every checkout
+	// that finds its pool empty (BenchmarkAcquireDeadPrimary). The cooldown
+	// only reroutes: when no eligible provider is warm, dials go ahead.
+	// Ported from upstream 5b55a7d5.
+	dialFailStreak    atomic.Int32
+	dialCooldownUntil atomic.Int64 // nanotimeNow deadline; 0 = no cooldown
+}
+
+// maxDialCooldown caps the exponential dial backoff, short enough that a
+// provider that recovers is tried again well inside the DFS stall windows.
+const maxDialCooldown = 15 * time.Second
+
+// errDialCooldown is returned by a checkout that would have to dial a
+// provider inside its dial cooldown.
+var errDialCooldown = errors.New("provider is cooling down after failed dials")
+
+func (pp *ProviderPool) inDialCooldown() bool {
+	until := pp.dialCooldownUntil.Load()
+	return until != 0 && nanotimeNow() < until
+}
+
+func (pp *ProviderPool) noteDialFailure() {
+	streak := pp.dialFailStreak.Add(1)
+	backoff := min(time.Second<<min(streak-1, 4), maxDialCooldown)
+	pp.dialCooldownUntil.Store(nanotimeNow() + int64(backoff))
+}
+
+func (pp *ProviderPool) noteDialSuccess() {
+	if pp.dialFailStreak.Load() != 0 {
+		pp.dialFailStreak.Store(0)
+		pp.dialCooldownUntil.Store(0)
+	}
+}
+
+// isWarm reports whether pp can give a connection without dialing through
+// an active cooldown: it isn't cooling down, has idle connections, or has
+// checked-out connections that will come back to it.
+func (pp *ProviderPool) isWarm() bool {
+	if !pp.inDialCooldown() {
+		return true
+	}
+	pp.mu.Lock()
+	idle := len(pp.conns)
+	pp.mu.Unlock()
+	return idle > 0 || len(pp.slots) > 0
 }
 
 // Client manages a pool of NNTP connections.
@@ -301,23 +350,41 @@ func (c *Client) release(conn *Connection) {
 	}
 }
 
-// isHealthy checks if a connection entry is still usable
-func (c *Client) isHealthy(entry *connectionEntry) bool {
+// checkEntryHealth reports whether a pooled entry is still usable.
+// pingTimedOut is true when its verify ping timed out rather than failing at
+// once: a reset means the server dropped this one session, a silent timeout
+// means the path to the provider is gone, and every older idle entry with it.
+func (c *Client) checkEntryHealth(entry *connectionEntry) (healthy, pingTimedOut bool) {
 	if entry == nil || entry.conn == nil {
-		return false
+		return false, false
 	}
 	// Check if explicitly closed
 	if entry.conn.IsClosed() {
-		return false
+		return false, false
 	}
 	// Check if already closed/expired (though normally caught by reaper)
 	// Or check stale threshold
 	if time.Since(entry.lastUsed) > timeouts.StaleThreshold {
 		if err := entry.conn.ping(); err != nil {
-			return false
+			return false, isTimeoutLike(err)
 		}
 	}
-	return true
+	return true, false
+}
+
+// flushIdle closes every idle pooled connection on pp. Called when a
+// checkout's verify ping times out: finding out one by one that the rest are
+// dead too would stall that checkout for PingTimeout per entry.
+func (c *Client) flushIdle(pp *ProviderPool) {
+	pp.mu.Lock()
+	drained := pp.conns
+	pp.conns = nil
+	pp.mu.Unlock()
+	for _, entry := range drained {
+		conn := entry.conn
+		releaseConnectionEntry(entry)
+		_ = conn.Close()
+	}
 }
 
 func isIdleExpired(lastUsed time.Time, now time.Time) bool {
@@ -709,7 +776,9 @@ func (c *Client) getConnectionFromProvider(ctx context.Context, provider config.
 
 	select {
 	case pp.slots <- struct{}{}:
-		conn, err := c.getOrCreateFromPool(ctx, pp, provider)
+		// Targeted callers (BatchStat on one provider) need this provider's
+		// answer, so a cooldown doesn't stop the dial.
+		conn, err := c.getOrCreateFromPool(ctx, pp, provider, true)
 		if err != nil {
 			<-pp.slots
 			return nil, provider, err
@@ -787,24 +856,43 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 		target = tierFill
 	}
 
+	// A provider cooling down after failed dials is skipped while another
+	// eligible one is warm. When the whole tier is cold, dial anyway, so a
+	// single-provider setup still fails fast instead of waiting silently.
+	ignoreCooldowns := true
+	for _, provider := range c.providers {
+		if c.providerTier(ctx, provider) != target || exclusions.excludes(provider) {
+			continue
+		}
+		if c.pools[provider.Host].isWarm() {
+			ignoreCooldowns = false
+			break
+		}
+	}
+
 	// Phase 1: Non-blocking scan - try to get a free slot from any provider
 	// within the target tier. Priority order, except that a primary measured
 	// far slower than the others is tried after them (body_routing.go).
 	eligibleCount := 0
+	var scanErr error
 	for _, provider := range c.bodyScanOrder(time.Now()) {
 		if c.providerTier(ctx, provider) != target || exclusions.excludes(provider) {
 			continue
 		}
 		eligibleCount++
 		pp := c.pools[provider.Host]
+		if !ignoreCooldowns && !pp.isWarm() {
+			continue // cooling down after failed dials; route around it
+		}
 
 		select {
 		case pp.slots <- struct{}{}:
 			// Got a slot - try to get or create connection
-			conn, err := c.getOrCreateFromPool(ctx, pp, provider)
+			conn, err := c.getOrCreateFromPool(ctx, pp, provider, ignoreCooldowns)
 			if err != nil {
 				<-pp.slots // Release slot on error
-				continue   // Try next provider
+				scanErr = err
+				continue // Try next provider
 			}
 			return conn, provider, nil
 		default:
@@ -822,11 +910,23 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	// the fill tier remain idle rather than getting roped in.
 	eligible := make([]config.UsenetProvider, 0, eligibleCount)
 	for _, provider := range c.providers {
-		if c.providerTier(ctx, provider) == target && !exclusions.excludes(provider) {
-			eligible = append(eligible, provider)
+		if c.providerTier(ctx, provider) != target || exclusions.excludes(provider) {
+			continue
 		}
+		if !ignoreCooldowns && !c.pools[provider.Host].isWarm() {
+			continue
+		}
+		eligible = append(eligible, provider)
 	}
-	return c.raceForConnection(ctx, eligible)
+	if len(eligible) == 0 {
+		// The scan's failed dials put every provider left into cooldown.
+		// Report that dial error; the next acquisition dials again.
+		if scanErr != nil {
+			return nil, config.UsenetProvider{}, scanErr
+		}
+		return nil, config.UsenetProvider{}, errors.New("no eligible providers available")
+	}
+	return c.raceForConnection(ctx, eligible, ignoreCooldowns)
 }
 
 // raceForConnection spawns goroutines that race to acquire a connection slot.
@@ -837,7 +937,10 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 // the receiver loop always terminates, and any extra connections won by multiple
 // goroutines are properly returned to the pool — preventing slot leaks under heavy
 // concurrent import load.
-func (c *Client) raceForConnection(ctx context.Context, eligible []config.UsenetProvider) (*Connection, config.UsenetProvider, error) {
+//
+// allowDial is passed to getOrCreateFromPool: false while some eligible
+// provider is warm, so a cooling-down one is not dialed.
+func (c *Client) raceForConnection(ctx context.Context, eligible []config.UsenetProvider, allowDial bool) (*Connection, config.UsenetProvider, error) {
 	type result struct {
 		conn     *Connection
 		provider config.UsenetProvider
@@ -871,7 +974,7 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 			}
 
 			// Try to get or create connection
-			conn, err := c.getOrCreateFromPool(innerCtx, pp, p)
+			conn, err := c.getOrCreateFromPool(innerCtx, pp, p, allowDial)
 			if err != nil {
 				<-pp.slots // Release slot on error
 				select {
@@ -951,8 +1054,9 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 }
 
 // getOrCreateFromPool tries to get an existing connection from pool, or creates a new one.
-// Caller must have already acquired a slot from pp.slots.
-func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, provider config.UsenetProvider) (*Connection, error) {
+// Caller must have already acquired a slot from pp.slots. With allowDial
+// false it refuses to dial a provider inside its dial cooldown.
+func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, provider config.UsenetProvider, allowDial bool) (*Connection, error) {
 	// Try to get existing connection from pool (quick lock)
 	for {
 		pp.mu.Lock()
@@ -973,7 +1077,8 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 			}
 
 			// Health check outside lock
-			if c.isHealthy(entry) {
+			healthy, pingTimedOut := c.checkEntryHealth(entry)
+			if healthy {
 				conn := entry.conn
 				releaseConnectionEntry(entry)
 				pp.activeConns.Store(conn, struct{}{}) // Register as active (checked-out)
@@ -983,6 +1088,11 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 			conn := entry.conn
 			releaseConnectionEntry(entry)
 			_ = conn.Close()
+			if pingTimedOut {
+				// The freshest idle connection timed out its ping, so the
+				// older ones below it are dead too: close them all now.
+				c.flushIdle(pp)
+			}
 			continue
 		}
 		pp.mu.Unlock()
@@ -990,10 +1100,17 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 	}
 
 	// No pooled connection available, create new one
+	if !allowDial && pp.inDialCooldown() {
+		return nil, errDialCooldown
+	}
 	conn, err := c.createConnection(ctx, provider)
 	if err != nil {
+		if ctx.Err() == nil {
+			pp.noteDialFailure()
+		}
 		return nil, err
 	}
+	pp.noteDialSuccess()
 	pp.activeConns.Store(conn, struct{}{}) // Register as active (checked-out)
 	return conn, nil
 }
