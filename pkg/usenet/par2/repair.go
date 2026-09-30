@@ -70,12 +70,14 @@ const (
 	maxRepairSlices = 128
 
 	// maxAccumulatorMemory caps total accumulator memory (k recovery slices
-	// x SliceSize bytes each, held for the whole streaming pass). At 1GiB it
-	// binds ahead of the 128-slice cap once SliceSize exceeds 8MiB, which
-	// covers most REMUX postings (10MiB slices allow 102). A repair's real
-	// peak is about three to four times this: the fetched recovery volumes,
-	// Repair's working copy of the chosen slices, and the rebuilt output.
-	maxAccumulatorMemory = 1 << 30 // 1GiB
+	// x SliceSize bytes each, held for the whole streaming pass). At 2GiB it
+	// binds ahead of the 128-slice cap only once SliceSize exceeds 16MiB, so
+	// the 10MiB slices common in REMUX postings reach the full slice cap. A
+	// repair's real peak is about three to four times this: the fetched
+	// recovery volumes, Repair's working copy of the chosen slices, and the
+	// rebuilt output. The manager runs repairs this large one at a time (see
+	// Par2Repair.waitForLargeRepair).
+	maxAccumulatorMemory = 2 << 30 // 2GiB
 
 	// maxIntactChecksumMismatches is the "small threshold" of confirmed-
 	// intact slices allowed to fail their own IFSC checksum during the

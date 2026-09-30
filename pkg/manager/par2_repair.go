@@ -86,6 +86,13 @@ const (
 	par2JobPassFloor = 4 << 20 // bytes per second
 	par2JobPasses    = 3
 
+	// largeRepairBytes is the accumulator size (damaged slices x slice size)
+	// above which a repair counts as large. Large repairs run one at a time
+	// across every lane (see waitForLargeRepair); smaller ones run side by
+	// side as before. It is the old per-repair memory limit, so every repair
+	// that could run alongside another before still can.
+	largeRepairBytes = 512 << 20
+
 	// par2ArticleFetchTimeout bounds a single article fetch within a job.
 	par2ArticleFetchTimeout = 60 * time.Second
 
@@ -292,6 +299,11 @@ type Par2Repair struct {
 	runningMu sync.Mutex
 	running   map[string]*runningJob
 
+	// largeRepair is a one-slot gate held by the one large repair running
+	// (see waitForLargeRepair). Nil means no gating (tests that build a
+	// Par2Repair directly).
+	largeRepair chan struct{}
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -323,7 +335,51 @@ func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 		urgentSet:  make(map[string]*urgentJob),
 		urgentWake: make(chan struct{}, 1),
 		running:    make(map[string]*runningJob),
+
+		largeRepair: make(chan struct{}, 1),
 	}
+}
+
+// waitForLargeRepair makes a large repair (k x sliceSize over
+// largeRepairBytes) wait until no other large repair is running, so two
+// multi-GB repairs never hold memory at once; the next one starts as soon as
+// the running one returns, with no manual re-run. It is a no-op for a small
+// repair, for a job that already holds the gate, and when p has no gate.
+// While waiting the job shows as queued, a phase the idle watchdog ignores,
+// and SetPhase refreshes the progress timestamp when it resumes. The wait
+// still counts toward the job's own timeout: a wait cut short by it, or by
+// preemption or shutdown, returns the context error, which
+// classifyPar2Failure treats as transient (backed off and retried).
+func (p *Par2Repair) waitForLargeRepair(ctx context.Context, progress *par2JobProgressState, entryName string, k int, sliceSize int64, held *bool) error {
+	if *held || p.largeRepair == nil || int64(k)*sliceSize <= largeRepairBytes {
+		return nil
+	}
+	select {
+	case p.largeRepair <- struct{}{}:
+		*held = true
+		return nil
+	default:
+	}
+	prev := progress.Phase()
+	progress.SetPhase(Par2PhaseQueued)
+	p.logger.Info().
+		Str("entry", entryName).
+		Int("damaged_slices", k).
+		Int64("slice_size", sliceSize).
+		Msg("par2: large repair waiting for the running large repair to finish")
+	select {
+	case p.largeRepair <- struct{}{}:
+		*held = true
+		progress.SetPhase(prev)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for another large repair to finish: %w", ctx.Err())
+	}
+}
+
+// releaseLargeRepair frees the gate taken by waitForLargeRepair.
+func (p *Par2Repair) releaseLargeRepair() {
+	<-p.largeRepair
 }
 
 // Start begins the worker's BATCH loop plus a bounded pool of URGENT lane
@@ -1758,6 +1814,15 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	u := p.manager.usenet
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 
+	// Held from the first point a large damaged set is known until this pass
+	// returns - see waitForLargeRepair.
+	var largeHeld bool
+	defer func() {
+		if largeHeld {
+			p.releaseLargeRepair()
+		}
+	}()
+
 	// fetchPosted wraps every article fetch this pass makes so runJob can
 	// report a real (not estimated) read_bytes total in the persisted attempt
 	// log - used in place of u.FetchArticle everywhere below. A posted file's
@@ -1939,6 +2004,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
 				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
 					errMoreDamageThanRecorded(earlyK, available, earlyIdx.SliceSize))
+			}
+			// Wait here, before the recovery fetch, so a queued large repair
+			// doesn't sit on its downloaded volumes while it waits.
+			if err := p.waitForLargeRepair(ctx, progress, entryName, earlyK, earlyIdx.SliceSize, &largeHeld); err != nil {
+				return err
 			}
 		}
 	}
@@ -2283,6 +2353,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		if k > par2.MaxRepairSlicesFor(idx.SliceSize) || uint32(k) > available {
 			return errMoreDamageThanRecorded(k, available, idx.SliceSize)
+		}
+		// No early index, or k grew past the large-repair size this round.
+		if err := p.waitForLargeRepair(ctx, progress, entryName, k, idx.SliceSize, &largeHeld); err != nil {
+			return err
 		}
 
 		// Top up recovery slice DATA until we hold at least k PARSED recovery
