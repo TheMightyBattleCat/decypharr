@@ -1842,6 +1842,29 @@ class RepairManager {
         return `<span class="badge badge-ghost badge-sm" title="${this.escapeAttr(reason)}">no par2</span>`;
     }
 
+    // overlayPar2CoverageNote is a one-line summary, under the repairable
+    // badge, of how much PAR2 the release was posted with and how much one
+    // repair could use (server: manager.Par2CoverageFor). It is worked out
+    // from the PAR2 file list only, so it describes what was posted; articles
+    // that have expired since are not counted. For a release with several
+    // PAR2 sets (a season pack) it describes the largest set.
+    overlayPar2CoverageNote(f) {
+        const c = f.par2_coverage;
+        if (!c || !c.recovery_slices_posted) return '';
+        const limits = {
+            posting: 'all posted recovery is usable',
+            slice_cap: 'limited by the per-repair slice cap',
+            memory: 'limited by repair memory at this slice size',
+        };
+        const title = `PAR2 posted: ${c.recovery_slices_posted} recovery slices of ~${this.formatBytes(c.slice_size)}. ` +
+            `One repair can rebuild up to ${c.max_repairable_slices} damaged slices (~${this.formatBytes(c.max_repairable_bytes)}), ` +
+            `${limits[c.limited_by] || c.limited_by}.` +
+            (c.sets > 1 ? ` The release has ${c.sets} PAR2 sets; these figures are for the largest, and a repair uses the set covering the damaged file.` : '') +
+            ' Based on what was posted; expired articles are not counted.';
+        return `<div class="text-xs opacity-70 whitespace-nowrap" title="${this.escapeAttr(title)}">` +
+            `up to ${c.max_repairable_slices}/${c.recovery_slices_posted} slices (~${this.formatBytes(c.max_repairable_bytes)})</div>`;
+    }
+
     // overlayRepairStatusBucket maps a file's raw repair_status (+ repairable)
     // onto the coarser buckets the "Repair status" filter offers - repairable
     // covers both never-attempted (none) and transient-failed-but-still-
@@ -2089,7 +2112,7 @@ class RepairManager {
                     ${this.renderOverlaySparkline(f.segment_runs, f.total_segments)}
                     <div class="text-[10px] opacity-60 mt-1">${((f.damage_byte_ratio || 0) * 100).toFixed(2)}%${f.coverage_fraction ? ' (' + (f.coverage_fraction * 100).toFixed(0) + '% verified)' : ''}</div>
                 </td>
-                <td>${this.overlayRepairableBadge(f)}</td>
+                <td>${this.overlayRepairableBadge(f)}${this.overlayPar2CoverageNote(f)}</td>
                 <td>${this.renderOverlayRepairStatusCell(f, progressDomId)}</td>
                 <td class="text-right text-xs whitespace-nowrap">
                     <div title="Real bytes on disk: patch + retained PAR2 metadata">${this.formatBytes(f.overlay_disk_bytes || 0)}</div>

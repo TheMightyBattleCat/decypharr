@@ -92,6 +92,11 @@ type OverlayFile struct {
 	// both of which a manual pass re-evaluates.
 	ManualRepairAllowed bool `json:"manual_repair_allowed"`
 
+	// Par2Coverage is how much PAR2 recovery the release was posted with and
+	// how much one repair could use (see manager.Par2CoverageFor). Nil when
+	// the release retained no PAR2 file list to estimate from.
+	Par2Coverage *manager.Par2Coverage `json:"par2_coverage,omitempty"`
+
 	// Par2Terminal mirrors storage.Par2RepairState.Terminal: true means the
 	// automatic path has given up re-enqueuing this file (see
 	// Par2Repair.par2ShouldAutoEnqueue) after a failure classifyPar2Failure
@@ -260,6 +265,12 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 		nzb, _ := u.GetNZB(nzbID)
 		protectedBytes := par2ProtectedReleaseBytes(nzb)
 		retainedMetaBytes := par2RetainedMetaBytes(nzb)
+		var coverage *manager.Par2Coverage
+		if nzb != nil {
+			if c, ok := manager.Par2CoverageFor(nzb.Par2Files); ok {
+				coverage = &c
+			}
+		}
 
 		repairable, notRepairableReason := false, "par2 repair worker unavailable"
 		manualPossible := false
@@ -327,6 +338,7 @@ func (s *Server) handleListOverlayFiles(w http.ResponseWriter, r *http.Request) 
 				of.BackfillEligible = s.par2RefsBackfillEligible(nzbID)
 			}
 			of.ManualRepairAllowed = pending && (manualPossible || of.BackfillEligible)
+			of.Par2Coverage = coverage
 			if repairState != nil {
 				of.Par2Terminal = repairState.Terminal
 				of.Par2AttemptCount = repairState.AttemptCount

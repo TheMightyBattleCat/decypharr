@@ -4451,6 +4451,13 @@ func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, p
 // season pack), not volumes. 0 when nothing qualifies. runRepair counts the
 // real slices once it has parsed them.
 func estimateUnnamedRecovery(files []storage.Par2FileRef) uint32 {
+	n, _ := unnamedRecoveryEstimate(files)
+	return n
+}
+
+// unnamedRecoveryEstimate is estimateUnnamedRecovery that also returns the
+// size step it counted in: one recovery packet, slice plus packet overhead.
+func unnamedRecoveryEstimate(files []storage.Par2FileRef) (uint32, int64) {
 	base := int64(-1)
 	for _, f := range files {
 		if f.Size > 0 && (base < 0 || f.Size < base) {
@@ -4458,7 +4465,7 @@ func estimateUnnamedRecovery(files []storage.Par2FileRef) uint32 {
 		}
 	}
 	if base <= 0 {
-		return 0
+		return 0, 0
 	}
 	step := int64(0)
 	for _, f := range files {
@@ -4469,7 +4476,7 @@ func estimateUnnamedRecovery(files []storage.Par2FileRef) uint32 {
 		}
 	}
 	if step == 0 {
-		return 0
+		return 0, 0
 	}
 	var n int64
 	for _, f := range files {
@@ -4480,5 +4487,5 @@ func estimateUnnamedRecovery(files []storage.Par2FileRef) uint32 {
 	if n > int64(^uint32(0)) {
 		n = int64(^uint32(0))
 	}
-	return uint32(n)
+	return uint32(n), step
 }
