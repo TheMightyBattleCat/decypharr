@@ -108,7 +108,7 @@ func (m *Manager) executeMigration(job *storage.SwitcherJob, torrent *storage.En
 
 	// Save updated torrent
 	if err := m.AddOrUpdate(torrent, func(t *storage.Entry) {
-		m.RefreshEntries(false)
+		m.InvalidateEntryCache()
 	}); err != nil {
 		job.Status = storage.SwitcherStatusFailed
 		job.Error = fmt.Sprintf("failed to update torrent: %v", err)

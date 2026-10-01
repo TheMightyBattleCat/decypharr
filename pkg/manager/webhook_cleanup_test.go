@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 // HandleArrWebhookCleanup: a real, temp-dir-backed Storage (so
 // AddOrUpdate/GetEntryItem/DeleteEntryHealth behave exactly as they do in
 // production), a non-nil config (RefreshMount, called async off DeleteEntry,
-// dereferences it), an initialized EntryCache (RefreshEntries needs it), and
+// dereferences it), an initialized EntryCache (InvalidateEntryCache needs it), and
 // its own temp-file-backed arrLibraryMap (isolated per test, rather than
 // sharing the package's one throwaway config dir across every subtest).
 // usenet is deliberately left nil - every call site already guards for that

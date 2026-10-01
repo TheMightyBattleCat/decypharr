@@ -835,7 +835,12 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 		return err
 	}
 	// Refresh entry cache
-	m.RefreshEntries(true)
+	m.InvalidateEntryCache()
+	go func() {
+		if err := m.RefreshMount(); err != nil {
+			m.logger.Error().Err(err).Msg("Mount refresh after entry deletion failed")
+		}
+	}()
 	return nil
 }
 

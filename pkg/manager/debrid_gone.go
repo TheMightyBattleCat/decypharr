@@ -342,7 +342,12 @@ func (r *Repair) deleteAndMarkDebridGone(refs debridGoneRefs, opts DebridGoneFix
 			Msg("Debrid-gone: deleted entry no Arr points at")
 	}
 	if found.Deleted > 0 {
-		r.manager.RefreshEntries(true)
+		r.manager.InvalidateEntryCache()
+		go func() {
+			if err := r.manager.RefreshMount(); err != nil {
+				r.logger.Error().Err(err).Msg("Mount refresh after entry deletion failed")
+			}
+		}()
 	}
 
 	names := make([]string, 0, len(found.Entries))
