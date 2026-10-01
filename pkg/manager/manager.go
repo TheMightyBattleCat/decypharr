@@ -294,8 +294,7 @@ func (m *Manager) init() {
 	// Initialize notifications service
 	m.Notifications = notifications.New(&m.config.Notifications, m.logger)
 
-	// Initialize hearsay network participation (nil when disabled).
-	// Never blocks decypharr: a failure just means no participation.
+	// Initialize local Hearsay state; network participation remains opt-in.
 	if hs, err := hearsay.New(m.config, m.logger); err != nil {
 		m.logger.Warn().Err(err).Msg("Hearsay disabled: failed to initialize")
 	} else {
@@ -525,8 +524,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start manager worker: %w", err)
 	}
 
-	// Join the hearsay network. Failure is never fatal: local
-	// observations still work without network participation.
+	// Start network participation when the operator opted in.
 	if m.hearsay != nil {
 		if err := m.hearsay.Start(ctx); err != nil {
 			m.logger.Warn().Err(err).Msg("Failed to start hearsay network participation")
