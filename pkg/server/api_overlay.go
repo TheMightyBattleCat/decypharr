@@ -22,6 +22,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
@@ -669,7 +670,8 @@ func (s *Server) par2RefsBackfillEligible(nzbID string) bool {
 	// BackfillPar2Refs rebuilds only a record that kept neither list; with
 	// one retained, "Repair now" answered queued and then failed terminal.
 	if len(nzb.Par2Source) > 0 || len(nzb.Par2Files) > 0 {
-		return false
+		// The pass first looks for PAR2 files stored among the posted files.
+		return usenet.Par2FilesMayBeAmongPosted(nzb)
 	}
 	if nzb.Path == "" {
 		return false

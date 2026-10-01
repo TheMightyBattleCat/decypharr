@@ -41,6 +41,7 @@ func TestPar2UsableNeedsBothRefListsOrABackfill(t *testing.T) {
 		t.Fatalf("write nzb: %v", err)
 	}
 	source := []storage.PostedFileRef{{Name: "movie.mkv"}}
+	obfuscated := []storage.PostedFileRef{{Name: "a8f3", Segments: []storage.Par2SegmentRef{{MessageID: "idx"}}}}
 
 	cases := []struct {
 		id       string
@@ -50,6 +51,14 @@ func TestPar2UsableNeedsBothRefListsOrABackfill(t *testing.T) {
 	}{
 		{"no-par2-files", source, nil, false},
 		{"neither-list", nil, nil, true}, // backfillable from the .nzb on disk
+		// An obfuscated posted file with articles that no stored file reads may
+		// be a PAR2 file stored as a posted file: with damage pending the pass
+		// looks; with none there is nothing for a pass to repair.
+		{"par2-among-posted", obfuscated, nil, true},
+		{"par2-among-posted-nothing-pending", obfuscated, nil, false},
+	}
+	if err := store.RecordDead("par2-among-posted", "movie.mkv", 4, "<a@test>", 1024); err != nil {
+		t.Fatalf("RecordDead: %v", err)
 	}
 	for _, c := range cases {
 		if err := u.AddNZBForTest(&storage.NZB{ID: c.id, Name: c.id, Path: nzbPath, Par2Source: c.source, Par2Files: c.files}); err != nil {

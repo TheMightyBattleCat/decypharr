@@ -1410,6 +1410,12 @@ func (p *NZBParser) getBaseFilename(filename string) string {
 }
 
 // Simplified file type detection
+// FileTypeByName is the type a file's name alone gives it; Unknown for a name
+// that says nothing, such as an obfuscated subject.
+func FileTypeByName(filename string) storage.NZBFileType {
+	return (&NZBParser{}).detectFileType(filename)
+}
+
 func (p *NZBParser) detectFileType(filename string) storage.NZBFileType {
 	lower := strings.ToLower(filename)
 

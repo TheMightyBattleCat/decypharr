@@ -840,6 +840,16 @@ func (p *Par2Repair) par2Usable(nzbID string) (usable bool, reason string) {
 		// without PAR2 files) it does nothing and the pass ends "no PAR2 data
 		// available": not usable, so the policy re-grabs instead.
 		if len(nzb.Par2Source) > 0 || len(nzb.Par2Files) > 0 {
+			// Unless the PAR2 files were stored among the posted files (see
+			// usenet.RefilePar2Refs) and there is damage for a pass to repair:
+			// the pass looks, and a release that has none ends terminal there,
+			// which the check above then answers. With nothing pending a pass
+			// has nothing to do, as below.
+			if usenet.Par2FilesMayBeAmongPosted(nzb) {
+				if pending, perr := p.manager.usenet.OverlayPendingRepair(nzbID); perr == nil && estimateNeededSlices(pending) > 0 {
+					return true, ""
+				}
+			}
 			return false, "no PAR2 files retained for this release"
 		}
 		if nzb.Path == "" {
@@ -1856,6 +1866,19 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	nzb, err := u.GetNZB(nzbID)
 	if err != nil {
 		return fmt.Errorf("load NZB record: %w", err)
+	}
+	if usenet.Par2FilesMayBeAmongPosted(nzb) {
+		moved, err := u.RefilePar2Refs(ctx, nzbID)
+		if err != nil {
+			return fmt.Errorf("looking for PAR2 files among the posted files did not complete: %w (transient: it can be retried)", err)
+		}
+		if moved > 0 {
+			p.logger.Info().Str("entry", nzbID).Int("par2_files", moved).
+				Msg("Found the release's PAR2 files among its posted files by their yEnc names")
+			if nzb, err = u.GetNZB(nzbID); err != nil {
+				return fmt.Errorf("reload NZB record after refiling PAR2 files: %w", err)
+			}
+		}
 	}
 	if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
 		if err := u.BackfillPar2Refs(ctx, nzbID); err != nil {
