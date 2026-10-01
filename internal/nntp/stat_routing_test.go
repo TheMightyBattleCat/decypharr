@@ -38,6 +38,7 @@ type fakeNNTP struct {
 	noReply   map[string]bool   // message IDs whose STAT gets no reply at all (a dropped line)
 	extraLine map[string]bool   // message IDs whose STAT reply is followed by a stray line
 	denied    map[string]bool   // message IDs whose STAT is answered 502
+	noDate    bool              // DATE gets no reply (a server gone silent)
 	stats     atomic.Int64
 	maxQueued atomic.Int64 // most command bytes already waiting when a STAT was answered
 	bodyReqs  atomic.Int64
@@ -115,6 +116,9 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 				_, _ = w.WriteString("223 0 <stray@test>\r\n")
 			}
 		case line == "DATE":
+			if s.noDate {
+				continue
+			}
 			_, _ = w.WriteString("111 20260930120000\r\n")
 		case strings.HasPrefix(line, "BODY "):
 			s.bodyReqs.Add(1)

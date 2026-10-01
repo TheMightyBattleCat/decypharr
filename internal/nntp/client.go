@@ -1384,6 +1384,16 @@ func (c *Client) Stats() map[string]any {
 			// discarded because their replies did not line up.
 			"stat_ms":      float64(pp.stat.nsPerStat.Load()) / 1e6,
 			"stat_desyncs": pp.stat.desyncs.Load(),
+			// Failed STAT checkouts and windows that cost this provider the
+			// routing error penalty (desyncs included), then by cause; and
+			// windows cut short by a cancelled caller, which cost nothing.
+			"stat_errors":       pp.stat.penalties(),
+			"stat_err_checkout": pp.stat.errCheckout.Load(),
+			"stat_err_timeout":  pp.stat.errTimeout.Load(),
+			"stat_err_eof":      pp.stat.errEOF.Load(),
+			"stat_err_closed":   pp.stat.errClosed.Load(),
+			"stat_err_other":    pp.stat.errOther.Load(),
+			"stat_cancelled":    pp.stat.cancelled.Load(),
 		}
 
 		// Add speed test result if available
@@ -1812,7 +1822,9 @@ const statPipelineDepth = 16
 // install: eweka ~450 ms, newshosting ~1.2 s, against ~10 ms), so misses - and
 // every fall-through chunk is all misses - would make a fast provider look
 // slow. A connection that can't be had or a window that fails records
-// statErrorPenalty. Windows already read are kept when a later one fails.
+// statErrorPenalty, counted and logged by cause (notePenalty); a window cut
+// short by the caller's context does not. Windows already read are kept when
+// a later one fails.
 func (c *Client) batchStatOnProvider(ctx context.Context, provider config.UsenetProvider, messageIDs []string) ([]StatResult, error) {
 	var hitTime time.Duration
 	hits := 0
@@ -1823,10 +1835,11 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 			return results, err
 		}
 		end := min(start+statPipelineDepth, len(messageIDs))
+		began := time.Now()
 		conn, providerCfg, err := c.getConnectionFromProvider(ctx, provider)
 		if err != nil {
 			if ctx.Err() == nil {
-				c.recordStatSample(provider, statErrorPenalty)
+				c.notePenalty(provider, statCauseCheckout, err, end-start, start, len(messageIDs), time.Since(began))
 			} else {
 				c.recordStatHits(provider, hitTime, hits)
 			}
@@ -1835,25 +1848,28 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 
 		// A cancelled sweep closes the connection to unblock the reads.
 		stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		began = time.Now()
 		window, windowHitTime, statErr := conn.StatBatch(messageIDs[start:end])
+		took := time.Since(began)
 		stopCancel()
 		if statErr != nil {
 			c.release(conn)
 			if ctxErr := ctx.Err(); ctxErr != nil {
+				if pp, ok := c.pools[provider.Host]; ok {
+					pp.stat.cancelled.Add(1)
+				}
 				c.recordStatHits(provider, hitTime, hits)
 				for i := range window {
 					window[i].Error = ctxErr
 				}
 				return append(results, window...), ctxErr
 			}
-			if errors.Is(statErr, errStatDesync) {
-				if pp, ok := c.pools[provider.Host]; ok {
-					pp.stat.desyncs.Add(1)
-				}
+			cause := statFailureCause(statErr)
+			if cause == statCauseDesync {
 				c.logger.Warn().Err(statErr).Str("provider", provider.Host).Int("window", end-start).
 					Msg("STAT pipeline replies did not line up; discarded the window and closed the connection")
 			}
-			c.recordStatSample(provider, statErrorPenalty)
+			c.notePenalty(provider, cause, statErr, end-start, start, len(messageIDs), took)
 			return append(results, window...), statErr
 		}
 		for _, r := range window {

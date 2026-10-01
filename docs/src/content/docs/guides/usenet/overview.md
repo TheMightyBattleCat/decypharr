@@ -188,6 +188,8 @@ Use `availability_sample_percent` for repair checks and
 
 A segment check is a STAT, which asks the server whether an article exists without downloading it. Checks are sent 16 at a time on one connection, followed by a `DATE` command whose reply must come straight after the last STAT reply. If the replies don't line up (the server dropped or added a line), nothing in that batch counts as found or missing, the connection is closed, and the segments are checked on the next provider. The provider stats show each provider's measured time per found article (`stat_ms`) and how many batches were thrown away this way (`stat_desyncs`, normally 0).
 
+A provider that fails a batch or cannot give a connection is treated as slow for a while and takes fewer checks. `stat_errors` counts those failures, and `stat_err_checkout`, `stat_err_timeout`, `stat_err_eof`, `stat_err_closed` and `stat_err_other` split them by cause: no connection could be opened, a reply did not arrive in time, the provider closed the connection, the connection was closed on this side, or anything else. `stat_cancelled` counts batches stopped because the check itself was cancelled, which is not held against the provider. At debug log level each failure is also logged with the error behind it.
+
 The import checks (availability, STAT census, padding and ffprobe) cover every video file of 100 MiB or more, and smaller video files that are at least a quarter of the size of the release's largest video. A lone SD episode or a pack of small episodes is checked; a small extra bundled with a film is not. Files named as samples are dropped when the NZB is added unless `allow_samples` is on. The repair sweep checks every library file whatever its size.
 
 ## Disk Buffer

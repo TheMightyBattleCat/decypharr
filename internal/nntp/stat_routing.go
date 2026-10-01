@@ -1,8 +1,13 @@
 package nntp
 
 import (
+	"errors"
+	"io"
+	"net"
+	"os"
 	"sort"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -59,6 +64,80 @@ type statLatency struct {
 	exploring atomic.Bool  // an ineligible home has a worker out re-measuring it
 	eligible  atomic.Bool  // last eligibility a worker saw, for transition logs
 	desyncs   atomic.Int64 // pipelined STAT windows discarded as out of step
+
+	// Failures that recorded statErrorPenalty, by cause (see statFailureCause).
+	// Desyncs are counted above.
+	errCheckout atomic.Int64
+	errTimeout  atomic.Int64
+	errEOF      atomic.Int64
+	errClosed   atomic.Int64
+	errOther    atomic.Int64
+	// cancelled counts windows cut short by the caller's context: the
+	// connection is closed to unblock the read, but no penalty is recorded.
+	cancelled atomic.Int64
+}
+
+// STAT failure causes, as logged and as the suffix of the stat_err_* stats.
+const (
+	statCauseCheckout = "checkout" // no connection could be had from the pool
+	statCauseTimeout  = "timeout"  // a read or write deadline passed
+	statCauseEOF      = "eof"      // the provider closed or reset the connection
+	statCauseClosed   = "closed"   // the connection was closed on our side mid-window
+	statCauseDesync   = "desync"
+	statCauseOther    = "other"
+)
+
+// statFailureCause names why a STAT window failed.
+func statFailureCause(err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, errStatDesync):
+		return statCauseDesync
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return statCauseTimeout
+	case errors.Is(err, net.ErrClosed):
+		return statCauseClosed
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), errors.Is(err, syscall.ECONNABORTED):
+		return statCauseEOF
+	default:
+		return statCauseOther
+	}
+}
+
+// penalties is the number of failures that recorded statErrorPenalty.
+func (s *statLatency) penalties() int64 {
+	return s.errCheckout.Load() + s.errTimeout.Load() + s.errEOF.Load() + s.errClosed.Load() +
+		s.errOther.Load() + s.desyncs.Load()
+}
+
+// notePenalty records statErrorPenalty against provider for a failed checkout
+// or window, counts it by cause and logs the error behind it.
+func (c *Client) notePenalty(provider config.UsenetProvider, cause string, err error, window, done, chunk int, took time.Duration) {
+	stage := "window"
+	if cause == statCauseCheckout {
+		stage = "checkout"
+	}
+	if pp, ok := c.pools[provider.Host]; ok {
+		switch cause {
+		case statCauseCheckout:
+			pp.stat.errCheckout.Add(1)
+		case statCauseTimeout:
+			pp.stat.errTimeout.Add(1)
+		case statCauseEOF:
+			pp.stat.errEOF.Add(1)
+		case statCauseClosed:
+			pp.stat.errClosed.Add(1)
+		case statCauseDesync:
+			pp.stat.desyncs.Add(1)
+		default:
+			pp.stat.errOther.Add(1)
+		}
+	}
+	c.logger.Debug().Err(err).Str("provider", provider.Host).Str("stage", stage).Str("cause", cause).
+		Int("window", window).Int("done", done).Int("chunk", chunk).Dur("took", took).
+		Msg("STAT penalty: a chunk failed on this provider, error penalty recorded")
+	c.recordStatSample(provider, statErrorPenalty)
 }
 
 // record folds one per-STAT latency sample into the average. The first sample,

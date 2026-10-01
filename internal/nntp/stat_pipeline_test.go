@@ -3,9 +3,11 @@ package nntp
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sirrobot01/decypharr/internal/config"
 )
 
@@ -206,4 +208,83 @@ func TestStatBatchCancelMidWindow(t *testing.T) {
 	if idle, slots := idleConns(c, p.Host); idle != 0 || slots != 0 {
 		t.Fatalf("pool after cancel: idle %d, checked out %d, want the connection closed", idle, slots)
 	}
+	// A cancelled window is the caller's doing: counted, never penalised.
+	st := &c.pools[p.Host].stat
+	if got := st.cancelled.Load(); got != 1 {
+		t.Fatalf("cancelled = %d, want 1", got)
+	}
+	if got := st.penalties(); got != 0 || st.nsPerStat.Load() != 0 {
+		t.Fatalf("a cancelled window recorded %d penalties and latency %v, want none", got, time.Duration(st.nsPerStat.Load()))
+	}
+}
+
+// Every failure that costs a provider the routing penalty is counted under
+// its cause, so the stats say why a provider keeps dropping out.
+func TestStatFailureCounters(t *testing.T) {
+	t.Run("refused dial", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		p := config.UsenetProvider{Host: "127.0.0.1", Port: port, Priority: 1, MaxConnections: 2}
+		c := newStatTestClient(t, []config.UsenetProvider{p}, 100)
+		if _, err := c.batchStatOnProvider(context.Background(), p, []string{"a@test"}); err == nil {
+			t.Fatal("expected a connection error")
+		}
+		st := &c.pools[p.Host].stat
+		if st.errCheckout.Load() != 1 || st.penalties() != 1 {
+			t.Fatalf("checkout = %d of %d penalties, want 1 of 1", st.errCheckout.Load(), st.penalties())
+		}
+	})
+
+	// The server hangs up partway through a window. The read sees EOF or a
+	// reset depending on timing; both are the provider's close.
+	t.Run("dropped mid-window", func(t *testing.T) {
+		srv := startFakeNNTP(t, 0)
+		srv.dropAfter = 2
+		c, p := pipelineTestClient(t, srv)
+		res, err := c.batchStatOnProvider(context.Background(), p, []string{"a@test", "b@test", "c@test", "d@test"})
+		if err == nil {
+			t.Fatal("expected a mid-window connection error")
+		}
+		for _, r := range res {
+			if r.Available || IsArticleNotFoundError(r.Error) {
+				t.Fatalf("result %+v from a dropped window, want no verdict", r)
+			}
+		}
+		st := &c.pools[p.Host].stat
+		if st.errEOF.Load() != 1 || st.penalties() != 1 {
+			t.Fatalf("eof = %d of %d penalties (err %v), want 1 of 1", st.errEOF.Load(), st.penalties(), err)
+		}
+	})
+
+	t.Run("read timeout", func(t *testing.T) {
+		shortReadTimeout(t)
+		srv := startFakeNNTP(t, 0)
+		srv.noReply = map[string]bool{"silent@test": true, "b@test": true}
+		srv.noDate = true
+		c, p := pipelineTestClient(t, srv)
+		_, err := c.batchStatOnProvider(context.Background(), p, []string{"silent@test", "b@test"})
+		if err == nil || errors.Is(err, errStatDesync) {
+			t.Fatalf("err = %v, want a read timeout", err)
+		}
+		st := &c.pools[p.Host].stat
+		if st.errTimeout.Load() != 1 || st.penalties() != 1 {
+			t.Fatalf("timeout = %d of %d penalties (err %v), want 1 of 1", st.errTimeout.Load(), st.penalties(), err)
+		}
+	})
+
+	t.Run("stats", func(t *testing.T) {
+		srv := startFakeNNTP(t, 0)
+		srv.dropAfter = 1
+		c, p := pipelineTestClient(t, srv)
+		c.speedTestResults = xsync.NewMap[string, SpeedTestResult]()
+		_, _ = c.batchStatOnProvider(context.Background(), p, []string{"a@test", "b@test"})
+		info := c.Stats()["providers"].([]map[string]any)[0]
+		if info["stat_errors"] != int64(1) || info["stat_err_eof"] != int64(1) || info["stat_cancelled"] != int64(0) {
+			t.Fatalf("stats = errors %v, eof %v, cancelled %v; want 1, 1, 0", info["stat_errors"], info["stat_err_eof"], info["stat_cancelled"])
+		}
+	})
 }
