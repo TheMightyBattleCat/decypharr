@@ -1,6 +1,6 @@
 module github.com/sirrobot01/decypharr
 
-go 1.26.0
+go 1.26.2
 
 require (
 	github.com/Tensai75/nzbparser v0.1.0
@@ -21,6 +21,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.35.1
 	github.com/sirrobot01/appendstore v0.6.0
+	github.com/sirrobot01/facetfs v0.7.0
 	github.com/sourcegraph/conc v0.3.0
 	github.com/stanNthe5/stringbuf v0.0.3
 	github.com/winfsp/cgofuse v1.6.0
