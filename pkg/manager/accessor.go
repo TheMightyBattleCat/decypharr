@@ -11,6 +11,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/hearsay"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/storage/migration"
+	"github.com/sirrobot01/decypharr/pkg/strm"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
@@ -70,7 +71,7 @@ func (m *Manager) Migrator() *migration.Migrator {
 
 // Strm returns the .strm reconciler. Created during init(), so callers can
 // rely on a non-nil value once the manager has been constructed.
-func (m *Manager) Strm() *Strm {
+func (m *Manager) Strm() *strm.Reconciler {
 	return m.strm
 }
 
