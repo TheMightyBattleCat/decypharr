@@ -1247,6 +1247,15 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 			}
 		}
 
+		// groupFiles drops a PAR2 file named so in its subject. One with an
+		// obfuscated subject is only recognised here, from its yEnc name, and
+		// "X.par2" has the same base name as X's volumes or media file: grouped,
+		// it would sit among them, or - listed first - make the group a PAR2
+		// one that no processor takes, and the release's files go with it.
+		if item.fileType == storage.NZBFileTypePar2 {
+			continue
+		}
+
 		var groupKey string
 		if item.actualFilename != "" && item.actualFilename != item.file.Filename {
 			groupKey = p.getBaseFilename(item.actualFilename)
