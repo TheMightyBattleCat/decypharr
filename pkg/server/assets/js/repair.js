@@ -1438,7 +1438,7 @@ class RepairManager {
             const deleted = preview?.deleted || [];
             const skipped = preview?.skipped_inflight || [];
             if (!deleted.length) {
-                window.createToast('No incomplete precache entries to delete', 'info');
+                window.decypharrUtils.createToast('No incomplete precache entries to delete', 'info');
                 return;
             }
             const skippedNote = skipped.length ? `\n\n${skipped.length} still downloading will be skipped.` : '';
@@ -1453,10 +1453,10 @@ class RepairManager {
             let msg = `Deleted ${deletedCount} (freed ${this.formatBytes(data?.freed_bytes || 0)})`;
             if (skippedCount) msg += `, ${skippedCount} in-flight skipped`;
             if (failedCount) msg += `, ${failedCount} couldn't be removed`;
-            window.createToast(msg, failedCount ? 'warning' : 'success');
+            window.decypharrUtils.createToast(msg, failedCount ? 'warning' : 'success');
             await this.loadPrecacheStatus();
         } catch (e) {
-            window.createToast(`Delete incomplete failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Delete incomplete failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
@@ -1479,7 +1479,7 @@ class RepairManager {
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
             await this.loadPrecacheStatus();
         } catch (e) {
-            window.createToast(`Pause precache failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Pause precache failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
@@ -1499,7 +1499,7 @@ class RepairManager {
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
             await this.loadPrecacheStatus();
         } catch (e) {
-            window.createToast(`Pause entry failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Pause entry failed: ${e.message}`, 'error');
         }
     }
 
@@ -1635,7 +1635,7 @@ class RepairManager {
     }
 
     toast(message, type = 'info') {
-        if (typeof window.createToast === 'function') return window.createToast(message, type);
+        if (typeof window.decypharrUtils.createToast === 'function') return window.decypharrUtils.createToast(message, type);
         console.log(`[${type}]`, message);
     }
 
@@ -1756,10 +1756,10 @@ class RepairManager {
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
             const deleted = (data?.deleted_entries || 0) + (data?.deleted_files || 0);
-            window.createToast(`Cleaned up ${deleted} orphaned overlay record(s)`, 'success');
+            window.decypharrUtils.createToast(`Cleaned up ${deleted} orphaned overlay record(s)`, 'success');
             await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage(), this.loadOverlayOrphanCount()]);
         } catch (e) {
-            window.createToast(`Cleanup failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Cleanup failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
@@ -2176,18 +2176,18 @@ class RepairManager {
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
             if (data && data.status === 'unavailable') {
-                window.createToast(`Not repairable: ${data.reason || 'unavailable'}`, 'warning');
+                window.decypharrUtils.createToast(`Not repairable: ${data.reason || 'unavailable'}`, 'warning');
             } else {
-                window.createToast(`PAR2 repair queued for ${f.file}`, 'success');
+                window.decypharrUtils.createToast(`PAR2 repair queued for ${f.file}`, 'success');
             }
             setTimeout(() => this.loadOverlayFiles(), 1000);
         } catch (e) {
-            window.createToast(`Repair now failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Repair now failed: ${e.message}`, 'error');
         }
     }
 
     async overlayVerify(f) {
-        window.createToast(`Verifying ${f.file} - this downloads the whole file and can take minutes`, 'info');
+        window.decypharrUtils.createToast(`Verifying ${f.file} - this downloads the whole file and can take minutes`, 'info');
         try {
             const res = await fetch(`${this.api}/overlay/verify`, {
                 method: 'POST',
@@ -2199,14 +2199,14 @@ class RepairManager {
             // "unsupported" (an extracted archive member, no index retained)
             // was reported as a red "Verify FAILED".
             if (data && data.pass) {
-                window.createToast(`Verify passed: ${f.file} matches PAR2's whole-file MD5`, 'success');
+                window.decypharrUtils.createToast(`Verify passed: ${f.file} matches PAR2's whole-file MD5`, 'success');
             } else if (data && data.status === 'unsupported') {
-                window.createToast(`Can't verify ${f.file}: ${data.reason || 'not supported for this file'}`, 'warning');
+                window.decypharrUtils.createToast(`Can't verify ${f.file}: ${data.reason || 'not supported for this file'}`, 'warning');
             } else {
-                window.createToast(`Verify FAILED for ${f.file}: ${(data && data.reason) || 'MD5 mismatch'}`, 'error');
+                window.decypharrUtils.createToast(`Verify FAILED for ${f.file}: ${(data && data.reason) || 'MD5 mismatch'}`, 'error');
             }
         } catch (e) {
-            window.createToast(`Verify failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Verify failed: ${e.message}`, 'error');
         }
     }
 
@@ -2221,14 +2221,14 @@ class RepairManager {
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
             if (data && data.status === 'not_found') {
-                window.createToast(`Nothing to reclaim for ${f.file}: ${data.reason || 'no overlay record found'}`, 'warning');
+                window.decypharrUtils.createToast(`Nothing to reclaim for ${f.file}: ${data.reason || 'no overlay record found'}`, 'warning');
             } else {
-                window.createToast(`Reclaimed overlay metadata for ${f.file}`, 'success');
+                window.decypharrUtils.createToast(`Reclaimed overlay metadata for ${f.file}`, 'success');
             }
             this.overlaySelected.delete(this.overlayKey(f));
             await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
         } catch (e) {
-            window.createToast(`Reclaim failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Reclaim failed: ${e.message}`, 'error');
         }
     }
 
@@ -2242,11 +2242,11 @@ class RepairManager {
             });
             const data = await this.parseJSONSafe(res);
             if (!res.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
-            window.createToast(`Blocklisted and re-searching for ${f.entry}`, 'success');
+            window.decypharrUtils.createToast(`Blocklisted and re-searching for ${f.entry}`, 'success');
             this.overlaySelected.delete(this.overlayKey(f));
             await this.loadOverlayFiles();
         } catch (e) {
-            window.createToast(`Research failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Research failed: ${e.message}`, 'error');
         }
     }
 
@@ -2331,7 +2331,7 @@ class RepairManager {
         btn.addEventListener('click', () => {
             const items = itemsFn();
             if (!items.length) {
-                window.createToast('Nothing to do', 'warning');
+                window.decypharrUtils.createToast('Nothing to do', 'warning');
                 return;
             }
             if (btn.dataset.confirming === 'true') {
@@ -2378,7 +2378,7 @@ class RepairManager {
             )) return;
         }
 
-        window.createToast(`Deleting & re-searching ${items.length} file(s)…`, 'info');
+        window.decypharrUtils.createToast(`Deleting & re-searching ${items.length} file(s)…`, 'info');
         let ok = 0, fail = 0;
         for (const f of items) {
             try {
@@ -2395,13 +2395,13 @@ class RepairManager {
                 console.error('Bulk delete & re-search failed for', f.file, e);
             }
         }
-        window.createToast(`Delete & re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
+        window.decypharrUtils.createToast(`Delete & re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
         this.clearOverlaySelection();
         await this.loadOverlayFiles();
     }
 
     async runOverlayBulkResearch(items) {
-        window.createToast(`Re-searching ${items.length} file(s)…`, 'info');
+        window.decypharrUtils.createToast(`Re-searching ${items.length} file(s)…`, 'info');
         let ok = 0, fail = 0;
         for (const f of items) {
             try {
@@ -2418,12 +2418,12 @@ class RepairManager {
                 console.error('Bulk research failed for', f.file, e);
             }
         }
-        window.createToast(`Re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
+        window.decypharrUtils.createToast(`Re-search: ${ok} started, ${fail} failed`, fail ? 'warning' : 'success');
         await this.loadOverlayFiles();
     }
 
     async runOverlayBulkReclaim(items) {
-        window.createToast(`Reclaiming ${items.length} file(s)…`, 'info');
+        window.decypharrUtils.createToast(`Reclaiming ${items.length} file(s)…`, 'info');
         let ok = 0, notFound = 0, fail = 0;
         for (const f of items) {
             try {
@@ -2448,7 +2448,7 @@ class RepairManager {
         const parts = [`${ok} done`];
         if (notFound) parts.push(`${notFound} nothing to reclaim`);
         if (fail) parts.push(`${fail} failed`);
-        window.createToast(`Reclaim: ${parts.join(', ')}`, (fail || notFound) ? 'warning' : 'success');
+        window.decypharrUtils.createToast(`Reclaim: ${parts.join(', ')}`, (fail || notFound) ? 'warning' : 'success');
         await Promise.all([this.loadOverlayFiles(), this.loadOverlayDiskUsage()]);
     }
 
@@ -2509,7 +2509,7 @@ class RepairManager {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             await this.loadOverlayHistory();
         } catch (e) {
-            window.createToast(`Clear failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Clear failed: ${e.message}`, 'error');
         }
     }
 
@@ -2598,9 +2598,9 @@ class RepairManager {
             if (!res.ok) throw new Error((data && (data.error || data.message)) || text || `HTTP ${res.status}`);
             this.repairConfig = data || payload;
             this.populateOverlayConfigForm();
-            window.createToast('Overlay/PAR2 config saved', 'success');
+            window.decypharrUtils.createToast('Overlay/PAR2 config saved', 'success');
         } catch (e) {
-            window.createToast(`Save failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Save failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
@@ -2676,9 +2676,9 @@ class RepairManager {
             this.repairConfig = repairRes.data || repairPayload;
             this.precacheConfig = precacheRes.data || precachePayload;
             this.populatePrecacheConfigForm();
-            window.createToast('Pre-cache config saved', 'success');
+            window.decypharrUtils.createToast('Pre-cache config saved', 'success');
         } catch (e) {
-            window.createToast(`Save failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Save failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }
@@ -2733,10 +2733,10 @@ class RepairManager {
 
             this.plexConfig = data || payload;
             this.populatePlexConfigForm();
-            window.createToast('Plex config saved', 'success');
+            window.decypharrUtils.createToast('Plex config saved', 'success');
             this.loadPlexReap();
         } catch (e) {
-            window.createToast(`Save failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast(`Save failed: ${e.message}`, 'error');
         } finally {
             if (btn) btn.disabled = false;
         }

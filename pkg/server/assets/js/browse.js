@@ -328,7 +328,7 @@ class FileBrowser {
                 return;
             }
             console.error('Error loading entries:', error);
-            window.createToast('Failed to load directory', 'error');
+            window.decypharrUtils.createToast('Failed to load directory', 'error');
         }
     }
 
@@ -406,7 +406,7 @@ class FileBrowser {
     // selection is not checked one entry at a time.
     async recheckEntry(name, {wait = true} = {}) {
         try {
-            window.createToast?.(`Rechecking ${name}…`, 'info');
+            window.decypharrUtils.createToast?.(`Rechecking ${name}…`, 'info');
             const query = wait ? '?wait=300s' : '';
             const url = `${window.urlBase}api/repair/health/${encodeURIComponent(name)}/check${query}`;
             const res = await fetch(url, {method: 'POST'});
@@ -418,15 +418,15 @@ class FileBrowser {
             this.state.health.set(name, state);
             this.refreshHealthBadges();
             if (!wait) {
-                window.createToast?.(`Recheck of ${name} started`, 'info');
+                window.decypharrUtils.createToast?.(`Recheck of ${name} started`, 'info');
             } else if (res.status === 202) {
-                window.createToast?.(`Recheck of ${name} still running`, 'info');
+                window.decypharrUtils.createToast?.(`Recheck of ${name} still running`, 'info');
             } else {
-                window.createToast?.(`Health: ${state.status}`, state.status === 'broken' ? 'warning' : 'success');
+                window.decypharrUtils.createToast?.(`Health: ${state.status}`, state.status === 'broken' ? 'warning' : 'success');
             }
         } catch (e) {
             console.error('Recheck failed', e);
-            window.createToast?.(`Recheck failed: ${e.message}`, 'error');
+            window.decypharrUtils.createToast?.(`Recheck failed: ${e.message}`, 'error');
         }
     }
 
@@ -708,11 +708,11 @@ class FileBrowser {
 
             if (!response.ok) throw new Error('Failed to delete entry');
 
-            window.createToast('Item deleted successfully', 'success');
+            window.decypharrUtils.createToast('Item deleted successfully', 'success');
             this.refresh();
         } catch (error) {
             console.error('Error deleting item:', error);
-            window.createToast('Failed to delete item', 'error');
+            window.decypharrUtils.createToast('Failed to delete item', 'error');
         }
     }
 
@@ -832,7 +832,7 @@ class FileBrowser {
         const files = selectedEntries.filter(e => !e.is_dir);
 
         if (files.length === 0) {
-            window.createToast('No files selected for download', 'warning');
+            window.decypharrUtils.createToast('No files selected for download', 'warning');
             return;
         }
 
@@ -840,7 +840,7 @@ class FileBrowser {
             this.downloadFile(entry.path, entry.name);
         });
 
-        window.createToast(`Downloading ${files.length} file(s)`, 'success');
+        window.decypharrUtils.createToast(`Downloading ${files.length} file(s)`, 'success');
     }
 
     async bulkDelete() {
@@ -848,7 +848,7 @@ class FileBrowser {
         const torrents = selectedEntries.filter(e => e.can_delete && e.info_hash);
 
         if (torrents.length === 0) {
-            window.createToast('No items selected for deletion', 'warning');
+            window.decypharrUtils.createToast('No items selected for deletion', 'warning');
             return;
         }
 
@@ -865,12 +865,12 @@ class FileBrowser {
                 body: JSON.stringify({ids})
             });
             if (!response.ok) throw new Error('Failed to delete selected items');
-            window.createToast(`Deleted ${ids.length} item(s)`, 'success');
+            window.decypharrUtils.createToast(`Deleted ${ids.length} item(s)`, 'success');
             this.clearSelection();
             this.refresh();
         } catch (error) {
             console.error('Error deleting selected items:', error);
-            window.createToast('Failed to delete selected items', 'error');
+            window.decypharrUtils.createToast('Failed to delete selected items', 'error');
         }
     }
 
@@ -994,7 +994,7 @@ class FileBrowser {
     // this stays until the next successful preview/cleanup replaces it or
     // the user closes the modal.
     showStaleNZBsError(message) {
-        window.createToast(message, 'error');
+        window.decypharrUtils.createToast(message, 'error');
         if (!this.refs.staleNZBsResult) return;
         this.refs.staleNZBsResult.textContent = message;
         this.refs.staleNZBsResult.classList.remove('hidden', 'alert-success', 'alert-warning');
@@ -1136,7 +1136,7 @@ class FileBrowser {
         btn.addEventListener('click', () => {
             const keys = keysFn();
             if (!keys.length) {
-                window.createToast('No entries to delete', 'warning');
+                window.decypharrUtils.createToast('No entries to delete', 'warning');
                 return;
             }
             if (btn.dataset.confirming === 'true') {
@@ -1178,7 +1178,7 @@ class FileBrowser {
             const freedCache = this.formatSize(result?.freed?.cacheBytes || 0);
             const freedNzbMeta = this.formatSize(result?.freed?.nzbMetaBytes || 0);
             const skippedCount = (result?.skipped || []).length;
-            window.createToast(
+            window.decypharrUtils.createToast(
                 `Freed ${freedTotal} (${freedCache} cache, ${freedNzbMeta} nzb/meta) — deleted ${result?.deleted || 0} entries, skipped ${skippedCount}`,
                 'success'
             );
@@ -1214,7 +1214,7 @@ class FileBrowser {
     async bulkRecheck() {
         const selected = this.getSelectedEntries();
         if (!selected.length) {
-            window.createToast('No items selected', 'warning');
+            window.decypharrUtils.createToast('No items selected', 'warning');
             return;
         }
         for (const entry of selected) {
