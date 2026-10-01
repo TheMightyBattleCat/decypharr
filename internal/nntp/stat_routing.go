@@ -25,9 +25,10 @@ import (
 // Each repair-pool worker now has a home provider and takes chunks only while
 // that provider answers STAT within statSlowFactor of the fastest measured
 // home. A provider that is slower, or not yet measured, keeps a single
-// explorer worker that takes one chunk when its last sample is older than
-// statExploreAfter, so a provider that speeds up (or recovers from an outage)
-// is picked up again. Unresolved IDs still fall through every other provider
+// explorer worker that takes one chunk when its last sample is older than its
+// re-test wait, so a provider that speeds up (or recovers from an outage) is
+// picked up again. The wait starts at statExploreAfter and doubles, up to
+// statExploreMax, each time the re-test still finds the provider too slow. Unresolved IDs still fall through every other provider
 // (see statOrder), so an article counts as missing only when every provider
 // says so - exactly as before. Within one BatchStat call a provider that turns
 // out to have none of the call's articles is asked last (see statHint).
@@ -42,12 +43,22 @@ const (
 	statLeaveFactor = 6
 	// statLatencyFloor is the least the fastest home's latency counts as when
 	// computing the cutoff, so one lucky sample can't shrink the eligible set.
-	// About one network round trip to a remote provider.
-	statLatencyFloor = 10 * time.Millisecond
+	// At 10 ms (one round trip) a provider answering in 5 ms set the leave
+	// cutoff at 60 ms, and on a production install a second fast provider
+	// working flat out measured 60-95 ms and was dropped again and again,
+	// while the genuinely slow providers sat at 300 ms and above. 25 ms puts
+	// the cutoffs at 100 ms to join and 150 ms to leave.
+	statLatencyFloor = 25 * time.Millisecond
 	// statExploreAfter: how old a provider's last sample must be before an
-	// ineligible home sends one chunk to re-measure it. A sample taken after
-	// a gap this long replaces the average instead of blending into it.
-	statExploreAfter = 5 * time.Minute
+	// ineligible home first sends one chunk to re-measure it. A sample taken
+	// after a gap this long replaces the average instead of blending into it.
+	// This was 5 minutes with no back-off: on a production install a fast
+	// provider whose latency spiked for a few seconds then sat out the full
+	// 5 minutes, and spent most of a sweep out of the rotation.
+	statExploreAfter = 30 * time.Second
+	// statExploreMax caps the re-test wait. A provider that stays slow backs
+	// off to one re-test chunk this often, as before.
+	statExploreMax = 5 * time.Minute
 	// statErrorPenalty is recorded as the per-STAT latency when a provider
 	// fails to give a connection or drops one mid-chunk.
 	statErrorPenalty = time.Second
@@ -64,7 +75,10 @@ type statLatency struct {
 	sampledAt atomic.Int64 // unix nanoseconds of the latest sample
 	exploring atomic.Bool  // an ineligible home has a worker out re-measuring it
 	eligible  atomic.Bool  // last eligibility a worker saw, for transition logs
-	desyncs   atomic.Int64 // pipelined STAT windows discarded as out of step
+	// exploreWait is the current re-test wait in nanoseconds; 0 means
+	// statExploreAfter. See exploreDone.
+	exploreWait atomic.Int64
+	desyncs     atomic.Int64 // pipelined STAT windows discarded as out of step
 
 	// Failures that recorded statErrorPenalty, by cause (see statFailureCause).
 	// Desyncs are counted above.
@@ -163,14 +177,35 @@ func (s *statLatency) record(perStat time.Duration, now time.Time) {
 	s.sampledAt.Store(now.UnixNano())
 }
 
+// retestWait is how old the provider's last sample must be before its next
+// re-test chunk.
+func (s *statLatency) retestWait() time.Duration {
+	if w := time.Duration(s.exploreWait.Load()); w > 0 {
+		return w
+	}
+	return statExploreAfter
+}
+
 // tryExplore claims the explorer role for an ineligible home. It fails while
 // another worker holds it, and while the provider has a sample younger than
-// statExploreAfter (fall-through STATs keep a slow provider measured).
+// its re-test wait (fall-through STATs keep a slow provider measured).
 func (s *statLatency) tryExplore(now time.Time) bool {
-	if last := s.sampledAt.Load(); last != 0 && now.Sub(time.Unix(0, last)) < statExploreAfter {
+	if last := s.sampledAt.Load(); last != 0 && now.Sub(time.Unix(0, last)) < s.retestWait() {
 		return false
 	}
 	return s.exploring.CompareAndSwap(false, true)
+}
+
+// exploreDone ends an explorer's turn. A provider the re-test still finds too
+// slow waits twice as long for the next one, up to statExploreMax; one that
+// is eligible again starts from statExploreAfter the next time it drops out.
+func (s *statLatency) exploreDone(eligible bool) {
+	if eligible {
+		s.exploreWait.Store(0)
+	} else {
+		s.exploreWait.Store(int64(min(2*s.retestWait(), statExploreMax)))
+	}
+	s.exploring.Store(false)
 }
 
 // recordStatSample records a per-STAT latency sample against provider.

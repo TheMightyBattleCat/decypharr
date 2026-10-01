@@ -249,7 +249,7 @@ func TestStatTryExplore(t *testing.T) {
 	s.exploring.Store(false)
 
 	s.record(125*time.Millisecond, now)
-	if s.tryExplore(now.Add(time.Minute)) {
+	if s.tryExplore(now.Add(statExploreAfter / 2)) {
 		t.Fatal("explorer allowed with a fresh sample")
 	}
 	if !s.tryExplore(now.Add(statExploreAfter)) {
@@ -397,7 +397,7 @@ func TestBatchStatAcrossProvidersAsksEveryProvider(t *testing.T) {
 // provider's single explorer chunk there, then nothing while the sample is
 // fresh; the fast provider takes the rest.
 func TestRepairPoolRoutesAwayFromSlowProvider(t *testing.T) {
-	slow := startFakeNNTP(t, 80*time.Millisecond)
+	slow := startFakeNNTP(t, 200*time.Millisecond)
 	fast := startFakeNNTP(t, 0)
 	ps, pf := twoLocalProviders(t, slow, fast)
 	c := newStatTestClient(t, []config.UsenetProvider{ps, pf}, 100)
@@ -413,6 +413,15 @@ func TestRepairPoolRoutesAwayFromSlowProvider(t *testing.T) {
 	}
 	if ok, _, _ := c.statEligible(c.pools[ps.Host]); ok {
 		t.Fatalf("slow provider still eligible after being measured")
+	}
+	// Its re-test found it slow, so the next one waits twice as long. The
+	// explorer finishes its turn just after the chunk's results are handed back.
+	st := &c.pools[ps.Host].stat
+	for deadline := time.Now().Add(2 * time.Second); st.retestWait() != 2*statExploreAfter; {
+		if time.Now().After(deadline) {
+			t.Fatalf("re-test wait = %v after a slow re-test, want %v", st.retestWait(), 2*statExploreAfter)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	before := slow.stats.Load()
@@ -482,8 +491,8 @@ func TestStatEligibleHardQuota(t *testing.T) {
 	}
 	c.statHomes = c.statHomePools()
 	setLatency(c, "capped", 5*time.Millisecond)
-	setLatency(c, "mid", 30*time.Millisecond)
-	setLatency(c, "slower", 100*time.Millisecond)
+	setLatency(c, "mid", 40*time.Millisecond)
+	setLatency(c, "slower", 140*time.Millisecond)
 
 	// Reserve band (used past limit-reserve, below limit): still a STAT home.
 	c.bw = quotaTracker("capped", 95, 100, 10)
@@ -491,11 +500,11 @@ func TestStatEligibleHardQuota(t *testing.T) {
 		t.Error("provider in its reserve band excluded; only a hard-quota block should exclude it")
 	}
 	if ok, _, _ := c.statEligible(c.pools["slower"]); ok {
-		t.Error("slower (100ms) eligible while capped (5ms) sets the cutoff at 40ms")
+		t.Error("slower (140ms) eligible while capped (5ms) leaves the cutoff at the 100ms floor")
 	}
 
 	// Hard quota: not eligible, and no longer the fastest the others are cut
-	// against (100ms is within 4x of mid's 30ms).
+	// against (140ms is within 4x of mid's 40ms).
 	c.bw = quotaTracker("capped", 100, 100, 10)
 	if ok, _, _ := c.statEligible(c.pools["capped"]); ok {
 		t.Error("provider over its hard quota still eligible")
