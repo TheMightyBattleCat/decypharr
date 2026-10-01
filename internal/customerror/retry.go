@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"regexp"
 	"strings"
 	"syscall"
 )
@@ -40,19 +41,27 @@ var retriableErrorStrings = []string{
 
 // permanentErrorStrings contains error message substrings that indicate non-retriable errors
 var permanentErrorStrings = []string{
-	"404",
 	"not found",
-	"403",
 	"forbidden",
-	"401",
 	"unauthorized",
-	"402",
 	"payment required",
-	"410",
 	"gone",
 	"invalid api key",
 	"file not exist",
 	"no such file",
+}
+
+// permanentStatusCode matches the HTTP status codes that mean a retry cannot
+// help, as whole numbers only. As plain substrings they matched inside any
+// longer number: "segment 41094 still missing" and "stalled for 4100ms" were
+// both read as a 410.
+var permanentStatusCode = regexp.MustCompile(`(^|[^0-9])(401|402|403|404|410)([^0-9]|$)`)
+
+// selfRetryable is an error that knows whether a retry can help, such as
+// *nntp.Error.
+type selfRetryable interface {
+	error
+	IsRetryable() bool
 }
 
 // IsRetriableError returns true if the error is likely transient and should be retried.
@@ -78,10 +87,10 @@ func IsRetriableError(err error) bool {
 	// *nntp.Error that carry their own retryability knowledge but are not
 	// *customerror.Error. We intentionally place this after the *Error check
 	// so the explicit permanent/retry flags above always win for our own type.
-	type selfRetryable interface {
-		IsRetryable() bool
-	}
-	if r, ok := err.(selfRetryable); ok {
+	// The whole chain is searched, and before any text pattern: a wrapper's
+	// text (a segment number, a quoted cause) must not outvote the typed
+	// answer underneath it.
+	if r, ok := errors.AsType[selfRetryable](err); ok {
 		return r.IsRetryable()
 	}
 
@@ -184,6 +193,12 @@ func IsPermanentError(err error) bool {
 		return false
 	}
 
+	// Nor is an error that says a retry can help. Only a yes counts: "not
+	// retryable" says nothing about permanence (see above).
+	if r, ok := errors.AsType[selfRetryable](err); ok && r.IsRetryable() {
+		return false
+	}
+
 	errStr := strings.ToLower(err.Error())
 	for _, pattern := range permanentErrorStrings {
 		if strings.Contains(errStr, pattern) {
@@ -191,5 +206,5 @@ func IsPermanentError(err error) bool {
 		}
 	}
 
-	return false
+	return permanentStatusCode.MatchString(errStr)
 }

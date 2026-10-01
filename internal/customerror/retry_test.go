@@ -8,7 +8,30 @@ import (
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
+	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
 )
+
+// The reader's "still missing" error is retriable and never permanent,
+// whatever the segment number: as plain text, segment 404 read as an HTTP
+// status and tripped the mount's read breaker. The same goes for a retryable
+// NNTP error under the reader's "re-fetch segment N" wrapper.
+func TestReaderSegmentErrorsAreNotPermanent(t *testing.T) {
+	timeout := nntp.NewTimeoutError(errors.New("read timed out"))
+	for _, seg := range []int{12, 404, 2403, 41094} {
+		for _, err := range []error{
+			&reader.SegmentMissingError{Segment: seg},
+			fmt.Errorf("stream: %w", &reader.SegmentMissingError{Segment: seg}),
+			fmt.Errorf("re-fetch segment %d: %w", seg, timeout),
+		} {
+			if customerror.IsPermanentError(err) {
+				t.Errorf("IsPermanentError(%q) = true, want false", err)
+			}
+			if !customerror.IsRetriableError(err) {
+				t.Errorf("IsRetriableError(%q) = false, want true", err)
+			}
+		}
+	}
+}
 
 func TestRetryClassificationUsesWrappedMetadata(t *testing.T) {
 	for _, tc := range []struct {

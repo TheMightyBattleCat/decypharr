@@ -23,6 +23,21 @@ import (
 // worth seeing on its own.
 const verificationFetchLogThreshold = 2 * time.Second
 
+// SegmentMissingError is a read that found a segment's bytes unreadable in
+// the cache even after fetching it again. The article itself was fetched, so
+// nothing is known to be gone: another try can succeed. It is a type so that
+// the error classifiers ask IsRetryable instead of reading the text, where a
+// segment number such as 404 or 41094 used to look like an HTTP status code.
+type SegmentMissingError struct {
+	Segment int
+}
+
+func (e *SegmentMissingError) Error() string {
+	return fmt.Sprintf("segment %d still missing after re-fetch", e.Segment)
+}
+
+func (e *SegmentMissingError) IsRetryable() bool { return true }
+
 var decryptionBufPool = sync.Pool{}
 
 func acquireDecryptionBuffer(size int) []byte {
@@ -358,7 +373,7 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 			}
 			n, ok = sr.cache.ReadRangeInto(segIdx, segDataOffset, copyLen, p[outOffset:outOffset+copyLen])
 			if !ok {
-				return totalRead, fmt.Errorf("segment %d still missing after re-fetch", segIdx)
+				return totalRead, &SegmentMissingError{Segment: segIdx}
 			}
 		}
 
