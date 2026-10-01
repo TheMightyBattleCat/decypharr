@@ -1,11 +1,13 @@
 package nntp
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"os"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -93,6 +95,10 @@ type statLatency struct {
 	// hintDemotions counts BatchStat calls that moved this provider to the
 	// back because it had none of the call's articles (see statHint).
 	hintDemotions atomic.Int64
+	// probeDemotions counts BatchStat calls that asked this provider last
+	// from the start, because another provider answered the call's probe with
+	// a hit and this one did not (see statProbe).
+	probeDemotions atomic.Int64
 }
 
 // STAT failure causes, as logged and as the suffix of the stat_err_* stats.
@@ -347,14 +353,27 @@ const statHintMinAnswers = 32
 // in its tier (primaries stay ahead of backups), and still gets every ID
 // nothing else had, so "missing" still means every provider said so. One hit
 // puts it back in its usual place.
+//
+// A provider is asked last on either of two grounds: it has answered
+// statHintMinAnswers of the call's articles and found none, or the call's
+// probe (statProbe) got a hit from another provider and none from this one.
 type statHint struct {
 	byHost map[string]*statHintCounts
+	// probeMu serialises probe results, which read and set the flags of
+	// several providers at once.
+	probeMu sync.Mutex
+	// probeSettled: the wait for the probe is over (probeSettle).
+	probeSettled bool
 }
 
 type statHintCounts struct {
 	answered atomic.Int64 // definitive replies: found or not found
 	hits     atomic.Int64
 	noted    atomic.Bool // the demotion was logged and counted for this call
+
+	probing       atomic.Bool // the call's probe asked this provider and has not failed on it
+	probeAnswered atomic.Bool // the probe got definitive replies from it
+	demoted       atomic.Bool // another provider answered the probe with a hit first
 }
 
 // newStatHint returns an empty hint covering every configured provider.
@@ -377,14 +396,77 @@ func (h *statHint) add(host string, answered, hits int) {
 	}
 }
 
-// absent reports whether host has answered enough of the call's articles,
-// finding none, to be asked last.
+// absent reports whether host is to be asked last: it has found none of the
+// call's articles, and has either answered enough of them or lost the probe.
 func (h *statHint) absent(host string) bool {
 	if h == nil {
 		return false
 	}
 	n, ok := h.byHost[host]
-	return ok && n.hits.Load() == 0 && n.answered.Load() >= statHintMinAnswers
+	return ok && n.hits.Load() == 0 && (n.demoted.Load() || n.answered.Load() >= statHintMinAnswers)
+}
+
+// probeStart marks host as asked by the call's probe.
+func (h *statHint) probeStart(host string) {
+	if n, ok := h.byHost[host]; ok {
+		n.probing.Store(true)
+	}
+}
+
+// probeResult records what the probe learned from host. Once any probed
+// provider has a hit, a probed provider that answered without one is asked
+// last. One still to answer is left alone until the probe has settled
+// (probeSettle): it may hold the file and be a few milliseconds behind, and
+// demoting it at the first hit would send the file's whole first wave of
+// chunks to the provider that answered first. A probe that failed
+// (answered == 0) says nothing about what host holds, so host is taken out
+// of the probe and keeps its usual place.
+func (h *statHint) probeResult(host string, answered, hits int) {
+	n, ok := h.byHost[host]
+	if !ok {
+		return
+	}
+	h.probeMu.Lock()
+	defer h.probeMu.Unlock()
+	if answered == 0 {
+		n.probing.Store(false)
+		n.demoted.Store(false)
+		return
+	}
+	n.probeAnswered.Store(true)
+	h.add(host, answered, hits)
+	h.probeDemoteLocked()
+}
+
+// probeSettle ends the wait for the probe's replies: the call's chunks are
+// about to start. From here on a probed provider that still has not answered
+// is asked last as soon as another has a hit. A hit takes about one round
+// trip and a miss 40-100x that, so by now it is answering misses. If it does
+// come back with a hit, the hit puts it back (see absent).
+func (h *statHint) probeSettle() {
+	h.probeMu.Lock()
+	defer h.probeMu.Unlock()
+	h.probeSettled = true
+	h.probeDemoteLocked()
+}
+
+// probeDemoteLocked applies the probe's rule; see probeResult and probeSettle.
+func (h *statHint) probeDemoteLocked() {
+	found := false
+	for _, o := range h.byHost {
+		if o.probing.Load() && o.hits.Load() > 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	for _, o := range h.byHost {
+		if o.probing.Load() && o.hits.Load() == 0 && (h.probeSettled || o.probeAnswered.Load()) {
+			o.demoted.Store(true)
+		}
+	}
 }
 
 // applyStatHint reorders the providers a chunk has still to ask, in place:
@@ -411,7 +493,10 @@ func (c *Client) applyStatHint(hint *statHint, rest []config.UsenetProvider) {
 			continue
 		}
 		demoted = true
-		if n := hint.byHost[p.Host]; n.noted.CompareAndSwap(false, true) {
+		// A provider asked last on the probe's word alone is logged and
+		// counted when the call ends (noteProbeDemotions): by then a late
+		// hit from it has had the chance to put it back.
+		if n := hint.byHost[p.Host]; n.answered.Load() >= statHintMinAnswers && n.noted.CompareAndSwap(false, true) {
 			if pp, ok := c.pools[p.Host]; ok {
 				pp.stat.hintDemotions.Add(1)
 			}
@@ -421,5 +506,162 @@ func (c *Client) applyStatHint(hint *statHint, rest []config.UsenetProvider) {
 	}
 	if demoted {
 		sort.SliceStable(rest, func(i, j int) bool { return rank(rest[i]) < rank(rest[j]) })
+	}
+}
+
+const (
+	// statProbeIDs is how many of a BatchStat call's articles the probe asks
+	// each fast provider about before the call's chunks start.
+	statProbeIDs = 4
+	// statProbeWait is the longest a call waits for the probe's first hit.
+	// A hit takes about one round trip, so a probe with none by now is
+	// waiting on misses everywhere: the chunks start as they did before.
+	statProbeWait = 250 * time.Millisecond
+	// statProbeGraceFactor: after the first hit the call waits for the other
+	// probes up to this many times as long as that hit took (at least
+	// statLatencyFloor, at most statProbeWait) before it starts the chunks
+	// and asks a provider still to answer last.
+	statProbeGraceFactor = 3
+	// statProbeMaxCalls caps the calls with a probe out at once. A probe
+	// takes its connections outside the repair pool's share of each provider,
+	// and one waiting on a provider's misses holds its connection until the
+	// call ends; a call over the cap goes without.
+	statProbeMaxCalls = 4
+)
+
+// statProbe asks every fast provider (a STAT home that is currently eligible)
+// about statProbeIDs of the call's articles, all at once. Once one answers
+// with a hit it waits a short grace for the rest (statProbeGraceFactor) and
+// returns. A provider that answered without a hit, or has still not answered,
+// is then asked last from the call's first chunk on (statHint.probeResult,
+// probeSettle), without waiting for its slow misses.
+//
+// Without it the hint cannot help a file's first chunks: they all start
+// before any has an answer, so each worker homed on a provider without the
+// file pays a whole chunk of misses first. On a production install the hint
+// fired after a median of 800 such misses, 4 to 16 s into the file.
+//
+// It costs a file one extra round trip on the slowest provider that has it,
+// or the grace when one does not. Like the hint it only reorders. A call too
+// small to gain, with fewer than two fast providers, or over
+// statProbeMaxCalls skips it.
+//
+// The probes run on ctx and are not stopped when the chunks start, so a
+// provider that has the file but answers after the grace puts itself back
+// for the chunks still to start. The caller
+// cancels ctx when the call is over and then calls the returned function,
+// which waits for the probes to end and logs what they decided.
+func (c *Client) statProbe(ctx context.Context, messageIDs []string, hint *statHint) (done func()) {
+	done = func() {}
+	if hint == nil || len(messageIDs) <= statProbeIDs {
+		return done
+	}
+	var homes []*ProviderPool
+	for _, pp := range c.statHomes {
+		if ok, _, _ := c.statEligible(pp); ok {
+			homes = append(homes, pp)
+		}
+	}
+	if len(homes) < 2 {
+		return done
+	}
+	if c.statProbing.Add(1) > statProbeMaxCalls {
+		c.statProbing.Add(-1)
+		return done
+	}
+
+	// Spread over the file, so one dead article at its start is not the
+	// whole sample.
+	probeIDs := make([]string, statProbeIDs)
+	for i := range probeIDs {
+		probeIDs[i] = messageIDs[i*len(messageIDs)/statProbeIDs]
+	}
+	for _, pp := range homes {
+		hint.probeStart(pp.config.Host)
+	}
+
+	began := time.Now()
+	hit := make(chan struct{}, len(homes))
+	var wg sync.WaitGroup
+	for _, pp := range homes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results, _ := c.batchStatOnProvider(ctx, pp.config, probeIDs)
+			answered, hits := 0, 0
+			for _, r := range results {
+				switch {
+				case r.Available:
+					answered++
+					hits++
+				case IsArticleNotFoundError(r.Error):
+					answered++
+				}
+			}
+			if answered == 0 && ctx.Err() != nil {
+				// Cut short by the end of the call, not a failure: the
+				// provider was still answering when the call finished.
+				return
+			}
+			hint.probeResult(pp.config.Host, answered, hits)
+			if hits > 0 {
+				hit <- struct{}{}
+			}
+		}()
+	}
+	all := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(all)
+	}()
+
+	wait := time.NewTimer(statProbeWait)
+	defer wait.Stop()
+	select {
+	case <-hit:
+		// Give the others a moment to answer too: one that holds the file
+		// is at most a round trip behind, one that does not is seconds away.
+		grace := time.NewTimer(min(max(statProbeGraceFactor*time.Since(began), statLatencyFloor), statProbeWait))
+		select {
+		case <-all:
+		case <-grace.C:
+		case <-ctx.Done():
+		}
+		grace.Stop()
+	case <-all:
+	case <-wait.C:
+	case <-ctx.Done():
+	}
+	hint.probeSettle()
+
+	return func() {
+		<-all
+		c.statProbing.Add(-1)
+		c.noteProbeDemotions(hint, time.Since(began))
+	}
+}
+
+// noteProbeDemotions logs and counts, once the call is over, the providers
+// its probe had asked last. A provider counts when its probe answered and
+// found nothing, or when it still had not answered after statProbeWait (it
+// was working through misses). One whose probe was simply cut short by a
+// call that finished sooner than that is left out: nothing is known about it.
+func (c *Client) noteProbeDemotions(hint *statHint, took time.Duration) {
+	for host, n := range hint.byHost {
+		if !n.demoted.Load() || n.hits.Load() != 0 {
+			continue
+		}
+		answered := n.probeAnswered.Load()
+		if !answered && took < statProbeWait {
+			continue
+		}
+		if !n.noted.CompareAndSwap(false, true) {
+			continue
+		}
+		if pp, ok := c.pools[host]; ok {
+			pp.stat.probeDemotions.Add(1)
+		}
+		c.logger.Debug().Str("provider", host).Bool("probe_answered", answered).Dur("check_took", took).
+			Msg("STAT probe: another provider had this check's articles and this one did not, it was asked last from the start")
 	}
 }

@@ -111,19 +111,23 @@ func (c *Client) newRepairPool(percent int) *RepairPool {
 // overcommit > 1 means we aim for more chunks than workers so a worker
 // finishing a fast chunk has a queued one waiting rather than idling
 // while the rest of the pool finishes slower chunks.
+//
+// The size picked is then rounded to a whole number of pipeline windows
+// (statPipelineDepth), at least one and no more than fit under the ceiling.
+// A chunk costs one round trip per window on each provider it asks, so a
+// part-filled window is a round trip spent on a few IDs: a chunk of 36 took
+// three round trips where 32 takes two, and a chunk of 10 or 50 wasted most
+// of one.
 func pickStatBatchSize(totalIDs, workers, ceilSize, minSize int) int {
-	if workers <= 0 || totalIDs <= 0 {
-		return ceilSize
+	size := ceilSize
+	if workers > 0 && totalIDs > 0 {
+		const overcommit = 3
+		want := (totalIDs + workers*overcommit - 1) / (workers * overcommit)
+		size = max(min(want, ceilSize), minSize)
 	}
-	const overcommit = 3
-	want := (totalIDs + workers*overcommit - 1) / (workers * overcommit)
-	if want >= ceilSize {
-		return ceilSize
-	}
-	if want < minSize {
-		return minSize
-	}
-	return want
+	windows := (size + statPipelineDepth/2) / statPipelineDepth
+	windows = max(min(windows, ceilSize/statPipelineDepth), 1)
+	return windows * statPipelineDepth
 }
 
 // TotalConnections is the sum of MaxConnections across configured providers.

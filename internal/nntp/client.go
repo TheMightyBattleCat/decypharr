@@ -116,6 +116,8 @@ type Client struct {
 	// statHomes are the pools repair-pool workers are homed on (see
 	// statHomePools); fixed at construction.
 	statHomes []*ProviderPool
+	// statProbing counts the BatchStat calls with a probe out (statProbe).
+	statProbing atomic.Int32
 
 	// TCP socket buffer sizes (bytes) applied to every new connection. 0 means
 	// "leave OS autotuning untouched". Sized from cfg.Usenet.Socket*Buffer.
@@ -1397,6 +1399,9 @@ func (c *Client) Stats() map[string]any {
 			// Checks (one file's articles each) that moved this provider
 			// to the back because it had none of them (statHint).
 			"stat_hint_demotions": pp.stat.hintDemotions.Load(),
+			// The same, decided by the probe before the check's chunks
+			// started (statProbe).
+			"stat_probe_demotions": pp.stat.probeDemotions.Load(),
 		}
 
 		// Add speed test result if available
@@ -1604,9 +1609,11 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// radius bounded for a single chunk's worth of STATs.
 	// Floor: smaller than this and per-chunk overhead starts dominating
 	// the actual STAT round-trip.
+	// Both are whole pipeline windows; pickStatBatchSize keeps every size in
+	// between to whole windows too.
 	const (
-		statBatchSize    = 50
-		statBatchMinSize = 10
+		statBatchSize    = 3 * statPipelineDepth
+		statBatchMinSize = statPipelineDepth
 	)
 	batchSize := pickStatBatchSize(len(messageIDs), c.repairPool.Capacity(), statBatchSize, statBatchMinSize)
 
@@ -1640,6 +1647,13 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// One call checks one file's articles, so what its first chunks learn
 	// about a provider (it has none of them) steers the rest. See statHint.
 	hint := c.newStatHint()
+	// Before any chunk starts, ask the fast providers about a few of the
+	// articles, so the chunks don't begin on one that has none (statProbe).
+	probeDone := c.statProbe(ctx, messageIDs, hint)
+	defer func() {
+		cancel() // ends a probe still waiting on a provider's slow misses
+		probeDone()
+	}()
 	var bailOnce sync.Once
 	var wg sync.WaitGroup
 	for _, ch := range chunks {
