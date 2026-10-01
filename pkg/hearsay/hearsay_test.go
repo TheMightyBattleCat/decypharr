@@ -1,12 +1,15 @@
 package hearsay
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
+	"github.com/Tensai75/nzbparser"
+	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/Tensai75/nzbparser"
 	"github.com/rs/zerolog"
 
 	hearsaylib "github.com/sirrobot01/hearsay"
@@ -16,6 +19,39 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
+
+func TestZerologHandlerDemotesRoutineSyncTraffic(t *testing.T) {
+	tests := []struct {
+		name    string
+		level   slog.Level
+		message string
+		want    string
+	}{
+		{name: "published generation", level: slog.LevelInfo, message: "published generation", want: "debug"},
+		{name: "ingested generation", level: slog.LevelInfo, message: "ingested generation", want: "debug"},
+		{name: "transient fetch failure", level: slog.LevelWarn, message: "fetch failed", want: "trace"},
+		{name: "real warning", level: slog.LevelWarn, message: "publish failed", want: "warn"},
+		{name: "other information", level: slog.LevelInfo, message: "pruned stale feeds", want: "info"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			log := zerolog.New(&output).Level(zerolog.TraceLevel)
+			slog.New(zerologHandler{log: log}).Log(t.Context(), test.level, test.message, "ns", "example")
+
+			var record map[string]any
+			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+				t.Fatalf("decode log record: %v", err)
+			}
+			if got := record[zerolog.LevelFieldName]; got != test.want {
+				t.Fatalf("level = %v, want %q", got, test.want)
+			}
+			if got := record["ns"]; got != "example" {
+				t.Fatalf("namespace attribute = %v, want example", got)
+			}
+		})
+	}
+}
 
 func testService(t *testing.T) *Service {
 	t.Helper()
@@ -248,6 +284,57 @@ func TestObserveAndReport(t *testing.T) {
 	}
 	if a.Value != 0 {
 		t.Fatal("report outcome should have overwritten the observation")
+	}
+}
+
+// The subject has to be the one upstream derives for the same post, or the
+// two never corroborate each other: message ids trimmed, and PAR2 files left
+// out wherever the fork's parser grouped them.
+func TestNZBSubjectFromGroupsMatchesUpstream(t *testing.T) {
+	file := func(name string, ids ...string) nzbparser.NzbFile {
+		f := nzbparser.NzbFile{Filename: name}
+		for i, id := range ids {
+			f.Segments = append(f.Segments, nzbparser.NzbSegment{Number: i + 1, Id: id})
+		}
+		return f
+	}
+	want := subjectFromIDs([]string{"m1@x", "m2@x", "r1@x"})
+
+	tests := []struct {
+		name   string
+		groups map[string]*parser.FileGroup
+	}{
+		{"plain", map[string]*parser.FileGroup{
+			"film": {Type: storage.NZBFileTypeMedia, Files: []nzbparser.NzbFile{file("film.mkv", "m1@x", "m2@x")}},
+			"rel":  {Type: storage.NZBFileTypeRar, Files: []nzbparser.NzbFile{file("rel.rar", "r1@x")}},
+		}},
+		{"pretty-printed ids", map[string]*parser.FileGroup{
+			"film": {Type: storage.NZBFileTypeMedia, Files: []nzbparser.NzbFile{file("film.mkv", "\n        m1@x\n      ", " m2@x\t")}},
+			"rel":  {Type: storage.NZBFileTypeRar, Files: []nzbparser.NzbFile{file("rel.rar", "r1@x", "  \n")}},
+		}},
+		{"PAR2 inside the release's groups", map[string]*parser.FileGroup{
+			"film": {Type: storage.NZBFileTypeMedia, Files: []nzbparser.NzbFile{
+				file("film.mkv", "m1@x", "m2@x"), file("film.par2", "p1@x"), file("film.vol00+01.PAR2", "p2@x"),
+			}},
+			"rel": {Type: storage.NZBFileTypeRar, Files: []nzbparser.NzbFile{file("rel.rar", "r1@x"), file("rel.par2", "p3@x")}},
+		}},
+		{"media inside a PAR2-typed group", map[string]*parser.FileGroup{
+			"film": {Type: storage.NZBFileTypePar2, Files: []nzbparser.NzbFile{file("film.par2", "p1@x"), file("film.mkv", "m1@x", "m2@x")}},
+			"rel":  {Type: storage.NZBFileTypeRar, Files: []nzbparser.NzbFile{file("rel.rar", "r1@x")}},
+			"nil":  nil,
+		}},
+	}
+	for _, tt := range tests {
+		if got := NZBSubjectFromGroups(tt.groups); got != want {
+			t.Errorf("%s: subject = %s, want %s", tt.name, got, want)
+		}
+	}
+
+	onlyPar2 := map[string]*parser.FileGroup{
+		"rel": {Type: storage.NZBFileTypePar2, Files: []nzbparser.NzbFile{file("rel.par2", "p1@x")}},
+	}
+	if got := NZBSubjectFromGroups(onlyPar2); got != "" {
+		t.Errorf("PAR2 only: subject = %s, want none", got)
 	}
 }
 
