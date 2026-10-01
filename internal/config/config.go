@@ -40,7 +40,6 @@ const (
 const (
 	DownloadActionSymlink  DownloadAction = "symlink"
 	DownloadActionDownload DownloadAction = "download"
-	DownloadActionStrm     DownloadAction = "strm"
 	DownloadActionNone     DownloadAction = "none"
 )
 
@@ -607,6 +606,8 @@ type Config struct {
 
 	Hearsay Hearsay `json:"hearsay,omitzero"`
 
+	Strm Strm `json:"strm,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }
@@ -645,14 +646,17 @@ func (c *Config) loadConfig() error {
 		return fmt.Errorf("error parsing config JSON: %w", err)
 	}
 	hadSessionSecret := c.SessionSecret != ""
+	hadStrmSecret := c.Strm.Secret != ""
 
 	// Set defaults for any missing values
 	c.setDefaults()
 
 	// Save a newly generated session secret so sessions and qBittorrent
-	// login cookies stay valid after a restart. This runs before the
-	// environment overrides so none of them is written to config.json.
-	if !hadSessionSecret {
+	// login cookies stay valid after a restart, and a newly generated STRM
+	// secret so the signatures in written .strm files do too. This runs
+	// before the environment overrides so none of them is written to
+	// config.json.
+	if !hadSessionSecret || !hadStrmSecret {
 		if err := c.Save(); err != nil {
 			return err
 		}
@@ -1026,6 +1030,7 @@ func (c *Config) setDefaults() {
 	c.applyRepairDefaults()
 	c.applyPrecacheDefaults()
 	c.applyPlexDefaults()
+	c.setStrmDefaults()
 }
 
 func (c *Config) applyPlexDefaults() {
@@ -1210,6 +1215,10 @@ func clearHotFields(c *Config) {
 	c.Precache = PrecacheConfig{}
 	// Read live by the NNTP client when it takes its body-routing verdicts.
 	c.Usenet.PreferFasterServers = nil
+
+	// STRM settings are read live on every URL build, stream request, and
+	// reconciler pass; a config change triggers a resweep, not a restart.
+	c.Strm = Strm{}
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.

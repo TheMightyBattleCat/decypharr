@@ -10,12 +10,15 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
-func getDownloadByteRange(info *manager.FileInfo) *[2]int64 {
-	return info.ByteRange()
+func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
+	return h.streamResponse(entry, info.Name(), info.Size(), info.ByteRange(), w, r)
 }
 
-func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
-	start, end := h.getRange(info, r)
+// streamResponse serves one file of an entry by name. byteRange is the file's
+// slice of its backing download (nil when it is the whole download); the
+// request's Range header is mapped into it.
+func (h *Handler) streamResponse(entry *storage.Entry, name string, size int64, byteRange *[2]int64, w http.ResponseWriter, r *http.Request) error {
+	start, end := resolveRange(r.Header.Get("Range"), size, byteRange)
 
 	// Extract client identifier from User-Agent header
 	client := r.UserAgent()
@@ -23,13 +26,13 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 		client = "Unknown"
 	}
 
-	streamID := h.manager.TrackStream(entry, info.Name(), client)
+	streamID := h.manager.TrackStream(entry, name, client)
 	if streamID != "" {
 		defer h.manager.UntrackStream(streamID)
 	}
 
 	headersWritten := false
-	err := h.manager.Stream(r.Context(), entry, info.Name(), start, end, w, func(meta *manager.StreamMetadata) error {
+	err := h.manager.Stream(r.Context(), entry, name, start, end, w, func(meta *manager.StreamMetadata) error {
 		if err := h.handleSuccessfulResponse(w, meta, start, end); err != nil {
 			return err
 		}
@@ -80,22 +83,23 @@ func (h *Handler) handleSuccessfulResponse(w http.ResponseWriter, meta *manager.
 	return nil
 }
 
-func (h *Handler) getRange(info *manager.FileInfo, r *http.Request) (int64, int64) {
-	rangeHeader := r.Header.Get("Range")
+// resolveRange maps a Range header to offsets in the file's backing download:
+// a file with a byte range is a slice of it, so the requested range is moved
+// by the slice's start.
+func resolveRange(rangeHeader string, size int64, byteRange *[2]int64) (int64, int64) {
 	if rangeHeader == "" {
-		if byteRange := getDownloadByteRange(info); byteRange != nil {
+		if byteRange != nil {
 			return byteRange[0], byteRange[1]
 		}
 		// Signal downstream streaming code to serve the entire file
 		return 0, -1
 	}
 
-	ranges, err := parseRange(rangeHeader, info.Size())
+	ranges, err := parseRange(rangeHeader, size)
 	if err != nil || len(ranges) != 1 {
 		return 0, 0
 	}
 
-	byteRange := getDownloadByteRange(info)
 	start, end := ranges[0].start, ranges[0].end
 
 	if byteRange != nil {

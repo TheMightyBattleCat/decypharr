@@ -68,6 +68,12 @@ func (m *Manager) Migrator() *migration.Migrator {
 	return m.migrator
 }
 
+// Strm returns the .strm reconciler. Created during init(), so callers can
+// rely on a non-nil value once the manager has been constructed.
+func (m *Manager) Strm() *Strm {
+	return m.strm
+}
+
 // Arr returns the Arr storage instance
 // PlexReaper returns the Plex stale-version reaper.
 func (m *Manager) PlexReaper() *PlexReaper {

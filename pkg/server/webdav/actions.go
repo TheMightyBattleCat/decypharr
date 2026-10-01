@@ -125,28 +125,31 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 	}
 
 	if err := h.StreamResponse(entry, info, w, r); err != nil {
-		// Use the file path as key for rate limiting - same file error logged once per 30s
-		logKey := fmt.Sprintf("%s/%s", info.Parent(), info.Name())
+		h.writeStreamError(info.Parent(), info.Name(), err, w)
+	}
+}
 
-		var streamErr *customerror.Error
-		if errors.As(err, &streamErr) {
-			if !streamErr.HeadersWritten {
-				http.Error(w, streamErr.Error(), http.StatusInternalServerError)
-			}
-			if !streamErr.IsSilent() {
-				h.logger.Rate(logKey).Error().Err(err).Str("entry", info.Parent()).Str(logger.FieldSubject, info.Name()).
-					Msg("Error streaming file")
-			}
-			return
+// writeStreamError answers a failed stream and logs it. The entry and file
+// name are the rate-limit key: one file's error is logged once per window.
+func (h *Handler) writeStreamError(entryName, fileName string, err error, w http.ResponseWriter) {
+	logKey := fmt.Sprintf("%s/%s", entryName, fileName)
+
+	var streamErr *customerror.Error
+	if errors.As(err, &streamErr) {
+		if !streamErr.HeadersWritten {
+			http.Error(w, streamErr.Error(), http.StatusInternalServerError)
 		}
-
-		// Generic error - only write if we haven't started the response
-		if !customerror.IsSilentError(err) {
-			h.logger.Rate(logKey).Error().Err(err).Str("entry", info.Parent()).Str(logger.FieldSubject, info.Name()).
+		if !streamErr.IsSilent() {
+			h.logger.Rate(logKey).Error().Err(err).Str("entry", entryName).Str(logger.FieldSubject, fileName).
 				Msg("Error streaming file")
 		}
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
+	// Generic error - only write if we haven't started the response
+	if !customerror.IsSilentError(err) {
+		h.logger.Rate(logKey).Error().Err(err).Str("entry", entryName).Str(logger.FieldSubject, fileName).
+			Msg("Error streaming file")
+	}
+	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 }

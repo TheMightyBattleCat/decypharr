@@ -49,6 +49,23 @@ func (m *Manager) OpenStreamForFile(ctx context.Context, info *FileInfo, offset 
 // goroutine, and a seek beyond shareSeekDiscardMax, or backwards, cancels it
 // and starts another.
 func (m *Manager) OpenStream(ctx context.Context, entry *storage.Entry, filename string, offset int64, client string) (StreamReader, error) {
+	s, err := m.openPipeStream(ctx, entry, filename, offset, client)
+	if err != nil {
+		return nil, err
+	}
+	s.streamID = m.TrackStream(entry, filename, client)
+	s.untrack = m.UntrackStream
+	return s, nil
+}
+
+// OpenStreamUntracked is OpenStream without the active-streams entry, for
+// internal reads that are not a client playing a file (the .strm export
+// fetching a subtitle or .nfo to put next to its .strm files).
+func (m *Manager) OpenStreamUntracked(ctx context.Context, entry *storage.Entry, filename string, offset int64) (StreamReader, error) {
+	return m.openPipeStream(ctx, entry, filename, offset, "internal")
+}
+
+func (m *Manager) openPipeStream(ctx context.Context, entry *storage.Entry, filename string, offset int64, client string) (*pipeStream, error) {
 	file, ok := entry.Files[filename]
 	if !ok {
 		return nil, fmt.Errorf("file %s not found in entry %s", filename, entry.Name)
@@ -60,11 +77,9 @@ func (m *Manager) OpenStream(ctx context.Context, entry *storage.Entry, filename
 		return nil, fmt.Errorf("offset %d out of range for %s (size %d)", offset, filename, file.Size)
 	}
 	s := &pipeStream{
-		ctx:      ctx,
-		size:     file.Size,
-		pos:      offset,
-		streamID: m.TrackStream(entry, filename, client),
-		untrack:  m.UntrackStream,
+		ctx:  ctx,
+		size: file.Size,
+		pos:  offset,
 	}
 	s.run = func(ctx context.Context, start int64, w io.Writer) error {
 		return m.Stream(ctx, entry, filename, start, -1, w, nil, client)
