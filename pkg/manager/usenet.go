@@ -161,6 +161,15 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 		meta, groups, err := m.usenet.ParseWithID(ctx, job.Entry.InfoHash, job.Request.Name, content, job.Request.Arr.Name)
 		if err != nil {
 			if errors.Is(err, parser.ErrReleaseUnavailable) {
+				// A missing article at the parse stat is a definitive
+				// availability result: record and share it, so the next
+				// encounter of this post - ours or another operator's -
+				// rejects without NNTP work. The parser hands back its
+				// groups only for that failure; the other unavailable
+				// verdicts carry none, so nothing is reported for them.
+				if m.hearsay != nil {
+					m.hearsay.ReportNZB(hearsay.NZBSubjectFromGroups(groups), false)
+				}
 				m.rejectDamagedNZB(job, err)
 				return errJobSettled
 			}
@@ -168,6 +177,17 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 				return errJobSettled
 			}
 			return fmt.Errorf("usenet parse failed: %w", err)
+		}
+
+		// Own truth or a strong network consensus that the segments are
+		// gone means the availability check is doomed. Upstream fails the
+		// add itself; here the NZB is parsed after it was queued, so the
+		// queued entry is failed the way a dead release is, and the Arr
+		// blocklists it and searches again. No report follows a
+		// rejection - nothing was actually checked.
+		if m.hearsay != nil && m.hearsay.NZBClaimedIncomplete(hearsay.NZBSubjectFromGroups(groups)) {
+			m.rejectDamagedNZB(job, fmt.Errorf("hearsay claims segments missing on every configured backbone: %w", parser.ErrReleaseUnavailable))
+			return errJobSettled
 		}
 
 		m.usenet.RemoveStagedNZB(job.Entry.Magnet)
@@ -241,11 +261,11 @@ func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry,
 			return fmt.Errorf("usenet processing timed out after %s: %w", m.usenetTimeout, err)
 		}
 		if errors.Is(err, customerror.UsenetSegmentMissingError) {
-			m.hearsay.ObserveNZB(hearsaySubject, false)
+			m.hearsay.ReportNZB(hearsaySubject, false)
 		}
 		return fmt.Errorf("failed to process nzb: %w", err)
 	}
-	m.hearsay.ObserveNZB(hearsaySubject, true)
+	m.hearsay.ReportNZB(hearsaySubject, true)
 
 	metadata = updatedNZB
 	return m.processNZB(ctx, entry, metadata)

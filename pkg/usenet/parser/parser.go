@@ -212,7 +212,10 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	// posting fails in one round trip instead of after N probe round trips.
 	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeaderFast, par2Names)
 	if err != nil {
-		return nil, nil, err
+		// The groups are fully built by now; return them so the caller can
+		// still derive the content identifier of a dead post and record
+		// the miss.
+		return nil, fileGroups, err
 	}
 
 	nzb.ID = uuid.New().String()
