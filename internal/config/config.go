@@ -580,6 +580,8 @@ type Config struct {
 	// Plex playing session - see PlexConfig.
 	Plex PlexConfig `json:"plex,omitzero"`
 
+	Hearsay Hearsay `json:"hearsay,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }

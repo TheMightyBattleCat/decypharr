@@ -25,11 +25,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
-# Build main binary — xx-go sets CC/CXX/GOOS/GOARCH automatically
+# Build main binary — xx-go sets CC/CXX/GOOS/GOARCH automatically.
+# disable_libutp keeps anacrolix/torrent (hearsay transport) on its
+# pure-Go uTP stack; the cgo libutp variant links libstdc++, which the
+# final image does not ship.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 \
-    xx-go build -trimpath \
+    xx-go build -trimpath -tags disable_libutp \
     -ldflags="-w -s -X github.com/sirrobot01/decypharr/pkg/version.Version=${VERSION} -X github.com/sirrobot01/decypharr/pkg/version.Channel=${CHANNEL}" \
     -o /decypharr && \
     xx-verify /decypharr
@@ -58,7 +61,8 @@ LABEL org.opencontainers.image.documentation="https://github.com/sirrobot01/decy
 # and during repair sweeps (they find it on PATH). Those checks need ffprobe
 # 6.0 or newer: older releases decode only the first of several sample
 # windows, so damage later in a file goes unseen.
-RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata ffmpeg && \
+# libstdc++/libgcc: required at runtime by rapidyenc's C++ decoder.
+RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata ffmpeg libstdc++ libgcc && \
     echo "user_allow_other" >> /etc/fuse.conf && \
     case "$(uname -m)" in \
         x86_64) ARCH=amd64 ;; \

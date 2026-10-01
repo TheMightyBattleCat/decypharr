@@ -8,6 +8,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/hearsay"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
@@ -49,6 +50,12 @@ func (m *Manager) SetPrecachePaused(paused bool) {
 // (infoHash,filename) pair - see Precache.SetKeyPaused.
 func (m *Manager) SetPrecacheEntryPaused(infoHash, filename string, paused bool) {
 	m.precache.SetKeyPaused(infoHash, filename, paused)
+}
+
+// Hearsay returns the hearsay service, or nil when disabled. A nil
+// service is safe to call.
+func (m *Manager) Hearsay() *hearsay.Service {
+	return m.hearsay
 }
 
 func (m *Manager) Scheduler() gocron.Scheduler {
