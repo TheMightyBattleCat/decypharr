@@ -190,7 +190,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		Password: raw.Meta["password"],
 	}
 	// Group files by base Name and type
-	fileGroups := p.groupFiles(ctx, raw.Files)
+	fileGroups, par2Names := p.groupFiles(ctx, raw.Files)
 
 	if len(fileGroups) == 0 {
 		// A bare error makes the Arr retry the identical grab forever. When
@@ -210,7 +210,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	// so there is no reason to spend a yEnc body-probe per posted file only to
 	// discard the result. Checked first, not just cheaper first: a dead
 	// posting fails in one round trip instead of after N probe round trips.
-	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeaderFast)
+	nzb.Par2Files, nzb.Par2Source, err = availabilityThenPar2Refs(ctx, p.logger, p.maxConcurrent, fileGroups, raw.Files, p.detectFileType, p.statSegment, p.fetchYencHeaderFast, par2Names)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -249,6 +249,7 @@ func availabilityThenPar2Refs(
 	detectFileType func(string) storage.NZBFileType,
 	statSegment segmentStatFunc,
 	fetch yencHeaderFetchFunc,
+	par2Names map[string]string,
 ) (par2Files []storage.Par2FileRef, source []storage.PostedFileRef, err error) {
 	checked := false
 	for _, group := range fileGroups {
@@ -281,7 +282,7 @@ func availabilityThenPar2Refs(
 	// RAR/7z/zip grouping and extraction decides to do with these files
 	// afterwards. Only reached once the release has passed the availability
 	// check above.
-	par2Files, source, _ = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch)
+	par2Files, source, _ = buildPar2RefsWithFetch(ctx, logger, maxConcurrent, rawFiles, detectFileType, fetch, par2Names)
 	return par2Files, source, nil
 }
 
@@ -378,6 +379,14 @@ type builtPar2File struct {
 // further probing only spends more round trips confirming what's already
 // known. A probe that fails for a transient reason (timeout, connection
 // drop) never counts toward this threshold - see realPar2SegmentRefs.
+//
+// A PAR2 file is recognised by its subject name or, for an obfuscated
+// subject, by its yEnc name: the one content detection read (par2Names, keyed
+// by fileMetaKey) or the one this function's own probe returns. Its ref takes
+// that name, since the repair reads a volume's slice range and its set from
+// the file name. Recognised by subject alone, the PAR2 files of an obfuscated
+// release were stored as posted files and the release had no PAR2 files to
+// repair with.
 func buildPar2RefsWithFetch(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -385,7 +394,33 @@ func buildPar2RefsWithFetch(
 	files nzbparser.NzbFiles,
 	detectFileType func(string) storage.NZBFileType,
 	fetch yencHeaderFetchFunc,
+	par2Names map[string]string,
 ) (par2Files []storage.Par2FileRef, source []storage.PostedFileRef, aborted bool) {
+	// par2Name is file's name when that names a PAR2 file, else its yEnc name
+	// when that does; "" for any other file.
+	par2Name := func(file nzbparser.NzbFile, yencName string) string {
+		switch detectFileType(file.Filename) {
+		case storage.NZBFileTypePar2:
+			return file.Filename
+		case storage.NZBFileTypeUnknown:
+		default:
+			// Grouped by its subject as a file of the release.
+			return ""
+		}
+		for _, n := range []string{yencName, par2Names[fileMetaKey(file)]} {
+			if n != "" && detectFileType(n) == storage.NZBFileTypePar2 {
+				return n
+			}
+		}
+		return ""
+	}
+	built := func(file nzbparser.NzbFile, yencName string, total int64, refs []storage.Par2SegmentRef) *builtPar2File {
+		if n := par2Name(file, yencName); n != "" {
+			return &builtPar2File{name: n, size: total, segments: refs, isPar2: true}
+		}
+		return &builtPar2File{name: file.Filename, size: total, segments: refs}
+	}
+
 	var eligible []nzbparser.NzbFile
 	for _, file := range files {
 		if len(file.Segments) > 0 {
@@ -438,7 +473,8 @@ func buildPar2RefsWithFetch(
 
 	if seedIdx >= 0 {
 		file, segs := eligible[seedIdx], sortedSegs[seedIdx]
-		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetch)
+		var yencName string
+		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, file.Filename, segs, fetchKeepingName(fetch, &yencName))
 		atomic.AddInt32(&filesProbed, 1)
 		if notFound {
 			atomic.AddInt32(&filesNotFound, 1)
@@ -459,10 +495,7 @@ func buildPar2RefsWithFetch(
 				atomic.AddInt32(&filesTransient, 1)
 			}
 		}
-		results[seedIdx] = &builtPar2File{
-			name: file.Filename, size: total, segments: refs,
-			isPar2: detectFileType(file.Filename) == storage.NZBFileTypePar2,
-		}
+		results[seedIdx] = built(file, yencName, total, refs)
 	}
 
 	candidates := make([]par2ProbeCandidate, 0, len(eligible)-1)
@@ -475,7 +508,8 @@ func buildPar2RefsWithFetch(
 
 	mapper := iter.Mapper[par2ProbeCandidate, *builtPar2File]{MaxGoroutines: maxConcurrent}
 	mapped := mapper.Map(candidates, func(c *par2ProbeCandidate) *builtPar2File {
-		isPar2 := detectFileType(c.file.Filename) == storage.NZBFileTypePar2
+		// Before the probe only the subject and content detection can say so.
+		isPar2 := par2Name(c.file, "") != ""
 		consistent := segmentsConsistentWithPostingSize(c.segs, postingSegmentSize)
 
 		// A PAR2 file's own size is never matched against a FileDesc, so the
@@ -484,20 +518,21 @@ func buildPar2RefsWithFetch(
 		// article's size.
 		if consistent && isPar2 {
 			refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
-			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+			return built(c.file, "", total, refs)
 		}
 
 		if atomic.LoadInt32(&abortedFlag) != 0 {
 			if consistent {
 				refs, total := par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
-				return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+				return built(c.file, "", total, refs)
 			}
 			atomic.AddInt32(&fellBack, 1)
 			refs, total := par2SegmentRefsFallback(c.segs)
-			return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+			return built(c.file, "", total, refs)
 		}
 
-		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetch)
+		var yencName string
+		refs, total, notFound, real := realPar2SegmentRefs(ctx, logger, c.file.Filename, c.segs, fetchKeepingName(fetch, &yencName))
 		atomic.AddInt32(&filesProbed, 1)
 		if notFound {
 			atomic.AddInt32(&filesNotFound, 1)
@@ -510,14 +545,14 @@ func buildPar2RefsWithFetch(
 				// Interior articles still take the shared size; only the final
 				// article stays an estimate.
 				refs, total = par2SegmentRefsFromPostingSize(c.segs, postingSegmentSize, seedLastSegBytes, seedSegCount)
-				return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+				return built(c.file, yencName, total, refs)
 			}
 			atomic.AddInt32(&fellBack, 1)
 			if !notFound {
 				atomic.AddInt32(&filesTransient, 1)
 			}
 		}
-		return &builtPar2File{name: c.file.Filename, size: total, segments: refs, isPar2: isPar2}
+		return built(c.file, yencName, total, refs)
 	})
 	for i, c := range candidates {
 		results[c.idx] = mapped[i]
@@ -655,6 +690,18 @@ func par2SegmentRefsFallback(segs nzbparser.NzbSegments) ([]storage.Par2SegmentR
 // exercised with a fake in tests, without a real, provider-backed client.
 type yencHeaderFetchFunc func(ctx context.Context, messageID string) (*nntp.YencMetadata, error)
 
+// fetchKeepingName is fetch, also storing the article's yEnc file name in
+// *name when the fetch returns one.
+func fetchKeepingName(fetch yencHeaderFetchFunc, name *string) yencHeaderFetchFunc {
+	return func(ctx context.Context, messageID string) (*nntp.YencMetadata, error) {
+		data, err := fetch(ctx, messageID)
+		if data != nil && data.Name != "" {
+			*name = data.Name
+		}
+		return data, err
+	}
+}
+
 // fetchYencHeaderFast probes one article's yEnc header with a single
 // connection attempt and a short, non-negotiable timeout - no cross-provider
 // failover and no retry ladder (see nntp.Client.ExecuteOnce). This is the
@@ -749,7 +796,11 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 	return refs, total, false, true
 }
 
-func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) map[string]*FileGroup {
+// groupFiles groups the NZB's files into releases' file groups. par2Names
+// holds, by fileMetaKey, the yEnc name of every file content detection found
+// to be a PAR2 file: such a file joins no group, and its subject does not say
+// what it is.
+func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) (groups map[string]*FileGroup, par2Names map[string]string) {
 	// Assign XML document order as Number for files with uniform Number values.
 	// This preserves upload order for obfuscated archives where the subject
 	// line doesn't contain file number patterns like [X/Y].
@@ -799,14 +850,36 @@ func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) ma
 	// Add unknown results
 	allFiles = append(allFiles, unknownResults...)
 
-	groups := p.groupProcessedFiles(allFiles)
+	par2Names = sniffedPar2Names(unknownResults, p.detectFileType)
+
+	groups = p.groupProcessedFiles(allFiles)
 
 	// Merge obfuscated RAR groups - when subjects are random strings,
 	// each RAR volume gets its own group. This merges them back together.
 	// Pass the raw file list so PAR2 name recovery can find PAR2 files.
-	groups = p.mergeObfuscatedRarGroups(ctx, groups, files)
+	groups = p.mergeObfuscatedRarGroups(ctx, groups, files, par2Names)
 
-	return groups
+	return groups, par2Names
+}
+
+// sniffedPar2Names returns, by fileMetaKey, the yEnc name of each content
+// detection result that names a PAR2 file.
+func sniffedPar2Names(results []contentResult, detectFileType func(string) storage.NZBFileType) map[string]string {
+	var names map[string]string
+	for _, r := range results {
+		if r.actualFilename == "" || detectFileType(r.actualFilename) != storage.NZBFileTypePar2 {
+			continue
+		}
+		key := fileMetaKey(r.file)
+		if key == "" {
+			continue
+		}
+		if names == nil {
+			names = make(map[string]string)
+		}
+		names[key] = r.actualFilename
+	}
+	return names
 }
 
 // mergeObfuscatedRarGroups detects and merges RAR FileGroups that likely belong
@@ -820,7 +893,7 @@ func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) ma
 // When PAR2 files are available, it attempts to recover real filenames from the
 // PAR2 FileDesc table via MD5-16k matching. Recovered names (e.g. ".part01.rar")
 // provide proper volume ordering; without them, NZB upload order is the fallback.
-func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[string]*FileGroup, rawFiles nzbparser.NzbFiles) map[string]*FileGroup {
+func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[string]*FileGroup, rawFiles nzbparser.NzbFiles, par2Names map[string]string) map[string]*FileGroup {
 	// Collect all single-file RAR groups (potential obfuscation victims)
 	var singleFileRarGroups []*FileGroup
 	var otherGroups []*FileGroup
@@ -871,7 +944,7 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 		Msg("Detected potential obfuscated RAR archive, merging groups")
 
 	// Try PAR2 name recovery before falling back to blind merge.
-	if recovered := p.tryPar2NameRecovery(ctx, singleFileRarGroups, otherGroups, rawFiles); recovered != nil {
+	if recovered := p.tryPar2NameRecovery(ctx, singleFileRarGroups, otherGroups, rawFiles, par2Names); recovered != nil {
 		return recovered
 	}
 
@@ -993,7 +1066,10 @@ func (p *NZBParser) separateStandaloneArchives(ctx context.Context, candidates, 
 // is worse than upload-order because unrecovered files have garbage names
 // that interleave arbitrarily with recovered ones. Returns nil to fall back
 // to blind merging on any partial failure.
-func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups []*FileGroup, otherGroups []*FileGroup, rawFiles nzbparser.NzbFiles) map[string]*FileGroup {
+//
+// par2Names gives the yEnc name of a PAR2 file whose subject is obfuscated
+// (see groupFiles), so the index of a fully obfuscated release is found too.
+func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups []*FileGroup, otherGroups []*FileGroup, rawFiles nzbparser.NzbFiles, par2Names map[string]string) map[string]*FileGroup {
 	// Find the base .par2 index file from the raw NZB file list.
 	// Only try the smallest base file (no .vol recovery volumes) and
 	// bail if it needs too many segments — this is the import path.
@@ -1003,10 +1079,14 @@ func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups
 		if len(f.Segments) == 0 {
 			continue
 		}
-		if p.detectFileType(f.Filename) != storage.NZBFileTypePar2 {
-			continue
+		name := f.Filename
+		if p.detectFileType(name) != storage.NZBFileTypePar2 {
+			name = par2Names[fileMetaKey(*f)]
+			if name == "" {
+				continue
+			}
 		}
-		lower := strings.ToLower(f.Filename)
+		lower := strings.ToLower(name)
 		if strings.Contains(lower, ".vol") {
 			continue
 		}

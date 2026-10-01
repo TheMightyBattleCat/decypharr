@@ -179,7 +179,7 @@ func TestMergeObfuscatedRarGroups_BreaksNumberTiesByNZBOrder(t *testing.T) {
 		for _, f := range raw {
 			groups[f.Filename] = &FileGroup{BaseName: f.Filename, Type: storage.NZBFileTypeRar, Files: []nzbparser.NzbFile{f}, Groups: map[string]struct{}{}}
 		}
-		merged := p.mergeObfuscatedRarGroups(context.Background(), groups, raw)
+		merged := p.mergeObfuscatedRarGroups(context.Background(), groups, raw, nil)
 		if len(merged) != 1 {
 			t.Fatalf("run %d: %d groups, want 1", run, len(merged))
 		}

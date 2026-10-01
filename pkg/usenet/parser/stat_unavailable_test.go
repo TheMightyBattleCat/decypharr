@@ -45,7 +45,7 @@ func TestTransientStatNotTaggedReleaseUnavailable(t *testing.T) {
 	for name, statErr := range cases {
 		t.Run(name, func(t *testing.T) {
 			stat := func(_ context.Context, _ string) error { return statErr }
-			_, _, err := availabilityThenPar2Refs(context.Background(), zerolog.Nop(), 4, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+			_, _, err := availabilityThenPar2Refs(context.Background(), zerolog.Nop(), 4, fileGroups, rawFiles, p.detectFileType, stat, fetch, nil)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -61,7 +61,7 @@ func TestTransientStatNotTaggedReleaseUnavailable(t *testing.T) {
 	// A genuine 430 on every provider is still tagged.
 	notFound := &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
 	stat := func(_ context.Context, _ string) error { return notFound }
-	_, _, err := availabilityThenPar2Refs(context.Background(), zerolog.Nop(), 4, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+	_, _, err := availabilityThenPar2Refs(context.Background(), zerolog.Nop(), 4, fileGroups, rawFiles, p.detectFileType, stat, fetch, nil)
 	if !errors.Is(err, ErrReleaseUnavailable) || !nntp.IsArticleNotFoundError(err) {
 		t.Errorf("430: err=%v, want ErrReleaseUnavailable wrapping an article-not-found", err)
 	}

@@ -46,7 +46,7 @@ func TestMergeObfuscatedRarGroups_KeepsSingleVolumeArchivesApart(t *testing.T) {
 	probe := &fakeVolumeProbe{volume: map[string]bool{base + ".proof.rar": false, base + ".subs.rar": false}}
 	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 2, volumeProbe: probe.probe}
 
-	got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw)
+	got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw, nil)
 	if len(got) != 2 || got[base+".proof.rar"] == nil || got[base+".subs.rar"] == nil {
 		t.Fatalf("groups = %v, want proof and subs left as their own groups", keysOf(got))
 	}
@@ -66,7 +66,7 @@ func TestMergeObfuscatedRarGroups_ProbesOnlyOddSizedFiles(t *testing.T) {
 	probe := &fakeVolumeProbe{volume: map[string]bool{"q0w2.rar": true, "release.proof.rar": false}}
 	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 2, volumeProbe: probe.probe}
 
-	got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw)
+	got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw, nil)
 	sort.Strings(probe.probed)
 	if want := []string{"q0w2.rar", "release.proof.rar"}; len(probe.probed) != 2 || probe.probed[0] != want[0] || probe.probed[1] != want[1] {
 		t.Fatalf("probed %v, want %v", probe.probed, want)
@@ -90,7 +90,7 @@ func TestMergeObfuscatedRarGroups_UnreadableHeaderStillMerges(t *testing.T) {
 	probe := &fakeVolumeProbe{volume: map[string]bool{}}
 	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 2, volumeProbe: probe.probe}
 
-	if got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw); len(got) != 1 {
+	if got := p.mergeObfuscatedRarGroups(context.Background(), groups, raw, nil); len(got) != 1 {
 		t.Fatalf("groups = %v, want one merged group", keysOf(got))
 	}
 }

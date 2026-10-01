@@ -75,7 +75,7 @@ func TestBuildPar2Refs(t *testing.T) {
 		// forcing a fetch error -> the ~3% XML-bytes fallback estimate.
 	})
 
-	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch, nil)
 	if aborted {
 		t.Fatal("aborted = true, want false (only one probe failure, well under the abort threshold)")
 	}
@@ -137,7 +137,7 @@ func TestBuildPar2RefsNoPar2Files(t *testing.T) {
 	fetch := fakeYencFetch(map[string]*nntp.YencMetadata{
 		"<mkv-seg1>": {Size: 1940, Begin: 0, End: 1939},
 	})
-	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch, nil)
 	if aborted {
 		t.Fatal("aborted = true, want false")
 	}
@@ -178,7 +178,7 @@ func TestAvailabilityThenPar2RefsShortCircuitsOnStatFailure(t *testing.T) {
 	stat := func(_ context.Context, _ string) error { return statErr }
 
 	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 4}
-	par2Files, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+	par2Files, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch, nil)
 	if err == nil {
 		t.Fatal("expected an error when the availability stat fails")
 	}
@@ -220,7 +220,7 @@ func TestAvailabilityThenPar2RefsRunsProbeAfterSuccessfulStat(t *testing.T) {
 	})
 
 	p := &NZBParser{logger: zerolog.Nop(), maxConcurrent: 4}
-	_, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch)
+	_, source, err := availabilityThenPar2Refs(context.Background(), p.logger, p.maxConcurrent, fileGroups, rawFiles, p.detectFileType, stat, fetch, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestBuildPar2RefsReusesPostingSizeForPar2Files(t *testing.T) {
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
-	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch, nil)
 	if aborted {
 		t.Fatal("aborted = true, want false")
 	}
@@ -398,7 +398,7 @@ func TestBuildPar2RefsProbesEveryPostedFile(t *testing.T) {
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
-	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch, nil)
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Errorf("fetch called %d times, want 3 (one per posted file)", got)
 	}
@@ -437,7 +437,7 @@ func TestBuildPar2RefsFailedPostedProbeKeepsEstimateUnreal(t *testing.T) {
 		return nil, nntp.NewConnectionError(errors.New("simulated dropped connection"))
 	}
 	p := &NZBParser{logger: zerolog.Nop()}
-	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch)
+	_, source, _ := buildPar2RefsWithFetch(context.Background(), p.logger, 4, files, p.detectFileType, fetch, nil)
 	var b storage.PostedFileRef
 	for _, f := range source {
 		if f.Name == "a.r00" {
@@ -477,7 +477,7 @@ func TestBuildPar2RefsEarlyAbortAfterKFailures(t *testing.T) {
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
-	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch, nil)
 	if !aborted {
 		t.Fatal("aborted = false, want true after par2ProbeMaxFailedFetches genuinely-not-found failures")
 	}
@@ -519,7 +519,7 @@ func TestBuildPar2RefsBelowThresholdNoAbort(t *testing.T) {
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
-	_, _, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	_, _, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch, nil)
 	if aborted {
 		t.Fatal("aborted = true, want false (19 < threshold of 20)")
 	}
@@ -553,7 +553,7 @@ func TestBuildPar2RefsTransientErrorsDontAbort(t *testing.T) {
 	}
 
 	p := &NZBParser{logger: zerolog.Nop()}
-	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch)
+	par2Files, source, aborted := buildPar2RefsWithFetch(context.Background(), p.logger, 1, files, p.detectFileType, fetch, nil)
 	if aborted {
 		t.Fatal("aborted = true, want false (every failure was a transient connection error, not a confirmed-missing article)")
 	}
