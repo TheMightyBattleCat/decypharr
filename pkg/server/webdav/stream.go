@@ -71,8 +71,10 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Redirect mode hands the player the provider link so bytes bypass us
 	// entirely. Usenet entries have no upstream URL and always proxy; a link
-	// failure falls back to proxying this request.
-	if cfg.Strm.DeliveryMode == config.StrmDeliveryRedirect && entry.IsTorrent() {
+	// failure falls back to proxying this request. So does a file that is a
+	// slice of its link (one file inside a stored RAR): the link is the whole
+	// archive, so the player would read the archive, not the file.
+	if cfg.Strm.DeliveryMode == config.StrmDeliveryRedirect && entry.IsTorrent() && file.ByteRange == nil {
 		if dl, err := h.manager.GetDownloadLink(r.Context(), entry, file.Name); err == nil && dl.DownloadLink != "" {
 			http.Redirect(w, r, dl.DownloadLink, http.StatusFound)
 			return
@@ -82,7 +84,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.streamResponse(entry, file.Name, file.Size, file.ByteRange, w, r); err != nil {
+	if err := h.streamResponse(entry, file.Name, file.Size, w, r); err != nil {
 		h.writeStreamError(entry.Name, file.Name, err, w)
 	}
 }

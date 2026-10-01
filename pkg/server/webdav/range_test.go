@@ -2,29 +2,26 @@ package webdav
 
 import "testing"
 
-// WebDAV and the /stream route share resolveRange. A file with a byte range
-// is a slice of its backing download, so a requested range has to be moved by
-// the slice's start on both routes.
+// WebDAV and the /stream route share resolveRange. It returns offsets inside
+// the file, whether or not the file is a slice of its backing download:
+// Manager.Stream moves them by the slice's start.
 func TestResolveRange(t *testing.T) {
-	slice := &[2]int64{1000, 1999}
 	tests := []struct {
 		name       string
 		header     string
 		size       int64
-		byteRange  *[2]int64
 		start, end int64
 	}{
-		{"no header, whole file", "", 500, nil, 0, -1},
-		{"no header, slice", "", 1000, slice, 1000, 1999},
-		{"range, whole file", "bytes=100-199", 500, nil, 100, 199},
-		{"range, slice", "bytes=100-199", 1000, slice, 1100, 1199},
-		{"open-ended range, slice", "bytes=900-", 1000, slice, 1900, 1999},
-		{"more than one range", "bytes=0-1,5-6", 500, nil, 0, 0},
-		{"not a byte range", "items=0-1", 500, nil, 0, 0},
+		{"no header", "", 500, 0, -1},
+		{"range", "bytes=100-199", 500, 100, 199},
+		{"open-ended range", "bytes=900-", 1000, 900, 999},
+		{"suffix range", "bytes=-50", 1000, 950, 999},
+		{"more than one range", "bytes=0-1,5-6", 500, 0, 0},
+		{"not a byte range", "items=0-1", 500, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			start, end := resolveRange(tt.header, tt.size, tt.byteRange)
+			start, end := resolveRange(tt.header, tt.size)
 			if start != tt.start || end != tt.end {
 				t.Fatalf("resolveRange(%q) = %d-%d, want %d-%d", tt.header, start, end, tt.start, tt.end)
 			}

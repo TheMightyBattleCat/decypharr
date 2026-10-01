@@ -11,14 +11,14 @@ import (
 )
 
 func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
-	return h.streamResponse(entry, info.Name(), info.Size(), info.ByteRange(), w, r)
+	return h.streamResponse(entry, info.Name(), info.Size(), w, r)
 }
 
-// streamResponse serves one file of an entry by name. byteRange is the file's
-// slice of its backing download (nil when it is the whole download); the
-// request's Range header is mapped into it.
-func (h *Handler) streamResponse(entry *storage.Entry, name string, size int64, byteRange *[2]int64, w http.ResponseWriter, r *http.Request) error {
-	start, end := resolveRange(r.Header.Get("Range"), size, byteRange)
+// streamResponse serves one file of an entry by name. Offsets are inside the
+// file; where the file is a slice of its backing download, Manager.Stream
+// moves them.
+func (h *Handler) streamResponse(entry *storage.Entry, name string, size int64, w http.ResponseWriter, r *http.Request) error {
+	start, end := resolveRange(r.Header.Get("Range"), size)
 
 	// Extract client identifier from User-Agent header
 	client := r.UserAgent()
@@ -83,14 +83,14 @@ func (h *Handler) handleSuccessfulResponse(w http.ResponseWriter, meta *manager.
 	return nil
 }
 
-// resolveRange maps a Range header to offsets in the file's backing download:
-// a file with a byte range is a slice of it, so the requested range is moved
-// by the slice's start.
-func resolveRange(rangeHeader string, size int64, byteRange *[2]int64) (int64, int64) {
+// resolveRange maps a Range header to offsets inside the file. A file that is
+// a slice of its backing download (it has a byte range) gets the same offsets
+// as any other: Manager.Stream moves them by the slice's start when it asks
+// the link, and checks them against the file's own size first. Adding the
+// slice's start here made that check refuse the request, or cut the file's
+// tail off.
+func resolveRange(rangeHeader string, size int64) (int64, int64) {
 	if rangeHeader == "" {
-		if byteRange != nil {
-			return byteRange[0], byteRange[1]
-		}
 		// Signal downstream streaming code to serve the entire file
 		return 0, -1
 	}
@@ -100,11 +100,5 @@ func resolveRange(rangeHeader string, size int64, byteRange *[2]int64) (int64, i
 		return 0, 0
 	}
 
-	start, end := ranges[0].start, ranges[0].end
-
-	if byteRange != nil {
-		start += byteRange[0]
-		end += byteRange[0]
-	}
-	return start, end
+	return ranges[0].start, ranges[0].end
 }

@@ -262,12 +262,32 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 		return fmt.Errorf("file not found in entry: %s", filename)
 	}
 
-	expectedLen := end - start + 1
-
 	// Get the validated download link using the link service
 	downloadLink, err := m.linkService.GetLink(ctx, torrent, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get download link: %w", err)
+	}
+	return m.streamLink(ctx, downloadLink.DownloadLink, file, start, end, writer, onReady)
+}
+
+// streamLink streams bytes start-end of file (offsets inside the file, end
+// inclusive) from its download link.
+//
+// A file with a byte range is a slice of its link: one file inside a stored
+// RAR that the debrid provider did not unpack. Its bytes sit at
+// ByteRange[0] onwards, so the link is asked for the range moved by that
+// much. This is the one place the offset is applied, for every caller of
+// Stream (WebDAV, /stream, the mount, the share and .strm pipe); callers
+// pass offsets inside the file. Everything the client sees - the length, the
+// status, Content-Range - stays in the file's own coordinates.
+func (m *Manager) streamLink(ctx context.Context, url string, file *storage.File, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
+	expectedLen := end - start + 1
+
+	linkStart, linkEnd := start, end
+	sliced := file.ByteRange != nil
+	if sliced {
+		linkStart += file.ByteRange[0]
+		linkEnd += file.ByteRange[0]
 	}
 
 	// Get buffer from pool - reduces GC pressure significantly
@@ -275,10 +295,21 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 	buf := *bufPtr
 	defer streamBufPool.Put(bufPtr)
 
-	resp, reqErr := m.doRequest(ctx, downloadLink.DownloadLink, start, end)
+	resp, reqErr := m.doRequest(ctx, url, linkStart, linkEnd)
 	if reqErr != nil {
 		// Network/connection error - retriable
 		return reqErr
+	}
+
+	// A link that answers a range request with the whole body is sending the
+	// archive from its first byte, not the slice asked for.
+	if sliced && linkStart > 0 && resp.StatusCode == http.StatusOK {
+		resp.Body.Close()
+		return retry.Unrecoverable(StreamError{
+			Err:       fmt.Errorf("link ignored the byte range %d-%d of %s", linkStart, linkEnd, file.Name),
+			Retryable: false,
+			LinkError: false,
+		})
 	}
 
 	// Got response - check status
@@ -300,7 +331,21 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 				header["Content-Length"] = []string{strconv.FormatInt(expectedLen, 10)}
 			}
 		}
-		if isPartial && resp.StatusCode == http.StatusOK {
+		switch {
+		case sliced && isPartial:
+			// The link's own Content-Range counts from the start of the
+			// archive and gives the archive's size.
+			meta.StatusCode = http.StatusPartialContent
+			if header != nil {
+				header["Content-Range"] = []string{buildContentRange(start, end, file.Size)}
+			}
+		case sliced:
+			// The whole file: a 206 to the link, but a 200 to the client.
+			meta.StatusCode = http.StatusOK
+			if header != nil {
+				header.Del("Content-Range")
+			}
+		case isPartial && resp.StatusCode == http.StatusOK:
 			meta.StatusCode = http.StatusPartialContent
 			if header != nil {
 				header["Content-Range"] = []string{buildContentRange(start, end, file.Size)}
