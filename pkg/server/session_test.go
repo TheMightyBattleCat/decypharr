@@ -18,7 +18,9 @@ func useTestAuth(t *testing.T, password, token string) *config.Config {
 	t.Helper()
 	cfg := config.Get()
 	prevUseAuth, prevAuth := cfg.UseAuth, cfg.Auth
-	t.Cleanup(func() { cfg.UseAuth, cfg.Auth = prevUseAuth, prevAuth })
+	// A handler that saves publishes a new config, so restore on whichever
+	// one is current when the test ends, not on the one captured here.
+	t.Cleanup(func() { live := config.Get(); live.UseAuth, live.Auth = prevUseAuth, prevAuth })
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)

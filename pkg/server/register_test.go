@@ -28,7 +28,9 @@ func postRegister(s *Server, username, password string) *httptest.ResponseRecord
 func TestRegisterClosesOnceACredentialExists(t *testing.T) {
 	cfg := config.Get()
 	prevUseAuth, prevAuth := cfg.UseAuth, cfg.Auth
-	t.Cleanup(func() { cfg.UseAuth, cfg.Auth = prevUseAuth, prevAuth })
+	// A registration publishes a new config: restore on, and read from,
+	// whichever one is current, not the one captured above.
+	t.Cleanup(func() { live := config.Get(); live.UseAuth, live.Auth = prevUseAuth, prevAuth })
 
 	s := &Server{logger: zerolog.Nop(), cookie: sessions.NewCookieStore([]byte("test-secret"))}
 
@@ -42,7 +44,8 @@ func TestRegisterClosesOnceACredentialExists(t *testing.T) {
 	if rec := postRegister(s, "admin", "secret"); rec.Code != http.StatusSeeOther {
 		t.Fatalf("first registration: status = %d, want 303", rec.Code)
 	}
-	if cfg.Auth.Username != "admin" || bcrypt.CompareHashAndPassword([]byte(cfg.Auth.Password), []byte("secret")) != nil {
+	stored := config.Get().Auth
+	if stored.Username != "admin" || bcrypt.CompareHashAndPassword([]byte(stored.Password), []byte("secret")) != nil {
 		t.Fatalf("first registration did not store the credential")
 	}
 
@@ -50,8 +53,8 @@ func TestRegisterClosesOnceACredentialExists(t *testing.T) {
 	if rec := postRegister(s, "attacker", "owned"); rec.Code != http.StatusForbidden {
 		t.Fatalf("second registration: status = %d, want 403", rec.Code)
 	}
-	if cfg.Auth.Username != "admin" {
-		t.Fatalf("stored username = %q, want admin", cfg.Auth.Username)
+	if got := config.Get().Auth.Username; got != "admin" {
+		t.Fatalf("stored username = %q, want admin", got)
 	}
 	rec := httptest.NewRecorder()
 	s.RegisterHandler(rec, httptest.NewRequest(http.MethodGet, "/register", nil))
@@ -60,7 +63,7 @@ func TestRegisterClosesOnceACredentialExists(t *testing.T) {
 	}
 
 	// Auth off: registration is closed too (it used to dereference a nil auth).
-	cfg.UseAuth = false
+	config.Get().UseAuth = false
 	if rec := postRegister(s, "attacker", "owned"); rec.Code != http.StatusForbidden {
 		t.Fatalf("auth off: status = %d, want 403", rec.Code)
 	}

@@ -82,7 +82,7 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 		}, nil
 	}
 
-	magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
+	magnet, err := utils.GetMagnetInfo(entry.Magnet, config.Get().AlwaysRmTrackerUrls)
 	if err != nil {
 		magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
 	}
@@ -90,7 +90,7 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 	downloadUncached := entry.DownloadUncached
 	req := NewTorrentRequest(
 		entry.ActiveProvider,
-		downloadFolderForEntry(m.config.DownloadFolder, entry),
+		downloadFolderForEntry(config.Get().DownloadFolder, entry),
 		magnet,
 		m.arr.GetOrCreate(entry.Category),
 		entry.Action,
@@ -125,7 +125,7 @@ func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
 		}
 		req := NewNZBRequest(
 			name,
-			downloadFolderForEntry(m.config.DownloadFolder, entry),
+			downloadFolderForEntry(config.Get().DownloadFolder, entry),
 			nil,
 			m.arr.GetOrCreate(entry.Category),
 			entry.Action,
@@ -168,7 +168,7 @@ func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
 
 	req := NewNZBRequest(
 		meta.Name,
-		downloadFolderForEntry(m.config.DownloadFolder, entry),
+		downloadFolderForEntry(config.Get().DownloadFolder, entry),
 		content,
 		m.arr.GetOrCreate(entry.Category),
 		entry.Action,

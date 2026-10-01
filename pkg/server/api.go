@@ -280,8 +280,11 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	arrStorage := s.manager.Arr()
-	cfg := config.Get()
+	cfg := *config.Get()
 	cfg.Arrs = arrStorage.SyncToConfig()
+	s.shownArrsMu.Lock()
+	s.shownArrs = cfg.Arrs
+	s.shownArrsMu.Unlock()
 
 	// Create response with API token info
 	type ConfigResponse struct {
@@ -292,7 +295,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		AuthUsername  string `json:"auth_username,omitempty"`
 	}
 
-	response := &ConfigResponse{Config: cfg}
+	response := &ConfigResponse{Config: &cfg}
 
 	// AddOrUpdate API token and auth information
 	auth := cfg.GetAuth()
@@ -307,140 +310,162 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	currentConfig := config.Get()
-	before, err := json.Marshal(currentConfig)
-	if err != nil {
-		http.Error(w, "Failed to read current config: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigBodyBytes))
 	if err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// The form sends only the settings it has inputs for. Lay it over the live
-	// config so every other setting keeps its value instead of resetting.
-	merged, err := config.MergeJSON(before, body)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("Failed to decode config update request")
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	var newConfig config.Config
-	if err := json.Unmarshal(merged, &newConfig); err != nil {
-		s.logger.Error().Err(err).Msg("Failed to decode config update request")
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
 
-	// Basic validation
-	if newConfig.BindAddress == "" {
-		newConfig.BindAddress = "0.0.0.0"
-	}
-	if newConfig.Port == "" {
-		newConfig.Port = "8282"
-	}
-	newConfig.MigrateVirtualFolders()
-	if err := newConfig.ValidateVirtualFolders(); err != nil {
-		http.Error(w, "Invalid virtual folders: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Preserve fields that shouldn't be overwritten by frontend. The merge
-	// above already keeps every key the form leaves out; the assignments below
-	// predate it and stay as a second guard (Auth is json:"-", so the merge
-	// cannot carry it). A regression in the merge shows in
-	// TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend, not here.
-	newConfig.Auth = currentConfig.GetAuth()
-	newConfig.SessionSecret = currentConfig.SessionSecret
-	// The frontend config form doesn't include use_auth or enable_webdav_auth,
-	// so they would be zero-valued (false) in the decoded payload. Preserve
-	// them from the live config so auth isn't silently disabled on every save.
-	newConfig.UseAuth = currentConfig.UseAuth
-	newConfig.EnableWebdavAuth = currentConfig.EnableWebdavAuth
-	// The frontend never sends the STRM signing secret; a save must not
-	// rotate it (rotation would invalidate every written .strm file).
-	if newConfig.Strm.Secret == "" {
-		newConfig.Strm.Secret = currentConfig.Strm.Secret
-	}
-	// The frontend settings form doesn't include webhook_token, so it would
-	// be zero-valued (empty) in the decoded payload. Preserve it from the
-	// live config the same way Auth is preserved above, so saving any other
-	// setting doesn't silently disable Arr webhook authentication.
-	newConfig.WebhookToken = currentConfig.WebhookToken
-	// Saved by its own endpoint (handleUpdateWebhookTeardown), same reason.
-	newConfig.ArrWebhookTeardown = currentConfig.ArrWebhookTeardown
-	// The general settings form has no fields for these Repair knobs (they're
-	// only ever set via the dedicated repair-config / overlay endpoints), so
-	// they'd decode to zero-valued/"unset" here and get silently reset to
-	// their defaults on every unrelated settings save - the same class of bug
-	// that used to silently wipe the Arr webhook token.
-	newConfig.Repair.PlaybackPadding = currentConfig.Repair.PlaybackPadding
-	newConfig.Repair.Par2Repair = currentConfig.Repair.Par2Repair
-	newConfig.Repair.Par2RepairOnSweep = currentConfig.Repair.Par2RepairOnSweep
-	newConfig.Repair.PadMaxRunSegments = currentConfig.Repair.PadMaxRunSegments
-	newConfig.Repair.PadMaxTotalSegments = currentConfig.Repair.PadMaxTotalSegments
-	newConfig.Repair.PadMaxByteRatio = currentConfig.Repair.PadMaxByteRatio
-	newConfig.Repair.Par2RepairMode = currentConfig.Repair.Par2RepairMode
-	newConfig.Repair.Par2RepairMinSegments = currentConfig.Repair.Par2RepairMinSegments
-	newConfig.Repair.PrecacheReadAhead = currentConfig.Repair.PrecacheReadAhead
-	// Precache config (threshold/concurrency/next-episodes/max-bytes) has its
-	// own dedicated save path (handleUpdatePrecacheConfig) - the general
-	// settings form has no fields for it either, so without this it would
-	// silently reset to defaults on every unrelated settings save, same bug
-	// class as the Repair fields preserved above.
-	newConfig.Precache = currentConfig.Precache
-	// Plex has a dedicated endpoint (handleUpdatePlexConfig); preserve it here so
-	// an unrelated settings save (e.g. editing an Arr) can't zero the Plex URL and
-	// token, which silently opens the precache session gate. Same bug class as the
-	// Precache/Repair preserves above.
-	newConfig.Plex = currentConfig.Plex
-
-	keepUnsentArrWantedSearch(body, currentConfig.Arrs, newConfig.Arrs)
-	if err := validateArrWantedSearch(newConfig.Arrs); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Filter out empty or incomplete arrs
-	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
-	for _, a := range newConfig.Arrs {
-		if a.Name != "" && a.Host != "" && a.Token != "" {
-			validArrs = append(validArrs, a)
+	var (
+		previous config.Config
+		before   []byte
+		invalid  bool
+	)
+	// The whole save runs on a private copy of the current config, under the
+	// config lock: a second save cannot slip in between the merge and the
+	// write. Nothing in the callback may call config.Get or config.Update.
+	shownArrs := s.takeShownArrs()
+	updated, err := config.Update(func(current *config.Config) error {
+		// The settings page was built from this list, so the save is laid over
+		// it: an Arr the page showed and the save leaves out was deleted there.
+		if shownArrs != nil {
+			current.Arrs = shownArrs
 		}
-	}
-	newConfig.Arrs = validArrs
+		snapshot, err := json.Marshal(current)
+		if err != nil {
+			return fmt.Errorf("Failed to read current config: %w", err)
+		}
+		// The form sends only the settings it has inputs for. Lay it over the
+		// current config so every other setting keeps its value instead of
+		// resetting.
+		merged, err := config.MergeJSON(snapshot, body)
+		if err != nil {
+			invalid = true
+			return fmt.Errorf("Invalid request body: %w", err)
+		}
+		var newConfig config.Config
+		if err := json.Unmarshal(merged, &newConfig); err != nil {
+			invalid = true
+			return fmt.Errorf("Invalid request body: %w", err)
+		}
 
-	// Sync arr storage with the new configuration
-	s.manager.Arr().SyncFromConfig(newConfig.Arrs, currentConfig.Arrs)
+		// Basic validation
+		if newConfig.BindAddress == "" {
+			newConfig.BindAddress = "0.0.0.0"
+		}
+		if newConfig.Port == "" {
+			newConfig.Port = "8282"
+		}
+		newConfig.MigrateVirtualFolders()
+		if err := newConfig.ValidateVirtualFolders(); err != nil {
+			invalid = true
+			return fmt.Errorf("Invalid virtual folders: %w", err)
+		}
 
-	// Save the updated config. This also applies defaults to newConfig, so the
-	// restart comparison below sees a fully-normalized config on both sides.
-	if err := newConfig.Save(); err != nil {
+		// Preserve fields that shouldn't be overwritten by frontend. The merge
+		// above already keeps every key the form leaves out; the assignments below
+		// predate it and stay as a second guard (Auth is json:"-", so the merge
+		// cannot carry it). A regression in the merge shows in
+		// TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend, not here.
+		newConfig.Auth = current.GetAuth()
+		newConfig.SessionSecret = current.SessionSecret
+		// The frontend config form doesn't include use_auth or enable_webdav_auth,
+		// so they would be zero-valued (false) in the decoded payload. Preserve
+		// them from the current config so auth isn't silently disabled on every save.
+		newConfig.UseAuth = current.UseAuth
+		newConfig.EnableWebdavAuth = current.EnableWebdavAuth
+		// The frontend never sends the STRM signing secret; a save must not
+		// rotate it (rotation would invalidate every written .strm file).
+		if newConfig.Strm.Secret == "" {
+			newConfig.Strm.Secret = current.Strm.Secret
+		}
+		// The frontend settings form doesn't include webhook_token, so it would
+		// be zero-valued (empty) in the decoded payload. Preserve it from the
+		// current config the same way Auth is preserved above, so saving any other
+		// setting doesn't silently disable Arr webhook authentication.
+		newConfig.WebhookToken = current.WebhookToken
+		// Saved by its own endpoint (handleUpdateWebhookTeardown), same reason.
+		newConfig.ArrWebhookTeardown = current.ArrWebhookTeardown
+		// The general settings form has no fields for these Repair knobs (they're
+		// only ever set via the dedicated repair-config / overlay endpoints), so
+		// they'd decode to zero-valued/"unset" here and get silently reset to
+		// their defaults on every unrelated settings save - the same class of bug
+		// that used to silently wipe the Arr webhook token.
+		newConfig.Repair.PlaybackPadding = current.Repair.PlaybackPadding
+		newConfig.Repair.Par2Repair = current.Repair.Par2Repair
+		newConfig.Repair.Par2RepairOnSweep = current.Repair.Par2RepairOnSweep
+		newConfig.Repair.PadMaxRunSegments = current.Repair.PadMaxRunSegments
+		newConfig.Repair.PadMaxTotalSegments = current.Repair.PadMaxTotalSegments
+		newConfig.Repair.PadMaxByteRatio = current.Repair.PadMaxByteRatio
+		newConfig.Repair.Par2RepairMode = current.Repair.Par2RepairMode
+		newConfig.Repair.Par2RepairMinSegments = current.Repair.Par2RepairMinSegments
+		newConfig.Repair.PrecacheReadAhead = current.Repair.PrecacheReadAhead
+		// Precache config (threshold/concurrency/next-episodes/max-bytes) has its
+		// own dedicated save path (handleUpdatePrecacheConfig) - the general
+		// settings form has no fields for it either, so without this it would
+		// silently reset to defaults on every unrelated settings save, same bug
+		// class as the Repair fields preserved above.
+		newConfig.Precache = current.Precache
+		// Plex has a dedicated endpoint (handleUpdatePlexConfig); preserve it here so
+		// an unrelated settings save (e.g. editing an Arr) can't zero the Plex URL and
+		// token, which silently opens the precache session gate. Same bug class as the
+		// Precache/Repair preserves above.
+		newConfig.Plex = current.Plex
+
+		keepUnsentArrWantedSearch(body, current.Arrs, newConfig.Arrs)
+		if err := validateArrWantedSearch(newConfig.Arrs); err != nil {
+			invalid = true
+			return err
+		}
+
+		// Filter out empty or incomplete arrs
+		validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
+		for _, a := range newConfig.Arrs {
+			if a.Name != "" && a.Host != "" && a.Token != "" {
+				validArrs = append(validArrs, a)
+			}
+		}
+		newConfig.Arrs = validArrs
+
+		// Update saves what the callback leaves in current. The save also
+		// applies defaults, so the restart comparison below sees a
+		// fully-normalized config on both sides.
+		previous, before = *current, snapshot
+		*current = newConfig
+		return nil
+	})
+	if err != nil {
+		if invalid {
+			s.logger.Error().Err(err).Msg("Failed to decode config update request")
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		s.logger.Error().Err(err).Msg("Failed to save config")
 		http.Error(w, "Error saving config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.logConfigChanges("settings", before, &newConfig)
+
+	// Sync arr storage with the new configuration
+	s.manager.Arr().SyncFromConfig(updated.Arrs, previous.Arrs)
+	s.logConfigChanges("settings", before, updated)
 
 	// A base-URL or STRM settings change moves the desired content of every
-	// .strm file; resweep after the new config is live. Save has already
-	// normalized newConfig, so the comparison sees defaults on both sides.
-	strmChanged := currentConfig.AppURL != newConfig.AppURL ||
-		!reflect.DeepEqual(currentConfig.Strm, newConfig.Strm)
+	// .strm file; resweep now that the new config is published.
+	strmChanged := previous.AppURL != updated.AppURL ||
+		!reflect.DeepEqual(previous.Strm, updated.Strm)
 
 	// Only restart when a field that needs it actually changed (HTTP bind,
-	// debrid/usenet clients, or the mount). For everything else, apply the new
-	// config live so users aren't disrupted by a full restart on every save.
-	restarted := config.Get().RequiresRestart(&newConfig)
+	// debrid/usenet clients, or the mount). Everything else is already live:
+	// Update published the new config, so users aren't disrupted by a full
+	// restart on every save.
+	restarted := previous.RequiresRestart(updated)
 	if restarted {
 		go s.Restart()
 	} else {
-		config.Get().ApplyRuntime(&newConfig)
 		if strmChanged {
 			s.manager.Strm().SweepAsync("config_change")
 		}
-		if err := s.manager.ApplyVirtualFolders(newConfig.VirtualFolders); err != nil {
+		if err := s.manager.ApplyVirtualFolders(updated.VirtualFolders); err != nil {
 			s.logger.Error().Err(err).Msg("Failed to apply virtual folders after live config update")
 			http.Error(w, "Configuration was saved, but virtual folders could not be applied: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -462,6 +487,23 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": restarted}, http.StatusOK)
+}
+
+// takeShownArrs returns the Arr list the last settings read returned, once.
+//
+// That list is the saved Arrs plus the ones only runtime storage knows
+// (auto-detected since the last save). A settings read used to write it into
+// the shared config, which is how a save knew what the page had shown; the
+// config is a read-only snapshot now, so the list is kept here instead and
+// handed to the next save. A save without a settings read before it (an API
+// client posting a few keys) gets nil and works from the saved list alone,
+// so it never drops an Arr the page did not show.
+func (s *Server) takeShownArrs() []config.Arr {
+	s.shownArrsMu.Lock()
+	defer s.shownArrsMu.Unlock()
+	shown := s.shownArrs
+	s.shownArrs = nil
+	return shown
 }
 
 // maxConfigBodyBytes bounds a settings save's request body.
@@ -607,8 +649,8 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cfg.Repair = req
-	if err := cfg.Save(); err != nil {
+	cfg, err = config.Update(func(next *config.Config) error { next.Repair = req; return nil })
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save repair config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -666,8 +708,8 @@ func (s *Server) handleUpdatePrecacheConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	cfg.Precache = req
-	if err := cfg.Save(); err != nil {
+	cfg, err = config.Update(func(next *config.Config) error { next.Precache = req; return nil })
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save precache config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -707,21 +749,24 @@ func (s *Server) handleUpdatePlexConfig(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	cfg := config.Get()
-	if req.Token == "" || req.Token == plexTokenPlaceholder {
-		req.Token = cfg.Plex.Token
-	}
 	switch req.ReapMode {
-	case config.PlexReapOff, config.PlexReapDryRun, config.PlexReapOn:
-	case "":
-		// An older page that doesn't send the field keeps the saved mode.
-		req.ReapMode = cfg.Plex.ReapMode
+	case config.PlexReapOff, config.PlexReapDryRun, config.PlexReapOn, "":
 	default:
 		http.Error(w, "invalid plex_reap_mode: "+string(req.ReapMode), http.StatusBadRequest)
 		return
 	}
-	cfg.Plex = req
-	if err := cfg.Save(); err != nil {
+	cfg, err := config.Update(func(next *config.Config) error {
+		if req.Token == "" || req.Token == plexTokenPlaceholder {
+			req.Token = next.Plex.Token
+		}
+		if req.ReapMode == "" {
+			// An older page that doesn't send the field keeps the saved mode.
+			req.ReapMode = next.Plex.ReapMode
+		}
+		next.Plex = req
+		return nil
+	})
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save plex config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -798,9 +843,11 @@ func (s *Server) handleUpdateWebhookTeardown(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	cfg := config.Get()
-	cfg.ArrWebhookTeardown = req.Enabled
-	if err := cfg.Save(); err != nil {
+	cfg, err := config.Update(func(next *config.Config) error {
+		next.ArrWebhookTeardown = req.Enabled
+		return nil
+	})
+	if err != nil {
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1500,26 +1547,22 @@ func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := config.Get()
-	auth := cfg.GetAuth()
-	if auth == nil {
-		auth = &config.Auth{}
-	}
-
 	// Check if trying to disable authentication (both empty)
 	if req.Username == "" && req.Password == "" {
 		// Disable authentication
-		cfg.UseAuth = false
-		auth.Username = ""
-		auth.Password = ""
-		if err := cfg.SaveAuth(auth); err != nil {
+		_, err := config.Update(func(next *config.Config) error {
+			auth := next.GetAuth()
+			if auth == nil {
+				auth = &config.Auth{}
+			}
+			next.UseAuth = false
+			auth.Username = ""
+			auth.Password = ""
+			return next.SaveAuth(auth)
+		})
+		if err != nil {
 			s.logger.Error().Err(err).Msg("Failed to save auth config")
 			http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
-			return
-		}
-		if err := cfg.Save(); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to save config")
-			http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
 			return
 		}
 
@@ -1551,22 +1594,20 @@ func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update auth settings
-	auth.Username = req.Username
-	auth.Password = string(hashedPassword)
-	cfg.UseAuth = true
-
-	// Save auth config
-	if err := cfg.SaveAuth(auth); err != nil {
+	// Update and save the auth settings, then the main config
+	_, err = config.Update(func(next *config.Config) error {
+		auth := next.GetAuth()
+		if auth == nil {
+			auth = &config.Auth{}
+		}
+		auth.Username = req.Username
+		auth.Password = string(hashedPassword)
+		next.UseAuth = true
+		return next.SaveAuth(auth)
+	})
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save auth config")
 		http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
-		return
-	}
-
-	// Save main config
-	if err := cfg.Save(); err != nil {
-		s.logger.Error().Err(err).Msg("Failed to save config")
-		http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
 		return
 	}
 

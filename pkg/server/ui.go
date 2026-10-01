@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 
 	json "github.com/bytedance/sonic"
@@ -79,7 +80,6 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	authCfg := cfg.GetAuth()
 
 	if r.Method == "GET" {
 		data := map[string]any{
@@ -114,11 +114,24 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set the credentials
-	authCfg.Username = username
-	authCfg.Password = string(hashedPassword)
-
-	if err := cfg.SaveAuth(authCfg); err != nil {
+	// Set the credentials. NeedsAuth is checked again on the copy being
+	// saved, so two registrations racing each other cannot both succeed.
+	closed := false
+	updated, err := config.Update(func(next *config.Config) error {
+		if !next.NeedsAuth() {
+			closed = true
+			return fmt.Errorf("registration is closed")
+		}
+		authCfg := next.GetAuth()
+		authCfg.Username = username
+		authCfg.Password = string(hashedPassword)
+		return next.SaveAuth(authCfg)
+	})
+	if closed {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err != nil {
 		http.Error(w, "Error saving credentials", http.StatusInternalServerError)
 		return
 	}
@@ -127,7 +140,7 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	session, _ := s.cookie.Get(r, "auth-session")
 	session.Values["authenticated"] = true
 	session.Values["username"] = username
-	session.Values["auth_version"] = sessionVersion(cfg)
+	session.Values["auth_version"] = sessionVersion(updated)
 	if err := session.Save(r, w); err != nil {
 		http.Error(w, "Error saving session", http.StatusInternalServerError)
 		return

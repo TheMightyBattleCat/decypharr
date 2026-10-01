@@ -376,7 +376,7 @@ func (m *Manager) syncNZBs(ctx context.Context) error {
 		}
 		req := NewNZBRequest(
 			pending.Name,
-			m.config.DownloadFolder,
+			config.Get().DownloadFolder,
 			pending.Content,
 			m.arr.GetOrCreate(""),
 			config.DownloadActionNone,

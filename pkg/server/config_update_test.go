@@ -10,6 +10,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
@@ -29,12 +30,8 @@ func newTestManager(t *testing.T) *manager.Manager {
 // handleUpdateConfig explicitly preserves the live value the same way it
 // already does for Auth.
 //
-// The assertion reads back the persisted config.json rather than the live
-// in-memory singleton: Save() writes newConfig's fields to disk
-// unconditionally, while the singleton is only mutated via ApplyRuntime,
-// which is skipped whenever RequiresRestart is true - as it would be here,
-// since a wiped WebhookToken alone differs enough from the live config to
-// trigger it. Checking the singleton would pass even with the bug present.
+// The assertion reads back the persisted config.json, which is what a
+// restart loads.
 func TestHandleUpdateConfig_PreservesWebhookToken(t *testing.T) {
 	config.Get().WebhookToken = "existing-secret-token"
 	t.Cleanup(func() { config.Get().WebhookToken = "" })
@@ -239,5 +236,222 @@ func TestHandleUpdateConfig_PreferFasterServersAppliesWithoutRestart(t *testing.
 		if got := persisted.Usenet.PreferFasterServersEnabled(); got != on {
 			t.Errorf("persisted setting = %v after saving %v", got, on)
 		}
+	}
+}
+
+// A settings read and a settings save must each leave the snapshot that was
+// current before them untouched: readers elsewhere may still hold it.
+func TestConfigHandlersUseSnapshots(t *testing.T) {
+	previousPath := config.GetMainPath()
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(func() {
+		config.Reset()
+		config.SetConfigPath(previousPath)
+	})
+	// A running service has a bind address; without one the handler fills in
+	// 0.0.0.0 and the save below would count as a restart-worthy change.
+	if _, err := config.Update(func(next *config.Config) error {
+		next.BindAddress = "0.0.0.0"
+		return nil
+	}); err != nil {
+		t.Fatalf("normalizing the config: %v", err)
+	}
+	before := config.Get()
+	mgr := newTestManager(t)
+	mgr.Arr().AddOrUpdate(&arr.Arr{Name: "manual", Host: "http://example.test", Token: "token", Source: arr.SourceManual})
+	server := &Server{logger: zerolog.Nop(), manager: mgr}
+	response := httptest.NewRecorder()
+	server.handleGetConfig(response, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET status=%d", response.Code)
+	}
+	if len(before.Arrs) != 0 {
+		t.Fatal("GET changed the current snapshot")
+	}
+	response = httptest.NewRecorder()
+	server.handleUpdateConfig(response, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(`{"app_url":"https://new.example.test"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST status=%d body=%s", response.Code, response.Body.String())
+	}
+	if before.AppURL == "https://new.example.test" {
+		t.Fatal("POST changed the previous snapshot")
+	}
+	if config.Get().AppURL != "https://new.example.test" {
+		t.Fatal("POST did not publish the update")
+	}
+	var result struct {
+		Restarted bool `json:"restarted"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Restarted {
+		t.Fatal("live URL update restarted services")
+	}
+}
+
+// The fork's own settings endpoints (repair, pre-cache, Plex, webhook
+// teardown, webhook token) each publish a new config. None may write to the
+// one that was current before: other goroutines may still be reading it.
+func TestDedicatedSettingsHandlersLeaveThePreviousSnapshotAlone(t *testing.T) {
+	previousPath := config.GetMainPath()
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(func() {
+		config.Reset()
+		config.SetConfigPath(previousPath)
+	})
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+
+	steps := []struct {
+		name    string
+		call    func(w http.ResponseWriter)
+		changed func(c *config.Config) bool
+	}{
+		{"repair", func(w http.ResponseWriter) {
+			s.handleUpdateRepairConfig(w, httptest.NewRequest(http.MethodPut, "/api/repair/config", strings.NewReader(`{"pad_max_run_segments":7}`)))
+		}, func(c *config.Config) bool { return c.Repair.PadMaxRunSegments == 7 }},
+		{"precache", func(w http.ResponseWriter) {
+			s.handleUpdatePrecacheConfig(w, httptest.NewRequest(http.MethodPut, "/api/precache/config", strings.NewReader(`{"precache_threshold_percent":37}`)))
+		}, func(c *config.Config) bool { return c.Precache.PrecacheThresholdPercent == 37 }},
+		{"plex", func(w http.ResponseWriter) {
+			s.handleUpdatePlexConfig(w, httptest.NewRequest(http.MethodPut, "/api/plex/config", strings.NewReader(`{"plex_url":"http://plex.example.test:32400","plex_token":"plex-token"}`)))
+		}, func(c *config.Config) bool { return c.Plex.Token == "plex-token" }},
+		{"webhook teardown", func(w http.ResponseWriter) {
+			s.handleUpdateWebhookTeardown(w, httptest.NewRequest(http.MethodPut, "/api/webhook/teardown", strings.NewReader(`{"enabled":true}`)))
+		}, func(c *config.Config) bool { return c.ArrWebhookTeardown }},
+		{"webhook token", func(w http.ResponseWriter) {
+			if _, err := s.refreshWebhookToken(); err != nil {
+				t.Fatalf("refreshWebhookToken: %v", err)
+			}
+		}, func(c *config.Config) bool { return c.WebhookToken != "" }},
+	}
+	for _, step := range steps {
+		before := config.Get()
+		if step.changed(before) {
+			t.Fatalf("%s: the setting is already at the value the step saves", step.name)
+		}
+		rec := httptest.NewRecorder()
+		step.call(rec)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body: %s", step.name, rec.Code, rec.Body.String())
+		}
+		if step.changed(before) {
+			t.Errorf("%s: the save wrote to the previous snapshot", step.name)
+		}
+		if config.Get() == before || !step.changed(config.Get()) {
+			t.Errorf("%s: the save was not published", step.name)
+		}
+	}
+
+	// Each save keeps what the earlier ones stored, on disk as well.
+	raw, err := os.ReadFile(config.Get().JsonFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted config.Config
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		if !step.changed(&persisted) {
+			t.Errorf("%s: not in config.json after the later saves", step.name)
+		}
+	}
+}
+
+// An Arr that only runtime storage knows (auto-detected, never saved) shows as
+// a card on the settings page. Deleting that card and saving must remove it;
+// a save that follows no settings read must leave it alone.
+func TestHandleUpdateConfig_DeletingAnAutoDetectedArrCardRemovesIt(t *testing.T) {
+	s := withLiveArrs(t, config.Arr{Name: "sonarr", Host: "http://127.0.0.1:1", Token: "k"})
+	detected := &arr.Arr{Name: "detected", Host: "http://127.0.0.1:2", Token: "t", Source: arr.SourceAuto}
+	s.manager.Arr().AddOrUpdate(detected)
+	before := config.Get()
+	saved := []any{map[string]any{"name": "sonarr", "host": "http://127.0.0.1:1", "token": "k"}}
+
+	// No settings read first: the save cannot know the Arr was ever shown.
+	if rec := postConfig(t, s, liveConfigBody(t, saved)); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	if s.manager.Arr().Get("detected") == nil {
+		t.Fatal("a save with no settings read before it dropped the auto-detected Arr")
+	}
+
+	// The page loads (showing both cards), the card is deleted, the page saves.
+	body := liveConfigBody(t, saved)
+	s.handleGetConfig(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if len(before.Arrs) != 1 || len(config.Get().Arrs) != 1 {
+		t.Fatal("the settings read changed the config")
+	}
+	if rec := postConfig(t, s, body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	if s.manager.Arr().Get("detected") != nil {
+		t.Fatal("the deleted card's Arr is still in runtime storage")
+	}
+	if s.manager.Arr().Get("sonarr") == nil {
+		t.Fatal("the saved Arr was dropped")
+	}
+
+	// The list is used once: detected again later, it survives a save that
+	// follows no new settings read.
+	s.manager.Arr().AddOrUpdate(detected)
+	if rec := postConfig(t, s, liveConfigBody(t, saved)); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	if s.manager.Arr().Get("detected") == nil {
+		t.Fatal("a later save reused the old shown list and dropped the Arr")
+	}
+}
+
+// Queue and notification settings are read once at start, so changing one
+// restarts the service. Saving the page with them unchanged must not: the
+// form posts an empty event list as [] where the config holds none, and
+// posts the defaults for fields left blank.
+func TestHandleUpdateConfig_UnchangedStartupSettingsDoNotRestart(t *testing.T) {
+	previousPath := config.GetMainPath()
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(func() {
+		config.Reset()
+		config.SetConfigPath(previousPath)
+	})
+	if _, err := config.Update(func(next *config.Config) error {
+		next.BindAddress = "0.0.0.0"
+		return nil
+	}); err != nil {
+		t.Fatalf("normalizing the config: %v", err)
+	}
+	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	save := func(body string) bool {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.handleUpdateConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Restarted bool `json:"restarted"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Restarted
+	}
+
+	unchanged := `{"refresh_interval":"30s","max_active_downloads":5,
+		"notifications":{"enabled":false,"webhook_url":"","callback_url":"","events":[]}}`
+	for i := range 2 {
+		if save(unchanged) {
+			t.Fatalf("save %d of unchanged queue and notification settings restarted the service", i+1)
+		}
+	}
+	if !save(`{"remove_stalled_after":"10m"}`) {
+		t.Error("changing remove_stalled_after did not restart the service; the queue reads it only at start")
+	}
+	if save(`{"remove_stalled_after":"10m"}`) {
+		t.Error("saving the same remove_stalled_after again restarted the service")
 	}
 }

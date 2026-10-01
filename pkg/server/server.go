@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -67,6 +68,11 @@ type Server struct {
 	nzbUserAgent string
 	urlBase      string
 	restartFunc  func()
+
+	// shownArrs is the Arr list the last settings read returned and no save
+	// has used yet. See takeShownArrs.
+	shownArrsMu sync.Mutex
+	shownArrs   []config.Arr
 }
 
 func New(mgr *manager.Manager) *Server {

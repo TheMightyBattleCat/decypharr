@@ -230,9 +230,10 @@ func (s *Server) refreshWebhookToken() (string, error) {
 		return "", err
 	}
 
-	cfg := config.Get()
-	cfg.WebhookToken = token
-	if err := cfg.Save(); err != nil {
+	if _, err := config.Update(func(next *config.Config) error {
+		next.WebhookToken = token
+		return nil
+	}); err != nil {
 		return "", err
 	}
 
