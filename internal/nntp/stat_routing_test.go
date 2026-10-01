@@ -380,7 +380,7 @@ func TestBatchStatAcrossProvidersAsksEveryProvider(t *testing.T) {
 
 	msgIDs := []string{"only-a@test", "only-b@test", "nowhere@test", "both@test"}
 	for _, home := range []config.UsenetProvider{pa, pb} {
-		res, err := c.batchStatAcrossProviders(context.Background(), msgIDs, home)
+		res, err := c.batchStatAcrossProviders(context.Background(), msgIDs, home, nil)
 		if err != nil {
 			t.Fatalf("home %s: %v", home.Host, err)
 		}

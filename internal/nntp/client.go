@@ -1394,6 +1394,9 @@ func (c *Client) Stats() map[string]any {
 			"stat_err_closed":   pp.stat.errClosed.Load(),
 			"stat_err_other":    pp.stat.errOther.Load(),
 			"stat_cancelled":    pp.stat.cancelled.Load(),
+			// Checks (one file's articles each) that moved this provider
+			// to the back because it had none of them (statHint).
+			"stat_hint_demotions": pp.stat.hintDemotions.Load(),
 		}
 
 		// Add speed test result if available
@@ -1634,11 +1637,14 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 			allResults[i].Error = e
 		}
 	}
+	// One call checks one file's articles, so what its first chunks learn
+	// about a provider (it has none of them) steers the rest. See statHint.
+	hint := c.newStatHint()
 	var bailOnce sync.Once
 	var wg sync.WaitGroup
 	for _, ch := range chunks {
 		wg.Add(1)
-		err := c.repairPool.Submit(ctx, ch.messageIDs, func(results []StatResult, taskErr error) {
+		err := c.repairPool.Submit(ctx, ch.messageIDs, hint, func(results []StatResult, taskErr error) {
 			defer wg.Done()
 			if taskErr != nil {
 				// Mirrors the previous behaviour: a chunk-level connection
@@ -1704,8 +1710,11 @@ func tallyStatResults(results []StatResult) (found, errs int) {
 }
 
 // batchStatAcrossProviders STATs one chunk: on home first, then whatever is
-// still unresolved on each remaining provider in statOrder.
-func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []string, home config.UsenetProvider) ([]StatResult, error) {
+// still unresolved on each remaining provider in statOrder. hint (nil for
+// none) is shared by the chunks of one BatchStat call: providers it marks
+// absent are asked last, and it is re-read before each provider so a chunk
+// already under way benefits from what the others have learned meanwhile.
+func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []string, home config.UsenetProvider, hint *statHint) ([]StatResult, error) {
 	results := make([]StatResult, len(messageIDs))
 	states := make([]batchStatState, len(messageIDs))
 	unresolved := make([]int, len(messageIDs))
@@ -1714,10 +1723,13 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 		unresolved[i] = i
 	}
 
-	for _, provider := range c.statOrder(home) {
+	order := c.statOrder(home)
+	for next := range order {
 		if len(unresolved) == 0 {
 			break
 		}
+		c.applyStatHint(hint, order[next:])
+		provider := order[next]
 		if ctx.Err() != nil {
 			return results, ctx.Err()
 		}
@@ -1744,6 +1756,7 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 			continue
 		}
 
+		answered, found := 0, 0
 		nextUnresolved := make([]int, 0, len(unresolved))
 		queryPos := 0
 		for _, idx := range unresolved {
@@ -1767,11 +1780,14 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 			queryPos++
 			if res.Available {
 				results[idx] = res
+				answered++
+				found++
 				continue
 			}
 
 			var nntpErr *Error
 			if res.Error != nil && errors.As(res.Error, &nntpErr) && nntpErr.Type == ErrorTypeArticleNotFound {
+				answered++
 				states[idx].sawNotFound = true
 				excludeForArticleNotFound(&states[idx].exclusions, provider)
 			} else {
@@ -1787,6 +1803,9 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 			nextUnresolved = append(nextUnresolved, idx)
 		}
 		unresolved = nextUnresolved
+		// Only found and not-found replies count: a failed window says
+		// nothing about what the provider holds.
+		hint.add(provider.Host, answered, found)
 	}
 
 	for _, idx := range unresolved {

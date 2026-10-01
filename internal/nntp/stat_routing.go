@@ -29,7 +29,8 @@ import (
 // statExploreAfter, so a provider that speeds up (or recovers from an outage)
 // is picked up again. Unresolved IDs still fall through every other provider
 // (see statOrder), so an article counts as missing only when every provider
-// says so - exactly as before.
+// says so - exactly as before. Within one BatchStat call a provider that turns
+// out to have none of the call's articles is asked last (see statHint).
 const (
 	// statSlowFactor: a home stays eligible while its STAT latency is at most
 	// this multiple of the fastest measured home.
@@ -75,6 +76,9 @@ type statLatency struct {
 	// cancelled counts windows cut short by the caller's context: the
 	// connection is closed to unblock the read, but no penalty is recorded.
 	cancelled atomic.Int64
+	// hintDemotions counts BatchStat calls that moved this provider to the
+	// back because it had none of the call's articles (see statHint).
+	hintDemotions atomic.Int64
 }
 
 // STAT failure causes, as logged and as the suffix of the stat_err_* stats.
@@ -289,4 +293,98 @@ func (c *Client) statOrder(home config.UsenetProvider) []config.UsenetProvider {
 	})
 	order = append(order, primaries...)
 	return append(order, backups...)
+}
+
+// statHintMinAnswers is how many of one BatchStat call's articles a provider
+// must have answered, without finding any, before the rest of the call asks
+// it last.
+const statHintMinAnswers = 32
+
+// statHint is what one BatchStat call has learned about where its articles
+// are. A call checks one file's (or one PAR2 set's) articles, which were
+// posted together: a provider that has none of the first few dozen almost
+// never has the rest. Providers answer "no such article" 40-100x slower than
+// a hit, one after another, so a chunk that starts on such a provider waits
+// seconds per article for nothing before it reaches the provider that has
+// the file.
+//
+// The hint only reorders. A provider with no hits is asked after the others
+// in its tier (primaries stay ahead of backups), and still gets every ID
+// nothing else had, so "missing" still means every provider said so. One hit
+// puts it back in its usual place.
+type statHint struct {
+	byHost map[string]*statHintCounts
+}
+
+type statHintCounts struct {
+	answered atomic.Int64 // definitive replies: found or not found
+	hits     atomic.Int64
+	noted    atomic.Bool // the demotion was logged and counted for this call
+}
+
+// newStatHint returns an empty hint covering every configured provider.
+func (c *Client) newStatHint() *statHint {
+	h := &statHint{byHost: make(map[string]*statHintCounts, len(c.providers))}
+	for _, p := range c.providers {
+		h.byHost[p.Host] = &statHintCounts{}
+	}
+	return h
+}
+
+// add records a provider's definitive replies for part of the call.
+func (h *statHint) add(host string, answered, hits int) {
+	if h == nil || answered == 0 {
+		return
+	}
+	if n, ok := h.byHost[host]; ok {
+		n.hits.Add(int64(hits))
+		n.answered.Add(int64(answered))
+	}
+}
+
+// absent reports whether host has answered enough of the call's articles,
+// finding none, to be asked last.
+func (h *statHint) absent(host string) bool {
+	if h == nil {
+		return false
+	}
+	n, ok := h.byHost[host]
+	return ok && n.hits.Load() == 0 && n.answered.Load() >= statHintMinAnswers
+}
+
+// applyStatHint reorders the providers a chunk has still to ask, in place:
+// within the primaries, and within the backups, those the hint marks absent
+// go last. It never drops or adds a provider, and leaves the order alone when
+// none is absent.
+func (c *Client) applyStatHint(hint *statHint, rest []config.UsenetProvider) {
+	if hint == nil || len(rest) < 2 {
+		return
+	}
+	rank := func(p config.UsenetProvider) int {
+		r := 0
+		if p.Backup {
+			r = 2
+		}
+		if hint.absent(p.Host) {
+			r++
+		}
+		return r
+	}
+	demoted := false
+	for _, p := range rest {
+		if !hint.absent(p.Host) {
+			continue
+		}
+		demoted = true
+		if n := hint.byHost[p.Host]; n.noted.CompareAndSwap(false, true) {
+			if pp, ok := c.pools[p.Host]; ok {
+				pp.stat.hintDemotions.Add(1)
+			}
+			c.logger.Debug().Str("provider", p.Host).Int64("answered", n.answered.Load()).
+				Msg("STAT hint: provider has none of this check's articles so far, asking it last for the rest")
+		}
+	}
+	if demoted {
+		sort.SliceStable(rest, func(i, j int) bool { return rank(rest[i]) < rank(rest[j]) })
+	}
 }

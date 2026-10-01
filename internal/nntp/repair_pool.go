@@ -42,6 +42,7 @@ type RepairPool struct {
 type repairTask struct {
 	ctx    context.Context
 	msgIDs []string
+	hint   *statHint // shared by the chunks of one BatchStat call; may be nil
 	done   func(results []StatResult, err error)
 }
 
@@ -150,15 +151,16 @@ func (p *RepairPool) Capacity() int {
 	return p.workers
 }
 
-// Submit hands a chunk to the pool. done is invoked on a worker goroutine
+// Submit hands a chunk to the pool. hint is the call's shared statHint (nil
+// for none). done is invoked on a worker goroutine
 // exactly once when the chunk has been processed (or rejected). Returns
 // an error and does NOT call done when the caller's ctx expires before a
 // worker takes the task, or when the pool has been stopped.
-func (p *RepairPool) Submit(ctx context.Context, msgIDs []string, done func([]StatResult, error)) error {
+func (p *RepairPool) Submit(ctx context.Context, msgIDs []string, hint *statHint, done func([]StatResult, error)) error {
 	if p == nil {
 		return errRepairPoolClosed
 	}
-	task := repairTask{ctx: ctx, msgIDs: msgIDs, done: done}
+	task := repairTask{ctx: ctx, msgIDs: msgIDs, hint: hint, done: done}
 	// quit takes priority: once Stop closes it, refuse new work even if
 	// the buffered tasks channel still has room.
 	select {
@@ -257,6 +259,6 @@ func (p *RepairPool) run(c *Client, home *ProviderPool, t repairTask) {
 	} else if len(c.providers) > 0 {
 		homeCfg = c.providers[0]
 	}
-	results, err := c.batchStatAcrossProviders(t.ctx, t.msgIDs, homeCfg)
+	results, err := c.batchStatAcrossProviders(t.ctx, t.msgIDs, homeCfg, t.hint)
 	t.done(results, err)
 }
