@@ -6,10 +6,13 @@ name: Fork Docker Build
 # for:
 #   image: ghcr.io/themightybattlecat/decypharr:latest
 #
-# The existing config.json is read as-is. Settings this build does not know
-# (upstream beta's virtual folders, STRM, NFS/SMB shares and share cache,
-# among others) are ignored, and the first save from the Settings page
-# writes config.json without them, so keep a copy to switch back.
+# The existing config.json is read as-is. Virtual folders, STRM and the
+# NFS/SMB shares are supported. The upstream beta settings this
+# build does not know (body_pipeline_depth, stream_backup_wait,
+# conn_idle_timeout, disk_path, fuse_max_background, fuse_max_read_ahead,
+# token_only and verify_content) are ignored, and the first save from the
+# Settings page writes config.json without them, so keep a copy to switch
+# back.
 #
 # Most new features are off until enabled in Settings; these usenet
 # safeguards are on unless the config turns them off: filling short gaps in
@@ -20,13 +23,12 @@ name: Fork Docker Build
 # servers first (usenet.prefer_faster_servers).
 #
 # The database in the /app data folder is read whichever image wrote it:
-# upstream beta's current format directly, and the older format of earlier
-# images (including earlier builds of this fork) by upgrading it in place on
-# first start. Each database file is copied beside itself (a .v3.bak file)
-# before it is upgraded; images that predate the upgrade cannot read the
-# upgraded files, so restore those copies, or keep a copy of /app, to switch
-# back. Upstream beta's per-file IDs are not kept by this build, so .strm
-# files written by upstream beta may need writing again after switching back.
+# upstream beta's current format directly (the two use the same format,
+# per-file IDs included), and the older format of earlier images (including
+# earlier builds of this fork) by upgrading it in place on first start. Each
+# database file is copied beside itself (a .bak file) before it is upgraded;
+# images that predate the upgrade cannot read the upgraded files, so restore
+# those copies, or keep a copy of /app, to switch back.
 #
 # NOTE: the Dockerfile embeds the web UI from the COMMITTED
 # pkg/server/assets/build/** (no npm stage), so regenerate + commit those
