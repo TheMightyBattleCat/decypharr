@@ -8,6 +8,9 @@
 // TTL" input is in seconds for a human to read.
 const NS_PER_SECOND = 1e9;
 const PLEX_TOKEN_PLACEHOLDER = '********';
+// How long one status poll may wait for its reply before it is given up and
+// retried; without a limit a request that never answers stops the polling.
+const STATUS_POLL_TIMEOUT_MS = 20000;
 // The unverified reasons Replace acts on, and how many entries one Replace
 // re-grabs (manager.replaceableReason, defaultReplaceUnverifiedLimit).
 const REPLACEABLE_REASONS = new Set(['import_tail_truncated', 'import_volume_order']);
@@ -590,16 +593,38 @@ class RepairManager {
     }
 
     async loadStatus() {
+        let status = null;
+        let failed = false;
         try {
-            const status = await this.fetchJSON(`${this.api}/repair/status`);
+            // Browsers from before 2022 have no AbortSignal.timeout; they poll without a limit.
+            const opts = typeof AbortSignal.timeout === 'function' ? {signal: AbortSignal.timeout(STATUS_POLL_TIMEOUT_MS)} : {};
+            status = await this.fetchJSON(`${this.api}/repair/status`, opts);
             this.renderStatus(status || {});
-            this.scheduleStatusPoll(status);
         } catch (e) {
+            failed = true;
             console.error('Failed to load status', e);
+        } finally {
+            // Always poll again: a failed or hung request used to end the
+            // polling, which left a run that had since finished on screen
+            // as still running, its counters frozen.
+            this.scheduleStatusPoll(status, failed);
         }
     }
 
-    scheduleStatusPoll(status) {
+    scheduleStatusPoll(status, failed = false) {
+        if (this.statusTimer) {
+            clearTimeout(this.statusTimer);
+            this.statusTimer = null;
+        }
+        if (failed) {
+            // Nothing new is known: keep wasRunning so the end of the run is
+            // still noticed, and say that the panel is not live.
+            if (this.wasRunning === true) {
+                document.getElementById('activeRunStage').textContent = 'no reply from the server, retrying';
+            }
+            this.statusTimer = setTimeout(() => this.loadStatus(), this.wasRunning === true ? 5000 : 15000);
+            return;
+        }
         const isRunning = !!(status && status.active_run);
         const wasRunning = this.wasRunning === true;
         this.wasRunning = isRunning;
@@ -610,10 +635,6 @@ class RepairManager {
             this.loadHistory();
             if (this.isBrokenModalOpen()) this.loadBroken();
             if (this.isUnverifiedModalOpen()) this.loadUnverified();
-        }
-        if (this.statusTimer) {
-            clearTimeout(this.statusTimer);
-            this.statusTimer = null;
         }
         const delay = isRunning ? 2000 : 15000;
         this.statusTimer = setTimeout(() => this.loadStatus(), delay);
@@ -1628,8 +1649,8 @@ class RepairManager {
         }
     }
 
-    async fetchJSON(url) {
-        const res = await fetch(url, {credentials: 'same-origin'});
+    async fetchJSON(url, opts = {}) {
+        const res = await fetch(url, {credentials: 'same-origin', ...opts});
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
     }
