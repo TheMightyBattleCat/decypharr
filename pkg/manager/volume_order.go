@@ -2,9 +2,12 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -350,12 +353,22 @@ func rar4EndNumbers(ctx context.Context, f *storage.NZBFile, vols []layoutVolume
 
 // volumeOrderCache keeps each file's verdict for the life of the process, so
 // a file listed Unverified for another reason is not re-read every sweep. Keyed
-// by the stored layout, so a re-import is checked again.
+// by the stored layout, so a re-import or a reordered file is checked again.
 var volumeOrderCache sync.Map // map[string]volumeOrderVerdict
 
+// volumeOrderKey names a file's stored layout: its release, its name and
+// every article in order. The first and last articles alone would not do - two
+// volumes swapped mid-file leave both where they were.
 func volumeOrderKey(infoHash string, f *storage.NZBFile) string {
-	segs := f.Segments
-	return fmt.Sprintf("%s\x00%s\x00%d\x00%s\x00%s", infoHash, f.Name, len(segs), segs[0].MessageID, segs[len(segs)-1].MessageID)
+	h := sha256.New()
+	h.Write([]byte(infoHash))
+	h.Write([]byte{0})
+	h.Write([]byte(f.Name))
+	for i := range f.Segments {
+		h.Write([]byte{0})
+		h.Write([]byte(f.Segments[i].MessageID))
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 // checkVolumeOrder runs checkFileVolumeOrder on a stored RAR file, over NNTP in
@@ -395,4 +408,67 @@ func (r *Repair) checkVolumeOrder(ctx context.Context, infoHash, name string) (v
 		Str("source", v.source).Bool("misordered", v.misordered).Int("out_of_place", v.outOfPlace).
 		Dur("took", time.Since(started)).Msg("Repair: checked the stored volume order")
 	return v, true
+}
+
+// volumeOrderOnce returns a stored RAR file's volume-order verdict: the one an
+// earlier probe recorded for the layout it still has, or else a fresh read of
+// its volumes' headers, which the caller records. A misordered file is logged
+// when it is first found. Nil when the file is not a multi-volume RAR file or
+// the check reached no verdict; that file is read again on the next probe.
+func (r *Repair) volumeOrderOnce(ctx context.Context, c *candidate, infoHash, name string) *storage.VolumeOrderCheck {
+	u := r.manager.usenet
+	if u == nil {
+		return nil
+	}
+	nzb, err := u.GetNZB(infoHash)
+	if err != nil || nzb == nil {
+		return nil
+	}
+	f := nzb.GetFileByName(name)
+	if f == nil || f.FileType != storage.NZBFileTypeRar || len(f.Segments) == 0 {
+		return nil
+	}
+	layout := volumeOrderKey(infoHash, f)
+	if prior, ok := c.volumeChecks[name]; ok && prior.Layout == layout {
+		return &prior
+	}
+	vo, checked := r.checkVolumeOrder(ctx, infoHash, name)
+	if !checked || vo.volumes < 2 {
+		return nil
+	}
+	check := &storage.VolumeOrderCheck{FileName: name, Layout: layout, Volumes: vo.volumes, Numbered: vo.numbered, Source: vo.source,
+		Misordered: vo.misordered, CheckedAt: time.Now()}
+	if vo.misordered {
+		check.Detail = vo.detail()
+		r.logger.Warn().Str("entry", c.name).Str("file", name).Int("volumes", vo.volumes).Int("out_of_place", vo.outOfPlace).
+			Int("position", vo.position).Int("volume_number", vo.number).Str("source", vo.source).
+			Msg("Repair: archive volumes are stored out of order (assembled wrong at import); replace it from Unverified")
+	}
+	return check
+}
+
+// mergeVolumeOrderChecks returns the checks to keep on an entry after a probe:
+// each probed file's verdict, and the earlier one for a file still in the
+// entry that this probe reached no verdict for.
+func mergeVolumeOrderChecks(prior []storage.VolumeOrderCheck, names []string, results []fileResult) []storage.VolumeOrderCheck {
+	byName := make(map[string]storage.VolumeOrderCheck, len(prior))
+	for _, vc := range prior {
+		if slices.Contains(names, vc.FileName) {
+			byName[vc.FileName] = vc
+		}
+	}
+	for _, res := range results {
+		if res.volumeCheck != nil {
+			byName[res.name] = *res.volumeCheck
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+	out := make([]storage.VolumeOrderCheck, 0, len(byName))
+	for _, vc := range byName {
+		out = append(out, vc)
+	}
+	slices.SortFunc(out, func(a, b storage.VolumeOrderCheck) int { return strings.Compare(a.FileName, b.FileName) })
+	return out
 }

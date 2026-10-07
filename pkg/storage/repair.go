@@ -281,6 +281,23 @@ type UnverifiedFile struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// VolumeOrderCheck is the verdict of the one volume-order check a stored RAR
+// file gets (see manager.checkFileVolumeOrder). Layout names the article
+// layout it was read from, so a re-import is checked again.
+type VolumeOrderCheck struct {
+	FileName string `json:"file_name"`
+	Layout   string `json:"layout"`
+	// Volumes is how many volumes the file is stored as, Numbered how many a
+	// number was read for, and Source where the numbers came from (empty when
+	// none could be read: the order is then unknown, not confirmed).
+	Volumes    int       `json:"volumes"`
+	Numbered   int       `json:"numbered"`
+	Source     string    `json:"source,omitempty"`
+	Misordered bool      `json:"misordered,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
 // EntryHealth is the source of truth for repair decisions. It is keyed by
 // EntryName (the folder-name shared across files of the same release) and is
 // updated live during a sweep — once when probing starts, once when it
@@ -311,6 +328,11 @@ type EntryHealth struct {
 	// meaningful while Status is healthy (see IsUnverified).
 	UnverifiedFiles []UnverifiedFile `json:"unverified_files,omitempty"`
 	UnverifiedRunID string           `json:"unverified_run_id,omitempty"`
+
+	// VolumeOrderChecks keeps each multi-volume RAR file's volume-order
+	// verdict, so its volumes' headers are read once and not on every probe.
+	// A misordered file is listed Unverified from it on every later probe.
+	VolumeOrderChecks []VolumeOrderCheck `json:"volume_order_checks,omitempty"`
 
 	Dirty       bool   `json:"dirty"`
 	DirtyReason string `json:"dirty_reason,omitempty"`
@@ -450,12 +472,30 @@ func (s *Storage) ClearEntryHealthByStatuses(statuses []HealthStatus) (int, erro
 
 	cleared := 0
 	for _, name := range names {
-		if err := s.DeleteEntryHealth(name); err != nil {
+		if err := s.clearEntryHealth(name); err != nil {
 			return cleared, err
 		}
 		cleared++
 	}
 	return cleared, nil
+}
+
+// clearEntryHealth deletes one record for ClearEntryHealthByStatuses, unless
+// it holds volume-order checks: those say how the file is stored, not how the
+// last probe went, and reading them again costs an article per archive
+// volume. Such a record is cut down to its name and its checks, with the
+// unknown status of an entry no sweep has probed.
+func (s *Storage) clearEntryHealth(name string) error {
+	state, err := s.GetEntryHealth(name)
+	if err != nil || state == nil || len(state.VolumeOrderChecks) == 0 {
+		return s.DeleteEntryHealth(name)
+	}
+	return s.SaveEntryHealth(&EntryHealth{
+		EntryName:         state.EntryName,
+		Protocol:          state.Protocol,
+		Status:            HealthUnknown,
+		VolumeOrderChecks: state.VolumeOrderChecks,
+	})
 }
 
 // ClearAllDecodeVerification zeroes DecodeVerifiedAt, DecodeVerifiedFingerprint

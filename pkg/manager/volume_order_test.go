@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
@@ -310,4 +312,105 @@ func TestCheckFileVolumeOrder(t *testing.T) {
 			t.Fatalf("got %+v, %v", v, err)
 		}
 	})
+}
+
+func TestVolumeOrderKey(t *testing.T) {
+	tags, articles := []string{"a", "b", "c", "d"}, []int{3, 3, 3, 2}
+	f := voFile(tags, articles)
+	if volumeOrderKey("id", f) != volumeOrderKey("id", voFile(tags, articles)) {
+		t.Fatal("the same layout gave two keys")
+	}
+	// Two volumes swapped mid-file keep the first and last articles: the
+	// reordered file has to be checked again all the same.
+	swapped := voFile([]string{"a", "c", "b", "d"}, articles)
+	if swapped.Segments[0].MessageID != f.Segments[0].MessageID ||
+		swapped.Segments[len(swapped.Segments)-1].MessageID != f.Segments[len(f.Segments)-1].MessageID {
+		t.Fatal("test layout should keep its first and last articles")
+	}
+	if volumeOrderKey("id", f) == volumeOrderKey("id", swapped) {
+		t.Fatal("a file with two middle volumes swapped kept its key")
+	}
+	if volumeOrderKey("id", f) == volumeOrderKey("other", f) {
+		t.Fatal("another release's file shares the key")
+	}
+}
+
+func TestMergeVolumeOrderChecks(t *testing.T) {
+	prior := []storage.VolumeOrderCheck{
+		{FileName: "b.mkv", Layout: "old"},
+		{FileName: "gone.mkv", Layout: "x"},
+		{FileName: "c.mkv", Layout: "kept", Misordered: true, Detail: "d"},
+	}
+	results := []fileResult{
+		{name: "a.mkv", volumeCheck: &storage.VolumeOrderCheck{FileName: "a.mkv", Layout: "new", Misordered: true}},
+		{name: "b.mkv", volumeCheck: &storage.VolumeOrderCheck{FileName: "b.mkv", Layout: "new"}},
+		{name: "c.mkv"}, // no verdict this probe: the earlier one stays
+		{name: "d.mkv"}, // not a multi-volume RAR file
+	}
+	got := mergeVolumeOrderChecks(prior, []string{"a.mkv", "b.mkv", "c.mkv", "d.mkv"}, results)
+	if len(got) != 3 {
+		t.Fatalf("got %+v", got)
+	}
+	if got[0].FileName != "a.mkv" || !got[0].Misordered || got[1].FileName != "b.mkv" || got[1].Layout != "new" ||
+		got[2].FileName != "c.mkv" || got[2].Layout != "kept" || !got[2].Misordered {
+		t.Fatalf("got %+v", got)
+	}
+	if mergeVolumeOrderChecks(nil, []string{"d.mkv"}, results[3:]) != nil {
+		t.Fatal("an entry with no checks should store none")
+	}
+}
+
+// A recorded verdict has to come back from the store, or every probe would
+// read the volumes' headers again.
+func TestVolumeOrderChecksAreStored(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "db")
+	s, err := storage.NewStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := storage.VolumeOrderCheck{FileName: "a.mkv", Layout: "0011223344556677", Volumes: 112, Numbered: 112,
+		Source: volumeSourceYencName, Misordered: true, Detail: "stored volume 45 of 112 is archive volume 44, after 45",
+		CheckedAt: time.Now().UTC().Truncate(time.Second)}
+	h := &storage.EntryHealth{EntryName: "entry", Status: storage.HealthHealthy, VolumeOrderChecks: []storage.VolumeOrderCheck{want}}
+	if err := s.SaveEntryHealth(h); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetEntryHealth("entry")
+	if err != nil || got == nil || len(got.VolumeOrderChecks) != 1 || got.VolumeOrderChecks[0] != want {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+// Clear state on the Repair page deletes health records; the volume-order
+// checks have to outlive it.
+func TestClearStateKeepsVolumeOrderChecks(t *testing.T) {
+	s, err := storage.NewStorage(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := storage.VolumeOrderCheck{FileName: "a.mkv", Layout: "k", Volumes: 3, Numbered: 3, Source: volumeSourceRAR5Header}
+	for _, h := range []*storage.EntryHealth{
+		{EntryName: "checked", Status: storage.HealthHealthy, DecodeVerifiedFingerprint: "fp", VolumeOrderChecks: []storage.VolumeOrderCheck{check}},
+		{EntryName: "plain", Status: storage.HealthHealthy},
+		{EntryName: "broken", Status: storage.HealthBroken, VolumeOrderChecks: []storage.VolumeOrderCheck{check}},
+	} {
+		if err := s.SaveEntryHealth(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := s.ClearEntryHealthByStatuses([]storage.HealthStatus{storage.HealthHealthy})
+	if err != nil || n != 2 {
+		t.Fatalf("cleared %d, %v", n, err)
+	}
+	if h, _ := s.GetEntryHealth("plain"); h != nil {
+		t.Fatalf("a record with no checks should be deleted, got %+v", h)
+	}
+	h, err := s.GetEntryHealth("checked")
+	if err != nil || h == nil || h.Status != storage.HealthUnknown || h.DecodeVerifiedFingerprint != "" ||
+		len(h.VolumeOrderChecks) != 1 || h.VolumeOrderChecks[0] != check {
+		t.Fatalf("got %+v, %v", h, err)
+	}
+	if h, _ := s.GetEntryHealth("broken"); h == nil || h.Status != storage.HealthBroken {
+		t.Fatalf("a status that was not cleared changed: %+v", h)
+	}
 }

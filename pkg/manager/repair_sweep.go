@@ -41,6 +41,9 @@ type candidate struct {
 	arrName    string
 	arrKind    storage.ArrKind
 	contentMap map[string]arr.ContentFile // file_name -> Arr metadata when source=arr
+	// volumeChecks holds the volume-order verdicts already recorded for the
+	// entry's files (file_name -> check); probeEntry sets it, probes only read it.
+	volumeChecks map[string]storage.VolumeOrderCheck
 }
 
 // healCache memoizes per-infohash auto-heal results within one sweep so
@@ -116,6 +119,11 @@ type fileResult struct {
 	// decoded_with_errors reason.
 	unverifiedCause  string
 	unverifiedDetail string
+
+	// volumeCheck is the file's volume-order verdict, read this probe or
+	// recorded by an earlier one; probeEntry persists it. Nil when the file is
+	// not a multi-volume RAR file or the check reached no verdict.
+	volumeCheck *storage.VolumeOrderCheck
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -495,6 +503,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		evt.Str("entry", c.item.Name).Msg("Repair: decode already verified for this fingerprint, skipping decode windows")
 	}
 
+	c.volumeChecks = make(map[string]storage.VolumeOrderCheck, len(h.VolumeOrderChecks))
+	for _, vc := range h.VolumeOrderChecks {
+		c.volumeChecks[vc.FileName] = vc
+	}
 	results, decodeRan, decodeCoverage, decodeAttempted := r.probeFiles(ctx, c, names, opts, decodeVerified)
 	if probeCutShort(ctx, results) {
 		// StopSchedule/StopRun ended the sweep before every file was probed.
@@ -526,6 +538,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.BrokenCount = len(broken)
 	h.UnverifiedFiles = unverifiedFiles(c, results)
 	h.UnverifiedRunID = runID
+	h.VolumeOrderChecks = mergeVolumeOrderChecks(h.VolumeOrderChecks, names, results)
 	h.Fingerprint = currentFP
 	h.LastCheckedAt = time.Now()
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
@@ -772,13 +785,17 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 					r.logger.Warn().Str("entry", c.name).Str("file", name).
 						Msg("Repair: one volume boundary serves another volume's article (assembled wrong at import); not re-grabbed automatically, re-grab by hand")
 				}
-				// A short volume before a full one, or a splice, is how a file
-				// stored out of volume order shows in its meta. Reading the
-				// volumes' headers settles it before a decode check spends its
-				// budget on the jumps.
-				if geo.singleSplice || geo.shortVolume {
-					if vo, checked := r.checkVolumeOrder(ctx, res.infoHash, name); checked && vo.misordered {
-						return r.markVolumeOrder(c.name, name, vo, res)
+				// A file stored out of volume order may show it in its meta (a
+				// short volume before a full one, a splice), but swapped
+				// volumes of equal size show nothing, and a decode check
+				// samples past them. So every multi-volume RAR file has its
+				// volumes' headers read once; the recorded verdict answers
+				// every later probe, before a decode check spends its budget
+				// on the jumps.
+				if check := r.volumeOrderOnce(ctx, c, res.infoHash, name); check != nil {
+					res.volumeCheck = check
+					if check.Misordered {
+						return markVolumeOrder(res, check)
 					}
 				}
 			}
@@ -806,9 +823,14 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 				res.unverifiedCause, res.unverifiedDetail = cause.decodeCause, cause.detail
 				// Misordered volumes decode through as valid Matroska from
 				// elsewhere in the file, which lands here rather than broken.
-				if entry.IsNZB() && (res.unverifiedReason == unverifiedDecodeErrors || res.unverifiedReason == unverifiedReadBudget) {
-					if vo, checked := r.checkVolumeOrder(ctx, res.infoHash, name); checked && vo.misordered {
-						res = r.markVolumeOrder(c.name, name, vo, res)
+				// Only a file whose header read reached no verdict above is
+				// read again here.
+				if entry.IsNZB() && res.volumeCheck == nil && (res.unverifiedReason == unverifiedDecodeErrors || res.unverifiedReason == unverifiedReadBudget) {
+					if check := r.volumeOrderOnce(ctx, c, res.infoHash, name); check != nil {
+						res.volumeCheck = check
+						if check.Misordered {
+							res = markVolumeOrder(res, check)
+						}
 					}
 				}
 			}
@@ -846,14 +868,11 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 // markVolumeOrder leaves a file whose volumes are stored out of order healthy
 // but unverified with reasonVolumeOrder: it plays, with jumps, and Replace
 // re-grabs it keeping the release.
-func (r *Repair) markVolumeOrder(entryName, name string, vo volumeOrderVerdict, res fileResult) fileResult {
-	r.logger.Warn().Str("entry", entryName).Str("file", name).Int("volumes", vo.volumes).Int("out_of_place", vo.outOfPlace).
-		Int("position", vo.position).Int("volume_number", vo.number).Str("source", vo.source).
-		Msg("Repair: archive volumes are stored out of order (assembled wrong at import); replace it from Unverified")
+func markVolumeOrder(res fileResult, check *storage.VolumeOrderCheck) fileResult {
 	res.decodeConclusive = false
 	res.unverifiedReason = reasonVolumeOrder
 	res.unverifiedCause = ""
-	res.unverifiedDetail = vo.detail()
+	res.unverifiedDetail = check.Detail
 	return res
 }
 
