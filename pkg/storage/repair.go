@@ -262,6 +262,13 @@ type BrokenFile struct {
 	ArrFileID  int     `json:"arr_file_id,omitempty"`
 	TargetPath string  `json:"target_path,omitempty"`
 	SourcePath string  `json:"source_path,omitempty"`
+
+	// ConfirmedDeadBytes is the size of the articles the sweep probe that
+	// found this file broken confirmed missing on every provider, when that
+	// probe asked about every article (see Repair.recordDeadSegments). It is
+	// only good for the heal that follows the probe, so it is not stored: a
+	// record read back has zero, meaning "not counted".
+	ConfirmedDeadBytes int64 `json:"-"`
 }
 
 // UnverifiedFile is a file a probe left healthy without verifying it: its

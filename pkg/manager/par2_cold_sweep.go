@@ -21,6 +21,44 @@ import (
 // start-up allowance.
 const par2SweepStartGrace = 30 * time.Second
 
+// coldSweepWanted reports whether the sweep may try a PAR2 pass on a file it
+// finds with dead segments: the part of coldSweepEligible known before the
+// file is probed. The probe uses it to decide whether counting every dead
+// article is worth the time (see Repair.recordDeadSegments).
+func coldSweepWanted(cfg config.RepairConfig) bool {
+	return cfg.Par2RepairOnSweep && cfg.Par2RepairEnabled() && cfg.Par2RepairMode != config.Par2RepairModeManual
+}
+
+// beyondPar2Recovery reports whether damage of deadBytes is more than a
+// release's PAR2 data could ever rebuild. Rebuilding a slice takes one
+// recovery slice of the same size, so the recovery data needed is at least
+// as large as the dead articles, and the recovery slices are held inside the
+// PAR2 files: dead articles bigger than every retained PAR2 file put
+// together cannot be repaired, whatever the slice size. Both sizes come from
+// the NZB, so they carry the same encoding overhead. False when either is
+// unknown (0).
+func beyondPar2Recovery(deadBytes, par2Bytes int64) bool {
+	return deadBytes > 0 && par2Bytes > 0 && deadBytes > par2Bytes
+}
+
+// retainedPar2Bytes is the total size of the PAR2 files kept for nzbID, or 0
+// when it is not known: nothing retained (the files may still be found from
+// the source NZB), or a file with no recorded size.
+func (p *Par2Repair) retainedPar2Bytes(nzbID string) int64 {
+	nzb, err := p.manager.usenet.GetNZB(nzbID)
+	if err != nil || nzb == nil {
+		return 0
+	}
+	var total int64
+	for _, f := range nzb.Par2Files {
+		if f.Size <= 0 {
+			return 0
+		}
+		total += f.Size
+	}
+	return total
+}
+
 // coldSweepEligible is the pure gate for one broken file: the setting and
 // PAR2 are on, the trigger mode is automatic, the probe found dead segments
 // (not a decode or assembly failure - PAR2 cannot fix those, and a file with
@@ -28,16 +66,13 @@ const par2SweepStartGrace = 30 * time.Second
 // has damage pending in the overlay, and in threshold mode the release's
 // pending dead segments reach the threshold.
 func coldSweepEligible(cfg config.RepairConfig, reason string, filePending, releasePending int) bool {
-	if !cfg.Par2RepairOnSweep || !cfg.Par2RepairEnabled() {
+	if !coldSweepWanted(cfg) {
 		return false
 	}
 	if reason != "usenet_segment_missing" || filePending <= 0 {
 		return false
 	}
-	switch cfg.Par2RepairMode {
-	case config.Par2RepairModeManual:
-		return false
-	case config.Par2RepairModeAutoThreshold:
+	if cfg.Par2RepairMode == config.Par2RepairModeAutoThreshold {
 		return releasePending >= cfg.Par2RepairMinSegments
 	}
 	return true
@@ -66,6 +101,13 @@ func (r *Repair) coldSweepRepair(ctx context.Context, broken []storage.BrokenFil
 		ctx = context.Background()
 	}
 
+	// What the probe confirmed missing, per release: a release whose dead
+	// articles outweigh its PAR2 data is not worth a pass.
+	confirmedDead := make(map[string]int64)
+	for _, bf := range broken {
+		confirmedDead[bf.InfoHash] += bf.ConfirmedDeadBytes
+	}
+
 	tried := make(map[string]struct{})
 	for _, bf := range broken {
 		if bf.InfoHash == "" {
@@ -86,6 +128,11 @@ func (r *Repair) coldSweepRepair(ctx context.Context, broken []storage.BrokenFil
 			continue
 		}
 		tried[bf.InfoHash] = struct{}{}
+		if dead, par2Bytes := confirmedDead[bf.InfoHash], p.retainedPar2Bytes(bf.InfoHash); beyondPar2Recovery(dead, par2Bytes) {
+			r.logger.Info().Str("entry", bf.EntryName).Int64("dead_bytes", dead).Int64("par2_bytes", par2Bytes).
+				Msg("Repair: sweep PAR2 skipped, the dead articles are larger than all the release's PAR2 data; re-grabbing")
+			continue
+		}
 		if usable, why := p.par2Usable(bf.InfoHash); !usable {
 			r.logger.Debug().Str("entry", bf.EntryName).Str("reason", why).
 				Msg("Repair: sweep PAR2 skipped, not usable for this release")

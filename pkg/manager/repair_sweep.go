@@ -25,6 +25,7 @@ import (
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
@@ -92,6 +93,11 @@ type fileResult struct {
 	// file (a backup provider still holds its sampled articles); this keeps
 	// the recorded damage visible in the sweep's verdict line.
 	pendingDamage int
+
+	// confirmedDeadBytes is the size of the articles this probe confirmed
+	// missing when it asked about every one (see recordDeadSegments); 0 when
+	// it did not count. Carried to the heal as BrokenFile.ConfirmedDeadBytes.
+	confirmedDeadBytes int64
 
 	// decodeConclusive is true when this file's ffprobe frame-decode pass
 	// actually ran to a verdict this probe (clean, or a concrete decode
@@ -952,7 +958,7 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		return res
 	}
 	if errors.Is(err, customerror.UsenetSegmentMissingError) {
-		r.recordDeadSegments(ctx, entry, name)
+		_, res.confirmedDeadBytes = r.recordDeadSegments(ctx, entry, name)
 		return r.routeAutoRepair(entry, res)
 	}
 	res.reason = "usenet_probe_error"
@@ -1020,28 +1026,52 @@ func (r *Repair) routeAutoRepair(entry *storage.Entry, res fileResult) fileResul
 	return res
 }
 
+// sweepDamageCountTimeout bounds recordDeadSegments' count of every dead
+// article in a file. Misses are slow, so a file that is mostly gone can take
+// this long; what was confirmed by then is still recorded.
+const sweepDamageCountTimeout = 5 * time.Minute
+
 // recordDeadSegments re-probes name for the specific segments confirmed
 // missing (CheckFile above only reports pass/fail) and persists them to the
 // overlay store, so the reader's padding policy and the PAR2 repair worker
 // see this damage without needing to rediscover it themselves. Returns the
 // resulting verdict (VerdictClean if the detail probe itself failed or found
 // nothing - callers must not queue PAR2 repair on that).
-func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, name string) overlay.Verdict {
+//
+// When the sweep may try PAR2 on what it finds (coldSweepWanted), the probe
+// asks about every article instead of stopping at the first miss, and
+// confirmedBytes is the size of what it confirmed missing. The early-stop
+// probe records only its first few misses, and a PAR2 pass sized from those
+// fetches recovery data for a file that may be mostly gone. confirmedBytes
+// is 0 for the early-stop probe: it is not a count.
+func (r *Repair) recordDeadSegments(ctx context.Context, entry *storage.Entry, name string) (verdict overlay.Verdict, confirmedBytes int64) {
 	if r.manager.usenet == nil {
-		return overlay.VerdictClean
+		return overlay.VerdictClean, 0
 	}
-	missing, err := r.manager.usenet.CheckFileDetailed(ctx, entry.InfoHash, name)
+	complete := coldSweepWanted(r.cfg())
+	var missing []usenet.MissingSegment
+	var err error
+	if complete {
+		countCtx, cancel := context.WithTimeout(ctx, sweepDamageCountTimeout)
+		missing, err = r.manager.usenet.CheckFileDetailedComplete(countCtx, entry.InfoHash, name)
+		cancel()
+	} else {
+		missing, err = r.manager.usenet.CheckFileDetailed(ctx, entry.InfoHash, name)
+	}
 	if err != nil || len(missing) == 0 {
-		return overlay.VerdictClean
+		return overlay.VerdictClean, 0
 	}
 	for _, seg := range missing {
 		if err := r.manager.usenet.RecordOverlayDead(entry.InfoHash, name, seg.Index, seg.MessageID, seg.Bytes); err != nil {
 			r.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", name).Int("segment", seg.Index).Msg("Repair: failed to record dead segment in overlay")
 		}
+		if complete {
+			confirmedBytes += seg.Bytes
+		}
 	}
-	verdict := r.manager.usenet.OverlayVerdict(entry.InfoHash, name)
-	r.logger.Debug().Str("entry", entry.Name).Str("file", name).Int("missing_segments", len(missing)).Str("verdict", string(verdict)).Msg("Repair: recorded dead segments from sweep probe")
-	return verdict
+	verdict = r.manager.usenet.OverlayVerdict(entry.InfoHash, name)
+	r.logger.Debug().Str("entry", entry.Name).Str("file", name).Int("missing_segments", len(missing)).Bool("every_article_asked", complete).Str("verdict", string(verdict)).Msg("Repair: recorded dead segments from sweep probe")
+	return verdict, confirmedBytes
 }
 
 func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {
@@ -1179,6 +1209,8 @@ func (r *Repair) brokenFiles(c *candidate, results []fileResult) []storage.Broke
 			InfoHash:  res.infoHash,
 			Protocol:  res.protocol,
 			Reason:    res.reason,
+
+			ConfirmedDeadBytes: res.confirmedDeadBytes,
 		}
 		if file, ok := c.item.Files[res.name]; ok && file != nil {
 			bf.Size = file.Size

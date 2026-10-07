@@ -43,3 +43,50 @@ func TestColdSweepEligible(t *testing.T) {
 		}
 	}
 }
+
+func TestColdSweepWanted(t *testing.T) {
+	on, off := true, false
+	base := config.RepairConfig{Par2RepairOnSweep: true, Par2Repair: &on, Par2RepairMode: config.Par2RepairModeAutoAll}
+	if !coldSweepWanted(base) {
+		t.Errorf("sweep PAR2 on: coldSweepWanted = false, want true")
+	}
+	// Threshold mode still wants the count: the threshold is judged later,
+	// against what the probe recorded.
+	threshold := base
+	threshold.Par2RepairMode = config.Par2RepairModeAutoThreshold
+	if !coldSweepWanted(threshold) {
+		t.Errorf("threshold mode: coldSweepWanted = false, want true")
+	}
+	for name, f := range map[string]func(*config.RepairConfig){
+		"setting off":     func(c *config.RepairConfig) { c.Par2RepairOnSweep = false },
+		"par2 repair off": func(c *config.RepairConfig) { c.Par2Repair = &off },
+		"manual mode":     func(c *config.RepairConfig) { c.Par2RepairMode = config.Par2RepairModeManual },
+	} {
+		c := base
+		f(&c)
+		if coldSweepWanted(c) {
+			t.Errorf("%s: coldSweepWanted = true, want false", name)
+		}
+	}
+}
+
+func TestBeyondPar2Recovery(t *testing.T) {
+	cases := []struct {
+		name            string
+		dead, par2Bytes int64
+		want            bool
+	}{
+		{"more than half a 2.5 GB file dead, 250 MB of PAR2", 1_400_000_000, 250_000_000, true},
+		{"a few dead articles", 12_000_000, 250_000_000, false},
+		{"as much dead as there is PAR2 data", 250_000_000, 250_000_000, false},
+		// Neither unknown may skip a repair: the probe did not count, or the
+		// PAR2 files' sizes are not on record.
+		{"damage not counted", 0, 250_000_000, false},
+		{"PAR2 size unknown", 1_400_000_000, 0, false},
+	}
+	for _, tc := range cases {
+		if got := beyondPar2Recovery(tc.dead, tc.par2Bytes); got != tc.want {
+			t.Errorf("%s: beyondPar2Recovery = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

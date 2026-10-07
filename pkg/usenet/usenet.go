@@ -1473,7 +1473,25 @@ type MissingSegment struct {
 // segment list so each sampled miss can be matched back to its index and
 // byte length - acceptable here since it only runs from the repair sweep,
 // not the streaming hot path.
+//
+// The probe stops at the first confirmed miss, so the list is whatever the
+// chunks in flight had found by then - enough to know the file is damaged,
+// not how badly. CheckFileDetailedComplete counts every miss.
 func (u *Usenet) CheckFileDetailed(ctx context.Context, nzoID, filename string) (missing []MissingSegment, err error) {
+	return u.checkFileDetailed(ctx, nzoID, filename, false)
+}
+
+// CheckFileDetailedComplete is CheckFileDetailed without the early stop:
+// every sampled segment is asked about, so the list is the file's whole
+// confirmed damage rather than its first few misses. Misses are slow (each
+// one is a not-found from every provider), so this takes minutes on a badly
+// damaged file. If ctx ends first, the misses confirmed by then are
+// returned: fewer than the truth, never more.
+func (u *Usenet) CheckFileDetailedComplete(ctx context.Context, nzoID, filename string) (missing []MissingSegment, err error) {
+	return u.checkFileDetailed(ctx, nzoID, filename, true)
+}
+
+func (u *Usenet) checkFileDetailed(ctx context.Context, nzoID, filename string, complete bool) (missing []MissingSegment, err error) {
 	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load NZB: %w", err)
@@ -1493,7 +1511,11 @@ func (u *Usenet) CheckFileDetailed(ctx context.Context, nzoID, filename string) 
 		messageIDs[i] = file.Segments[j].MessageID
 	}
 
-	result, batchErr := u.nntp.BatchStat(ctx, messageIDs)
+	stat := u.nntp.BatchStat
+	if complete {
+		stat = u.nntp.BatchStatComplete
+	}
+	result, batchErr := stat(ctx, messageIDs)
 	if batchErr != nil {
 		u.logger.Warn().Err(batchErr).Str("file", filename).Msg("Non-fatal error during detailed availability check, ignoring")
 		return nil, nil
