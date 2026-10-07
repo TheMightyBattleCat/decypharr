@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -688,6 +689,24 @@ type decodeScope struct {
 	// probe gave none usable. Set by check; decodeInterval ends every read
 	// interval by a frame count derived from it.
 	fps float64
+	// shift moves the spread's windows after the first by a fraction of the
+	// gap between two of them, in [-0.5, 0.5). Drawn once per verification
+	// (see spreadShift), so a retry decodes the same windows and the next
+	// verification of the file decodes others.
+	shift    float64
+	shiftSet bool
+}
+
+// spreadShift returns the scope's window shift, drawing it on first use. With
+// no scope the windows stay where an unshifted spread puts them.
+func (s *decodeScope) spreadShift() float64 {
+	if s == nil {
+		return 0
+	}
+	if !s.shiftSet {
+		s.shift, s.shiftSet = rand.Float64()-0.5, true
+	}
+	return s.shift
 }
 
 func (s *decodeScope) frameRate() float64 {
@@ -873,13 +892,20 @@ const decodeSpreadLead = 5 * time.Second
 
 // spreadIntervals builds the evenly-spaced -read_intervals list that samples
 // the whole duration - the normal decode check.
-func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64, fps float64) []string {
-	return f.spreadIntervalsLead(duration, fileBytes, fps, 0)
+func (f *ffprobeChecker) spreadIntervals(duration time.Duration, fileBytes int64, fps, shift float64) []string {
+	return f.spreadIntervalsLead(duration, fileBytes, fps, shift, 0)
 }
 
 // spreadIntervalsLead is spreadIntervals with each window starting lead
 // earlier (not before 0) and running through the same frames.
-func (f *ffprobeChecker) spreadIntervalsLead(duration time.Duration, fileBytes int64, fps float64, lead time.Duration) []string {
+//
+// shift moves every window after the first by that fraction of the gap between
+// two windows (decodeScope.spreadShift). Unshifted, each verification of a file
+// decodes the same few seconds and never anything between them: a REMUX with
+// two archive volumes stored in each other's place 51 minutes in passed six
+// windows at 0, 22, 44, 66, 88 and 110 minutes every time. The first window
+// stays at 0, where the file's own start time is read (see offPosition).
+func (f *ffprobeChecker) spreadIntervalsLead(duration time.Duration, fileBytes int64, fps, shift float64, lead time.Duration) []string {
 	// Adaptive window count: a large file (REMUX) gets fewer windows so the
 	// probe pulls ~120-150 MB of cold random I/O over WebDAV instead of
 	// ~300-450 MB. Still spans the whole duration.
@@ -896,10 +922,94 @@ func (f *ffprobeChecker) spreadIntervalsLead(duration time.Duration, fileBytes i
 	intervals := make([]string, n)
 	for i := range n {
 		startSec := duration * time.Duration(i) / time.Duration(n)
+		if i > 0 && shift != 0 {
+			gap := duration / time.Duration(n)
+			startSec += time.Duration(shift * float64(gap))
+			startSec = max(0, min(startSec, duration-ffprobeDecodeWindowSpan))
+		}
 		from := max(0, startSec-lead)
 		intervals[i] = decodeInterval(from, ffprobeDecodeWindowSpan+(startSec-from), fps)
 	}
 	return intervals
+}
+
+// How far from its window's start a decoded frame's timestamp may be before
+// the frame counts as coming from elsewhere in the file. Measured 2026-10-07 on
+// a production install (ffprobe 9.0, 25 Matroska files, 15 windows each):
+// frames ran from 10.3 s before the window's start - the seek lands on the
+// keyframe before it, and ffprobe prints from there - to 2.1 s after. A window
+// decoded with a lead-in runs decodeSpreadLead longer. A misplaced archive
+// volume moves its frames by its own playing time or more: on a 24 GB REMUX
+// with three pairs of volumes swapped, windows at 3100, 3200 and 3650 s came
+// back timed 3170, 3235 and 3723 s. A volume that plays for less than the
+// tolerance is not caught.
+const (
+	decodePositionBack    = 30 * time.Second
+	decodePositionForward = 15 * time.Second
+)
+
+// offPosition reports whether a spread probe decoded frames from another
+// part of the file than its windows asked for, and describes the first.
+//
+// A file with archive volumes stored out of order holds valid Matroska at the
+// wrong offsets. A window that seeks into such a stretch can decode cleanly -
+// but what it decodes carries the timestamps of where the data belongs.
+// ffprobe prints the windows' frames in order, so each frame is held against
+// the window being printed, or the one after it once that window has printed
+// frames: within decodePositionBack before its start and
+// decodePositionForward after. A
+// frame is tried as timed and with the file's start time taken off (the first
+// frame of the first window, which starts at 0), since a container may count
+// either way. With fewer than two windows, or frames without timestamps, there
+// is nothing to compare. Only a probe that printed no errors is judged: after
+// an error a window may print few frames or none, and the next window's
+// frames then look out of turn.
+func offPosition(stdout []byte, intervals []string) (bool, string) {
+	if len(intervals) < 2 {
+		return false, ""
+	}
+	starts := make([]float64, len(intervals))
+	for i, iv := range intervals {
+		start, _, found := strings.Cut(iv, "%")
+		v, err := strconv.ParseFloat(start, 64)
+		if !found || err != nil {
+			return false, ""
+		}
+		starts[i] = v
+	}
+	back, forward := decodePositionBack.Seconds(), decodePositionForward.Seconds()
+	fits := func(ts float64, w int) bool {
+		return ts >= starts[w]-back && ts <= starts[w]+forward
+	}
+	first := true
+	var base float64
+	cur, printed := 0, false
+	for line := range strings.SplitSeq(string(stdout), "\n") {
+		field, _, _ := strings.Cut(strings.TrimSpace(line), ",")
+		ts, err := strconv.ParseFloat(field, 64)
+		if field == "" || err != nil {
+			continue
+		}
+		if first {
+			base, first = ts-starts[0], false
+		}
+		switch {
+		case fits(ts, cur) || fits(ts-base, cur):
+			printed = true
+		case printed && cur+1 < len(starts) && (fits(ts, cur+1) || fits(ts-base, cur+1)):
+			// The next window's frames begin only once this one has printed
+			// some: a frame that fits the next window before then is this
+			// window's, from the wrong place.
+			cur++
+		default:
+			w := cur
+			if printed && cur+1 < len(starts) {
+				w = cur + 1
+			}
+			return true, fmt.Sprintf("the window at %.0f s decoded a frame timed %.0f s", starts[w], ts-base)
+		}
+	}
+	return false, ""
 }
 
 // recordedDecodeCause returns the decode-error cause a probe noted on ctx
@@ -1035,6 +1145,9 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 			// reference frames, MPEG-2 pic cod ext, VC-1 no keyframe): every
 			// window that printed them printed the same count when decoding
 			// 5x the frames from the same seek, and decoded every frame.
+			if f.frameOffPosition(ctx, entryFolder, fileName, phase, stdout.Bytes(), intervals, budget) {
+				return true, "", false
+			}
 			evt().Int("stderr_lines", n).Str("ignored", lines).
 				Msg("Repair: ffprobe printed only seek warnings and decoded to the end of its window; counting the check as passed")
 			return true, "", true
@@ -1058,8 +1171,31 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 		return false, ffprobeReasonDecodeError, true
 	}
 
+	if f.frameOffPosition(ctx, entryFolder, fileName, phase, stdout.Bytes(), intervals, budget) {
+		return true, "", false
+	}
 	evt().Msg("Repair: ffprobe decode check passed")
 	return true, "", true
+}
+
+// frameOffPosition applies offPosition to a spread probe that decoded without
+// a verdict against the file. When a frame is off position the file is left
+// unverified - never broken: the frames decoded, and a broken verdict deletes
+// the grab - and the verification is exhausted, since a retry seeks to the
+// same windows.
+func (f *ffprobeChecker) frameOffPosition(ctx context.Context, entryFolder, fileName, phase string, stdout []byte, intervals []string, budget *VerifyBudget) bool {
+	if phase != decodePhaseSpread && phase != decodePhaseSpreadLead {
+		return false
+	}
+	off, detail := offPosition(stdout, intervals)
+	if !off {
+		return false
+	}
+	f.logger.Warn().Str("entry", entryFolder).Str("file", fileName).Str("phase", phase).Str("detail", detail).
+		Msg("Repair: ffprobe decoded frames from another part of the file than it asked for; the file may be assembled out of order, leaving it unverified")
+	budget.Exhaust()
+	noteWrongPosition(ctx, detail)
+	return true
 }
 
 // decodeWindows verifies the video stream actually decodes to frames, not just
@@ -1143,9 +1279,10 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 		run = f.runDecodeProbe
 	}
 	fps := decodeScopeFromContext(ctx).frameRate()
+	shift := decodeScopeFromContext(ctx).spreadShift()
 
 	spread := func() (bool, string, bool, string) {
-		intervals := f.spreadIntervals(duration, fileBytes, fps)
+		intervals := f.spreadIntervals(duration, fileBytes, fps, shift)
 		if len(intervals) == 0 {
 			return true, "", true, decodeCoverageFull
 		}
@@ -1160,7 +1297,7 @@ func (f *ffprobeChecker) decodeWindows(ctx context.Context, entryFolder, fileNam
 			// a frame that needs the ones before it (decodeSpreadLead). Decode
 			// the same frames from earlier, on the same budget: clean means the
 			// file decodes and the check passes.
-			lead := f.spreadIntervalsLead(duration, fileBytes, fps, decodeSpreadLead)
+			lead := f.spreadIntervalsLead(duration, fileBytes, fps, shift, decodeSpreadLead)
 			ok2, reason2, conclusive2 := run(ctx, entryFolder, fileName, decodePhaseSpreadLead, lead, timeout, fileBytes, budget)
 			if ok2 && reason2 == "" && conclusive2 {
 				budgetStats(f.logger.Info().Str("entry", entryFolder).Str("file", fileName).Int("windows", len(lead)), budget).

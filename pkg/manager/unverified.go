@@ -56,6 +56,10 @@ const (
 	decodeCauseSeekWarnings = "seek_warnings"
 	// decodeCauseCodec: other codec errors in the video stream.
 	decodeCauseCodec = "codec_errors"
+	// decodeCauseWrongPosition: no errors, but a decode window returned
+	// frames timed for another part of the file (offPosition): data stored
+	// at the wrong offsets, as archive volumes out of order are.
+	decodeCauseWrongPosition = "wrong_position"
 )
 
 var (
@@ -141,6 +145,16 @@ func noteDecodeErrors(ctx context.Context, stderr, summary string) {
 		c.reason = unverifiedDecodeErrors
 		c.decodeCause = decodeErrorCause(stderr)
 		c.detail = summary
+	}
+}
+
+// noteWrongPosition records a decoded_with_errors reason for a probe that
+// decoded frames from another part of the file than it asked for.
+func noteWrongPosition(ctx context.Context, detail string) {
+	if c, _ := ctx.Value(unverifiedCauseCtxKey{}).(*unverifiedCause); c != nil {
+		c.reason = unverifiedDecodeErrors
+		c.decodeCause = decodeCauseWrongPosition
+		c.detail = detail
 	}
 }
 

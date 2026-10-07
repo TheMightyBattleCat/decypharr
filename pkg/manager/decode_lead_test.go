@@ -224,8 +224,8 @@ func TestDecodeWindows_DetectCodecErrorsDecodedAgainFromEarlier(t *testing.T) {
 func TestSpreadIntervalsLead(t *testing.T) {
 	f := &ffprobeChecker{}
 	const fps = 23.976
-	plain := f.spreadIntervals(6000*time.Second, testSmall, fps)
-	lead := f.spreadIntervalsLead(6000*time.Second, testSmall, fps, decodeSpreadLead)
+	plain := f.spreadIntervals(6000*time.Second, testSmall, fps, 0)
+	lead := f.spreadIntervalsLead(6000*time.Second, testSmall, fps, 0, decodeSpreadLead)
 	if len(plain) != len(lead) || len(plain) < 2 {
 		t.Fatalf("plain %v, lead %v", plain, lead)
 	}
