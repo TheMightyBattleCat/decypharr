@@ -209,6 +209,25 @@ func TestStatPostedFileDamage(t *testing.T) {
 		}
 	})
 
+	// The STAT returns no error when its context ends part-way: the articles
+	// it never reached carry a per-article error. The sweep must not call
+	// itself complete, but what it confirmed missing still stands.
+	t.Run("ctx ended mid-sweep -> completed false, confirmed misses kept", func(t *testing.T) {
+		cut, cancel := context.WithCancel(ctx)
+		cutShort := func(c context.Context, ids []string) ([]nntp.StatResult, error) {
+			out, err := mockStat(map[string]bool{"a1": true}, map[string]bool{"b0": true, "b1": true})(c, ids)
+			cancel()
+			return out, err
+		}
+		got, ok := statPostedFileDamage(cut, parallelFetchNopLogger, cutShort, matches, src, nil, "e")
+		if ok {
+			t.Fatalf("completed = true for a sweep its context cut short")
+		}
+		if fmt.Sprint(got) != fmt.Sprint([]string{"a1"}) {
+			t.Fatalf("missing = %v, want [a1]", got)
+		}
+	})
+
 	t.Run("no matched files -> completed true, nil", func(t *testing.T) {
 		got, ok := statPostedFileDamage(ctx, parallelFetchNopLogger, mockStat(nil, nil), nil, src, nil, "e")
 		if !ok || got != nil {

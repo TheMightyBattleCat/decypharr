@@ -3367,9 +3367,11 @@ func statRecoveryVolumes(
 //
 // The bool return is whether the sweep actually completed: false means a
 // whole-batch STAT error (the caller falls back to per-round discovery,
-// exactly as before this sweep existed). An individual ambiguous per-article
-// error is simply not reported as missing - that segment is left for the
-// round loop, same as any transient miss.
+// exactly as before this sweep existed), or ctx ending before every article
+// was asked about - then the misses confirmed so far are still returned, as
+// a lower bound. An individual ambiguous per-article error is simply not
+// reported as missing - that segment is left for the round loop, same as any
+// transient miss.
 func statPostedFileDamage(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -3425,15 +3427,37 @@ func statPostedFileDamage(
 			Msg("par2: posted-file STAT damage sweep failed; damage will be found per-round instead")
 		return nil, false
 	}
+	unchecked := 0
 	for _, r := range results {
-		if !r.Available && nntp.IsArticleNotFoundError(r.Error) {
+		switch {
+		case r.Available:
+		case nntp.IsArticleNotFoundError(r.Error):
 			missing = append(missing, r.MessageID)
+		default:
+			unchecked++
 		}
+	}
+	// The STAT returns no error when ctx ends part-way: the articles it never
+	// reached come back as per-article errors. That is not a finished sweep.
+	// The misses already confirmed are kept - each one is a not-found from
+	// every provider - but the caller is told the set is incomplete.
+	if ctx.Err() != nil {
+		logger.Warn().
+			Err(ctx.Err()).
+			Str("entry", entryName).
+			Int("segments_probed", len(msgIDs)).
+			Int("segments_missing", len(missing)).
+			Int("segments_unchecked", unchecked).
+			Int("controls", len(controls)).
+			Dur("duration", time.Since(start)).
+			Msg("par2: posted-file STAT damage sweep cut short; the rest of the damage will be found per-round")
+		return missing, false
 	}
 	logger.Info().
 		Str("entry", entryName).
 		Int("segments_probed", len(msgIDs)).
 		Int("segments_missing", len(missing)).
+		Int("segments_unchecked", unchecked).
 		Int("controls", len(controls)).
 		Dur("duration", time.Since(start)).
 		Msg("par2: posted-file STAT damage sweep complete")
