@@ -33,6 +33,7 @@ const DECODE_CAUSE_INFO = {
     file_ended: ['File ended early', 'The file is shorter than its own structure says, often a volume or tail missing at import.'],
     container_errors: ['Container damage', 'Matroska structure is garbled at some point in the file.'],
     codec_errors: ['Codec errors', 'The video stream has errors that are not seek warnings. Check playback at that point.'],
+    wrong_position: ['Wrong position', 'A check asked for one part of the file and got video from another: data stored at the wrong offsets, as archive volumes out of order are. Playback jumps or stops there.'],
 };
 
 class RepairManager {
@@ -1136,7 +1137,7 @@ class RepairManager {
                     <button class="btn btn-xs btn-outline" data-action="recheck" aria-label="Recheck ${this.escapeAttr(h.entry_name)}" title="Check this entry again">
                         <i class="bi bi-search-heart"></i>
                     </button>
-                    ${replaceable ? `<button class="btn btn-xs btn-warning btn-outline" data-action="replace" aria-label="Replace ${this.escapeAttr(h.entry_name)}" title="Delete and re-search the files assembled wrong at import (tail truncated, volumes out of order), keeping the release">
+                    ${replaceable ? `<button class="btn btn-xs btn-warning btn-outline" data-action="replace" aria-label="Replace ${this.escapeAttr(h.entry_name)}" title="Fix the files assembled wrong at import: volumes out of order are put back in place when the file itself confirms the order, otherwise (and for a truncated tail) the file is deleted and re-searched, keeping the release">
                         <i class="bi bi-arrow-repeat"></i>
                     </button>` : ''}
                 </td>
@@ -1283,7 +1284,12 @@ class RepairManager {
             if (!res.ok) throw new Error(text.trim() || `HTTP ${res.status}`);
             const data = text ? JSON.parse(text) : {};
             const queued = data.queued?.length ?? 0;
-            this.toast(`Replacing ${queued} entr${queued === 1 ? 'y' : 'ies'}: deleting and re-searching through their Arr, releases kept`, 'success');
+            const reordered = data.reordered?.length ?? 0;
+            const plural = (n) => `${n} entr${n === 1 ? 'y' : 'ies'}`;
+            const parts = [];
+            if (reordered) parts.push(`Put the volumes of ${plural(reordered)} back in order in place, nothing re-grabbed`);
+            if (queued || !reordered) parts.push(`Replacing ${plural(queued)}: deleting and re-searching through their Arr, releases kept`);
+            this.toast(parts.join('. '), 'success');
             await Promise.all([this.loadStatus(), this.loadHistory(), this.loadUnverified()]);
         } catch (e) {
             this.toast(`Replace failed: ${e.message}`, 'error');
