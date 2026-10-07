@@ -131,6 +131,9 @@ type volumeOrderVerdict struct {
 	number     int // the number read there
 	prev       int // the number of the numbered volume before it
 	outOfPlace int // numbered volumes not above the one before them
+	// numbers holds what was read for each stored volume, -1 where nothing
+	// was. They only order the volumes; for matroska_cluster they are times.
+	numbers []int
 }
 
 func (v volumeOrderVerdict) detail() string {
@@ -286,6 +289,7 @@ func checkFileVolumeOrder(ctx context.Context, f *storage.NZBFile, posted []stor
 	if v.source == "" {
 		return v, nil
 	}
+	v.numbers = nums
 
 	last := -1
 	for k, n := range nums {
@@ -567,8 +571,12 @@ func mergeVolumeOrderChecks(prior []storage.VolumeOrderCheck, names []string, re
 		}
 	}
 	for _, res := range results {
-		if res.volumeCheck != nil {
+		switch {
+		case res.volumeCheck != nil:
 			byName[res.name] = *res.volumeCheck
+		case res.volumeReordered:
+			// Its earlier verdict was for the layout it no longer has.
+			delete(byName, res.name)
 		}
 	}
 	if len(byName) == 0 {

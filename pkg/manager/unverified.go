@@ -226,7 +226,10 @@ type ReplaceUnverifiedResult struct {
 	// Eligible counts the unverified entries with a replaceable file among
 	// those asked for; Queued names the ones this call re-grabs and Remaining
 	// how many are left for another call.
-	Eligible  int                `json:"eligible"`
+	Eligible int `json:"eligible"`
+	// Reordered lists the entries whose misordered files were all put back in
+	// order in place: nothing was re-grabbed for them.
+	Reordered []string           `json:"reordered,omitempty"`
 	Queued    []string           `json:"queued"`
 	Remaining int                `json:"remaining"`
 	Run       *storage.RepairRun `json:"run,omitempty"`
@@ -276,6 +279,15 @@ func (r *Repair) ReplaceUnverified(ctx context.Context, names []string, limit in
 
 	originals := make([]storage.EntryHealth, 0, len(chosen))
 	for _, h := range chosen {
+		// A misordered file whose right order is known and confirmed by its
+		// own content is fixed where it is. Only what that leaves is re-grabbed.
+		if r.reorderMisordered(ctx, h) > 0 {
+			r.saveHealth(h)
+			if !slices.ContainsFunc(h.UnverifiedFiles, isReplaceable) {
+				res.Reordered = append(res.Reordered, h.EntryName)
+				continue
+			}
+		}
 		orig := *h
 		orig.UnverifiedFiles = slices.Clone(h.UnverifiedFiles)
 		orig.BrokenFiles = slices.Clone(h.BrokenFiles)
@@ -283,6 +295,12 @@ func (r *Repair) ReplaceUnverified(ctx context.Context, names []string, limit in
 		markReplaceableBroken(h, time.Now())
 		r.saveHealth(h)
 		res.Queued = append(res.Queued, h.EntryName)
+	}
+
+	if len(res.Queued) == 0 {
+		r.logger.Info().Int("entries", len(res.Reordered)).Int("remaining", res.Remaining).
+			Msg("Repair: every chosen file was put back in volume order in place; nothing to re-grab")
+		return res, nil
 	}
 
 	run, err := r.FixBroken(ctx, res.Queued)

@@ -124,6 +124,9 @@ type fileResult struct {
 	// recorded by an earlier one; probeEntry persists it. Nil when the file is
 	// not a multi-volume RAR file or the check reached no verdict.
 	volumeCheck *storage.VolumeOrderCheck
+	// volumeReordered: this probe put the file's volumes back in order in
+	// place (autoReorderResults), so no earlier check of it stands.
+	volumeReordered bool
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -529,6 +532,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		r.autoHealResults(ctx, results, heal)
 	}
 
+	// Files stored out of volume order are put right where they stand, never
+	// re-grabbed; with auto-repair off they are only listed.
+	reordered := r.autoRepairStillOn(ctx, autoRepair) && r.autoReorderResults(ctx, c, results)
+
 	broken := r.brokenFiles(c, results)
 	final := rollupStatus(results)
 
@@ -562,10 +569,17 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.LastFailedAt = h.LastCheckedAt
 		h.FailureReason = topReason(broken)
 	}
-	if final != storage.HealthHealthy {
+	if final != storage.HealthHealthy || reordered {
 		h.DecodeVerifiedAt = time.Time{}
 		h.DecodeVerifiedFingerprint = ""
 		h.DecodeVerifiedCoverage = ""
+	}
+	if reordered {
+		// The reordered file was not decoded this probe, and what an earlier
+		// decode read came from another layout: due again at once.
+		h.NextCheckDueAt = h.LastCheckedAt
+		h.Dirty = true
+		h.DirtyReason = "volumes reordered in place"
 	}
 
 	r.saveHealth(h)

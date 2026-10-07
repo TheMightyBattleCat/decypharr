@@ -296,6 +296,10 @@ type VolumeOrderCheck struct {
 	Misordered bool      `json:"misordered,omitempty"`
 	Detail     string    `json:"detail,omitempty"`
 	CheckedAt  time.Time `json:"checked_at"`
+	// ReorderRefused says why a sweep with auto-repair on did not put a
+	// misordered file's volumes back in order in place. Once set, sweeps do
+	// not try again; Replace still does.
+	ReorderRefused string `json:"reorder_refused,omitempty"`
 }
 
 // EntryHealth is the source of truth for repair decisions. It is keyed by

@@ -651,6 +651,83 @@ func (u *Usenet) EvictCache(nzoID, filename string) bool {
 	return true
 }
 
+// DropIdleReader tears down the cached reader for one file like EvictCache,
+// but reports true when there was none to drop: false only means a stream
+// holds the file open.
+func (u *Usenet) DropIdleReader(nzoID, filename string) bool {
+	if u == nil || u.fs == nil {
+		return true
+	}
+	if _, ok := u.fs.Load(fsKey(nzoID, filename)); !ok {
+		return true
+	}
+	return u.EvictCache(nzoID, filename)
+}
+
+// ReorderFileSegments replaces the article layout of one stored file with
+// segs, for a file whose archive volumes were stored out of order (see
+// manager.reorderFileVolumes). wantKey names the layout segs was worked out
+// from and key computes it for the record as it is now, under the storage
+// lock: a record that changed in between is left alone. segs must cover the
+// same bytes: as many articles, ending at the same offset. The record as it
+// was is first copied to the volume-order-backup folder beside the meta
+// store under its own time, and that path is returned: copying it back over
+// the record (RestoreNZBRecord) undoes the change.
+func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*storage.NZBFile) string, segs []storage.NZBSegment) (string, error) {
+	src := u.nzbStorage.MetaFilePath(nzoID)
+	dir := filepath.Join(filepath.Dir(u.nzbStorage.MetaDir()), "volume-order-backup")
+	backup := filepath.Join(dir, fmt.Sprintf("%s.%s", filepath.Base(src), time.Now().UTC().Format("20060102T150405.000")))
+	err := u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
+		f := nzb.GetFileByName(filename)
+		if f == nil {
+			return false, fmt.Errorf("file %q is not in the record", filename)
+		}
+		if key(f) != wantKey {
+			return false, fmt.Errorf("the record for %q changed while its volume order was being worked out", filename)
+		}
+		if len(segs) != len(f.Segments) || len(segs) == 0 ||
+			segs[len(segs)-1].EndOffset != f.Segments[len(f.Segments)-1].EndOffset || segs[0].StartOffset != f.Segments[0].StartOffset {
+			return false, fmt.Errorf("the new layout of %q does not cover the bytes the stored one does", filename)
+		}
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return false, fmt.Errorf("failed to read the record for its backup: %w", err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return false, fmt.Errorf("failed to create the backup folder: %w", err)
+		}
+		if err := os.WriteFile(backup, data, 0o644); err != nil {
+			return false, fmt.Errorf("failed to back up the record: %w", err)
+		}
+		f.Segments = segs
+		return true, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to store the reordered layout: %w", err)
+	}
+	return backup, nil
+}
+
+// RestoreNZBRecord writes a copy ReorderFileSegments kept back over nzoID's
+// record, under the storage lock.
+func (u *Usenet) RestoreNZBRecord(nzoID, backup string) error {
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return fmt.Errorf("failed to read the kept record: %w", err)
+	}
+	kept, err := decodeNZB(data)
+	if err != nil {
+		return fmt.Errorf("the kept record does not decode: %w", err)
+	}
+	if kept.ID != nzoID {
+		return fmt.Errorf("the kept record is for %s, not %s", kept.ID, nzoID)
+	}
+	return u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
+		*nzb = *kept
+		return true, nil
+	})
+}
+
 // RefreshRepairedSegments makes a live reader of filename fetch segIdx again
 // on its next read (see reader.StreamingReader.RefetchSegments), so segments
 // a PAR2 repair just patched are served from the patch rather than the
