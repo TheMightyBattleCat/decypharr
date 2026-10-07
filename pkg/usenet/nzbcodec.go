@@ -301,6 +301,15 @@ func encodeHeader(nzb *storage.NZB) []byte {
 	// decode-side guard stays a plain "is there more?" check.
 	w.str(nzb.ContentHash)
 
+	// Per-file VolumeOrderVerified, appended after ContentHash on the same
+	// append-only terms: a blob written before this field ends above and
+	// decodes with the flag false on every file, so the repair sweep reads
+	// those files' volume headers itself. One byte per file, in Files order.
+	w.uvarint(uint64(len(nzb.Files)))
+	for i := range nzb.Files {
+		w.boolean(nzb.Files[i].VolumeOrderVerified)
+	}
+
 	return w.buf
 }
 
@@ -783,6 +792,22 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 				if r.pos < len(buf) {
 					if nzb.ContentHash, err = r.strCopy(); err != nil {
 						return nil, nil, err
+					}
+					// Per-file VolumeOrderVerified, appended after ContentHash.
+					// A blob written before this field ends above.
+					if r.pos < len(buf) {
+						n, err := r.uvarint()
+						if err != nil {
+							return nil, nil, err
+						}
+						if n != uint64(len(nzb.Files)) {
+							return nil, nil, fmt.Errorf("nzbcodec: volume order flags for %d files, record has %d", n, len(nzb.Files))
+						}
+						for i := range nzb.Files {
+							if nzb.Files[i].VolumeOrderVerified, err = r.boolean(); err != nil {
+								return nil, nil, err
+							}
+						}
 					}
 				}
 			}

@@ -142,6 +142,10 @@ type NZBFile struct {
 	EncryptionKey []byte       `json:"encryption_key,omitempty" msgpack:"encryption_key,omitempty"` // AES-256 key for encrypted files (32 bytes)
 	EncryptionIV  []byte       `json:"encryption_iv,omitempty" msgpack:"encryption_iv,omitempty"`   // AES IV for encrypted files (16 bytes, from file extra area)
 	IsEncrypted   bool         `json:"is_encrypted,omitempty" msgpack:"is_encrypted,omitempty"`     // True if file data is encrypted
+	// VolumeOrderVerified: the import read a volume number for every archive
+	// volume and laid the file out by them, so the repair sweep has no need to
+	// read the volumes' headers again (see manager.volumeOrderOnce).
+	VolumeOrderVerified bool `json:"volume_order_verified,omitempty" msgpack:"volume_order_verified,omitempty"`
 }
 
 // GetFileByName returns the live file record named name.

@@ -392,17 +392,19 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 
 		file := &storage.NZBFile{
-			Name:          name,
-			InternalPath:  rarFile.Name,
-			Groups:        getGroupsList(group.Groups),
-			Segments:      fileSegments, // Direct segment list with offsets!
-			Password:      password,
-			FileType:      storage.NZBFileTypeRar,
-			Size:          size,
-			IsStored:      rarFile.IsStored,
-			IsEncrypted:   rarFile.IsEncrypted, // Per-file encryption from extra area
-			EncryptionKey: rarFile.EncryptionKey,
-			EncryptionIV:  rarFile.EncryptionIV, // Per-file IV from extra area
+			Name:         name,
+			InternalPath: rarFile.Name,
+			Groups:       getGroupsList(group.Groups),
+			Segments:     fileSegments, // Direct segment list with offsets!
+			Password:     password,
+			FileType:     storage.NZBFileTypeRar,
+			Size:         size,
+			IsStored:     rarFile.IsStored,
+			IsEncrypted:  rarFile.IsEncrypted, // Per-file encryption from extra area
+			// Every volume gave a number and the layout above follows them.
+			VolumeOrderVerified: len(group.Files) > 1 && archiveInfo.VolumeOrderKnown,
+			EncryptionKey:       rarFile.EncryptionKey,
+			EncryptionIV:        rarFile.EncryptionIV, // Per-file IV from extra area
 		}
 
 		// Fallback to global archive key if no specific file key derived

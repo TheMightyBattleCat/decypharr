@@ -563,3 +563,37 @@ func TestNZBCodecV2DecodesPar2BlobWithoutMatchTrailer(t *testing.T) {
 		t.Errorf("Real bitset did not round-trip without a match trailer")
 	}
 }
+
+func TestNZBCodecV2RoundTripsVolumeOrderVerified(t *testing.T) {
+	nzb := sampleNZBWithPar2()
+	if len(nzb.Files) == 0 {
+		t.Fatal("sample has no files")
+	}
+	nzb.Files[0].VolumeOrderVerified = true
+
+	data, err := encodeNZBV2(nzb)
+	if err != nil {
+		t.Fatalf("encodeNZBV2: %v", err)
+	}
+	got, err := decodeNZBV2(data)
+	if err != nil {
+		t.Fatalf("decodeNZBV2: %v", err)
+	}
+	for i := range nzb.Files {
+		if got.Files[i].VolumeOrderVerified != nzb.Files[i].VolumeOrderVerified {
+			t.Errorf("file %d VolumeOrderVerified = %v, want %v", i, got.Files[i].VolumeOrderVerified, nzb.Files[i].VolumeOrderVerified)
+		}
+	}
+
+	// A header written before the flags existed ends after ContentHash: it
+	// decodes with every flag false, and the sweep reads those files itself.
+	header := encodeHeader(nzb)
+	old := header[:len(header)-1-len(nzb.Files)]
+	prev, _, err := decodeHeader(old)
+	if err != nil {
+		t.Fatalf("decodeHeader on a blob without the flags: %v", err)
+	}
+	if prev.ContentHash != nzb.ContentHash || prev.Files[0].VolumeOrderVerified {
+		t.Errorf("old blob decoded as ContentHash %q, verified %v", prev.ContentHash, prev.Files[0].VolumeOrderVerified)
+	}
+}

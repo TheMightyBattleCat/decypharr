@@ -111,6 +111,9 @@ const (
 	volumeSourceYencName   = "yenc_name"
 	volumeSourceRAR4End    = "rar4_end"
 	volumeSourceRAR4First  = "rar4_first_volume"
+	// volumeSourceImport: not read by the check - the import parser read every
+	// volume's number and stored the file in that order.
+	volumeSourceImport = "import"
 )
 
 // volumeOrderVerdict is what checkFileVolumeOrder found for one file.
@@ -431,6 +434,15 @@ func (r *Repair) volumeOrderOnce(ctx context.Context, c *candidate, infoHash, na
 	layout := volumeOrderKey(infoHash, f)
 	if prior, ok := c.volumeChecks[name]; ok && prior.Layout == layout {
 		return &prior
+	}
+	if f.VolumeOrderVerified {
+		// The import ordered the volumes by their own numbers: nothing to read.
+		vols := len(layoutVolumes(f.Segments))
+		if vols < 2 {
+			return nil
+		}
+		return &storage.VolumeOrderCheck{FileName: name, Layout: layout, Volumes: vols, Numbered: vols,
+			Source: volumeSourceImport, CheckedAt: time.Now()}
 	}
 	vo, checked := r.checkVolumeOrder(ctx, infoHash, name)
 	if !checked || vo.volumes < 2 {
