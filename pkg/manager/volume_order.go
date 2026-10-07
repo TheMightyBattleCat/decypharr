@@ -1,10 +1,12 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/bits"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -111,6 +113,9 @@ const (
 	volumeSourceYencName   = "yenc_name"
 	volumeSourceRAR4End    = "rar4_end"
 	volumeSourceRAR4First  = "rar4_first_volume"
+	// volumeSourceMatroska: no volume gave a number, so the stored file's own
+	// Matroska Cluster timestamps order the volumes that show one.
+	volumeSourceMatroska = "matroska_cluster"
 	// volumeSourceImport: not read by the check - the import parser read every
 	// volume's number and stored the file in that order.
 	volumeSourceImport = "import"
@@ -200,12 +205,15 @@ func checkFileVolumeOrder(ctx context.Context, f *storage.NZBFile, posted []stor
 		nums[k] = -1
 	}
 	parsed := make([]parser.VolumeHead, len(vols))
+	// A set with encrypted headers keeps its volume numbers behind the
+	// archive's password, which the file's record holds.
+	reader := parser.VolumeHeadReader{Password: f.Password}
 	var rar5, rar5Numbered, rar4 int
 	for k, h := range heads {
 		if h == nil {
 			continue
 		}
-		parsed[k] = parser.ReadVolumeHead(h.Prefix)
+		parsed[k] = reader.Read(h.Prefix)
 		switch parsed[k].Version {
 		case 5:
 			rar5++
@@ -262,6 +270,19 @@ func checkFileVolumeOrder(ctx context.Context, f *storage.NZBFile, posted []stor
 			}
 		}
 	}
+	if v.source == "" && body != nil && f.IsStored && !f.IsEncrypted && isMatroskaName(f.Name) {
+		n, err := clusterNumbers(ctx, f, vols, body, nums)
+		if err != nil {
+			return v, err
+		}
+		if n >= 2 {
+			v.source = volumeSourceMatroska
+		} else {
+			for k := range nums {
+				nums[k] = -1
+			}
+		}
+	}
 	if v.source == "" {
 		return v, nil
 	}
@@ -281,6 +302,82 @@ func checkFileVolumeOrder(ctx context.Context, f *storage.NZBFile, posted []stor
 		last = k
 	}
 	return v, nil
+}
+
+// clusterTimestamp returns the timestamp of the first Matroska Cluster that
+// starts in data: the Cluster ID, a valid size, then the Timestamp element
+// every Cluster opens with. The four ID bytes alone turn up by chance about
+// once in 6,000 articles of video; the element after them does not.
+func clusterTimestamp(data []byte) (int64, bool) {
+	id := []byte{0x1F, 0x43, 0xB6, 0x75}
+	for off := 0; ; {
+		i := bytes.Index(data[off:], id)
+		if i < 0 {
+			return 0, false
+		}
+		p := off + i + len(id)
+		off += i + 1
+		if p >= len(data) || data[p] == 0 {
+			continue
+		}
+		p += bits.LeadingZeros8(data[p]) + 1 // the Cluster's size
+		if p+1 >= len(data) || data[p] != 0xE7 {
+			continue
+		}
+		n := int(data[p+1]) - 0x80 // the Timestamp's size: 1 to 8 bytes
+		if n < 1 || n > 8 || p+2+n > len(data) {
+			continue
+		}
+		var ts int64
+		for _, b := range data[p+2 : p+2+n] {
+			ts = ts<<8 | int64(b)
+		}
+		if ts < 0 {
+			continue
+		}
+		return ts, true
+	}
+}
+
+// clusterNumbers reads the first article of every stored volume and fills
+// nums with the timestamp of the first Matroska Cluster in the file's bytes
+// there, where one starts. A stored (uncompressed) file's bytes are the
+// Matroska stream itself, so the timestamps rise through volumes in order.
+// Returns how many volumes gave one.
+func clusterNumbers(ctx context.Context, f *storage.NZBFile, vols []layoutVolume, body volumeBodyFunc, nums []int) (int, error) {
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+		n        int
+	)
+	sem := make(chan struct{}, volumeOrderFetchers)
+	for k, vol := range vols {
+		wg.Add(1)
+		go func(k int, seg storage.NZBSegment) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			data, err := body(ctx, seg.MessageID)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			if seg.SegmentDataStart >= int64(len(data)) {
+				return
+			}
+			if ts, ok := clusterTimestamp(data[seg.SegmentDataStart:]); ok {
+				nums[k] = int(ts)
+				n++
+			}
+		}(k, f.Segments[vol.first])
+	}
+	wg.Wait()
+	return n, firstErr
 }
 
 // nameNumbers fills nums from the yEnc names when every read head's name gives
@@ -399,7 +496,7 @@ func (r *Repair) checkVolumeOrder(ctx context.Context, infoHash, name string) (v
 	started := time.Now()
 	v, err := checkFileVolumeOrder(cctx, f, nzb.Par2Source,
 		func(ctx context.Context, id string) (usenet.ArticleHead, error) {
-			return u.FetchArticleHead(ctx, id, parser.VolumeHeadBytes)
+			return u.FetchArticleHead(ctx, id, parser.EncryptedVolumeHeadBytes)
 		},
 		u.FetchArticle)
 	if err != nil {

@@ -414,3 +414,76 @@ func TestClearStateKeepsVolumeOrderChecks(t *testing.T) {
 		t.Fatalf("a status that was not cleared changed: %+v", h)
 	}
 }
+
+// mkvCluster is file bytes holding a Matroska Cluster that opens at ts.
+func mkvCluster(ts int) []byte {
+	out := append(make([]byte, 100), []byte("video...")...)                    // 100 = voFile's data start
+	out = append(out, 0x1F, 0x43, 0xB6, 0x75, 0x01, 0, 0, 0, 0, 0, 0x10, 0x00) // ID, 8-byte size
+	return append(out, 0xE7, 0x83, byte(ts>>16), byte(ts>>8), byte(ts))
+}
+
+func TestClusterTimestamp(t *testing.T) {
+	if ts, ok := clusterTimestamp(mkvCluster(3089336)[100:]); !ok || ts != 3089336 {
+		t.Fatalf("got %d, %v", ts, ok)
+	}
+	// The ID bytes by chance, with no Timestamp element after the size.
+	chance := []byte{9, 9, 0x1F, 0x43, 0xB6, 0x75, 0x85, 0x11, 0x22, 0x33}
+	if _, ok := clusterTimestamp(chance); ok {
+		t.Fatal("took chance bytes for a Cluster")
+	}
+	// A chance match before a real Cluster does not hide it.
+	if ts, ok := clusterTimestamp(append(chance, mkvCluster(42)[100:]...)); !ok || ts != 42 {
+		t.Fatalf("got %d, %v", ts, ok)
+	}
+	if _, ok := clusterTimestamp([]byte{0x1F, 0x43, 0xB6, 0x75}); ok {
+		t.Fatal("a cut-off Cluster gave a timestamp")
+	}
+}
+
+// Old RAR4 volumes with no numbers anywhere: the stored Matroska file's own
+// Cluster timestamps order the volumes.
+func TestCheckFileVolumeOrderByClusterTimestamps(t *testing.T) {
+	ctx := context.Background()
+	tags := []string{"a", "b", "c", "d"}
+	articles := []int{3, 3, 3, 2}
+	run := func(times map[string]int, stored bool, name string) (volumeOrderVerdict, error) {
+		heads := fakeHeads{}
+		for _, tag := range tags {
+			heads[tag+"-1"] = usenet.ArticleHead{Prefix: []byte("no archive header here"), Name: "obf", Part: 1}
+		}
+		f := voFile(tags, articles)
+		f.IsStored, f.Name = stored, name
+		body := func(_ context.Context, id string) ([]byte, error) {
+			if ts, ok := times[id]; ok {
+				return mkvCluster(ts), nil
+			}
+			return make([]byte, 400), nil
+		}
+		return checkFileVolumeOrder(ctx, f, nil, heads.head, body)
+	}
+
+	v, err := run(map[string]int{"a-1": 0, "b-1": 9000, "c-1": 18000, "d-1": 27000}, true, "f.mkv")
+	if err != nil || v.misordered || v.numbered != 4 || v.source != volumeSourceMatroska {
+		t.Fatalf("in order: got %+v, %v", v, err)
+	}
+	v, err = run(map[string]int{"a-1": 0, "b-1": 18000, "c-1": 9000, "d-1": 27000}, true, "f.mkv")
+	if err != nil || !v.misordered || v.position != 3 || v.outOfPlace != 1 {
+		t.Fatalf("swapped: got %+v, %v", v, err)
+	}
+	// A volume whose first article opens no Cluster is left out, not guessed.
+	v, err = run(map[string]int{"a-1": 0, "c-1": 18000, "d-1": 9000}, true, "f.mkv")
+	if err != nil || !v.misordered || v.numbered != 3 || v.position != 4 {
+		t.Fatalf("one unread: got %+v, %v", v, err)
+	}
+	// One timestamp orders nothing.
+	if v, err = run(map[string]int{"b-1": 9000}, true, "f.mkv"); err != nil || v.source != "" || v.misordered {
+		t.Fatalf("one timestamp: got %+v, %v", v, err)
+	}
+	// Compressed data and other containers are not raw Matroska.
+	if v, err = run(map[string]int{"a-1": 9000, "b-1": 0}, false, "f.mkv"); err != nil || v.source != "" {
+		t.Fatalf("compressed: got %+v, %v", v, err)
+	}
+	if v, err = run(map[string]int{"a-1": 9000, "b-1": 0}, true, "f.mp4"); err != nil || v.source != "" {
+		t.Fatalf("mp4: got %+v, %v", v, err)
+	}
+}

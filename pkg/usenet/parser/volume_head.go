@@ -3,8 +3,11 @@ package parser
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"path/filepath"
 	"strings"
+
+	"github.com/sirrobot01/decypharr/internal/crypto"
 )
 
 // VolumeHeadBytes is how much of a RAR volume's first article ReadVolumeHead
@@ -45,41 +48,7 @@ func ReadVolumeHead(prefix []byte) VolumeHead {
 		if _, err := readVInt(r); err != nil { // header size
 			return VolumeHead{}
 		}
-		if typ, err := readVInt(r); err != nil || typ != 1 { // 1 = main archive header
-			return VolumeHead{}
-		}
-		flags, err := readVInt(r)
-		if err != nil {
-			return VolumeHead{}
-		}
-		if flags&rar5HeaderFlagExtra != 0 {
-			if _, err := readVInt(r); err != nil {
-				return VolumeHead{}
-			}
-		}
-		if flags&rar5HeaderFlagData != 0 {
-			if _, err := readVInt(r); err != nil {
-				return VolumeHead{}
-			}
-		}
-		archiveFlags, err := readVInt(r)
-		if err != nil {
-			return VolumeHead{}
-		}
-		h := VolumeHead{Version: 5, Volume: archiveFlags&rar5ArchiveFlagVolume != 0}
-		if !h.Volume {
-			return h
-		}
-		if archiveFlags&RAR5MainFlagVolumeNumber == 0 {
-			h.HasNumber = true
-			return h
-		}
-		n, err := readVInt(r)
-		if err != nil {
-			return VolumeHead{Version: 5, Volume: true}
-		}
-		h.Number, h.HasNumber = int(n), true
-		return h
+		return readRAR5MainHead(r)
 	case bytes.HasPrefix(prefix, rar4Signature):
 		m := prefix[len(rar4Signature):]
 		if len(m) < 5 || m[2] != RAR4HeaderTypeArchive {
@@ -89,6 +58,144 @@ func ReadVolumeHead(prefix []byte) VolumeHead {
 		return VolumeHead{Version: 4, Volume: flags&rar4MainFlagVolume != 0, First: flags&rar4MainFlagFirstVolume != 0}
 	}
 	return VolumeHead{}
+}
+
+// readRAR5MainHead reads a RAR5 main archive header from its type field on.
+func readRAR5MainHead(r *bytes.Reader) VolumeHead {
+	if typ, err := readVInt(r); err != nil || typ != 1 { // 1 = main archive header
+		return VolumeHead{}
+	}
+	flags, err := readVInt(r)
+	if err != nil {
+		return VolumeHead{}
+	}
+	if flags&rar5HeaderFlagExtra != 0 {
+		if _, err := readVInt(r); err != nil {
+			return VolumeHead{}
+		}
+	}
+	if flags&rar5HeaderFlagData != 0 {
+		if _, err := readVInt(r); err != nil {
+			return VolumeHead{}
+		}
+	}
+	archiveFlags, err := readVInt(r)
+	if err != nil {
+		return VolumeHead{}
+	}
+	h := VolumeHead{Version: 5, Volume: archiveFlags&rar5ArchiveFlagVolume != 0}
+	if !h.Volume {
+		return h
+	}
+	if archiveFlags&RAR5MainFlagVolumeNumber == 0 {
+		h.HasNumber = true
+		return h
+	}
+	n, err := readVInt(r)
+	if err != nil {
+		return VolumeHead{Version: 5, Volume: true}
+	}
+	h.Number, h.HasNumber = int(n), true
+	return h
+}
+
+// EncryptedVolumeHeadBytes is how much of a volume's first article
+// VolumeHeadReader needs when the archive's headers are encrypted: the
+// signature, the encryption header, an IV and the main header's blocks.
+const EncryptedVolumeHeadBytes = 256
+
+// maxVolumeHeadKDF bounds the key derivation a volume head may ask for
+// (2^24 rounds, RAR's own limit), so a damaged header cannot stall a check.
+const maxVolumeHeadKDF = 24
+
+// VolumeHeadReader reads RAR volume heads like ReadVolumeHead, and also those
+// of a RAR5 set whose headers are encrypted, given the archive's password:
+// such a volume opens with an encryption header (salt and key-derivation
+// count, in the clear), then an IV and the main header encrypted with the
+// derived key. Keys are kept per salt, so a set that shares one derives once.
+// Not safe for concurrent use.
+type VolumeHeadReader struct {
+	Password string
+	keys     map[string][]byte
+}
+
+// Read parses a volume's first bytes. A wrong password, or bytes cut before
+// the main header ends, give the zero VolumeHead, as an unreadable head does.
+func (v *VolumeHeadReader) Read(prefix []byte) VolumeHead {
+	h := ReadVolumeHead(prefix)
+	if h.Version != 0 || v.Password == "" || !bytes.HasPrefix(prefix, rar5Signature) {
+		return h
+	}
+	r := bytes.NewReader(prefix[len(rar5Signature):])
+	if _, err := r.Seek(4, 1); err != nil { // header CRC32
+		return VolumeHead{}
+	}
+	size, err := readVInt(r)
+	if err != nil || size > uint64(r.Len()) {
+		return VolumeHead{}
+	}
+	body := make([]byte, size)
+	if _, err := r.Read(body); err != nil {
+		return VolumeHead{}
+	}
+	br := bytes.NewReader(body)
+	if typ, err := readVInt(br); err != nil || typ != RAR5HeaderTypeEncrypt {
+		return VolumeHead{}
+	}
+	flags, err := readVInt(br)
+	if err != nil || flags&(rar5HeaderFlagExtra|rar5HeaderFlagData) != 0 {
+		return VolumeHead{}
+	}
+	enc, err := crypto.ParseEncryptionHeader(body[len(body)-br.Len():])
+	if err != nil || enc.KdfCount > maxVolumeHeadKDF {
+		return VolumeHead{}
+	}
+	key := v.key(enc)
+	if key == nil {
+		return VolumeHead{}
+	}
+
+	// What follows: a 16-byte IV, then the main header in whole AES blocks.
+	rest := prefix[len(prefix)-r.Len():]
+	if len(rest) < 2*crypto.BlockSize {
+		return VolumeHead{}
+	}
+	iv := rest[:crypto.BlockSize]
+	plain := bytes.Clone(rest[crypto.BlockSize:])
+	plain = plain[:len(plain)/crypto.BlockSize*crypto.BlockSize]
+	if err := crypto.DecryptBlock(plain, key, iv); err != nil {
+		return VolumeHead{}
+	}
+	pr := bytes.NewReader(plain[4:])
+	hsize, err := readVInt(pr)
+	if err != nil || hsize > uint64(pr.Len()) {
+		return VolumeHead{}
+	}
+	// The header's CRC covers its size field and body: it tells a header
+	// decrypted with the right key from noise.
+	start := len(plain) - pr.Len()
+	sizeLen := start - 4
+	if crc32.ChecksumIEEE(plain[4:start+int(hsize)]) != binary.LittleEndian.Uint32(plain[:4]) || sizeLen < 1 {
+		return VolumeHead{}
+	}
+	return readRAR5MainHead(bytes.NewReader(plain[start : start+int(hsize)]))
+}
+
+func (v *VolumeHeadReader) key(enc *crypto.EncryptionHeader) []byte {
+	id := string(enc.Salt) + string(rune(enc.KdfCount))
+	if k, ok := v.keys[id]; ok {
+		return k
+	}
+	keys := crypto.DeriveKeys([]byte(v.Password), enc.Salt, enc.KdfCount)
+	var k []byte
+	if !enc.HasPwCheck || crypto.VerifyPassword(keys, enc.PwCheck) {
+		k = keys.Key
+	}
+	if v.keys == nil {
+		v.keys = make(map[string][]byte)
+	}
+	v.keys[id] = k
+	return k
 }
 
 // NameVolumeNumber returns the volume order a RAR volume's file name gives
