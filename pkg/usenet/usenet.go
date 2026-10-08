@@ -2143,6 +2143,19 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	}
 	copyStart := time.Now()
 
+	// The DFS mount's downloaders store what they are handed in the durable
+	// cache, and every later read of it - a seek back included - is served
+	// from there without reaching this reader. So the scratch copy is dead
+	// weight the moment the mount has taken it: release it while it is
+	// still only in RAM, before it can be written to the scratch file.
+	// Other callers (WebDAV, rclone, verification reads) keep nothing, so
+	// for them the scratch cache stays as it was.
+	if sr := ufsEntry.streaming.Load(); sr != nil && reader.BufferedPlayback(ctx) && !verifyRead {
+		rw := &releasingWriter{w: writer, from: rangeStart, next: rangeStart, release: sr.Release}
+		defer rw.flush()
+		writer = rw
+	}
+
 	// Use a safe copy loop that checks context and validates read counts
 	written, err := safeCopyBuffer(ctx, writer, copySrc, buf)
 	if meter != nil {
@@ -2291,6 +2304,49 @@ func (u *Usenet) shouldPoisonFailedFile(ctx context.Context, nzoID, filename str
 
 // safeCopyBuffer copies from src to dst using buf, with context checking and
 // validation of read counts to prevent panics from corrupted readers during shutdown.
+// releasingWriter passes a stream through to a writer that keeps it, and
+// releases from the scratch cache what the writer has accepted.
+type releasingWriter struct {
+	w       io.Writer
+	release func(off, length int64) int
+	from    int64 // file offset the next release starts at
+	next    int64 // file offset of the next byte to be written
+}
+
+const (
+	// streamReleaseStep is how much the writer accepts between releases, so
+	// segments leave the scratch cache in a few coalesced runs rather than
+	// one at a time.
+	streamReleaseStep = 8 << 20
+	// streamReleaseOverlap is how far back the next release starts. Only
+	// whole segments are released, so the one cut by the end of a step is
+	// left for the step after, which has to reach back over it.
+	streamReleaseOverlap = 4 << 20
+)
+
+// Write releases nothing for a write the writer refused or cut short: those
+// bytes are not known to be anywhere but the scratch cache.
+func (r *releasingWriter) Write(p []byte) (int, error) {
+	n, err := r.w.Write(p)
+	if err != nil || n != len(p) {
+		return n, err
+	}
+	r.next += int64(n)
+	if r.next-r.from >= streamReleaseStep+streamReleaseOverlap {
+		r.flush()
+	}
+	return n, nil
+}
+
+// flush releases what has been accepted so far.
+func (r *releasingWriter) flush() {
+	if r.next <= r.from {
+		return
+	}
+	r.release(r.from, r.next-r.from)
+	r.from = max(r.from, r.next-streamReleaseOverlap)
+}
+
 func safeCopyBuffer(ctx context.Context, dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
 	var release func()
 	if len(buf) == 0 {
@@ -2441,7 +2497,28 @@ func (u *Usenet) ReadCachedAt(ctx context.Context, nzoID, filename string, p []b
 	if err != nil {
 		return 0, fmt.Errorf("failed to get reader: %w", err)
 	}
-	return readerAt.ReadAtContext(ctx, p, off)
+	// A copy out of the scratch cache, not a client reading the file: it
+	// must not start prefetch ahead of itself - see reader.ContextForCopyOut.
+	return readerAt.ReadAtContext(reader.ContextForCopyOut(ctx), p, off)
+}
+
+// ReleaseCached drops from nzoID/filename's scratch cache the segments lying
+// wholly inside [off, off+length), for a caller that has copied those bytes
+// into durable storage - see reader.StreamingReader.Release. Returns how
+// many segments it dropped; 0 when the file has no open reader.
+func (u *Usenet) ReleaseCached(nzoID, filename string, off, length int64) int {
+	if u == nil || u.fs == nil || length <= 0 {
+		return 0
+	}
+	entry, ok := u.fs.Load(fsKey(nzoID, filename))
+	if !ok {
+		return 0
+	}
+	sr := entry.streaming.Load()
+	if sr == nil {
+		return 0
+	}
+	return sr.Release(off, length)
 }
 
 // ReadAhead aggressively fetches the remainder of a file - [from, EOF) -
@@ -2500,6 +2577,7 @@ func (u *Usenet) ReadAheadRange(ctx context.Context, nzoID, filename string, off
 func (u *Usenet) Stats() map[string]any {
 	stats := u.nntp.Stats()
 	stats["readers"] = u.fs.Size()
+	stats["scratch"] = reader.ScratchStats()
 	stats["nzb_storage"] = u.nzbStorage.Stats()
 	return stats
 }

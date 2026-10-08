@@ -149,6 +149,12 @@ func (s *overlapSource) ReadCachedAt(ctx context.Context, id, name string, p []b
 	return s.scratchSource.ReadCachedAt(ctx, id, name, p, off)
 }
 
+func (s *overlapSource) ReleaseCached(id, name string, off, length int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scratchSource.ReleaseCached(id, name, off, length)
+}
+
 // lockedStore is a durableStore two bursts can write at once.
 type lockedStore struct {
 	mu sync.Mutex
@@ -293,13 +299,13 @@ func TestBurstChunksStopWhenKeepFails(t *testing.T) {
 	if !errors.Is(err, errViewerLeft) {
 		t.Fatalf("err = %v, want errViewerLeft", err)
 	}
-	if want := int64(2 * burstChunk); res.fetched != want {
+	if want := int64(2 * alignedChunk); res.fetched != want {
 		t.Fatalf("fetched = %d, want the two chunks before the viewer left (%d)", res.fetched, want)
 	}
 	if g.busy {
 		t.Fatal("the stopped burst kept the turn")
 	}
-	if !store.HasCachedRange("Entry", filename, 0, 2*burstChunk) {
+	if !store.HasCachedRange("Entry", filename, 0, 2*alignedChunk) {
 		t.Fatal("the chunks fetched before the viewer left were not kept")
 	}
 }

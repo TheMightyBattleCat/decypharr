@@ -373,6 +373,13 @@ func bufferedPlayback(ctx context.Context) bool {
 	return v
 }
 
+// BufferedPlayback is the exported form of bufferedPlayback, for
+// pkg/usenet.Stream, which releases from the scratch cache what such a
+// stream's writer has taken into durable storage.
+func BufferedPlayback(ctx context.Context) bool {
+	return bufferedPlayback(ctx)
+}
+
 // isPlaybackRead reports whether ctx serves a client stream and isn't a
 // verification read.
 func isPlaybackRead(ctx context.Context) bool {
@@ -414,6 +421,26 @@ func ContextForBurstDownload(ctx context.Context) context.Context {
 // burstNoFill reports whether ctx was marked by ContextForBurstDownload.
 func burstNoFill(ctx context.Context) bool {
 	v, _ := ctx.Value(burstNoFillCtxKey{}).(bool)
+	return v
+}
+
+type copyOutCtxKey struct{}
+
+// ContextForCopyOut marks a read that copies bytes out of the scratch cache
+// into durable storage - the precache burst's read-back of the chunk it has
+// just fetched (pkg/manager.persistSegments). It is not a client consuming
+// the file, so it neither queues prefetch ahead of itself nor advances the
+// consumed mark the sliding-window sweeper works from. Before this, every
+// segment read back queued PrefetchAhead segments of the next chunk on the
+// fetcher's own context: a second, ungated fetch stream running ahead of the
+// burst, and the reason a burst's scratch footprint was a chunk plus a
+// read-ahead window instead of a chunk.
+func ContextForCopyOut(ctx context.Context) context.Context {
+	return context.WithValue(ctx, copyOutCtxKey{}, true)
+}
+
+func copyOut(ctx context.Context) bool {
+	v, _ := ctx.Value(copyOutCtxKey{}).(bool)
 	return v
 }
 

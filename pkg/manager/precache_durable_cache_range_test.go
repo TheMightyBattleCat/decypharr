@@ -19,6 +19,12 @@ type fakeNZBSource struct {
 	pendingErr error
 	reads      map[int64][]byte // offset -> bytes ReadCachedAt returns
 	readCalls  map[int64]int    // offset -> number of ReadCachedAt calls, for asserting a range was never touched
+	released   [][2]int64       // [off, end) of each ReleaseCached call, in order
+}
+
+func (f *fakeNZBSource) ReleaseCached(_, _ string, off, length int64) int {
+	f.released = append(f.released, [2]int64{off, off + length})
+	return 0
 }
 
 func (f *fakeNZBSource) GetNZB(id string) (*storage.NZB, error) { return f.nzb, f.nzbErr }

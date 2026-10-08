@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
@@ -69,6 +71,9 @@ type precacheNZBSource interface {
 	GetNZB(id string) (*storage.NZB, error)
 	OverlayPendingRepair(nzoID string) (map[string][]overlay.DeadSegment, error)
 	ReadCachedAt(ctx context.Context, nzoID, filename string, p []byte, off int64) (int, error)
+	// ReleaseCached drops from the reader's scratch cache the segments lying
+	// wholly inside [off, off+length), now that they are durable.
+	ReleaseCached(nzoID, filename string, off, length int64) int
 }
 
 // persistDurableRanges durably writes every CLEAN segment of filename
@@ -143,6 +148,7 @@ func persistDurableSpan(ctx context.Context, src precacheNZBSource, writer dfsCa
 type persistStats struct {
 	bytesWritten, segmentsWritten, writeFailures, segmentsSeen int64
 	shortReads, deadReads, readErrors, alreadyCached           int64
+	released                                                   int64 // segments dropped from the scratch cache once durable
 	firstByteZero, aborted                                     bool
 }
 
@@ -155,6 +161,7 @@ func (s *persistStats) add(o persistStats) {
 	s.deadReads += o.deadReads
 	s.readErrors += o.readErrors
 	s.alreadyCached += o.alreadyCached
+	s.released += o.released
 	s.firstByteZero = s.firstByteZero || o.firstByteZero
 	s.aborted = s.aborted || o.aborted
 }
@@ -171,6 +178,7 @@ func (s persistStats) log(log zerolog.Logger, entryName, filename string, segmen
 		Int64("bytes", s.bytesWritten).Int64("segments", s.segmentsWritten).
 		Int64("segmentsSeen", s.segmentsSeen).Int("segmentsTotal", segmentsTotal).
 		Int64("alreadyCached", s.alreadyCached).
+		Int64("released", s.released).
 		Int64("writeFailures", s.writeFailures).
 		Int64("shortReads", s.shortReads).Int64("deadReads", s.deadReads).Int64("readErrors", s.readErrors).
 		Bool("firstByteZero", s.firstByteZero).Bool("aborted", s.aborted).
@@ -192,6 +200,28 @@ func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCache
 		for _, seg := range pending[filename] {
 			dead[seg.Index] = true
 		}
+	}
+
+	// Once a segment is in the durable cache its copy in the reader's scratch
+	// cache is dead weight: playback of it is served from the durable cache
+	// and never asks the reader. Releasing it straight away, while it is
+	// still only in RAM, is what keeps a burst from being written to disk
+	// twice - once to the scratch file, then here. Runs of durable segments
+	// are released together; a segment held for repair, short, failed or
+	// unwritten breaks the run and is left where it is.
+	runLo, runHi := int64(-1), int64(-1)
+	flushRun := func() {
+		if runHi > runLo {
+			st.released += int64(src.ReleaseCached(infoHash, filename, runLo, runHi-runLo))
+		}
+		runLo, runHi = -1, -1
+	}
+	durable := func(start, end int64) {
+		if runHi != start {
+			flushRun()
+			runLo = start
+		}
+		runHi = end
 	}
 
 	var buf []byte
@@ -218,6 +248,7 @@ func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCache
 		size := end - start
 		if have != nil && have.HasCachedRange(entryName, filename, start, size) {
 			st.alreadyCached++
+			durable(start, end)
 			continue
 		}
 		if int64(cap(buf)) < size {
@@ -255,6 +286,7 @@ func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCache
 		}
 		st.bytesWritten += size
 		st.segmentsWritten++
+		durable(start, end)
 		if start == 0 {
 			// Front-of-file zero-fill canary: burst zero-fill is already fixed
 			// upstream, so this is a belt-and-suspenders alarm, not the
@@ -262,6 +294,7 @@ func persistSegments(ctx context.Context, src precacheNZBSource, writer dfsCache
 			st.firstByteZero = len(buf) > 0 && buf[0] == 0x00
 		}
 	}
+	flushRun()
 	return st
 }
 
@@ -281,14 +314,19 @@ func (p *Precache) persistCleanRanges(ctx context.Context, entry *storage.Entry,
 }
 
 // durableBurstChunk is how much a burst fetches before copying it into the
-// durable cache. The reader's scratch SegmentCache evicts past 256 MB
-// (reader.DefaultConfig().MaxDisk) and also carries the playing file's own
-// prefetch window, so a chunk has to fit well inside it. Before this a burst
-// fetched the whole file first: Rocky III's in-playback read-ahead on
-// 2026-09-18 fetched 10.8 GB and kept none of it, and a next-episode burst
-// fetched everything but its last ~256 MB twice, once for the burst and
-// again for the persist walk reading it back.
-const durableBurstChunk = 96 << 20
+// durable cache and releasing it from the reader's scratch cache. A chunk
+// has to stay in that cache's RAM until it is copied out, beside the playing
+// file's own read-ahead window, or it is written to the scratch file on the
+// way - so its size is the reader's to set (reader.BurstChunkBytes). At
+// 96 MB it was larger than the 64 MB of RAM a stream then had, and every
+// burst went to disk twice.
+//
+// Before bursts were chunked at all a burst fetched the whole file first:
+// Rocky III's in-playback read-ahead on 2026-09-18 fetched 10.8 GB and kept
+// none of it, and a next-episode burst fetched everything but its last
+// ~256 MB twice, once for the burst and again for the persist walk reading
+// it back.
+const durableBurstChunk = reader.BurstChunkBytes
 
 // burstResult is what burstToDurable did.
 type burstResult struct {
@@ -355,6 +393,20 @@ type burstSource interface {
 	ReadAheadRange(ctx context.Context, nzoID, filename string, off, length int64, concurrency int) error
 }
 
+// segmentAlignedEnd moves end forward to the end of the segment it falls
+// inside, and leaves it alone when it already sits on a segment boundary or
+// the segment map does not cover it. Never past fileSize.
+func segmentAlignedEnd(file *storage.NZBFile, end, fileSize int64) int64 {
+	segs := file.Segments
+	// The first segment that ends at or after end-1 is the one holding the
+	// chunk's last byte.
+	i := sort.Search(len(segs), func(i int) bool { return segs[i].EndOffset >= end-1 })
+	if i < len(segs) && segs[i].StartOffset < end {
+		end = max(end, segs[i].EndOffset+1)
+	}
+	return min(end, fileSize)
+}
+
 // burstQueuedLogAfter is how long a burst must wait for its turn before the
 // wait is logged.
 const burstQueuedLogAfter = 5 * time.Second
@@ -378,8 +430,13 @@ func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWrite
 
 	var active time.Duration // spent fetching and persisting, against opts.budget
 	queuedLogged := false
-	for off := from; off < fileSize; off += chunk {
-		n := min(chunk, fileSize-off)
+	var n int64
+	for off := from; off < fileSize; off += n {
+		// A chunk ends where a segment does. Each chunk is released from the
+		// scratch cache once it is durable, so a segment cut by a chunk
+		// boundary would be fetched with one chunk, released, and fetched
+		// again with the next.
+		n = segmentAlignedEnd(file, min(off+chunk, fileSize), fileSize) - off
 		if have != nil && have.HasCachedRange(entryName, filename, off, n) {
 			res.skipped += n
 			continue

@@ -166,6 +166,14 @@ type Buffer struct {
 
 	ranges *rangeSet
 
+	// onDisk is the part of ranges that has reached the disk file: flushed
+	// from a RAM block, written through, or seeded from a previous run. Bytes
+	// that only ever lived in a RAM block are not in it, so discarding them
+	// touches nothing but memory - no hole punch, no page-cache hint. For a
+	// scratch buffer whose data is released as soon as it is copied
+	// elsewhere, that is every discard. Guarded by mu.
+	onDisk *rangeSet
+
 	// range carries stateFastDisk, ReadAt bypasses mu, the range tree,
 	// and the block map and just pread's — matching baseline's hot path
 	// exactly. Transitions are written under mu but read lock-free, so
@@ -268,6 +276,7 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 		blocks:   make(map[int64]*block),
 		maxBytes: cfg.MemorySize,
 		ranges:   newRangeSet(),
+		onDisk:   newRangeSet(),
 	}
 	if cfg.TotalSize > 0 {
 		n := int((cfg.TotalSize + blockSize - 1) / blockSize)
@@ -284,6 +293,7 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 			// Seeded ranges are already on disk from a prior run: count them
 			// toward this Buffer's (and the pool's) disk footprint.
 			b.rangesInsert(r.Off, r.Size)
+			b.onDisk.insert(r.Off, r.Size)
 		}
 	}
 	// Seed fast-path state for any block fully covered by InitialRanges.
@@ -340,6 +350,7 @@ func (b *Buffer) WriteAt(p []byte, off int64) (int, error) {
 		}
 		cur += int64(hi - lo)
 	}
+	b.pool.statsWritten.Add(int64(len(p)))
 	return len(p), nil
 }
 
@@ -393,6 +404,7 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 		return fmt.Errorf("buffer: write-through at %d: %w", diskOff, err)
 	}
 	b.statsWriteThrough.Add(1)
+	b.pool.statsWriteThroughBytes.Add(int64(len(src)))
 
 	b.mu.Lock()
 	// Same closed re-check as the cached path: never publish into the range
@@ -405,6 +417,7 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 	// another writer cached this block while our pwrite was in flight.
 	// Mirror our bytes into RAM so the resident block stays authoritative.
 	var err error
+	b.onDisk.insert(diskOff, int64(hi-lo))
 	if blk, ok := b.blocks[blockOff]; ok {
 		err = b.writeIntoBlockLocked(blk, lo, hi, src)
 	} else {
@@ -617,6 +630,21 @@ func (b *Buffer) discard(off, length int64) int64 {
 		blk.removeDirty(startInBlk, endInBlk)
 	}
 	removed := b.rangesRemove(off, length)
+	// A straddling block the discard left with nothing present is dropped
+	// too. Segments rarely end on a block boundary, so the block shared by
+	// two neighbours is trimmed twice, once from each side, and never falls
+	// "fully inside" either discard. Left resident it holds a block of the
+	// RAM ceiling for good: nothing evicts on the write path (writeRegion
+	// writes through once the ceiling is reached), so every such block
+	// pushed one more block of later writes to disk until, a few GB into a
+	// file, all of them went there.
+	for _, blkOff := range [2]int64{alignDown(off), alignDown(end - 1)} {
+		if blk, ok := b.blocks[blkOff]; ok && !b.ranges.anyPresent(blkOff, blockSize) {
+			b.dropBlockLocked(blk)
+		}
+	}
+	// Only bytes that reached the file need releasing from it.
+	hadDisk := b.onDisk.remove(off, length) > 0
 	// Recompute fast-path state for every block this discard touched —
 	// any FastDisk block whose disk bytes we're punching must drop back
 	// to the slow path so readers don't pread the soon-to-be-hole.
@@ -626,6 +654,14 @@ func (b *Buffer) discard(off, length int64) int64 {
 		}
 	}
 	b.mu.Unlock()
+
+	if !hadDisk {
+		// The range only ever lived in RAM blocks: there is no disk extent to
+		// punch and no page cache to drop, and a fallocate would still cost a
+		// journalled inode update.
+		b.pool.statsReleasedInRAM.Add(removed)
+		return removed
+	}
 
 	// Punch on disk outside the lock — file ops are thread-safe and the
 	// caller doesn't want to block other RAM-only readers behind a syscall.
@@ -848,6 +884,7 @@ func (b *Buffer) Close() error {
 	// reaches it (belt and suspenders on top of the closed re-checks) finds
 	// nothing to remove and cannot perturb the pool accounting again.
 	b.ranges = newRangeSet()
+	b.onDisk = newRangeSet()
 	b.mu.Unlock()
 	b.pool.remove(b)
 
@@ -1049,6 +1086,8 @@ func (b *Buffer) flushBlockLocked(blk *block) error {
 			return fmt.Errorf("buffer: flush block %d [%d,%d): %w", blk.off, ext.lo, ext.hi, err)
 		}
 		b.statsFlushes.Add(1)
+		b.pool.statsFlushedBytes.Add(int64(ext.hi - ext.lo))
+		b.onDisk.insert(blk.off+int64(ext.lo), int64(ext.hi-ext.lo))
 	}
 	blk.clearDirty()
 	return nil

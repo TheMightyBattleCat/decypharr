@@ -232,7 +232,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// explicitly opting out of that. A seeky verification caller (ffprobe
 	// jumps across decode windows) gets nothing useful from a sequential
 	// read-ahead prediction anyway.
-	if !paddingDisabled(ctx) {
+	if !paddingDisabled(ctx) && !copyOut(ctx) {
 		prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
 		if prefetchEnd > endSeg {
 			sr.fetcher.QueuePrefetchRange(endSeg+1, prefetchEnd)
@@ -308,7 +308,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// Tell the cache what we actually delivered so its sliding-window
 	// sweeper can advance the back-window cutoff. Skip on zero-byte reads
 	// (probe, short EOF) to avoid moving the high-water mark spuriously.
-	if n > 0 {
+	if n > 0 && !copyOut(ctx) {
 		sr.cache.MarkConsumed(off, int64(n))
 	}
 
@@ -804,6 +804,39 @@ func (sr *StreamingReader) RefetchSegments(segIdx []int) {
 		}
 		sr.cache.invalidateForRefetch(i)
 	}
+}
+
+// Release drops from the scratch cache every segment that lies wholly inside
+// [off, off+length), and returns how many it dropped. It is for a caller
+// that has just copied those bytes somewhere durable (the DFS cache): the
+// scratch copy has no further use, since a later read of the range is served
+// from there and never reaches this reader, and dropping it while it is
+// still only in RAM is what keeps it off the scratch file altogether.
+//
+// A segment is left alone when it straddles either end of the range, is
+// pinned by a read in progress, is still being fetched, or holds the
+// overlay's bytes rather than the article's (a zero-fill pad or a PAR2
+// patch): those are never what the caller made durable, and dropping a pad
+// would send the next read back through every provider for an article
+// already known to be gone. A released segment that is asked for again is
+// simply fetched again.
+func (sr *StreamingReader) Release(off, length int64) int {
+	if sr.closed.Load() || length <= 0 || off < 0 || off >= sr.totalSize {
+		return 0
+	}
+	end := min(off+length, sr.totalSize)
+	first, last := sr.cache.SegmentsForRange(off, end-off)
+	indices := make([]int, 0, last-first+1)
+	for i := first; i <= last; i++ {
+		if sr.cache.SegmentOffset(i) < off || sr.cache.SegmentOffset(i+1) > end {
+			continue
+		}
+		if sr.fetcher != nil && (sr.fetcher.isPadded(i) || sr.fetcher.isPatched(i)) {
+			continue
+		}
+		indices = append(indices, i)
+	}
+	return sr.cache.release(indices)
 }
 
 // Stats returns a snapshot of current statistics.

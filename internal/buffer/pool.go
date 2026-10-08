@@ -42,6 +42,12 @@ type Pool struct {
 
 	statsPunches   atomic.Int64
 	statsReclaimed atomic.Int64
+
+	// Where the bytes written into this pool's Buffers went - see PoolStats.
+	statsWritten           atomic.Int64
+	statsFlushedBytes      atomic.Int64
+	statsWriteThroughBytes atomic.Int64
+	statsReleasedInRAM     atomic.Int64
 }
 
 // PoolConfig configures a Pool.
@@ -73,6 +79,16 @@ type PoolStats struct {
 	Buffers        int
 	DiskPunches    int64
 	BytesReclaimed int64
+
+	// Cumulative since the pool was created, across every Buffer it has ever
+	// held. (FlushedBytes + WriteThroughBytes) / WrittenBytes is the share of
+	// the data written into the pool that was also written to its disk
+	// files; ReleasedInRAMBytes is what was discarded without ever reaching
+	// one.
+	WrittenBytes       int64 // accepted by WriteAt
+	FlushedBytes       int64 // written to disk from a RAM block, on eviction, Flush or Close
+	WriteThroughBytes  int64 // written straight to disk because the RAM ceiling was reached
+	ReleasedInRAMBytes int64 // discarded having only ever been in RAM
 }
 
 // NewPool creates a Pool. If DiskLimit > 0 it starts a background worker that
@@ -136,6 +152,11 @@ func (p *Pool) Stats() PoolStats {
 		Buffers:        n,
 		DiskPunches:    p.statsPunches.Load(),
 		BytesReclaimed: p.statsReclaimed.Load(),
+
+		WrittenBytes:       p.statsWritten.Load(),
+		FlushedBytes:       p.statsFlushedBytes.Load(),
+		WriteThroughBytes:  p.statsWriteThroughBytes.Load(),
+		ReleasedInRAMBytes: p.statsReleasedInRAM.Load(),
 	}
 }
 

@@ -23,6 +23,7 @@ type scratchSource struct {
 	lru       []int // oldest first
 	downloads map[int]int
 	readBacks map[int]int
+	released  map[int]int // segment -> times released from the scratch cache
 }
 
 func newScratchSource(filename string, segments, capacity int) *scratchSource {
@@ -71,6 +72,26 @@ func (s *scratchSource) ReadCachedAt(_ context.Context, _, _ string, p []byte, o
 		p[i] = byte(idx + 1)
 	}
 	return len(p), nil
+}
+
+// ReleaseCached drops the segments wholly inside [off, off+length), as the
+// real reader does.
+func (s *scratchSource) ReleaseCached(_, _ string, off, length int64) int {
+	if s.released == nil {
+		s.released = map[int]int{}
+	}
+	n := 0
+	for idx := int((off + burstSegSize - 1) / burstSegSize); int64((idx+1)*burstSegSize) <= off+length; idx++ {
+		for i, v := range s.lru {
+			if v == idx {
+				s.lru = append(s.lru[:i], s.lru[i+1:]...)
+				s.released[idx]++
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
 
 func (s *scratchSource) ReadAhead(ctx context.Context, nzoID, filename string, from int64, concurrency int) error {
@@ -145,9 +166,14 @@ func (d *durableStore) holes(size int64) [][2]int64 {
 	return out
 }
 
-// burstChunk cuts through segments (burstSegSize 100), as a 96 MB chunk
-// cuts through ~700 KB articles.
-const burstChunk = 250
+// burstChunk cuts through segments (burstSegSize 100), as a chunk of tens of
+// megabytes cuts through ~700 KB articles. burstChunks ends each chunk on
+// the segment boundary after the cut, so the chunks really fetched are
+// alignedChunk long.
+const (
+	burstChunk   = 250
+	alignedChunk = 300
+)
 
 // Chunk by chunk, every segment is downloaded once and persisted from the
 // scratch cache, the whole file ends up durable, and a segment straddling a
@@ -200,17 +226,17 @@ func TestBurstChunksSkipDurableChunks(t *testing.T) {
 	const size = 10 * burstSegSize
 	src := newScratchSource(filename, 10, 4)
 	store := newDurableStore()
-	store.seed(200, 400) // segments 2-5; covers the chunk [250, 500)
+	store.seed(200, 400) // segments 2-5; covers the chunk [300, 600)
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
 		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.skipped != burstChunk || res.fetched != size-burstChunk {
-		t.Fatalf("skipped %d fetched %d, want %d and %d", res.skipped, res.fetched, burstChunk, size-burstChunk)
+	if res.skipped != alignedChunk || res.fetched != size-alignedChunk {
+		t.Fatalf("skipped %d fetched %d, want %d and %d", res.skipped, res.fetched, alignedChunk, size-alignedChunk)
 	}
-	for _, seg := range []int{3, 4} { // only in the skipped chunk
+	for _, seg := range []int{3, 4, 5} { // the skipped chunk
 		if src.downloads[seg] != 0 {
 			t.Fatalf("segment %d, inside the durable chunk, was downloaded", seg)
 		}
@@ -225,29 +251,91 @@ func TestBurstChunksSkipDurableChunks(t *testing.T) {
 	}
 }
 
-// A durable chunk whose last segment runs on into the next, fetched chunk:
-// that segment's tail is persisted by the next chunk. Selecting segments by
-// where they start left it to the skipped chunk, and a hole at the boundary.
-func TestBurstChunksStraddlingSegmentAfterSkippedChunk(t *testing.T) {
+// The durable cache holds a chunk's segments except the tail of its last
+// one. The chunk is fetched, since it is not all there, but only that
+// segment is read back and written: the others are found durable and left.
+func TestBurstChunksPartlyDurableSegmentIsCompleted(t *testing.T) {
 	const filename = "episode.mkv"
 	const size = 10 * burstSegSize
 	src := newScratchSource(filename, 10, 4)
 	store := newDurableStore()
-	store.seed(0, burstChunk) // segments 0, 1 and the head of 2 [200, 300)
+	store.seed(0, burstChunk) // segments 0, 1 and the head of 2 [200, 250)
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
 		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.skipped != burstChunk {
-		t.Fatalf("skipped %d, want the first chunk (%d)", res.skipped, burstChunk)
+	if res.skipped != 0 {
+		t.Fatalf("skipped %d, want 0: the first chunk lacks the tail of segment 2", res.skipped)
 	}
 	if h := store.holes(size); len(h) != 0 {
 		t.Fatalf("durable holes %v, want none", h)
 	}
 	if store.writes[2*burstSegSize] != 1 {
-		t.Fatalf("straddling segment 2 written %d times, want once", store.writes[2*burstSegSize])
+		t.Fatalf("partly durable segment 2 written %d times, want once", store.writes[2*burstSegSize])
+	}
+	for _, seg := range []int{0, 1} {
+		if store.writes[int64(seg*burstSegSize)] != 0 || src.readBacks[seg] != 0 {
+			t.Fatalf("durable segment %d read back or written again", seg)
+		}
+	}
+}
+
+// Chunks end on segment boundaries, so no segment is fetched with one chunk,
+// released, and fetched again with the next - and every segment made
+// durable is released from the scratch cache exactly once.
+func TestBurstChunksReleaseEachDurableSegmentOnce(t *testing.T) {
+	const filename = "episode.mkv"
+	const size = 10 * burstSegSize
+	src := newScratchSource(filename, 10, 4)
+	store := newDurableStore()
+
+	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seg := range 10 {
+		if src.downloads[seg] != 1 {
+			t.Fatalf("segment %d downloaded %d times, want once", seg, src.downloads[seg])
+		}
+		if src.released[seg] != 1 {
+			t.Fatalf("segment %d released %d times, want once", seg, src.released[seg])
+		}
+	}
+	if len(src.lru) != 0 {
+		t.Fatalf("scratch cache still holds segments %v after the burst", src.lru)
+	}
+	if res.persist.released != 10 {
+		t.Fatalf("persist stats count %d released, want 10", res.persist.released)
+	}
+}
+
+// A segment held for repair is not durable, so it is not released either:
+// it stays in the scratch cache, and the durable segments either side of it
+// are released as two runs.
+func TestBurstChunksPendingRepairNotReleased(t *testing.T) {
+	const filename = "episode.mkv"
+	const size = 6 * burstSegSize
+	src := newScratchSource(filename, 6, 6)
+	src.pending = map[string][]overlay.DeadSegment{filename: {{Index: 1}}}
+	store := newDurableStore()
+
+	if _, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if src.released[1] != 0 {
+		t.Fatal("the segment held for repair was released from the scratch cache")
+	}
+	if len(src.lru) != 1 || src.lru[0] != 1 {
+		t.Fatalf("scratch cache holds %v, want only the pending segment 1", src.lru)
+	}
+	for _, seg := range []int{0, 2, 3, 4, 5} {
+		if src.released[seg] != 1 {
+			t.Fatalf("durable segment %d released %d times, want once", seg, src.released[seg])
+		}
 	}
 }
 

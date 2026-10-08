@@ -109,19 +109,36 @@ const (
 	// the rest.
 	segmentSweepBatch = 128
 
-	// bufferMemorySize is the per-stream RAM ceiling for the underlying buffer:
-	// forward prefetch + recent reads. 64 MB gives a verification read's
-	// rolling no-pad prefetch window (Usenet.verificationPrefetch keeps ~32 MB
-	// fetched ahead) room to stay resident alongside the working set and a
-	// seek-back cushion, instead of spilling to the HDD-backed stream file.
+	// bufferMemorySize is the per-stream RAM ceiling for the underlying buffer.
+	// It has to hold everything a reader can have in flight at once, or the
+	// overflow is written to the scratch file on the way to wherever it is
+	// really going: the read-ahead window of the stream being played
+	// (Usenet.read_ahead: 16 MB by default, commonly raised to 64 MB), one
+	// pre-cache burst chunk on top of it when the file being played is also
+	// being read ahead (BurstChunkBytes), and the segments the connections
+	// are filling. It was 64 MB, sized for a verification read's ~32 MB
+	// rolling window; a 64 MB read-ahead alone filled that, so a burst on
+	// the same file went to disk in full. A read-ahead set much above 64 MB
+	// (the window is capped at 256 segments, ~180 MB) still overflows it.
+	//
+	// A reader nothing releases from - a verification read - can now hold
+	// up to this much of the pool where it held 64 MB before.
+	//
 	// This is only a per-stream cap: the effective ceiling is the global
 	// buffer budget (Usenet.buffer_memory), and once that is exhausted new
 	// blocks fall back to the lock-free write-through path (to disk) regardless
 	// of this number. So the residency win holds while the pool has headroom;
 	// under a busy sweep + playback it degrades to "pipelined but disk-backed",
 	// which is still faster than the synchronous fetch it replaces.
-	bufferMemorySize = 64 << 20
+	bufferMemorySize = 128 << 20
 )
+
+// BurstChunkBytes is how much a pre-cache burst should fetch before copying
+// it out and releasing it (pkg/manager.durableBurstChunk). Defined here
+// because it is this cache's RAM ceiling that bounds it: a chunk has to fit
+// beside a playing stream's read-ahead window, with room to spare for
+// segments in flight, or it spills to the scratch file.
+const BurstChunkBytes = 32 << 20
 
 // NewSegmentCache creates a new segment cache backed by a freshly-created
 // buffer.Buffer on a sparse disk file under config.DiskPath (or a temp dir).
@@ -972,6 +989,20 @@ func (sc *SegmentCache) evictBatch(indices []int) {
 		if !sc.states[idx].CompareAndSwap(uint32(StateOnDisk), uint32(StateEvicting)) {
 			continue
 		}
+		// A read pins its segments before it looks at their state, so
+		// checking the pin again after the reservation settles the race with
+		// a read that pinned between the check above and the CAS: either this
+		// sees its pin and backs off, or the read sees Evicting and waits.
+		// Without it the read could go on to read a range being punched -
+		// and from the scratch file the buffer's lock-free path hands a
+		// punched hole back as zeros, with no error. The sweeper only ever
+		// evicted segments untouched for 30 s, far behind the playhead; a
+		// release evicts ones a moment old, so the gap has to be closed.
+		if sc.pinCounts[idx].Load() > 0 {
+			sc.states[idx].Store(uint32(StateOnDisk))
+			sc.wakeWaiters(idx)
+			continue
+		}
 		size := sc.segLengths[idx].Load()
 		if size <= 0 {
 			size = sc.segments[idx].Bytes
@@ -1016,6 +1047,18 @@ func (sc *SegmentCache) evictBatch(indices []int) {
 		sc.states[idx].Store(uint32(StateEmpty))
 		sc.wakeWaiters(idx)
 	}
+}
+
+// release evicts the given segments on behalf of a caller that has made
+// their bytes durable elsewhere, and returns how many it evicted. evictBatch
+// skips any that are pinned or not OnDisk.
+func (sc *SegmentCache) release(indices []int) int {
+	if len(indices) == 0 || sc.closed.Load() {
+		return 0
+	}
+	before := sc.stats.Evictions.Load()
+	sc.evictBatch(indices)
+	return int(sc.stats.Evictions.Load() - before)
 }
 
 // onBufferEvict is invoked by the buffer pool after it punches a hole behind
@@ -1119,6 +1162,11 @@ func (sc *SegmentCache) Close() error {
 	sc.sweepWg.Wait()
 
 	if sc.buf != nil {
+		// The file is deleted just below, so nothing in the buffer is worth
+		// writing to it. Buffer.Close flushes every dirty block first - right
+		// for a durable cache, but here up to bufferMemorySize of disk writes
+		// per reader closed, for bytes about to be unlinked.
+		_ = sc.buf.Discard(0, sc.totalSize)
 		_ = sc.buf.Close()
 	}
 	if sc.diskPath != "" {
