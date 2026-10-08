@@ -141,11 +141,12 @@ type fsEntry struct {
 	refCount      atomic.Int32
 	lastAccessed  atomic.Int64 // Unix timestamp
 
-	// overlayOpts wires the playback-padding/PAR2-patch store into the
-	// single-volume reader (see getOrCreateReader). Built once at createEntry
-	// time, when the owning nzbID and logical filename are known; nil when
-	// overlay support is disabled (e.g. no usable overlay store).
-	overlayOpts []reader.Option
+	// readerOpts are the single-volume reader's options (see
+	// getOrCreateReader), built once at createEntry time, when the owning
+	// nzbID and logical filename are known: a logger that names the file,
+	// and the playback-padding/PAR2-patch store unless overlay support is
+	// disabled (e.g. no usable overlay store).
+	readerOpts []reader.Option
 
 	// streaming is the reader as a *reader.StreamingReader, once created -
 	// published atomically so RefreshRepairedSegments can reach a live
@@ -204,7 +205,7 @@ func (fe *fsEntry) getOrCreateReader() (fs.PrefetchableReaderAt, int64, error) {
 
 		// Single volume optimization - skip multi-volume overhead
 		if len(fe.volumes) == 1 {
-			readerAt, size, cleanup, err = fe.fs.CreateReaderAtForVolume(fe.volumes[0], fe.overlayOpts...)
+			readerAt, size, cleanup, err = fe.fs.CreateReaderAtForVolume(fe.volumes[0], fe.readerOpts...)
 		} else {
 			// Multi-volume case - need to create reader differently
 			// For now, fall back to io.ReaderAt (no prefetch for multi-volume)
@@ -548,10 +549,17 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 		overlayOpts = []reader.Option{reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name)}
 	}
 
+	// Every line the reader logs names its file: a playback stall or a slow
+	// fetch could otherwise be tied to a title only by working back from
+	// segment numbers. Passed here rather than with the overlay options,
+	// which are absent when playback padding is off.
+	readerLog := u.logger.With().Str("nzb_id", file.NzbID).Str("file", file.Name).Logger()
+	readerOpts := append([]reader.Option{reader.WithLogger(readerLog)}, overlayOpts...)
+
 	return &fsEntry{
-		fs:          usenetFS,
-		volumes:     volumes,
-		overlayOpts: overlayOpts,
+		fs:         usenetFS,
+		volumes:    volumes,
+		readerOpts: readerOpts,
 	}, nil
 }
 

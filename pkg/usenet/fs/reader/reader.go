@@ -261,31 +261,23 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	fetchStart := time.Now()
 	if endSeg > startSeg {
 		ensureErr = sr.fetcher.EnsureSegmentsConcurrent(ctx, startSeg, endSeg)
-		// Only log the slow ones. With prefetch pipelining ahead the common
-		// case is an instant cache hit, one line per readAtPlain call - pure
-		// noise. A fetch that actually blocked here means prefetch fell behind.
-		if d := time.Since(fetchStart); d >= verificationFetchLogThreshold {
-			ev := sr.logger.Debug().
-				Int("start_seg", startSeg).
-				Int("end_seg", endSeg).
-				Int("segments", endSeg-startSeg+1).
-				Dur("fetch_dur", d)
-			// Labelled by the same test that marks a playback stall below,
-			// so a background read (a durable-cache persist walk, say) no
-			// longer logs as playback.
-			switch {
-			case paddingDisabled(ctx):
-				ev.Msg("verification read: concurrent segment fetch blocked")
-			case isPlaybackRead(ctx) && bufferedPlayback(ctx):
-				ev.Msg("mount read-ahead: concurrent segment fetch blocked")
-			case isPlaybackRead(ctx):
-				ev.Msg("playback read: concurrent segment fetch blocked")
-			default:
-				ev.Msg("background read: concurrent segment fetch blocked")
-			}
-		}
 	} else {
 		ensureErr = sr.fetcher.EnsureSegments(ctx, startSeg, endSeg)
+	}
+	// Only log the slow ones. With prefetch pipelining ahead the common case
+	// is an instant cache hit, one line per readAtPlain call - pure noise. A
+	// fetch that actually blocked here means prefetch fell behind. Where the
+	// time went is on the fetcher's "slow segment fetch" line.
+	if d := time.Since(fetchStart); d >= verificationFetchLogThreshold {
+		// Labelled by the same test that marks a playback stall below, so a
+		// background read (a durable-cache persist walk, say) does not log as
+		// playback.
+		sr.logger.Debug().
+			Int("start_seg", startSeg).
+			Int("end_seg", endSeg).
+			Int("segments", endSeg-startSeg+1).
+			Dur("fetch_dur", d).
+			Msg(readKind(ctx) + ": concurrent segment fetch blocked")
 	}
 	// A playback read that waited long for its segments pauses read-ahead
 	// bursts on other files (playback_yield.go). A caller that walked away

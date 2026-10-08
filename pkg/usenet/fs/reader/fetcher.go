@@ -206,6 +206,9 @@ type SegmentFetcher struct {
 	// must not be handed to a read that may not see padding - see padUnfit.
 	padded []atomic.Uint64
 
+	// slowLog rate-limits the "slow segment fetch" line - see noteSlowFetch.
+	slowLog slowFetchLog
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -407,10 +410,12 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 	// Acquire connection slot
 	waitStart := time.Now()
+	var phases fetchPhases
 	select {
 	case sf.semaphore <- struct{}{}:
 		defer func() { <-sf.semaphore }()
-		sf.client.ObserveSegmentWait(time.Since(waitStart))
+		phases.slotWait = time.Since(waitStart)
+		sf.client.ObserveSegmentWait(phases.slotWait)
 	case <-ctx.Done():
 		sf.cache.ReleaseFetching(segIdx)
 		return ctx.Err()
@@ -440,20 +445,28 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// ExecuteWithFailover already retries per provider and across providers —
 		// a single call is sufficient.  An outer retry loop would multiply the
 		// total attempts by retries×providers, leading to very long failure times.
+		execStart := time.Now()
 		err = sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
+			connStart := time.Now()
+			defer func() { phases.onConn += time.Since(connStart) }()
+
 			stopCancel := context.AfterFunc(downloadCtx, func() {
 				_ = conn.Close()
 			})
 			defer stopCancel()
 
-			// Get the segment writer for the disk cache.
+			// Get the segment writer for the disk cache. Making room for it
+			// (StreamWriter's drainOverBudget) is time spent storing.
 			writer := sf.cache.StreamWriter(segIdx)
+			phases.store += time.Since(connStart)
 			if writer == nil {
 				return ErrCacheClosed
 			}
 
 			// Stream the decoded body into the chosen tier.
-			n, meta, err := conn.StreamBodyMeta(messageID, writer)
+			timed := &timedWriter{w: writer}
+			n, meta, err := conn.StreamBodyMeta(messageID, timed)
+			phases.store += timed.spent
 			if err != nil {
 				writer.Discard()
 				if ctxErr := downloadCtx.Err(); ctxErr != nil {
@@ -494,14 +507,18 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 
 			// Commit (updates cache state to StateOnDisk).
+			commitStart := time.Now()
 			writer.Finalize()
+			phases.store += time.Since(commitStart)
 			if meta != nil && meta.Part > 0 && meta.Part == int64(seg.Number) && sf.partNumbersMatched.Load() < partNumberTrust {
 				sf.partNumbersMatched.Add(1)
 			}
 
 			return nil
 		})
+		phases.exec = time.Since(execStart)
 	}
+	sf.noteSlowFetch(ctx, segIdx, phases, err)
 
 	if err != nil {
 		sf.stats.DownloadErrors.Add(1)
