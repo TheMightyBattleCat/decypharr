@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,9 @@ type ImportResponseSchema struct {
 		LanguageProfileId int `json:"languageProfileId"`
 		Id                int `json:"id"`
 	} `json:"series"`
+	Movie struct {
+		Id int `json:"id"`
+	} `json:"movie"`
 	SeasonNumber int `json:"seasonNumber"`
 	Episodes     []struct {
 		SeriesId                 int       `json:"seriesId"`
@@ -82,21 +86,9 @@ type ImportResponseSchema struct {
 		Id                       int       `json:"id"`
 		FinaleType               string    `json:"finaleType,omitempty"`
 	} `json:"episodes"`
-	ReleaseGroup string `json:"releaseGroup"`
-	Quality      struct {
-		Quality struct {
-			Id         int    `json:"id"`
-			Name       string `json:"name"`
-			Source     string `json:"source"`
-			Resolution int    `json:"resolution"`
-		} `json:"quality"`
-		Revision struct {
-			Version  int  `json:"version"`
-			Real     int  `json:"real"`
-			IsRepack bool `json:"isRepack"`
-		} `json:"revision"`
-	} `json:"quality"`
-	Languages []struct {
+	ReleaseGroup string          `json:"releaseGroup"`
+	Quality      json.RawMessage `json:"quality"`
+	Languages    []struct {
 		Id   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"languages"`
@@ -113,26 +105,15 @@ type ImportResponseSchema struct {
 }
 
 type ManualImportRequestFile struct {
-	DownloadId   string `json:"downloadId"`
-	FolderName   string `json:"folderName"`
-	Path         string `json:"path"`
-	SeriesId     int    `json:"seriesId"`
-	SeasonNumber int    `json:"seasonNumber"`
-	EpisodeIds   []int  `json:"episodeIds"`
-	Quality      struct {
-		Quality struct {
-			Id         int    `json:"id"`
-			Name       string `json:"name"`
-			Source     string `json:"source"`
-			Resolution int    `json:"resolution"`
-		} `json:"quality"`
-		Revision struct {
-			Version  int  `json:"version"`
-			Real     int  `json:"real"`
-			IsRepack bool `json:"isRepack"`
-		} `json:"revision"`
-	} `json:"quality"`
-	Languages []struct {
+	DownloadId   string          `json:"downloadId"`
+	FolderName   string          `json:"folderName"`
+	Path         string          `json:"path"`
+	MovieId      int             `json:"movieId,omitzero"`
+	SeriesId     int             `json:"seriesId,omitzero"`
+	SeasonNumber int             `json:"seasonNumber,omitzero"`
+	EpisodeIds   []int           `json:"episodeIds,omitempty"`
+	Quality      json.RawMessage `json:"quality"`
+	Languages    []struct {
 		Id   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"languages"`
@@ -140,7 +121,7 @@ type ManualImportRequestFile struct {
 	CustomFormats     []any  `json:"customFormats"`
 	CustomFormatScore int    `json:"customFormatScore"`
 	IndexerFlags      int    `json:"indexerFlags"`
-	ReleaseType       string `json:"releaseType"`
+	ReleaseType       string `json:"releaseType,omitempty"`
 	Rejections        []struct {
 		Reason string `json:"reason"`
 		Type   string `json:"type"`
@@ -162,8 +143,17 @@ func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to import: %w", err)
 	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("manual import: no files found for download %q", downloadID)
+	}
 	var files []ManualImportRequestFile
 	for _, d := range data {
+		if a.Type == Radarr && d.Movie.Id <= 0 {
+			return nil, fmt.Errorf("manual import: no movie matched for %q", d.Path)
+		}
+		if len(d.Quality) == 0 || string(d.Quality) == "null" {
+			return nil, fmt.Errorf("manual import: no quality returned for %q", d.Path)
+		}
 		var episodesIds []int
 		for _, e := range d.Episodes {
 			episodesIds = append(episodesIds, e.Id)
@@ -172,6 +162,7 @@ func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
 			DownloadId:        downloadID,
 			Path:              d.Path,
 			FolderName:        d.FolderName,
+			MovieId:           d.Movie.Id,
 			SeriesId:          d.Series.Id,
 			SeasonNumber:      d.SeasonNumber,
 			EpisodeIds:        episodesIds,
