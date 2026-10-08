@@ -83,12 +83,25 @@ at the start of the file. This fork can go further:
   - **The decode check.** `ffprobe` actually decodes short samples of video at points spread across the file,
     including the end. This finds damage in the middle of a file that the headers say nothing about. It reads
     real data from every file, so it costs time and bandwidth. A file that passes is trusted for 30 days by
-    default, then decoded again.
+    default, then decoded again. The samples are taken at slightly different points each time, so repeated
+    checks do not keep reading the same few seconds. A sample that decodes cleanly but returns video from
+    another part of the file than was asked for leaves the file unverified.
 - Each check has a byte budget, so a repair sweep cannot quietly download a whole remux to test it.
 - An **Unverified** list on the Repair page for files that play but could not be fully checked, with a
   **Replace** button for the ones that were assembled wrongly at import.
 - Multi-volume RAR releases with scrambled file names are ordered by the volume numbers in their own headers,
-  not by the order they were posted in. Files imported before that fix are detected and can be replaced.
+  not by the order they were posted in. This works for password-protected releases with encrypted headers
+  too.
+- Files imported before that fix can have their volumes stored in the wrong order: they play until the first
+  misplaced volume, then jump or stop, and every article still exists. A repair sweep reads the volume
+  headers of each multi-volume RAR file once (one article per volume), remembers the answer, and lists a
+  misordered file as Unverified.
+- A misordered file is put back in order where it is, with nothing downloaded again, when the volumes that
+  move are the same shape and the file's own video timestamps confirm the order (Matroska files stored
+  without compression). With Auto-repair on the repair sweep does this by itself; otherwise **Replace** does.
+  A file that cannot be reordered this way stays on the Unverified list until you replace it, which deletes
+  it and searches again while keeping the release. A copy of the old record is kept in
+  `usenet/volume-order-backup`.
 - Optionally, an article that fails for good during playback starts a repair of that file straight away
   instead of waiting for the next repair sweep (built-in DFS mount only).
 
