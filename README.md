@@ -126,9 +126,13 @@ Around that:
 - The Repair page lists every pre-cached file with how much of it is cached and whether it was clean,
   repaired or still has damage pending. Pre-caching can be paused, for everything or for one file.
 - Pre-caching steps back when someone else's playback is struggling for bandwidth.
+- Only one file is pre-cached at a time, so several viewers do not have their read-aheads competing for the
+  disk. They take turns a chunk at a time, and files being watched go before next episodes.
 - Watched episodes can be dropped from the cache as soon as they are finished.
 - With a Plex URL and token set, it only starts for files Plex reports as playing, so a library scan or
-  thumbnail job does not set it off.
+  thumbnail job does not set it off. The read-ahead for the file you are watching also stops about a minute
+  after Plex no longer lists a session for it (pausing does not stop it), and picks up where it left off if
+  you come back.
 
 ### Usenet providers
 

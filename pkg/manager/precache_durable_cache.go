@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/nntp"
@@ -291,10 +292,37 @@ const durableBurstChunk = 96 << 20
 
 // burstResult is what burstToDurable did.
 type burstResult struct {
-	fetched       int64 // bytes of chunks fetched over NNTP
-	skipped       int64 // bytes of chunks the durable cache already held
-	segmentsTotal int   // segments in the file; 0 when nothing was persisted
+	fetched       int64         // bytes of chunks fetched over NNTP
+	skipped       int64         // bytes of chunks the durable cache already held
+	segmentsTotal int           // segments in the file; 0 when nothing was persisted
+	queued        time.Duration // time spent waiting for a turn behind other bursts
 	persist       persistStats
+}
+
+// burstOpts is how a burst shares the box with other bursts and with the
+// viewer it runs for - see precache_burst_gate.go. The zero value is a burst
+// that runs at once, to the end, with no time limit of its own.
+type burstOpts struct {
+	// turn waits for this burst's turn to fetch and persist one chunk, and
+	// returns the func that gives the turn up. nil: no waiting.
+	turn func(ctx context.Context) (release func(), err error)
+	// keep is asked twice before each chunk is fetched: before waiting for
+	// the turn (holding false), and again with the turn in hand (holding
+	// true), when it must answer at once - every other burst is waiting on
+	// it. An error ends the burst with it. nil: always carry on.
+	keep func(holding bool) error
+	// budget is the time the burst may spend fetching and persisting. Waiting
+	// for a turn is not counted. 0: no limit beyond ctx's.
+	budget time.Duration
+}
+
+// withBudget is ctx limited to o.budget, for a burst with no chunks to take
+// turns over.
+func (o burstOpts) withBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	if o.budget <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, o.budget)
 }
 
 // burstToDurable fetches [from, fileSize) of filename at concurrency and
@@ -305,16 +333,19 @@ type burstResult struct {
 // persistDurableRanges). With no DFS write seam (rclone mode, no mount) it
 // is the plain read-ahead it replaced.
 //
-// Returns the first ctx error; chunks persisted before it stay durable. A
-// dead article is not an error here, as with ReadAhead.
-func (p *Precache) burstToDurable(ctx context.Context, entry *storage.Entry, filename string, from, fileSize int64, concurrency int) (burstResult, error) {
+// Returns the first ctx error, or what opts.keep ended the burst with; chunks
+// persisted before it stay durable. A dead article is not an error here, as
+// with ReadAhead.
+func (p *Precache) burstToDurable(ctx context.Context, entry *storage.Entry, filename string, from, fileSize int64, concurrency int, opts burstOpts) (burstResult, error) {
 	writer := p.cacheWriter()
 	if writer == nil {
+		ctx, cancel := opts.withBudget(ctx)
+		defer cancel()
 		return burstResult{fetched: max(fileSize-from, 0)},
 			p.manager.usenet.ReadAhead(ctx, entry.InfoHash, filename, from, concurrency)
 	}
 	return burstChunks(ctx, p.manager.usenet, writer, p.cachePresence(), entry.Name, entry.InfoHash, filename,
-		from, fileSize, concurrency, durableBurstChunk, p.logger)
+		from, fileSize, concurrency, durableBurstChunk, p.logger, opts)
 }
 
 // burstSource is what burstChunks needs from *usenet.Usenet.
@@ -324,9 +355,13 @@ type burstSource interface {
 	ReadAheadRange(ctx context.Context, nzoID, filename string, off, length int64, concurrency int) error
 }
 
+// burstQueuedLogAfter is how long a burst must wait for its turn before the
+// wait is logged.
+const burstQueuedLogAfter = 5 * time.Second
+
 // burstChunks is burstToDurable with its seams and chunk size passed in, so
 // it can be tested without a usenet client or DFS mount.
-func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWriter, have dfsCacheRangePresence, entryName, infoHash, filename string, from, fileSize int64, concurrency int, chunk int64, log zerolog.Logger) (burstResult, error) {
+func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWriter, have dfsCacheRangePresence, entryName, infoHash, filename string, from, fileSize int64, concurrency int, chunk int64, log zerolog.Logger, opts burstOpts) (burstResult, error) {
 	var res burstResult
 	from = max(from, 0)
 	var file *storage.NZBFile
@@ -335,19 +370,64 @@ func burstChunks(ctx context.Context, src burstSource, writer dfsCacheRangeWrite
 	}
 	if file == nil {
 		res.fetched = max(fileSize-from, 0)
+		ctx, cancel := opts.withBudget(ctx)
+		defer cancel()
 		return res, src.ReadAhead(ctx, infoHash, filename, from, concurrency)
 	}
 	res.segmentsTotal = len(file.Segments)
 
+	var active time.Duration // spent fetching and persisting, against opts.budget
+	queuedLogged := false
 	for off := from; off < fileSize; off += chunk {
 		n := min(chunk, fileSize-off)
 		if have != nil && have.HasCachedRange(entryName, filename, off, n) {
 			res.skipped += n
 			continue
 		}
-		err := src.ReadAheadRange(ctx, infoHash, filename, off, n, concurrency)
-		res.fetched += n
-		res.persist.add(persistSegments(ctx, src, writer, have, entryName, infoHash, filename, file, fileSize, off, off+n, log))
+		err := func() error {
+			if opts.keep != nil {
+				if err := opts.keep(false); err != nil {
+					return err
+				}
+			}
+			if opts.turn != nil {
+				waitStart := time.Now()
+				release, err := opts.turn(ctx)
+				waited := time.Since(waitStart)
+				res.queued += waited
+				if err != nil {
+					return err
+				}
+				defer release()
+				if waited >= burstQueuedLogAfter && !queuedLogged {
+					queuedLogged = true
+					log.Debug().Str("entry", entryName).Str("file", filename).Int64("offset", off).Dur("waited", waited).
+						Msg("pre-cache burst waited its turn: bursts run one at a time")
+				}
+			}
+			// Asked again with the turn in hand, so a burst whose viewer left
+			// while it queued gives the turn straight back.
+			if opts.keep != nil {
+				if err := opts.keep(true); err != nil {
+					return err
+				}
+			}
+			chunkCtx := ctx
+			if opts.budget > 0 {
+				if active >= opts.budget {
+					return context.DeadlineExceeded
+				}
+				var cancel context.CancelFunc
+				chunkCtx, cancel = context.WithTimeout(ctx, opts.budget-active)
+				defer cancel()
+			}
+			start := time.Now()
+			err := src.ReadAheadRange(chunkCtx, infoHash, filename, off, n, concurrency)
+			res.fetched += n
+			res.persist.add(persistSegments(chunkCtx, src, writer, have, entryName, infoHash, filename, file, fileSize, off, off+n, log))
+			active += time.Since(start)
+			return err
+		}()
 		if err != nil {
 			return res, err
 		}

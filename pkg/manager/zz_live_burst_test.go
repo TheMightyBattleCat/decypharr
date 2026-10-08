@@ -148,7 +148,7 @@ func TestLiveBurst(t *testing.T) {
 		var resA burstResult
 		run("A chunked 1-3 GB", func() error {
 			var err error
-			resA, err = burstChunks(context.Background(), u, storeA, storeA, "live", id, file.Name, 1*GB, 3*GB, 12, durableBurstChunk, log)
+			resA, err = burstChunks(context.Background(), u, storeA, storeA, "live", id, file.Name, 1*GB, 3*GB, 12, durableBurstChunk, log, burstOpts{})
 			return err
 		}, 2*GB)
 		t.Logf("A result: fetched %d skipped %d persist %+v", resA.fetched, resA.skipped, resA.persist)
@@ -169,7 +169,7 @@ func TestLiveBurst(t *testing.T) {
 		cOff, cLen := int64(20*GB), int64(300<<20)
 		storeC := &fileStore{f: out}
 		run("C chunked 300 MB inside live-cached region", func() error {
-			_, err := burstChunks(context.Background(), u, storeC, storeC, "live", id, file.Name, cOff, cOff+cLen, 12, durableBurstChunk, log)
+			_, err := burstChunks(context.Background(), u, storeC, storeC, "live", id, file.Name, cOff, cOff+cLen, 12, durableBurstChunk, log, burstOpts{})
 			return err
 		}, cLen)
 		live, err := os.Open(dp)

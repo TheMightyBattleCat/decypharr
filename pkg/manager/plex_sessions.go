@@ -122,6 +122,10 @@ type plexSessionFile struct {
 	path       string
 	viewOffset int64
 	duration   int64
+	// idle is a session Plex lists but is not playing: paused or buffering.
+	// It never opens the precache gate, but it does keep a read-ahead that
+	// is already running (see watchState).
+	idle bool
 }
 
 // sessionProgress is a session's live playback position (milliseconds), as
@@ -146,6 +150,7 @@ type plexSessionChecker struct {
 	lastSuccess time.Time                  // last time a poll succeeded; zero if it never has
 	degraded    bool                       // true once a failed poll has exceeded the grace window; isPlexWatching denies everything while degraded
 	resolved    map[string]sessionProgress // resolved absolute file path -> playback progress of files in active sessions, from the last successful poll
+	listed      map[string]struct{}        // resolved path of every file in a session, paused and buffering ones included, from the last successful poll
 
 	lastWarnMu sync.Mutex
 	lastWarn   time.Time
@@ -182,6 +187,41 @@ func (c *plexSessionChecker) isPlexWatching(entry *storage.Entry, filename strin
 	_, ok := c.resolved[expected]
 	return ok
 }
+
+// watchState says whether any Plex session has the file, with "don't know"
+// kept apart from "no": a read-ahead already running is stopped only on a
+// plain "no" (see viewerWatch), where a new one is refused on either. Unlike
+// isPlexWatching it counts a paused or buffering session, so pausing does
+// not stop a read-ahead.
+//
+// refresh false answers from the session list as it stands, without asking
+// Plex - for a caller that must not wait on Plex. A list too old to trust
+// (plexWatchStaleAfter refreshes) is then "don't know".
+func (c *plexSessionChecker) watchState(entry *storage.Entry, filename string, refresh bool) plexWatch {
+	cfg := config.Get().Plex
+	if !cfg.Enabled() {
+		return plexWatchUnknown
+	}
+	if refresh {
+		c.refresh(cfg)
+	}
+
+	expected := filepath.Join(c.manager.GetTorrentMountPath(entry), filename)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.degraded || c.lastSuccess.IsZero() || time.Since(c.lastSuccess) > plexWatchStaleAfter*cfg.SessionTTL() {
+		return plexWatchUnknown
+	}
+	if _, ok := c.listed[expected]; ok {
+		return plexWatchPlaying
+	}
+	return plexWatchAbsent
+}
+
+// plexWatchStaleAfter is how many session-list refresh intervals old the
+// list may be before watchState stops trusting it.
+const plexWatchStaleAfter = 3
 
 // sessionProgress returns a snapshot of every active session's resolved path
 // and playback progress, from the last successful poll. Returns a copy so
@@ -239,11 +279,16 @@ func (c *plexSessionChecker) refresh(cfg config.PlexConfig) {
 	}
 
 	resolved := resolvePlexSessionPaths(files)
+	listed := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		listed[resolvePlexSessionPath(f.path)] = struct{}{}
+	}
 	c.mu.Lock()
 	c.fetched = now
 	c.lastSuccess = now
 	c.degraded = false
 	c.resolved = resolved
+	c.listed = listed
 	c.mu.Unlock()
 }
 
@@ -295,10 +340,10 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSession
 		// Only a genuinely-playing session should open the precache gate. Plex
 		// also lists paused/buffering sessions and, during a library scan, items
 		// being analysed - none of which are real playback, and all of which
-		// would otherwise trigger read-ahead on a scan/metadata read.
-		if meta.Player.State != "playing" {
-			continue
-		}
+		// would otherwise trigger read-ahead on a scan/metadata read. They are
+		// kept, marked idle, so a viewer who pauses does not lose a read-ahead
+		// that is already running.
+		idle := meta.Player.State != "playing"
 		// An unparseable value already decoded to 0 in flexInt64.UnmarshalJSON -
 		// checkSessionProgress's duration<=0 guard skips it rather than
 		// treating it as 0% watched.
@@ -309,7 +354,7 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSession
 		for _, media := range meta.Media {
 			for _, part := range media.Part {
 				if part.File != "" {
-					files = append(files, plexSessionFile{path: part.File, viewOffset: viewOffset, duration: duration})
+					files = append(files, plexSessionFile{path: part.File, viewOffset: viewOffset, duration: duration, idle: idle})
 				}
 			}
 		}
@@ -324,7 +369,7 @@ func (c *plexSessionChecker) fetchSessions(cfg config.PlexConfig) ([]plexSession
 					for _, part := range media.Media {
 						for _, p := range part.Part {
 							if p.File != "" {
-								files = append(files, plexSessionFile{path: p.File, viewOffset: viewOffset, duration: duration})
+								files = append(files, plexSessionFile{path: p.File, viewOffset: viewOffset, duration: duration, idle: idle})
 							}
 						}
 					}
@@ -351,16 +396,25 @@ func TestPlexConnection(cfg config.PlexConfig) error {
 // (the DownloadActionSymlink setup collectArrFiles/the repair sweep already
 // trust), falling back to the raw path itself when it isn't a symlink
 // (Plex mounted directly on the DFS/rclone mount, no symlink layer).
+// Idle (paused or buffering) sessions are left out: this is the set that
+// opens the precache gate and drives the progress trigger.
 func resolvePlexSessionPaths(files []plexSessionFile) map[string]sessionProgress {
 	resolved := make(map[string]sessionProgress, len(files))
 	for _, f := range files {
-		target := readSymlinkTarget(f.path)
-		if target == "" {
-			target = filepath.Clean(f.path)
+		if f.idle {
+			continue
 		}
-		resolved[target] = sessionProgress{viewOffset: f.viewOffset, duration: f.duration}
+		resolved[resolvePlexSessionPath(f.path)] = sessionProgress{viewOffset: f.viewOffset, duration: f.duration}
 	}
 	return resolved
+}
+
+// resolvePlexSessionPath is one path's resolution for resolvePlexSessionPaths.
+func resolvePlexSessionPath(path string) string {
+	if target := readSymlinkTarget(path); target != "" {
+		return target
+	}
+	return filepath.Clean(path)
 }
 
 // warnDebounced logs a Plex-unreachable warning at most once per

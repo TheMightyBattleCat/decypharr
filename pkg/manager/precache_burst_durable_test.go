@@ -161,7 +161,7 @@ func TestBurstChunksPersistWithoutRefetch(t *testing.T) {
 	store := newDurableStore()
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
-		0, size, 4, burstChunk, zerolog.Nop())
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestBurstChunksSkipDurableChunks(t *testing.T) {
 	store.seed(200, 400) // segments 2-5; covers the chunk [250, 500)
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
-		0, size, 4, burstChunk, zerolog.Nop())
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestBurstChunksStraddlingSegmentAfterSkippedChunk(t *testing.T) {
 	store.seed(0, burstChunk) // segments 0, 1 and the head of 2 [200, 300)
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
-		0, size, 4, burstChunk, zerolog.Nop())
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestBurstChunksPendingRepairNotPersisted(t *testing.T) {
 	store := newDurableStore()
 
 	res, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
-		0, size, 4, burstChunk, zerolog.Nop())
+		0, size, 4, burstChunk, zerolog.Nop(), burstOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestBurstChunksFromMidSegment(t *testing.T) {
 
 	from := int64(2*burstSegSize + 50)
 	if _, err := burstChunks(context.Background(), src, store, store, "Entry", "hash", filename,
-		from, size, 4, burstChunk, zerolog.Nop()); err != nil {
+		from, size, 4, burstChunk, zerolog.Nop(), burstOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	for seg := range 2 {

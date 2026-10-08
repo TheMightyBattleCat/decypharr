@@ -102,9 +102,7 @@ func (p *Precache) rewarmDue() {
 		p.logger.Info().Str("series", t.ref.seriesName).Int("season", t.ref.seasonNumber).
 			Int("episode", t.ref.episodeNumber).Str("entry", entry.Name).
 			Msg("next-episode pre-cache: re-grabbed episode imported; warming its replacement")
-		epCtx, cancel := context.WithTimeout(base, precacheNextEpisodeTimeout)
-		step := p.burstEpisode(epCtx, t.ref, next)
-		cancel()
+		step := p.burstEpisode(base, t.ref, next) // limits the burst itself
 		if step == stepDeferred {
 			continue // budget or bandwidth said not now; try again next tick
 		}

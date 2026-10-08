@@ -289,15 +289,16 @@ func (p *Precache) precacheForwardWalk(ident walkIdentity, key string, w *forwar
 			return
 		}
 
-		epCtx, cancel := context.WithTimeout(base, precacheNextEpisodeTimeout)
-		step := p.precacheEpisodeFile(epCtx, walkIdentity{
+		// base, not a deadline: precacheEpisodeFile limits the burst itself
+		// (precacheNextEpisodeTimeout), so that waiting for a turn behind
+		// other bursts does not use the time up.
+		step := p.precacheEpisodeFile(base, walkIdentity{
 			arr:           a,
 			seriesName:    ident.seriesName,
 			seriesId:      seriesId,
 			seasonNumber:  seasonNumber,
 			episodeNumber: next.EpisodeNumber,
 		}, next)
-		cancel()
 		switch step {
 		case stepBurst:
 			burstsRun++
@@ -454,7 +455,10 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, ref walkIdentity, ne
 		// the whole episode first and persisting after meant reading it back
 		// through a 256 MB scratch cache, which re-downloaded all but its last
 		// few hundred MB.
-		res, burstErr := p.burstToDurable(burstCtx, nextEntry, filename, 0, next.Size, concurrency)
+		res, burstErr := p.burstToDurable(burstCtx, nextEntry, filename, 0, next.Size, concurrency, burstOpts{
+			turn:   p.bursts.turn(burstAhead),
+			budget: precacheNextEpisodeTimeout,
+		})
 		if burstErr != nil {
 			p.logger.Debug().Err(burstErr).Str("entry", nextEntry.Name).Str("file", filename).Msg("next-episode burst-download ended early")
 		}
@@ -462,7 +466,7 @@ func (p *Precache) precacheEpisodeFile(ctx context.Context, ref walkIdentity, ne
 			res.persist.log(p.logger, nextEntry.Name, filename, res.segmentsTotal, "durable persist complete")
 		}
 		p.logger.Debug().Str("entry", nextEntry.Name).Str("file", filename).
-			Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
+			Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).Dur("queued", res.queued).
 			Msg("next-episode burst-download finished")
 	}
 

@@ -14,6 +14,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -170,6 +171,10 @@ type Precache struct {
 
 	// playedBurst is playedBurstFile, replaceable in tests.
 	playedBurst func(entry *storage.Entry, filename string, from int64)
+
+	// bursts lets one burst fetch and persist at a time - see
+	// precache_burst_gate.go.
+	bursts burstGate
 
 	// ctx/cancel/wg govern progressTriggerLoop, the Plex playback-progress
 	// poll loop, and rewarmLoop - see Start/Stop.
@@ -570,7 +575,9 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 
 	concurrency := p.cfg().ReadAheadConcurrency()
 
-	ctx, cancel := context.WithTimeout(context.Background(), readAheadTimeout(size-from))
+	// The burst's time limit is its budget below, not a deadline on ctx:
+	// time spent waiting for a turn behind other bursts must not use it up.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Same gate as the next-episode burst: the point of the read-ahead is to
@@ -607,19 +614,38 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 		// dead article left failed instead of padded would fail the viewer's
 		// read. A padded segment is held for repair in the overlay, and
 		// persisting skips those, so no fill bytes become durable.
-		res, err := p.burstToDurable(ctx, entry, filename, from, size, concurrency)
-		if err != nil {
+		res, err := p.burstToDurable(ctx, entry, filename, from, size, concurrency, burstOpts{
+			turn:   p.bursts.turn(burstPlaying),
+			keep:   p.stillWatched(entry, filename),
+			budget: readAheadTimeout(size - from),
+		})
+		left := errors.Is(err, errViewerLeft)
+		switch {
+		case left:
+			// Forget the trigger, so the viewer coming back starts a burst
+			// again; it skips what this one already made durable.
+			p.untrigger(key)
+			p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
+				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).Dur("queued", res.queued).
+				Msg("read-ahead stopped: nobody is watching this file any more")
+		case err != nil:
 			p.logger.Debug().Err(err).Str("entry", entry.Name).Str("file", filename).Msg("read-ahead precache ended early")
 			p.logger.Warn().Str("entry", entry.Name).Str("file", filename).Int64("from", from).Err(err).
-				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
+				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).Dur("queued", res.queued).
 				Msg("read-ahead incomplete")
-		} else {
+		default:
 			p.logger.Info().Str("entry", entry.Name).Str("file", filename).Int64("from", from).
-				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).
+				Int64("fetchedBytes", res.fetched).Int64("skippedBytes", res.skipped).Dur("queued", res.queued).
 				Msg("read-ahead complete")
 		}
 		if res.segmentsTotal > 0 {
 			res.persist.log(p.logger, entry.Name, filename, res.segmentsTotal, "read-ahead: durable persist complete")
+		}
+		if left {
+			// No urgent repair and no walk to the next episode for a viewer
+			// who has gone: both start again with the read-ahead if they
+			// come back.
+			return
 		}
 	}
 
@@ -628,6 +654,23 @@ func (p *Precache) readAhead(entry *storage.Entry, filename string, from, size i
 	// unmarkInflight would otherwise keep the playing file "in flight" (and
 	// out of PurgeIncomplete's reach) for all of it.
 	go p.maybePrecacheNextEpisodes(entry, filename)
+}
+
+// stillWatched returns the check a read-ahead makes before each chunk (see
+// burstOpts.keep): it fails with errViewerLeft once Plex has shown no
+// session for the file for viewerLeftGrace. Plex is asked only before the
+// burst waits for its turn; with the turn in hand the session list is read
+// as it stands. Without the Plex gate, or while Plex is unreachable, it
+// never fails - there is no telling whether anyone is watching.
+func (p *Precache) stillWatched(entry *storage.Entry, filename string) func(holding bool) error {
+	watch := &viewerWatch{}
+	return func(holding bool) error {
+		watch.grace = viewerLeftGrace(config.Get().Plex)
+		if watch.left(p.plexChecker.watchState(entry, filename, !holding), time.Now()) {
+			return errViewerLeft
+		}
+		return nil
+	}
 }
 
 // playedBurstFile is what playing a file a burst already cached does instead
