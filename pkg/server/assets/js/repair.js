@@ -1976,6 +1976,7 @@ class RepairManager {
     overlayPhaseLabel(phase) {
         const labels = {
             queued: 'Queued',
+            probing: 'Checking articles',
             fetching_recovery: 'Fetching recovery vols',
             streaming_intact: 'Streaming intact slices',
             solving: 'Solving',
@@ -1987,7 +1988,8 @@ class RepairManager {
     }
 
     // renderOverlayProgressBody renders the live-progress body for one job:
-    // phase, slices-read/total, recovery-vols fetched/needed, bytes (cache
+    // phase, articles checked/total, slices-read/total, recovery slices
+    // fetched and needed, bytes (cache
     // vs usenet split once either is nonzero), and elapsed time. p === null
     // is the initial "waiting for progress" placeholder shown before the
     // first poll response lands.
@@ -1997,11 +1999,19 @@ class RepairManager {
         }
         const intactTotal = p.intact_slices_total || 0;
         const intactRead = p.intact_slices_read || 0;
-        const volsNeeded = p.recovery_slices_needed || 0;
-        const volsFetched = p.recovery_slices_fetched || 0;
+        const slicesNeeded = p.recovery_slices_needed || 0;
+        const slicesFetched = p.recovery_slices_fetched || 0;
+        const statTotal = p.stat_total || 0;
+        const statProbed = Math.min(p.stat_probed || 0, statTotal);
+        // The bar follows the step that is running. While articles are
+        // being checked it shows that count, never the recovery fetch that
+        // finished before it: more slices are fetched than needed, which
+        // pinned the bar at 100% for the whole check.
         let pct = null;
-        if (intactTotal > 0) pct = Math.min(100, Math.round((intactRead / intactTotal) * 100));
-        else if (volsNeeded > 0) pct = Math.min(100, Math.round((volsFetched / volsNeeded) * 100));
+        if (p.phase === 'probing') {
+            if (statTotal > 0) pct = Math.round((statProbed / statTotal) * 100);
+        } else if (intactTotal > 0) pct = Math.min(100, Math.round((intactRead / intactTotal) * 100));
+        else if (slicesNeeded > 0) pct = Math.min(100, Math.round((slicesFetched / slicesNeeded) * 100));
 
         const elapsed = p.started_at ? this.formatDuration(Date.now() - new Date(p.started_at).getTime()) : '-';
         const totalBytes = (p.cache_bytes || 0) + (p.usenet_bytes || 0);
@@ -2017,7 +2027,8 @@ class RepairManager {
                 </div>
                 <progress class="progress progress-info w-28 h-1.5" ${pct === null ? '' : `value="${pct}"`} max="100"></progress>
                 ${intactTotal ? `<div class="opacity-70">slices ${intactRead}/${intactTotal}</div>` : ''}
-                ${volsNeeded ? `<div class="opacity-70">recovery vols ${volsFetched}/${volsNeeded}</div>` : ''}
+                ${statTotal ? `<div class="opacity-70">articles checked ${statProbed}/${statTotal}</div>` : ''}
+                ${slicesNeeded ? `<div class="opacity-70">recovery slices ${slicesFetched} fetched, ${slicesNeeded} needed</div>` : ''}
                 ${splitLine}
                 ${p.last_error ? `<div class="text-error/90">${this.escape(p.last_error)}</div>` : ''}
             </div>`;

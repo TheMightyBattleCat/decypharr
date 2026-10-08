@@ -2218,7 +2218,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			statControls = append(statControls, d.MessageID)
 		}
 	}
-	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName)
+	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName, progress)
 	statCancel2()
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
@@ -2257,6 +2257,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		statMissingSet[mid] = struct{}{}
 	}
 	progress.SetPhase(Par2PhaseProbing)
+	progress.SetStatTotal(0) // the article count above is finished; this step has none
 	deadRefs, err = p.healFetchableDeadSegments(ctx, nzbID, entryName, nzb, idx, fetchers, deadRefs, statMissingSet)
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
@@ -3372,6 +3373,10 @@ func statRecoveryVolumes(
 // a lower bound. An individual ambiguous per-article error is simply not
 // reported as missing - that segment is left for the round loop, same as any
 // transient miss.
+//
+// progress (nil for none) is told how many articles there are and how many
+// have been checked, so the Repair page can show the sweep moving. The
+// control probe is not counted.
 func statPostedFileDamage(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -3380,6 +3385,7 @@ func statPostedFileDamage(
 	par2Source []storage.PostedFileRef,
 	controls []string,
 	entryName string,
+	progress *par2JobProgressState,
 ) (missing []string, completed bool) {
 	// Calibrate first. Providers answer STAT 223 for articles whose body is
 	// gone everywhere - eweka did so for all 15 dead articles of Game of
@@ -3421,7 +3427,8 @@ func statPostedFileDamage(
 	}
 
 	start := time.Now()
-	results, err := stat(ctx, msgIDs)
+	progress.SetStatTotal(len(msgIDs))
+	results, err := stat(nntp.WithStatProgress(ctx, progress.AddStatProbed), msgIDs)
 	if err != nil {
 		logger.Warn().Err(err).Str("entry", entryName).
 			Msg("par2: posted-file STAT damage sweep failed; damage will be found per-round instead")

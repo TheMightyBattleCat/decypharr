@@ -1581,6 +1581,28 @@ func (c *Client) BatchStatComplete(ctx context.Context, messageIDs []string) (*B
 	return c.batchStat(ctx, messageIDs, true)
 }
 
+// statProgressKey carries a WithStatProgress callback on a context.
+type statProgressKey struct{}
+
+// WithStatProgress returns a context that makes a BatchStat or
+// BatchStatComplete call report its progress: fn is called with the number
+// of message IDs each finished chunk checked. A chunk that failed as a whole
+// is not reported, so the total may fall short of the IDs asked about. fn is
+// called from the pool's workers, several at once, and must not block.
+func WithStatProgress(ctx context.Context, fn func(checked int)) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, statProgressKey{}, fn)
+}
+
+// ReportStatProgress calls the WithStatProgress callback on ctx, if any.
+func ReportStatProgress(ctx context.Context, checked int) {
+	if fn, ok := ctx.Value(statProgressKey{}).(func(int)); ok && checked > 0 {
+		fn(checked)
+	}
+}
+
 // batchStat is the shared implementation behind BatchStat and
 // BatchStatComplete - see those for what exhaustive changes.
 func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive bool) (*BatchStatResult, error) {
@@ -1669,6 +1691,7 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 			for i := range results {
 				allResults[ch.startIdx+i] = results[i]
 			}
+			ReportStatProgress(ctx, len(results))
 			// Bail out the rest of the sample as soon as one segment is
 			// definitively missing — not-found on every provider, so the
 			// terminal classification carries an ArticleNotFound error.

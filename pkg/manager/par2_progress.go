@@ -43,6 +43,11 @@ type Par2JobProgress struct {
 	IntactSlicesRead  int `json:"intact_slices_read"`
 	IntactSlicesTotal int `json:"intact_slices_total"`
 
+	// Articles checked so far, and how many there are to check, in the STAT
+	// damage check that runs in Par2PhaseProbing. Both 0 until it starts.
+	StatProbed int `json:"stat_probed"`
+	StatTotal  int `json:"stat_total"`
+
 	CacheBytes  int64 `json:"cache_bytes"`
 	UsenetBytes int64 `json:"usenet_bytes"`
 
@@ -66,6 +71,8 @@ type par2JobProgressState struct {
 	recoverySlicesNeeded  atomic.Int64
 	intactSlicesRead      atomic.Int64
 	intactSlicesTotal     atomic.Int64
+	statProbed            atomic.Int64
+	statTotal             atomic.Int64
 	cacheBytes            atomic.Int64
 	usenetBytes           atomic.Int64
 
@@ -187,6 +194,24 @@ func (s *par2JobProgressState) AddIntactRead(n int) {
 	s.touch()
 }
 
+// SetStatTotal starts the count for a STAT damage check of n articles.
+func (s *par2JobProgressState) SetStatTotal(n int) {
+	if s == nil {
+		return
+	}
+	s.statProbed.Store(0)
+	s.statTotal.Store(int64(n))
+	s.touch()
+}
+
+func (s *par2JobProgressState) AddStatProbed(n int) {
+	if s == nil || n == 0 {
+		return
+	}
+	s.statProbed.Add(int64(n))
+	s.touch()
+}
+
 func (s *par2JobProgressState) AddCacheBytes(n int64) {
 	if s == nil || n == 0 {
 		return
@@ -226,6 +251,9 @@ func (s *par2JobProgressState) Snapshot() Par2JobProgress {
 
 		IntactSlicesRead:  int(s.intactSlicesRead.Load()),
 		IntactSlicesTotal: int(s.intactSlicesTotal.Load()),
+
+		StatProbed: int(s.statProbed.Load()),
+		StatTotal:  int(s.statTotal.Load()),
 
 		CacheBytes:  s.cacheBytes.Load(),
 		UsenetBytes: s.usenetBytes.Load(),

@@ -2,6 +2,7 @@ package nntp
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -336,5 +337,26 @@ func TestStatProbeSkipped(t *testing.T) {
 	c.statProbe(ctx, file, c.newStatHint())()
 	if got := absent.stats.Load(); got != 0 {
 		t.Errorf("probed with one fast provider (%d STATs)", got)
+	}
+}
+
+// A caller that asks for progress is told about every article the call
+// checked, and the verdicts are the same as without it.
+func TestBatchStatReportsProgress(t *testing.T) {
+	file := ids("file", 200)
+	c, _, holder, _, _ := probeProviders(t, 10*time.Millisecond, 0, file)
+	holder.missing["file-150@test"] = true
+
+	var checked atomic.Int64
+	ctx := WithStatProgress(context.Background(), func(n int) { checked.Add(int64(n)) })
+	res, err := c.BatchStatComplete(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := checked.Load(); got != int64(len(file)) {
+		t.Fatalf("progress reported %d articles, want %d", got, len(file))
+	}
+	if res.FoundCount != len(file)-1 || res.ErrorCount != 0 {
+		t.Fatalf("found %d, errors %d; want %d found and no errors", res.FoundCount, res.ErrorCount, len(file)-1)
 	}
 }
