@@ -109,7 +109,7 @@ func TestLivePar2DryRun(t *testing.T) {
 		var slicesRepaired, deadDiscovered int
 		progress := newPar2JobProgressState(id, nzb.Name)
 		start := time.Now()
-		err = p.runRepair(ctx, id, nzb.Name, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadDiscovered, progress)
+		err = p.runRepair(ctx, id, nzb.Name, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadDiscovered, progress, nil)
 		cancel()
 		class := par2OutcomeClass(err, 1)
 		fmt.Printf("RESULT %s err=%v terminal=%v suspect=%v read=%d slices_repaired=%d dead_discovered=%d took=%s\n",

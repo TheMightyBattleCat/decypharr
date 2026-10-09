@@ -1408,7 +1408,8 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
 	var slicesRepaired int
 	var deadSlicesDiscovered int // distinct dead slices the repair engine found across all rounds, beyond what the overlay already recorded
-	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress); err != nil {
+	tally := &par2PassTally{recorded: deadSegments}
+	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress, tally); err != nil {
 		if job.preempted.Load() {
 			preempted = true
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
@@ -1420,6 +1421,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
 			Str("class", class.name()).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
+			Func(tally.logFields).
 			Msg("par2 repair unavailable")
 		progress.SetPhase(Par2PhaseFailed)
 		progress.SetLastError(err.Error())
@@ -1475,7 +1477,8 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	p.logger.Info().
 		Str("entry", entryName).
 		Str("lane", lane.String()).
-		Int("segments_patched", deadSegments).
+		Func(tally.logFields).
+		Int("slices_rebuilt", slicesRepaired).
 		Dur("duration", time.Since(start)).
 		Int64("cache_bytes", cacheBytes).
 		Int64("usenet_bytes", readBytes).
@@ -1490,11 +1493,79 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		Outcome:         storage.Par2RepairOutcomeCompleted,
 		ReadBytes:       readBytes,
 		SlicesRepaired:  slicesRepaired,
-		SegmentsPatched: deadSegments,
+		SegmentsPatched: tally.patched(),
 	})
 	p.recordPar2Outcome(nzbID, nil, 0)
 	p.unfailRepaired(nzbID, entryName)
-	p.notifyCompleted(entryName, deadSegments, time.Since(start))
+	p.notifyCompleted(entryName, tally.patched(), time.Since(start))
+}
+
+// par2PassTally is what one pass actually wrote, by how it got the bytes. The
+// completion line used to report the number of segments the overlay had
+// recorded when the pass started as "patched": a pass that began with one
+// recorded segment and rebuilt dozens more it found itself said 1, and so
+// did the attempt history and the notification. A nil tally counts nothing.
+type par2PassTally struct {
+	recorded          int    // dead segments the overlay had recorded when the pass started
+	patchedRecorded   int    // of those, written from rebuilt slices
+	healed            int    // of those, fetched intact after all and written without parity
+	patchedDiscovered int    // found dead by the pass itself, recorded and written
+	rounds            int    // full reads of the release the solve needed
+	statSweep         string // how the up-front damage check ended
+}
+
+func (t *par2PassTally) addPatchedRecorded(n int) {
+	if t != nil {
+		t.patchedRecorded += n
+	}
+}
+
+func (t *par2PassTally) addHealed(n int) {
+	if t != nil {
+		t.healed += n
+	}
+}
+
+func (t *par2PassTally) addPatchedDiscovered(n int) {
+	if t != nil {
+		t.patchedDiscovered += n
+	}
+}
+
+func (t *par2PassTally) setRounds(n int) {
+	if t != nil {
+		t.rounds = n
+	}
+}
+
+func (t *par2PassTally) setStatSweep(state string) {
+	if t != nil {
+		t.statSweep = state
+	}
+}
+
+// patched is every segment the pass wrote, whichever way.
+func (t *par2PassTally) patched() int {
+	if t == nil {
+		return 0
+	}
+	return t.patchedRecorded + t.healed + t.patchedDiscovered
+}
+
+// logFields adds the tally to a log line: the total first, then its parts.
+func (t *par2PassTally) logFields(e *zerolog.Event) {
+	if t == nil {
+		return
+	}
+	e.Int("segments_patched", t.patched()).
+		Int("segments_recorded", t.recorded).
+		Int("patched_recorded", t.patchedRecorded).
+		Int("healed", t.healed).
+		Int("patched_discovered", t.patchedDiscovered).
+		Int("rounds", t.rounds)
+	if t.statSweep != "" {
+		e.Str("stat_sweep", t.statSweep)
+	}
 }
 
 // unfailRepaired clears the Failed verdict of nzbID's files the pass left
@@ -1820,7 +1891,7 @@ func earlyDamagedSliceCheck(
 // runRepair does the actual work; every error return means "PAR2 couldn't
 // handle this," triggering the legacy fallback in the caller. It never
 // returns a nil error after only partially patching pending's segments.
-func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, deadDiscovered *int, progress *par2JobProgressState) (retErr error) {
+func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pending map[string][]overlay.DeadSegment, readBytes, cacheBytes *int64, slicesRepaired *int, deadDiscovered *int, progress *par2JobProgressState, tally *par2PassTally) (retErr error) {
 	u := p.manager.usenet
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 
@@ -2012,7 +2083,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		available = uint32(len(earlyIdx.Recovery))
 	}
 	if available == 0 {
-		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
+		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource, tally,
 			par2FetchShortfall("no PAR2 recovery volumes retained", int(transportFails.Load())))
 	}
 	if earlyIdx != nil {
@@ -2025,7 +2096,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 					Uint32("available", available).
 					Str("entry", entryName).
 					Msg("par2: repair provably unavailable before recovery fetch (early arithmetic check)")
-				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource,
+				return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource, tally,
 					errMoreDamageThanRecorded(earlyK, available, earlyIdx.SliceSize))
 			}
 			// Wait here, before the recovery fetch, so a queued large repair
@@ -2084,7 +2155,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
 			Msg("par2: no recovery slices fetched, skipping file matching")
-		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource,
+		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource, tally,
 			recoveryShortfall(deadCount, 0))
 	}
 
@@ -2220,6 +2291,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName, progress)
 	statCancel2()
+	if statSwept {
+		tally.setStatSweep("complete")
+	} else {
+		tally.setStatSweep("incomplete")
+	}
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
 
@@ -2258,12 +2334,14 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	progress.SetPhase(Par2PhaseProbing)
 	progress.SetStatTotal(0) // the article count above is finished; this step has none
+	recordedRefs := len(deadRefs)
 	deadRefs, err = p.healFetchableDeadSegments(ctx, nzbID, entryName, nzb, idx, fetchers, deadRefs, statMissingSet)
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
 	if err != nil {
 		return err
 	}
+	tally.addHealed(recordedRefs - len(deadRefs))
 	if len(deadRefs) == 0 {
 		return nil // every dead segment healed; the heal invalidated them
 	}
@@ -2371,6 +2449,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	var repaired []par2.RepairedSlice
 	var damagedPos map[int64]struct{}
 	for round := 0; ; round++ {
+		tally.setRounds(round + 1)
 		k := len(damaged)
 		if k == 0 {
 			return fmt.Errorf("no damaged slices resolved (nothing to repair)")
@@ -2607,6 +2686,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// and a manual "repair now" (RunNow runs this exact same path).
 		u.ClearFailedFile(nzbID, dr.file)
 		written = append(written, dr)
+		tally.addPatchedRecorded(1)
 	}
 
 	// Articles this pass itself found gone or corrupt everywhere: their
@@ -2639,6 +2719,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		written = append(written, dr)
 		patchedDiscovered++
 	}
+	tally.addPatchedDiscovered(patchedDiscovered)
 	if patchedDiscovered > 0 {
 		p.logger.Info().Str("entry", entryName).Int("articles", patchedDiscovered).
 			Msg("par2 repair: also patched articles the pass found missing or corrupt on every provider")
@@ -2832,8 +2913,9 @@ var errHealNoTieBreak = errors.New("par2 heal: length tie not broken without rec
 //   - some healed: a transient error, so the next attempt re-evaluates the
 //     smaller damage against the same recovery data;
 //   - none healed: gateErr, unchanged.
-func (p *Par2Repair) healBeforeRecoveryGate(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, pending map[string][]overlay.DeadSegment, fetch postedFetchFunc, cacheSource *cacheSlicedSource, gateErr error) error {
+func (p *Par2Repair) healBeforeRecoveryGate(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, pending map[string][]overlay.DeadSegment, fetch postedFetchFunc, cacheSource *cacheSlicedSource, tally *par2PassTally, gateErr error) error {
 	healed, total := p.healWithoutRecovery(ctx, nzbID, entryName, nzb, idx, pending, fetch, cacheSource, p.manager.usenet.StatSegments)
+	tally.addHealed(healed)
 	switch {
 	case total > 0 && healed == total:
 		p.logger.Info().Str("entry", entryName).Int("healed", healed).AnErr("gate", gateErr).
