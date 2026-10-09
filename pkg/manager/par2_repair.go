@@ -263,6 +263,9 @@ type runningJob struct {
 	// EnqueueUrgent and followUpMerged.
 	merged          int
 	mergedProximity time.Duration
+	// entryName is the release name once the job has resolved it (guarded
+	// by runningMu), so lines about the job can name it instead of its ID.
+	entryName string
 }
 
 // Par2Repair is the manager-level PAR2 repair worker. See the package doc
@@ -492,32 +495,56 @@ func (p *Par2Repair) claimRun(ctx context.Context, nzbID string, lane repairLane
 // read under the same lock that deregisters it, so a request arriving as
 // the job ends is either counted here or finds no job and queues normally.
 func (p *Par2Repair) releaseRun(nzbID string, job *runningJob) (merged int, proximity time.Duration) {
+	merged, proximity, _ = p.releaseRunNamed(nzbID, job)
+	return merged, proximity
+}
+
+// releaseRunNamed is releaseRun, also returning the release name the job
+// resolved (nzbID if it never did).
+func (p *Par2Repair) releaseRunNamed(nzbID string, job *runningJob) (merged int, proximity time.Duration, name string) {
 	p.runningMu.Lock()
 	if p.running[nzbID] == job {
 		delete(p.running, nzbID)
 	}
-	merged, proximity = job.merged, job.mergedProximity
+	merged, proximity, name = job.merged, job.mergedProximity, job.entryName
 	job.merged = 0
 	p.runningMu.Unlock()
 	close(job.done)
-	return merged, proximity
+	if name == "" {
+		name = nzbID
+	}
+	return merged, proximity, name
 }
 
 // mergeIntoRunningUrgent records an URGENT request against the URGENT job
 // already running for nzbID, if there is one. first reports whether this is
-// the first request merged into that job.
-func (p *Par2Repair) mergeIntoRunningUrgent(nzbID string, proximity time.Duration) (merged, first bool) {
+// the first request merged into that job, and name is the job's release
+// name (nzbID until the job has resolved it).
+func (p *Par2Repair) mergeIntoRunningUrgent(nzbID string, proximity time.Duration) (merged, first bool, name string) {
 	p.runningMu.Lock()
 	defer p.runningMu.Unlock()
 	job, ok := p.running[nzbID]
 	if !ok || job.lane != laneUrgent {
-		return false, false
+		return false, false, nzbID
 	}
 	if job.merged == 0 || proximity < job.mergedProximity {
 		job.mergedProximity = proximity
 	}
 	job.merged++
-	return true, job.merged == 1
+	name = job.entryName
+	if name == "" {
+		name = nzbID
+	}
+	return true, job.merged == 1, name
+}
+
+// setRunningEntryName records the release name job resolved.
+func (p *Par2Repair) setRunningEntryName(nzbID string, job *runningJob, name string) {
+	p.runningMu.Lock()
+	if p.running[nzbID] == job {
+		job.entryName = name
+	}
+	p.runningMu.Unlock()
 }
 
 // pendingDeadSegments counts nzbID's recorded dead segments that are not
@@ -550,34 +577,37 @@ func (p *Par2Repair) pendingDeadSegments(nzbID string) (int, error) {
 // backoff or a terminal verdict still holds it back. One follow-up per pass,
 // and only when something asked: a pass nothing interrupted never re-queues
 // itself.
-func (p *Par2Repair) followUpMerged(nzbID string, merged int, proximity time.Duration) {
+func (p *Par2Repair) followUpMerged(nzbID, entryName string, merged int, proximity time.Duration) {
 	if merged == 0 {
 		return
 	}
 	if p.ctx != nil && p.ctx.Err() != nil {
 		return
 	}
+	if entryName == "" {
+		entryName = nzbID
+	}
+	requests := logger.Count(merged, "request") + " during the pass"
 	left, err := p.pendingDeadSegments(nzbID)
 	if err != nil {
-		p.logger.Warn().Err(err).Str("entry", nzbID).Int("requests", merged).
+		p.logger.Warn().Err(err).Str("entry", entryName).Str("nzb_id", nzbID).Int("requests", merged).Str(par2NoteField, requests).
 			Msg("par2 repair: requests arrived during the pass, but the overlay's pending damage could not be read; not re-checking")
 		return
 	}
 	if left == 0 {
-		p.logger.Info().Str("entry", nzbID).Int("requests", merged).
+		p.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Int("requests", merged).Str(par2NoteField, requests).
 			Msg("par2 repair: requests that arrived during the pass are covered; no damage left recorded")
 		return
 	}
+	note := requests + " • " + logger.Count(left, "dead segment") + " still recorded"
+	ev := p.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Int("requests", merged).Int("dead_segments", left).Str(par2NoteField, note)
 	switch p.enqueueUrgent(nzbID, proximity) {
 	case urgentQueued, urgentMerged:
-		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
-			Msg("par2 repair: damage is still recorded after a pass that received more requests; checking again")
+		ev.Msg("par2 repair: damage is still recorded after a pass that received more requests; checking again")
 	case urgentRefusedGate:
-		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
-			Msg("par2 repair: damage is still recorded after the pass, but the entry is backing off or unrepairable; not re-checking now")
+		ev.Msg("par2 repair: damage is still recorded after the pass, but the entry is backing off or unrepairable; not re-checking now")
 	case urgentRefusedRegrab:
-		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
-			Msg("par2 repair: damage is still recorded after the pass, but a re-grab now owns the entry; not re-checking")
+		ev.Msg("par2 repair: damage is still recorded after the pass, but a re-grab now owns the entry; not re-checking")
 	}
 }
 
@@ -1203,9 +1233,9 @@ func (p *Par2Repair) enqueueUrgent(nzbID string, proximity time.Duration) urgent
 	// the request lost. The running pass holds the handler claim; it is
 	// told instead, and re-checks the recorded damage when it ends. One
 	// line per pass says so.
-	if merged, first := p.mergeIntoRunningUrgent(nzbID, proximity); merged {
+	if merged, first, name := p.mergeIntoRunningUrgent(nzbID, proximity); merged {
 		if first {
-			p.logger.Info().Str("entry", nzbID).
+			p.logger.Info().Str("entry", name).Str("nzb_id", nzbID).
 				Msg("par2 repair: more damage reported while a pass is running; it will be re-checked when the pass ends")
 		}
 		return urgentMerged
@@ -1421,8 +1451,8 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	// the handler claim below is released, which a follow-up pass needs to
 	// take.
 	defer func() {
-		merged, proximity := p.releaseRun(nzbID, job)
-		p.followUpMerged(nzbID, merged, proximity)
+		merged, proximity, name := p.releaseRunNamed(nzbID, job)
+		p.followUpMerged(nzbID, name, merged, proximity)
 	}()
 
 	start := time.Now()
@@ -1546,7 +1576,10 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		deadSegments += len(segs)
 	}
 	// Logged as the pass starts (after claimRun), not when it was queued.
-	p.logger.Info().Str("entry", entryName).Str("lane", lane.String()).Int("dead_segments", deadSegments).Msg("par2 repair started")
+	p.logger.Info().Str("entry", entryName).Str("lane", lane.String()).Int("dead_segments", deadSegments).
+		Str(par2NoteField, logger.Count(deadSegments, "dead segment")+" recorded • "+lane.String()).
+		Msg("par2 repair started")
+	p.setRunningEntryName(nzbID, job, entryName)
 
 	var readBytes int64  // Usenet bytes only - see runRepair's fetch wrapper
 	var cacheBytes int64 // bytes sourced from the local DFS cache instead
@@ -1566,6 +1599,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			Str("class", class.name()).
 			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
 			Func(tally.logFields).
+			Dur(par2TookField, time.Since(start)).
 			Msg("par2 repair unavailable")
 		progress.SetPhase(Par2PhaseFailed)
 		progress.SetLastError(err.Error())
@@ -1623,6 +1657,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		Str("lane", lane.String()).
 		Func(tally.logFields).
 		Int("slices_rebuilt", slicesRepaired).
+		Dur(par2TookField, time.Since(start)).
 		Dur("duration", time.Since(start)).
 		Int64("cache_bytes", cacheBytes).
 		Int64("usenet_bytes", readBytes).
@@ -1696,11 +1731,35 @@ func (t *par2PassTally) patched() int {
 	return t.patchedRecorded + t.healed + t.patchedDiscovered
 }
 
+// note is the tally as the journal's one-line summary. Info and warning
+// lines print no other fields there, so without it the journal said only
+// that a repair had completed.
+func (t *par2PassTally) note() string {
+	if t == nil {
+		return ""
+	}
+	parts := []string{fmt.Sprintf("%d of %d recorded patched", t.patchedRecorded+t.healed, t.recorded)}
+	if t.healed > 0 {
+		parts = append(parts, fmt.Sprintf("%d fetched intact", t.healed))
+	}
+	if t.patchedDiscovered > 0 {
+		parts = append(parts, fmt.Sprintf("%d more found and patched", t.patchedDiscovered))
+	}
+	if t.rounds > 0 {
+		parts = append(parts, logger.Count(t.rounds, "full read"))
+	}
+	if t.statSweep != "" {
+		parts = append(parts, "damage check "+t.statSweep)
+	}
+	return strings.Join(parts, " • ")
+}
+
 // logFields adds the tally to a log line: the total first, then its parts.
 func (t *par2PassTally) logFields(e *zerolog.Event) {
 	if t == nil {
 		return
 	}
+	e.Str(par2NoteField, t.note())
 	e.Int("segments_patched", t.patched()).
 		Int("segments_recorded", t.recorded).
 		Int("patched_recorded", t.patchedRecorded).
@@ -2527,6 +2586,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if found, seeded := foldStatSlices(damagedSet, statMissing, statSlicesOf, reducedTrust, statBudget); !seeded {
 		p.logger.Warn().Str("entry", entryName).Int("slices", found).Int("recorded_slices", overlayDamaged).Int("budget", statBudget).
 			Strs("providers_left_out", statExcluded).
+			Str(par2NoteField, fmt.Sprintf("%d more slices on top of %d recorded • budget %d • without %s", found, overlayDamaged, statBudget, strings.Join(statExcluded, ", "))).
 			Msg("par2 repair: damage found with a provider left out is over the recovery budget; leaving it for the solve to confirm")
 		tally.setStatSweep(statSweepState(statSwept, statExcluded, true))
 	}
@@ -2794,6 +2854,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Str("providers", nntp.DescribeOutcomes(nntp.FailoverOutcomes(repairErr))).
 			Int("round", round+1).
 			Bool("stat_sweep_ran", statSwept).
+			Str(par2NoteField, fmt.Sprintf("%d more damaged after full read %d", len(newlyDamaged), round+1)).
 			Msg("par2 repair: intact slice(s) unreadable; expanding damaged set and retrying")
 		damaged = append(damaged, newlyDamaged...)
 		sort.Slice(damaged, func(i, j int) bool { return damaged[i] < damaged[j] })
@@ -2872,6 +2933,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	tally.addPatchedDiscovered(patchedDiscovered)
 	if patchedDiscovered > 0 {
 		p.logger.Info().Str("entry", entryName).Int("articles", patchedDiscovered).
+			Str(par2NoteField, logger.Count(patchedDiscovered, "article")).
 			Msg("par2 repair: also patched articles the pass found missing or corrupt on every provider")
 	}
 
@@ -3668,6 +3730,7 @@ func statPostedFileDamage(
 					Str("entry", entryName).
 					Str("message_id", unverifiedID).
 					Strs("providers_left_out", excluded).
+					Str(par2NoteField, statLeftOutNote("", excluded)).
 					Msg("par2: a known-dead article could not be checked on the providers still asked; skipping the STAT damage sweep for this release")
 				return nil, false, excluded
 			}
@@ -3682,6 +3745,7 @@ func statPostedFileDamage(
 				Str("message_id", lyingID).
 				Str("provider", liar).
 				Strs("providers_left_out", excluded).
+				Str(par2NoteField, statLeftOutNote(liar, excluded)).
 				Msg("par2: a provider reports a known-dead article as present; skipping the STAT damage sweep for this release")
 			return nil, false, excluded
 		}
@@ -3690,6 +3754,7 @@ func statPostedFileDamage(
 			Str("entry", entryName).
 			Str("message_id", lyingID).
 			Str("provider", liar).
+			Str(par2NoteField, liar).
 			Msg("par2: a provider reports a known-dead article as present; its STAT answers are left out of this release's damage sweep")
 	}
 
@@ -3738,6 +3803,8 @@ func statPostedFileDamage(
 			Int("controls", len(controls)).
 			Strs("providers_left_out", excluded).
 			Dur("duration", time.Since(start)).
+			Dur(par2TookField, time.Since(start)).
+			Str(par2NoteField, statSweepNote(len(msgIDs), len(missing), unchecked, excluded)).
 			Msg("par2: posted-file STAT damage sweep cut short; the rest of the damage will be found per-round")
 		return missing, false, excluded
 	}
@@ -3749,6 +3816,8 @@ func statPostedFileDamage(
 		Int("controls", len(controls)).
 		Strs("providers_left_out", excluded).
 		Dur("duration", time.Since(start)).
+		Dur(par2TookField, time.Since(start)).
+		Str(par2NoteField, statSweepNote(len(msgIDs), len(missing), unchecked, excluded)).
 		Msg("par2: posted-file STAT damage sweep complete")
 	return missing, true, excluded
 }
@@ -3773,6 +3842,13 @@ func statHostExcluded(excluded []string, host string) bool {
 	return false
 }
 
+// The journal's summary fields, under names that functions taking a
+// "logger" parameter can still reach.
+const (
+	par2NoteField = logger.FieldNote
+	par2TookField = logger.FieldTook
+)
+
 // maxStatExcludedHosts bounds how many providers one damage sweep leaves
 // out for misreporting its controls.
 const maxStatExcludedHosts = 32
@@ -3793,6 +3869,31 @@ func statSweepState(completed bool, excluded []string, leftForSolve bool) string
 		state += ", misses left for the solve"
 	}
 	return state
+}
+
+// statSweepNote is the damage sweep's result as the journal's summary.
+func statSweepNote(checked, missing, unchecked int, excluded []string) string {
+	parts := []string{fmt.Sprintf("%d checked", checked), fmt.Sprintf("%d missing", missing)}
+	if unchecked > 0 {
+		parts = append(parts, fmt.Sprintf("%d could not be checked", unchecked))
+	}
+	if len(excluded) > 0 {
+		parts = append(parts, "without "+strings.Join(excluded, ", "))
+	}
+	return strings.Join(parts, " • ")
+}
+
+// statLeftOutNote names the provider a control line is about and the ones
+// already left out, for the journal's summary.
+func statLeftOutNote(provider string, excluded []string) string {
+	var parts []string
+	if provider != "" {
+		parts = append(parts, provider)
+	}
+	if len(excluded) > 0 {
+		parts = append(parts, "already without "+strings.Join(excluded, ", "))
+	}
+	return strings.Join(parts, " • ")
 }
 
 // settleStatMisses turns the damage sweep's misses into the set the pass
@@ -3912,6 +4013,7 @@ func confirmStatMisses(
 	if len(candidates) > limit {
 		logger.Warn().Str("entry", entryName).Int("candidates", len(candidates)).Int("limit", limit).
 			Strs("providers_left_out", excluded).
+			Str(par2NoteField, fmt.Sprintf("%d missing • limit %d • without %s", len(candidates), limit, strings.Join(excluded, ", "))).
 			Msg("par2: too many articles missing on the providers asked to confirm one by one; damage will be found per-round instead")
 		return nil
 	}
@@ -3966,6 +4068,8 @@ func confirmStatMisses(
 		Int("undecided", unknown).
 		Strs("providers_left_out", excluded).
 		Dur("duration", time.Since(start)).
+		Dur(par2TookField, time.Since(start)).
+		Str(par2NoteField, fmt.Sprintf("%d fetched • %d dead • %d alive after all • %d undecided", len(candidates), len(confirmed), alive, unknown)).
 		Msg("par2: articles missing on the providers asked were fetched to confirm")
 	return confirmed
 }

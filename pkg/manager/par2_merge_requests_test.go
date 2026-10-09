@@ -89,7 +89,7 @@ func TestFollowUpMergedQueuesOnePassOnlyWhenDamageRemains(t *testing.T) {
 			lookups := 0
 			p.pendingDamage = func(string) (int, error) { lookups++; return tc.pending, nil }
 
-			p.followUpMerged("x", tc.merged, 7*time.Second)
+			p.followUpMerged("x", "Some Release", tc.merged, 7*time.Second)
 
 			if got := urgentWaiting(p, "x"); got != tc.want {
 				t.Fatalf("follow-up queued = %v, want %v", got, tc.want)
@@ -123,7 +123,7 @@ func TestFollowUpMergedRespectsHandlerOwnedByRegrab(t *testing.T) {
 	}
 	defer release()
 
-	p.followUpMerged("x", 2, 0)
+	p.followUpMerged("x", "Some Release", 2, 0)
 
 	if urgentWaiting(p, "x") {
 		t.Fatal("follow-up queued a pass on an entry a re-grab owns")

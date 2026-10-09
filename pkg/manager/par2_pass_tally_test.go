@@ -39,6 +39,8 @@ func TestPar2PassTallyCountsEverySegmentWritten(t *testing.T) {
 		"patched_discovered": float64(33),
 		"rounds":             float64(2),
 		"stat_sweep":         "incomplete",
+		// The journal prints only this on an info line.
+		"note": "3 of 3 recorded patched • 1 fetched intact • 33 more found and patched • 2 full reads • damage check incomplete",
 	}
 	for k, v := range want {
 		if line[k] != v {
