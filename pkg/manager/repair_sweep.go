@@ -2569,10 +2569,23 @@ func (r *Repair) handleAutoDamage(ctx context.Context, source RepairSource, entr
 		defer release()
 		return r.regrabOutcome(r.repairPlaybackFileNow(ctx, entryName, fileName, true, false))
 	case autoActionQueuePar2:
+		// The reason says what became of the request, so the caller's log
+		// line no longer reads as a fresh pass when one was already running
+		// or the gate held it back.
+		reason := ""
 		if r.manager.par2Repair != nil {
-			r.manager.par2Repair.EnqueueUrgent(nzbID, proximity)
+			switch r.manager.par2Repair.enqueueUrgent(nzbID, proximity) {
+			case urgentQueued:
+				reason = "PAR2 pass queued"
+			case urgentMerged:
+				reason = "merged into the running PAR2 pass"
+			case urgentRefusedGate:
+				reason = "PAR2 pass not queued: backing off or unrepairable"
+			case urgentRefusedRegrab:
+				reason = "PAR2 pass not queued: a re-grab owns the entry"
+			}
 		}
-		return autoRepairOutcome{acted: true}, nil
+		return autoRepairOutcome{acted: true, reason: reason}, nil
 	default:
 		return autoRepairOutcome{reason: fmt.Sprintf("no action needed (verdict=%s)", verdict)}, nil
 	}

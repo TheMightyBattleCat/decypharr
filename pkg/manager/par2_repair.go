@@ -257,6 +257,12 @@ type runningJob struct {
 	// done is closed once the job has deregistered, so a job for the same
 	// nzbID can wait out a preempted one instead of running alongside it.
 	done chan struct{}
+	// merged counts URGENT requests that arrived while this (URGENT) job
+	// ran, and mergedProximity is the smallest proximity among them. Both
+	// are guarded by Par2Repair.runningMu and read by releaseRun. See
+	// EnqueueUrgent and followUpMerged.
+	merged          int
+	mergedProximity time.Duration
 }
 
 // Par2Repair is the manager-level PAR2 repair worker. See the package doc
@@ -298,6 +304,11 @@ type Par2Repair struct {
 	// nzbID is ever active regardless of lane.
 	runningMu sync.Mutex
 	running   map[string]*runningJob
+
+	// pendingDamage overrides pendingDeadSegments' overlay lookup. Nil in
+	// production; tests that build a Par2Repair without a Usenet client set
+	// it.
+	pendingDamage func(nzbID string) (int, error)
 
 	// largeRepair is a one-slot gate held by the one large repair running
 	// (see waitForLargeRepair). Nil means no gating (tests that build a
@@ -476,14 +487,98 @@ func (p *Par2Repair) claimRun(ctx context.Context, nzbID string, lane repairLane
 	}
 }
 
-// releaseRun deregisters job and wakes anything waiting on it.
-func (p *Par2Repair) releaseRun(nzbID string, job *runningJob) {
+// releaseRun deregisters job and wakes anything waiting on it. It returns
+// the URGENT requests merged into the job while it ran (see EnqueueUrgent):
+// read under the same lock that deregisters it, so a request arriving as
+// the job ends is either counted here or finds no job and queues normally.
+func (p *Par2Repair) releaseRun(nzbID string, job *runningJob) (merged int, proximity time.Duration) {
 	p.runningMu.Lock()
 	if p.running[nzbID] == job {
 		delete(p.running, nzbID)
 	}
+	merged, proximity = job.merged, job.mergedProximity
+	job.merged = 0
 	p.runningMu.Unlock()
 	close(job.done)
+	return merged, proximity
+}
+
+// mergeIntoRunningUrgent records an URGENT request against the URGENT job
+// already running for nzbID, if there is one. first reports whether this is
+// the first request merged into that job.
+func (p *Par2Repair) mergeIntoRunningUrgent(nzbID string, proximity time.Duration) (merged, first bool) {
+	p.runningMu.Lock()
+	defer p.runningMu.Unlock()
+	job, ok := p.running[nzbID]
+	if !ok || job.lane != laneUrgent {
+		return false, false
+	}
+	if job.merged == 0 || proximity < job.mergedProximity {
+		job.mergedProximity = proximity
+	}
+	job.merged++
+	return true, job.merged == 1
+}
+
+// pendingDeadSegments counts nzbID's recorded dead segments that are not
+// patched.
+func (p *Par2Repair) pendingDeadSegments(nzbID string) (int, error) {
+	if p.pendingDamage != nil {
+		return p.pendingDamage(nzbID)
+	}
+	if p.manager == nil || p.manager.usenet == nil {
+		return 0, nil
+	}
+	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, segs := range pending {
+		n += len(segs)
+	}
+	return n, nil
+}
+
+// followUpMerged runs after an URGENT pass has deregistered and released
+// its handler claim. A pass reads the overlay's damage once, when it starts;
+// requests that arrived while it ran (the read-ahead finding more missing
+// articles, its final hand-off) were merged into it rather than each
+// starting a pass that claimRun refused and dropped. If damage is still
+// recorded now - the pass did not cover what those requests were about, or
+// it failed - one more pass is requested through the normal gate, so a
+// backoff or a terminal verdict still holds it back. One follow-up per pass,
+// and only when something asked: a pass nothing interrupted never re-queues
+// itself.
+func (p *Par2Repair) followUpMerged(nzbID string, merged int, proximity time.Duration) {
+	if merged == 0 {
+		return
+	}
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
+	left, err := p.pendingDeadSegments(nzbID)
+	if err != nil {
+		p.logger.Warn().Err(err).Str("entry", nzbID).Int("requests", merged).
+			Msg("par2 repair: requests arrived during the pass, but the overlay's pending damage could not be read; not re-checking")
+		return
+	}
+	if left == 0 {
+		p.logger.Info().Str("entry", nzbID).Int("requests", merged).
+			Msg("par2 repair: requests that arrived during the pass are covered; no damage left recorded")
+		return
+	}
+	switch p.enqueueUrgent(nzbID, proximity) {
+	case urgentQueued, urgentMerged:
+		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
+			Msg("par2 repair: damage is still recorded after a pass that received more requests; checking again")
+	case urgentRefusedGate:
+		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
+			Msg("par2 repair: damage is still recorded after the pass, but the entry is backing off or unrepairable; not re-checking now")
+	case urgentRefusedRegrab:
+		p.logger.Info().Str("entry", nzbID).Int("requests", merged).Int("dead_segments", left).
+			Msg("par2 repair: damage is still recorded after the pass, but a re-grab now owns the entry; not re-checking")
+	}
 }
 
 // AutoEnqueue is the automatic-trigger entry point - called from the reader's
@@ -1068,11 +1163,28 @@ const Par2VerifyMismatch = "whole-file MD5 mismatch"
 // accurate; the smallest proximity ever reported for a still-pending nzbID
 // wins. If a BATCH pass for the same nzbID is currently running, it is
 // preempted (cancelled without falling back to legacy repair) so the URGENT
-// lane can take over immediately. Safe to call from any goroutine; a no-op
-// if p is nil or nzbID is empty.
+// lane can take over immediately. If an URGENT pass for nzbID is already
+// running, the request is merged into it instead: the pass re-checks the
+// entry's recorded damage when it ends (see followUpMerged). Safe to call
+// from any goroutine; a no-op if p is nil or nzbID is empty.
 func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
+	p.enqueueUrgent(nzbID, proximity)
+}
+
+// urgentEnqueueResult is what enqueueUrgent did with a request.
+type urgentEnqueueResult int
+
+const (
+	urgentQueued        urgentEnqueueResult = iota // on the URGENT heap (new, or already waiting there)
+	urgentMerged                                   // an URGENT pass is running; it re-checks when it ends
+	urgentRefusedGate                              // disabled, backing off or unrepairable
+	urgentRefusedRegrab                            // a re-grab owns the entry
+)
+
+// enqueueUrgent is EnqueueUrgent, reporting what happened to the request.
+func (p *Par2Repair) enqueueUrgent(nzbID string, proximity time.Duration) urgentEnqueueResult {
 	if p == nil || nzbID == "" {
-		return
+		return urgentRefusedGate
 	}
 	if proximity < 0 {
 		proximity = 0
@@ -1083,7 +1195,20 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 	// backoff window, do not preempt a running job or queue a new one.
 	// Playback padding already covers the viewing experience meanwhile.
 	if !p.par2ShouldAutoEnqueue(nzbID) {
-		return
+		return urgentRefusedGate
+	}
+	// An URGENT pass is already running for this entry. Queueing another
+	// only had a second worker pop it, fail claimRun and drop it - one
+	// "already running" line per missing article a read-ahead found, and
+	// the request lost. The running pass holds the handler claim; it is
+	// told instead, and re-checks the recorded damage when it ends. One
+	// line per pass says so.
+	if merged, first := p.mergeIntoRunningUrgent(nzbID, proximity); merged {
+		if first {
+			p.logger.Info().Str("entry", nzbID).
+				Msg("par2 repair: more damage reported while a pass is running; it will be re-checked when the pass ends")
+		}
+		return urgentMerged
 	}
 	// Claim the entry for the pass, as Enqueue does: without a claim the
 	// sweep's re-grab could delete the entry under a queued or running pass.
@@ -1091,7 +1216,7 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 	// would only race its delete.
 	if p.repair != nil && p.repair.handlers != nil && !p.repair.handlers.ClaimPar2Queued(nzbID) {
 		p.logger.Debug().Str("entry", nzbID).Msg("par2 repair: not queued; a re-grab is already handling this entry")
-		return
+		return urgentRefusedRegrab
 	}
 
 	p.runningMu.Lock()
@@ -1108,7 +1233,7 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 			heap.Fix(&p.urgentHeap, item.index)
 		}
 		p.urgentMu.Unlock()
-		return
+		return urgentQueued
 	}
 	p.urgentSeq++
 	item := &urgentJob{nzbID: nzbID, proximity: proximity, seq: p.urgentSeq}
@@ -1120,6 +1245,7 @@ func (p *Par2Repair) EnqueueUrgent(nzbID string, proximity time.Duration) {
 	case p.urgentWake <- struct{}{}:
 	default:
 	}
+	return urgentQueued
 }
 
 // handledByUrgent reports whether nzbID is already queued or actively
@@ -1275,11 +1401,29 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	// URGENT job) leaves both to the job that owns them.
 	job, ok := p.claimRun(base, nzbID, lane, jobCancel)
 	if !ok {
+		// An URGENT request that was already on the heap when another pass
+		// took the entry (it arrived between that pass being popped and
+		// registering, or two workers waited out the same preempted batch
+		// pass). Hand it back: it merges into the running URGENT pass, or
+		// queues again if that pass has just ended. Dropping it here lost
+		// the request.
+		if lane == laneUrgent && (p.ctx == nil || p.ctx.Err() == nil) {
+			res := p.enqueueUrgent(nzbID, 0)
+			p.logger.Debug().Str("entry", nzbID).Str("lane", lane.String()).Bool("merged", res == urgentMerged).Bool("requeued", res == urgentQueued).
+				Msg("par2 repair: a pass is already running for this entry; request handed back")
+			return
+		}
 		p.logger.Debug().Str("entry", nzbID).Str("lane", lane.String()).
 			Msg("par2 repair: a pass is already running for this entry; skipping duplicate")
 		return
 	}
-	defer p.releaseRun(nzbID, job)
+	// Registered first among the job's own defers, so it runs last: after
+	// the handler claim below is released, which a follow-up pass needs to
+	// take.
+	defer func() {
+		merged, proximity := p.releaseRun(nzbID, job)
+		p.followUpMerged(nzbID, merged, proximity)
+	}()
 
 	start := time.Now()
 	progress := p.progress.Start(nzbID, nzbID) // entry name backfilled below once resolved
