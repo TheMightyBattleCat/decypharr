@@ -557,7 +557,12 @@ func (c *Client) statProbe(ctx context.Context, messageIDs []string, hint *statH
 		return done
 	}
 	var homes []*ProviderPool
+	skipHosts := statExcludedHosts(ctx)
 	for _, pp := range c.statHomes {
+		// A provider the caller left out is not asked here either.
+		if _, skip := skipHosts[pp.config.Host]; skip {
+			continue
+		}
 		if ok, _, _ := c.statEligible(pp); ok {
 			homes = append(homes, pp)
 		}

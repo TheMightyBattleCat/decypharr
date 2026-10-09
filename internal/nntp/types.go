@@ -45,6 +45,12 @@ type StatResult struct {
 	MessageID string // The message ID that was checked
 	Available bool   // Whether the article is available
 	Error     error  // Error if any (nil means success or article found)
+	// Host is the provider that reported the article present, when a batch
+	// STAT across providers found it. Empty otherwise. A provider can report
+	// present for an article whose body no provider can serve, so a caller
+	// that knows the article is dead uses this to tell which provider's
+	// STAT not to believe (see WithStatExcludedHosts).
+	Host string
 }
 
 // BatchStatResult contains results for all message IDs in a batch

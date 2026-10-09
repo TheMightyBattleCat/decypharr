@@ -1596,6 +1596,45 @@ func WithStatProgress(ctx context.Context, fn func(checked int)) context.Context
 	return context.WithValue(ctx, statProgressKey{}, fn)
 }
 
+// statExcludedHostsKey carries a WithStatExcludedHosts set on a context.
+type statExcludedHostsKey struct{}
+
+// WithStatExcludedHosts returns a context that makes a BatchStat or
+// BatchStatComplete call leave the given providers out: they are not asked,
+// so their answers cannot settle an article as present. For a caller that
+// has caught a provider reporting a known-dead article present and wants
+// the others' view. Exclusion is by host only - another provider on the
+// same backbone is still asked. A not-found result then means not found on
+// every provider that was asked, not on every provider configured.
+func WithStatExcludedHosts(ctx context.Context, hosts []string) context.Context {
+	if len(hosts) == 0 {
+		return ctx
+	}
+	set := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		if h != "" {
+			set[h] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, statExcludedHostsKey{}, set)
+}
+
+// statExcludedHosts returns ctx's WithStatExcludedHosts set (nil for none).
+func statExcludedHosts(ctx context.Context) map[string]struct{} {
+	set, _ := ctx.Value(statExcludedHostsKey{}).(map[string]struct{})
+	return set
+}
+
+// StatHostExcluded reports whether ctx leaves host out of a batch STAT (see
+// WithStatExcludedHosts). For a stand-in STAT that has to honour the option.
+func StatHostExcluded(ctx context.Context, host string) bool {
+	_, ok := statExcludedHosts(ctx)[host]
+	return ok
+}
+
 // ReportStatProgress calls the WithStatProgress callback on ctx, if any.
 func ReportStatProgress(ctx context.Context, checked int) {
 	if fn, ok := ctx.Value(statProgressKey{}).(func(int)); ok && checked > 0 {
@@ -1761,6 +1800,7 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 	}
 
 	order := c.statOrder(home)
+	skipHosts := statExcludedHosts(ctx)
 	for next := range order {
 		if len(unresolved) == 0 {
 			break
@@ -1769,6 +1809,9 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 		provider := order[next]
 		if ctx.Err() != nil {
 			return results, ctx.Err()
+		}
+		if _, skip := skipHosts[provider.Host]; skip {
+			continue
 		}
 
 		queryIdxs := make([]int, 0, len(unresolved))
@@ -1817,6 +1860,7 @@ func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []stri
 			queryPos++
 			if res.Available {
 				results[idx] = res
+				results[idx].Host = provider.Host
 				answered++
 				found++
 				continue

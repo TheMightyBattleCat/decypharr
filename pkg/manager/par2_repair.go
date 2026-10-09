@@ -2396,10 +2396,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
 	msgIDRange := make(map[string]postedRange)
+	msgIDSeg := make(map[string]postedSegPos)
 	for _, m := range matches {
 		f := fetchers[m.FileID]
 		for i, seg := range nzb.Par2Source[m.PostedIndex].Segments {
 			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
+			msgIDSeg[seg.MessageID] = postedSegPos{fileID: m.FileID, index: i}
 		}
 	}
 
@@ -2433,13 +2435,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			statControls = append(statControls, d.MessageID)
 		}
 	}
-	statMissing, statSwept := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName, progress)
+	statMissing, statSwept, statExcluded := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName, progress)
 	statCancel2()
-	if statSwept {
-		tally.setStatSweep("complete")
-	} else {
-		tally.setStatSweep("incomplete")
-	}
+	reducedTrust := len(statExcluded) > 0
+	statBudget := min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize))
+	statMissing, statLeftForSolve := settleStatMisses(ctx, p.logger, entryName, fetchers, msgIDSeg, statMissing, statExcluded,
+		max(1, u.ProcessingMaxConnections()), statBudget, progress)
+	tally.setStatSweep(statSweepState(statSwept, statExcluded, statLeftForSolve))
 	progress.SetPhase(Par2PhaseFetchingRecovery)
 	progress.Touch()
 
@@ -2511,18 +2513,22 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// reconstructed only to run the solve, not patched for playback (same as
 	// the round loop's own newlyDamaged handling).
 	overlayDamaged := len(damagedSet)
-	for _, mid := range statMissing {
+	statSlicesOf := func(mid string) []int64 {
 		rng, ok := msgIDRange[mid]
 		if !ok {
-			continue
+			return nil
 		}
 		slices, derr := idx.DamagedSlices(rng.fileID, rng.start, rng.end)
 		if derr != nil {
-			continue
+			return nil
 		}
-		for _, s := range slices {
-			damagedSet[s] = struct{}{}
-		}
+		return slices
+	}
+	if found, seeded := foldStatSlices(damagedSet, statMissing, statSlicesOf, reducedTrust, statBudget); !seeded {
+		p.logger.Warn().Str("entry", entryName).Int("slices", found).Int("recorded_slices", overlayDamaged).Int("budget", statBudget).
+			Strs("providers_left_out", statExcluded).
+			Msg("par2 repair: damage found with a provider left out is over the recovery budget; leaving it for the solve to confirm")
+		tally.setStatSweep(statSweepState(statSwept, statExcluded, true))
 	}
 	if extra := len(damagedSet) - overlayDamaged; extra > 0 {
 		if deadDiscovered != nil {
@@ -3592,6 +3598,15 @@ func statRecoveryVolumes(
 // belong to ANY posted file, not only one with overlay-recorded damage, so
 // the sweep covers the whole matched set.
 //
+// A provider that reports one of the controls present is left out and the
+// controls are asked again, until the providers still asked all agree the
+// controls are missing. The sweep then runs without the ones left out
+// (excluded): one provider answering STAT 223 for dead articles used to
+// switch the whole sweep off, and the solve then needed a full read of the
+// release just to find the damage and a second one to repair it. A miss
+// from a sweep with providers left out is not proof on its own - see
+// confirmStatMisses.
+//
 // The bool return is whether the sweep actually completed: false means a
 // whole-batch STAT error (the caller falls back to per-round discovery,
 // exactly as before this sweep existed), or ctx ending before every article
@@ -3612,31 +3627,70 @@ func statPostedFileDamage(
 	controls []string,
 	entryName string,
 	progress *par2JobProgressState,
-) (missing []string, completed bool) {
+) (missing []string, completed bool, excluded []string) {
 	// Calibrate first. Providers answer STAT 223 for articles whose body is
 	// gone everywhere - eweka did so for all 15 dead articles of Game of
 	// Castles S08E05, six others for Under Reef S11E06 - which makes a
 	// sweep that reports nothing missing worthless. controls are this
 	// release's own recorded-dead articles: playback already proved their
-	// bodies unfetchable, so STAT must report them missing. When it does
-	// not, the sweep is skipped rather than believed, and the first solve
-	// pass finds the damage instead (it collects every unreadable slice).
-	if len(controls) > 0 {
-		results, err := stat(ctx, controls)
+	// bodies unfetchable, so STAT must report them missing. A provider
+	// that does not is left out and the controls asked again; only when no
+	// provider is left whose answer can be believed is the sweep skipped,
+	// and the first solve pass finds the damage instead (it collects every
+	// unreadable slice).
+	for len(controls) > 0 {
+		results, err := stat(nntp.WithStatExcludedHosts(ctx, excluded), controls)
 		if err != nil {
 			logger.Warn().Err(err).Str("entry", entryName).
 				Msg("par2: STAT control probe failed; damage will be found per-round instead")
-			return nil, false
+			return nil, false, excluded
 		}
+		var liar, lyingID, unverifiedID string
+		var unverifiedErr error
+		present := false
 		for _, r := range results {
-			if r.Available || !nntp.IsArticleNotFoundError(r.Error) {
-				logger.Warn().
-					Str("entry", entryName).
-					Str("message_id", r.MessageID).
-					Msg("par2: a provider reports a known-dead article as present; skipping the STAT damage sweep for this release")
-				return nil, false
+			switch {
+			case r.Available:
+				if !present {
+					liar, lyingID = r.Host, r.MessageID
+				}
+				present = true
+			case !nntp.IsArticleNotFoundError(r.Error):
+				// Could not be asked (a connection error, or nobody left
+				// to ask): unknown, not evidence that anyone lied.
+				unverifiedID, unverifiedErr = r.MessageID, r.Error
 			}
 		}
+		if !present {
+			if unverifiedID != "" {
+				logger.Warn().
+					AnErr("cause", unverifiedErr).
+					Str("entry", entryName).
+					Str("message_id", unverifiedID).
+					Strs("providers_left_out", excluded).
+					Msg("par2: a known-dead article could not be checked on the providers still asked; skipping the STAT damage sweep for this release")
+				return nil, false, excluded
+			}
+			break // every provider still asked agrees the controls are gone
+		}
+		// The answer names no provider, or names one already left out, or
+		// more have lied than a release plausibly has providers: nothing
+		// more to narrow down, so the sweep is skipped rather than believed.
+		if liar == "" || statHostExcluded(excluded, liar) || len(excluded) >= maxStatExcludedHosts {
+			logger.Warn().
+				Str("entry", entryName).
+				Str("message_id", lyingID).
+				Str("provider", liar).
+				Strs("providers_left_out", excluded).
+				Msg("par2: a provider reports a known-dead article as present; skipping the STAT damage sweep for this release")
+			return nil, false, excluded
+		}
+		excluded = append(excluded, liar)
+		logger.Warn().
+			Str("entry", entryName).
+			Str("message_id", lyingID).
+			Str("provider", liar).
+			Msg("par2: a provider reports a known-dead article as present; its STAT answers are left out of this release's damage sweep")
 	}
 
 	var msgIDs []string
@@ -3649,16 +3703,16 @@ func statPostedFileDamage(
 		}
 	}
 	if len(msgIDs) == 0 {
-		return nil, true
+		return nil, true, excluded
 	}
 
 	start := time.Now()
 	progress.SetStatTotal(len(msgIDs))
-	results, err := stat(nntp.WithStatProgress(ctx, progress.AddStatProbed), msgIDs)
+	results, err := stat(nntp.WithStatExcludedHosts(nntp.WithStatProgress(ctx, progress.AddStatProbed), excluded), msgIDs)
 	if err != nil {
 		logger.Warn().Err(err).Str("entry", entryName).
 			Msg("par2: posted-file STAT damage sweep failed; damage will be found per-round instead")
-		return nil, false
+		return nil, false, excluded
 	}
 	unchecked := 0
 	for _, r := range results {
@@ -3682,9 +3736,10 @@ func statPostedFileDamage(
 			Int("segments_missing", len(missing)).
 			Int("segments_unchecked", unchecked).
 			Int("controls", len(controls)).
+			Strs("providers_left_out", excluded).
 			Dur("duration", time.Since(start)).
 			Msg("par2: posted-file STAT damage sweep cut short; the rest of the damage will be found per-round")
-		return missing, false
+		return missing, false, excluded
 	}
 	logger.Info().
 		Str("entry", entryName).
@@ -3692,9 +3747,227 @@ func statPostedFileDamage(
 		Int("segments_missing", len(missing)).
 		Int("segments_unchecked", unchecked).
 		Int("controls", len(controls)).
+		Strs("providers_left_out", excluded).
 		Dur("duration", time.Since(start)).
 		Msg("par2: posted-file STAT damage sweep complete")
-	return missing, true
+	return missing, true, excluded
+}
+
+// seedStatSlices decides whether the damage sweep's extra slices go into
+// the damaged set before the first solve. A sweep that asked every provider
+// always seeds. One that left providers out seeds only while the recorded
+// and extra slices together fit the recovery budget: past it the opening
+// capacity gate would fail the job terminally on evidence the round loop
+// classifies more carefully.
+func seedStatSlices(reducedTrust bool, recordedSlices, extraSlices, budget int) bool {
+	return !reducedTrust || recordedSlices+extraSlices <= budget
+}
+
+// statHostExcluded reports whether host is already left out.
+func statHostExcluded(excluded []string, host string) bool {
+	for _, h := range excluded {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
+// maxStatExcludedHosts bounds how many providers one damage sweep leaves
+// out for misreporting its controls.
+const maxStatExcludedHosts = 32
+
+// statSweepState is the up-front damage check's outcome for the pass's
+// summary line: whether it finished, which providers it left out, and
+// whether what it found was left for the solve to find again (too many
+// misses to confirm, or more than the recovery budget).
+func statSweepState(completed bool, excluded []string, leftForSolve bool) string {
+	state := "incomplete"
+	if completed {
+		state = "complete"
+	}
+	if len(excluded) > 0 {
+		state += ", without " + strings.Join(excluded, ", ")
+	}
+	if leftForSolve {
+		state += ", misses left for the solve"
+	}
+	return state
+}
+
+// settleStatMisses turns the damage sweep's misses into the set the pass
+// acts on, and reports whether they were given up on (leftForSolve).
+//
+// A sweep that asked every provider is believed: each miss is recorded
+// against its file, so the article is patched from the rebuilt slices like
+// one the round loop found (see discoveredDeadRefs). It used to be rebuilt
+// for the solve and then discarded, and playback failed on it later.
+//
+// With a provider left out, a miss is only "not found on the providers
+// asked": the one left out may hold the article after all. Each is settled
+// by fetching its body through the normal failover, every provider included
+// - the same evidence the round loop goes on - and only the ones that fail
+// as missing or corrupt everywhere are kept (see confirmStatMisses). One
+// that turns out fetchable is dropped, so the heal step still tries it.
+func settleStatMisses(
+	ctx context.Context,
+	logger zerolog.Logger,
+	entryName string,
+	fetchers map[[16]byte]*postedFileFetcher,
+	where map[string]postedSegPos,
+	missing []string,
+	excluded []string,
+	concurrency, budget int,
+	progress *par2JobProgressState,
+) (settled []string, leftForSolve bool) {
+	if len(excluded) == 0 {
+		markStatMissingBad(fetchers, where, missing)
+		return missing, false
+	}
+	if len(missing) == 0 {
+		return nil, false
+	}
+	limit := statConfirmCap(budget)
+	return confirmStatMisses(ctx, logger, entryName, fetchers, where, missing, excluded, concurrency, limit, progress), len(missing) > limit
+}
+
+// foldStatSlices adds the slices of the sweep's settled misses to
+// damagedSet, so the first solve already knows them. found is how many
+// slices they cover beyond those already in the set.
+//
+// Seeding makes the round loop's opening capacity gate answer for these
+// slices, and that gate is terminal. With every provider asked that is
+// right. With one left out the evidence is a body fetch, which the round
+// loop judges by cause (par2RoundCapError) - so when the seeded set would
+// not fit the recovery budget, nothing is added (seeded false) and the
+// round loop finds and classifies the damage exactly as if the sweep had
+// not run.
+func foldStatSlices(damagedSet map[int64]struct{}, missing []string, slicesOf func(messageID string) []int64, reducedTrust bool, budget int) (found int, seeded bool) {
+	extra := make(map[int64]struct{})
+	for _, mid := range missing {
+		for _, s := range slicesOf(mid) {
+			if _, known := damagedSet[s]; !known {
+				extra[s] = struct{}{}
+			}
+		}
+	}
+	if !seedStatSlices(reducedTrust, len(damagedSet), len(extra), budget) {
+		return len(extra), false
+	}
+	for s := range extra {
+		damagedSet[s] = struct{}{}
+	}
+	return len(extra), true
+}
+
+// postedSegPos locates one article within the posted file PAR2 protects.
+type postedSegPos struct {
+	fileID [16]byte
+	index  int
+}
+
+// markStatMissingBad records articles a full damage sweep found missing on
+// every provider as bad on their file's fetcher, the same record a failed
+// body fetch leaves, so the pass patches them once their slices are
+// rebuilt.
+func markStatMissingBad(fetchers map[[16]byte]*postedFileFetcher, where map[string]postedSegPos, missing []string) {
+	for _, mid := range missing {
+		pos, ok := where[mid]
+		if !ok {
+			continue
+		}
+		if f := fetchers[pos.fileID]; f != nil {
+			f.badArticles.Store(pos.index, struct{}{})
+		}
+	}
+}
+
+// statConfirmCap is how many sweep misses confirmStatMisses will fetch.
+// Past it the release is damaged far beyond what budget recovery slices
+// can rebuild, and the solve's early stop reaches that verdict without one
+// failing fetch per article.
+func statConfirmCap(budget int) int {
+	return min(1024, max(64, 8*budget))
+}
+
+// confirmStatMisses settles the misses of a damage sweep that ran with
+// providers left out. Each candidate's body is fetched through its file's
+// fetcher - the normal failover, the left-out providers included, never the
+// local cache - and it is kept only when that fails as missing or corrupt
+// on every provider, which also records it as bad so the pass patches it
+// (see discoveredDeadRefs). One that fetches is alive after all; one that
+// fails any other way is left for the round loop to judge. Over limit
+// candidates, none is fetched and none kept.
+func confirmStatMisses(
+	ctx context.Context,
+	logger zerolog.Logger,
+	entryName string,
+	fetchers map[[16]byte]*postedFileFetcher,
+	where map[string]postedSegPos,
+	candidates []string,
+	excluded []string,
+	concurrency, limit int,
+	progress *par2JobProgressState,
+) []string {
+	if len(candidates) > limit {
+		logger.Warn().Str("entry", entryName).Int("candidates", len(candidates)).Int("limit", limit).
+			Strs("providers_left_out", excluded).
+			Msg("par2: too many articles missing on the providers asked to confirm one by one; damage will be found per-round instead")
+		return nil
+	}
+	start := time.Now()
+	const (
+		verdictUnknown = iota
+		verdictDead
+		verdictAlive
+	)
+	verdicts := make([]int, len(candidates))
+	gp := pool.New().WithMaxGoroutines(max(1, concurrency))
+	for i, mid := range candidates {
+		pos, ok := where[mid]
+		f := fetchers[pos.fileID]
+		if !ok || f == nil || pos.index < 0 || pos.index >= len(f.segs) {
+			continue
+		}
+		gp.Go(func() {
+			defer progress.Touch()
+			if ctx.Err() != nil {
+				return
+			}
+			_, err := f.segmentData(pos.index)
+			switch {
+			case err == nil:
+				verdicts[i] = verdictAlive
+			case nntp.IsArticleNotFoundError(err) || nntp.IsCorruptArticleError(err):
+				f.badArticles.Store(pos.index, struct{}{})
+				verdicts[i] = verdictDead
+			}
+		})
+	}
+	gp.Wait()
+
+	var confirmed []string
+	alive, unknown := 0, 0
+	for i, v := range verdicts {
+		switch v {
+		case verdictDead:
+			confirmed = append(confirmed, candidates[i])
+		case verdictAlive:
+			alive++
+		default:
+			unknown++
+		}
+	}
+	logger.Info().
+		Str("entry", entryName).
+		Int("candidates", len(candidates)).
+		Int("confirmed_dead", len(confirmed)).
+		Int("alive_after_all", alive).
+		Int("undecided", unknown).
+		Strs("providers_left_out", excluded).
+		Dur("duration", time.Since(start)).
+		Msg("par2: articles missing on the providers asked were fetched to confirm")
+	return confirmed
 }
 
 // volumeFetchResult holds one parallel recovery-volume fetch outcome.
