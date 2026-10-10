@@ -19,6 +19,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/version"
+	"github.com/sirrobot01/hearsay/transport"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -366,6 +367,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		if err := newConfig.ValidateVirtualFolders(); err != nil {
 			invalid = true
 			return fmt.Errorf("Invalid virtual folders: %w", err)
+		}
+		if _, err := transport.ParseBlockedPeers(newConfig.Hearsay.BlockPrivatePeers, newConfig.Hearsay.Blocklist); err != nil {
+			invalid = true
+			return fmt.Errorf("Invalid hearsay blocklist: %w", err)
 		}
 
 		// Preserve fields that shouldn't be overwritten by frontend. The merge

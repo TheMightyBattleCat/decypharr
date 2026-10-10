@@ -455,3 +455,22 @@ func TestHandleUpdateConfig_UnchangedStartupSettingsDoNotRestart(t *testing.T) {
 		t.Error("saving the same remove_stalled_after again restarted the service")
 	}
 }
+
+// An invalid Hearsay blocklist is refused and nothing is saved.
+func TestHandleUpdateConfig_RejectsInvalidHearsayBlocklist(t *testing.T) {
+	s := &Server{
+		logger:  zerolog.Nop(),
+		manager: newTestManager(t),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(`{"hearsay":{"blocklist":["10.0.0.1"]}}`))
+	rec := httptest.NewRecorder()
+	s.handleUpdateConfig(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if len(config.Get().Hearsay.Blocklist) != 0 {
+		t.Fatal("invalid blocklist was saved")
+	}
+}
