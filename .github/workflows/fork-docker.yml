@@ -61,11 +61,26 @@ jobs:
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/${OWNER}/decypharr" >> "$GITHUB_OUTPUT"
 
+      # Docker Hub limits anonymous pulls per IP, and hosted runners share
+      # IPs, so a build can fail with 429 Too Many Requests before any code
+      # compiles. Every Docker Hub image this job needs is therefore pulled
+      # through Google's public mirror of Docker Hub (mirror.gcr.io): the
+      # QEMU and BuildKit images by name here, and the Dockerfile's base
+      # images through the BuildKit mirror setting, which still falls back
+      # to Docker Hub for a tag the mirror does not have. The Dockerfile is
+      # shared with upstream, so its FROM lines stay as they are.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          image: mirror.gcr.io/tonistiigi/binfmt:latest
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
