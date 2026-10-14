@@ -195,3 +195,44 @@ func TestRouterQueueContracts(t *testing.T) {
 		})
 	}
 }
+
+func TestHistoryDeleteOfGoneEntrySucceeds(t *testing.T) {
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	cfg := config.Get()
+	cfg.UseAuth = true
+	cfg.Auth = &config.Auth{Username: "admin", Password: "not-a-bcrypt-hash", APIToken: "test-token"}
+	cfg.DownloadFolder = t.TempDir()
+	mgr := manager.New()
+	t.Cleanup(func() {
+		if err := mgr.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	router := New(mgr).Routes()
+	// The Arr removes an imported download through the history API and retries
+	// on every refresh until it succeeds, so an entry that is already gone must
+	// count as deleted there. The queue API keeps reporting it as a failure.
+	for _, tc := range []struct {
+		mode       string
+		wantStatus int
+	}{
+		{"history", 200},
+		{"queue", 500},
+	} {
+		values := url.Values{"mode": {tc.mode}, "name": {"delete"}, "value": {"gone"}, "category": {"radarr"}, "ma_password": {"test-token"}}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/?"+values.Encode(), nil))
+		if response.Code != tc.wantStatus {
+			t.Fatalf("%s: status = %d, body = %s", tc.mode, response.Code, response.Body.String())
+		}
+		var got StatusResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != (tc.wantStatus == 200) {
+			t.Fatalf("%s: response = %#v", tc.mode, got)
+		}
+	}
+}

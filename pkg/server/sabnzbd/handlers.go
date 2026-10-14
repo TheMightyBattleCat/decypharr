@@ -2,12 +2,14 @@ package sabnzbd
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/sirrobot01/appendstore"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
@@ -59,7 +61,7 @@ func (s *SABnzbd) handleQueue(w http.ResponseWriter, r *http.Request) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	switch name {
 	case "delete":
-		s.handleDelete(w, r)
+		s.handleDelete(w, r, false)
 	case "pause":
 		s.handleQueuePause(w, r)
 	case "resume":
@@ -73,8 +75,11 @@ func (s *SABnzbd) handleQueueResume(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, response, http.StatusOK)
 }
 
-// handleDelete handles delete operations
-func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
+// handleDelete handles delete operations. With goneIsDeleted an entry that no
+// longer exists counts as deleted, as SABnzbd's history delete does: the Arr
+// retries a failed removal on every refresh, so answering 500 for an entry
+// that is already gone loops forever.
+func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request, goneIsDeleted bool) {
 	nzoIDs := r.FormValue("value")
 	cat := getCategory(r.Context())
 	if nzoIDs == "" {
@@ -108,7 +113,11 @@ func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Use atomic delete operation
-		if err := s.manager.Queue().Delete(nzoID, true, nil); err != nil {
+		err := s.manager.Queue().Delete(nzoID, true, nil)
+		if err != nil && goneIsDeleted && stderrors.Is(err, appendstore.ErrKeyNotFound) {
+			err = nil
+		}
+		if err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to delete %s: %v", nzoID, err))
 		} else {
 			successCount++
@@ -222,7 +231,7 @@ func (s *SABnzbd) handleHistory(w http.ResponseWriter, r *http.Request) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	switch name {
 	case "delete":
-		s.handleDelete(w, r)
+		s.handleDelete(w, r, true)
 	default:
 		s.writeError(w, "Unknown history action", http.StatusBadRequest)
 	}
