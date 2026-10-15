@@ -71,6 +71,9 @@ type cacheMapEntry struct {
 // for every segment (raw: no header to skip) or not (store-mode: header
 // bytes precede the useful data within some articles).
 //
+// An encrypted member is excluded too: the cache holds its decrypted bytes,
+// while PAR2 covers the posted ciphertext.
+//
 // A compressed archive member is deliberately excluded: its extracted bytes
 // have no direct byte-for-byte relationship to the posted article bytes (a
 // real decompression pass produced them), so there is nothing here to map -
@@ -80,7 +83,7 @@ type cacheMapEntry struct {
 func buildCacheSegmentMap(nzb *storage.NZB) map[string][]cacheMapEntry {
 	out := make(map[string][]cacheMapEntry)
 	for _, f := range nzb.Files {
-		if f.IsDeleted || !f.IsStored {
+		if f.IsDeleted || !f.IsStored || f.IsEncrypted {
 			continue
 		}
 		for _, seg := range f.Segments {

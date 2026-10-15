@@ -204,7 +204,8 @@ func (r *Repair) checkImportGeometry(ctx context.Context, infoHash, name string,
 		return geometryVerdict{}
 	}
 	var head []byte
-	if first := f.Segments[0]; readHead && first.StartOffset == 0 && isMatroskaName(name) && spliceBoundaries(f.Segments) == 0 {
+	// An encrypted file's first article is ciphertext: no header to read.
+	if first := f.Segments[0]; readHead && !f.IsEncrypted && first.StartOffset == 0 && isMatroskaName(name) && spliceBoundaries(f.Segments) == 0 {
 		want := first.SegmentDataStart + min(first.Bytes, matroskaHeadBytes)
 		prefix, err := u.FetchArticlePrefix(ctx, first.MessageID, int(want))
 		if err == nil && int64(len(prefix)) == want {

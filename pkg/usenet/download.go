@@ -35,6 +35,16 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 	if len(file.Segments) == 0 {
 		return fmt.Errorf("file has no segments: %s", file.Name)
 	}
+	if file.IsEncrypted {
+		// The segments below are ciphertext; the stream reader decrypts.
+		if err := u.Stream(ctx, nzoID, filename, 0, file.Size-1, writer); err != nil {
+			return err
+		}
+		if progressCallback != nil {
+			progressCallback(file.Size, 0)
+		}
+		return nil
+	}
 
 	// Track progress
 	var completedSegments atomic.Int64

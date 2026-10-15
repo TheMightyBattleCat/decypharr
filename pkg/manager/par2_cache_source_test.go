@@ -54,6 +54,14 @@ func TestBuildCacheSegmentMapIndexesOnlyStoredFiles(t *testing.T) {
 					{MessageID: "<d>", StartOffset: 0, EndOffset: 99, SegmentDataStart: 0, Bytes: 100},
 				},
 			},
+			{
+				Name:        "encrypted.mkv",
+				IsStored:    true,
+				IsEncrypted: true, // cache holds plaintext, PAR2 the ciphertext
+				Segments: []storage.NZBSegment{
+					{MessageID: "<e>", StartOffset: 0, EndOffset: 99, SegmentDataStart: 0, Bytes: 100},
+				},
+			},
 		},
 	}
 
@@ -70,6 +78,9 @@ func TestBuildCacheSegmentMapIndexesOnlyStoredFiles(t *testing.T) {
 	}
 	if _, ok := m["<d>"]; ok {
 		t.Errorf("deleted file's segment <d> must not be indexed")
+	}
+	if _, ok := m["<e>"]; ok {
+		t.Errorf("encrypted file's segment <e> must not be indexed - its cached bytes are plaintext")
 	}
 
 	entry := m["<a>"][0]

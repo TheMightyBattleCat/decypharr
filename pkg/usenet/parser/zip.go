@@ -46,6 +46,7 @@ type ZIPFileEntry struct {
 	Method            uint16
 	IsStored          bool
 	IsDirectory       bool
+	Encrypted         bool // general purpose flag bit 0: ZipCrypto or AES
 	LocalHeaderOffset int64
 	CRC32             uint32
 }
@@ -106,6 +107,10 @@ func (p *ZIPParser) Process(ctx context.Context, group *FileGroup, password stri
 		// Only process stored (uncompressed) files for streaming
 		if !file.IsStored {
 			continue
+		}
+		if file.Encrypted {
+			// Its stored bytes are ciphertext, which the reader cannot decrypt.
+			return nil, fmt.Errorf("%s: encrypted ZIP entries are not supported", file.Name)
 		}
 
 		internal := NormalizeArchivePath(file.Name)
@@ -461,6 +466,7 @@ func (p *ZIPParser) parseCentralDirEntry(r *bytes.Reader) (*ZIPFileEntry, error)
 		Method:            header.Method,
 		IsStored:          header.Method == ZIPStoreMethod,
 		IsDirectory:       isDir,
+		Encrypted:         header.Flags&1 != 0,
 		LocalHeaderOffset: localHeaderOffset,
 		CRC32:             header.CRC32,
 	}, nil
