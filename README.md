@@ -70,6 +70,25 @@ Padding and PAR2 repair are on by default. This is the largest difference betwee
 - An article that turns out to belong to a different upload, served under a reused message ID, is refused
   instead of being stitched into your file.
 
+### Password-protected releases
+
+Releases posted as password-protected archives stream like any other, decrypted as they are read: stored
+(uncompressed) 7z archives, including ones whose file list is encrypted too, and RAR5 archives.
+
+- The password is looked for, in this order: every password the NZB itself carries, a `Name{{password}}.nzb`
+  file name, and the SABnzbd `password` (or `nzbname` with `{{password}}`) field of the add call. A password
+  given with the name or the add call is written into the stored NZB, so it survives a restart, and is kept
+  out of the folder name.
+- `usenet.archive_passwords` in `config.json` is a list of further passwords, tried in order after the
+  release's own. There is no field for it on the Settings page yet; saving settings leaves it in place.
+- Each password is checked against the archive before it is used: for 7z by decrypting the start of a video
+  file, for RAR5 against the archive's own password check. When none fits, the release fails with "archive is
+  encrypted and no known password opens it", the Arr blocklists it and grabs another, and the same NZB
+  imports later once the right password is known.
+- An encrypted release that cannot be streamed is refused with the reason rather than imported unreadable:
+  a solid or compressed encrypted 7z, RAR 2.9/3.x encryption, RAR volumes inside an encrypted 7z, and
+  encrypted ZIP entries.
+
 ### Repair sweeps look inside the file
 
 Upstream's repair sweep checks that a file's articles still exist and can optionally check the container signature

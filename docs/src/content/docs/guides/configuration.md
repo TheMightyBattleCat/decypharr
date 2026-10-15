@@ -138,6 +138,7 @@ Array of Debrid services:
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
 | `disk_buffer_path`            | string | Disk buffer location            | `{main_path}/usenet/streams` |
 | `prefer_faster_servers`       | bool   | Try a primary provider that is far slower than the others after them; off = strict priority order. Backups are never reordered. Applies without a restart ([details](../usenet/overview/#prefer-faster-servers)) | `true` |
+| `archive_passwords`           | array  | Passwords tried, in order, on an encrypted archive after the ones its NZB carries (meta, `Name{{password}}.nzb`, the add call's `password` field). Each is checked against the archive before use. Not on the Settings page; saving settings keeps it | `[]` |
 
 ### Provider Fields
 
