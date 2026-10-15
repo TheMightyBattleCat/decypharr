@@ -42,6 +42,10 @@ type NZB struct {
 	Storage        string    `json:"storage" msgpack:"storage"`
 	FailMessage    string    `json:"fail_message,omitempty" msgpack:"fail_message,omitempty"`
 	Password       string    `json:"password,omitempty" msgpack:"password,omitempty"`
+	// Passwords lists every password the NZB carries, for the archive
+	// processors to try in turn. Parse fills it and Process reads it in the
+	// same run; it is never stored (Password keeps the one that worked).
+	Passwords []string `json:"-" msgpack:"-"`
 
 	// ContentHash is a hash of the raw NZB content this record was parsed
 	// from - the release's identity independent of ID (a fresh UUID every

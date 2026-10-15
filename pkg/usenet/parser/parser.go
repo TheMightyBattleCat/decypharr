@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -172,7 +173,7 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	}()
 
 	// Parse raw XML
-	raw, oneCopy, err := parseNZB(bytes.NewReader(content))
+	raw, oneCopy, passwords, err := parseNZBWithPasswords(bytes.NewReader(content))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse NZB content: %w", err)
 	}
@@ -183,11 +184,14 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 
 	// Create base NZB structure
 	nzb = &storage.NZB{
-		Files:    []storage.NZBFile{},
-		Status:   "parsed",
-		Name:     determineNZBName(filename, raw.Meta),
-		Title:    raw.Meta["title"],
-		Password: raw.Meta["password"],
+		Files:     []storage.NZBFile{},
+		Status:    "parsed",
+		Name:      determineNZBName(filename, raw.Meta),
+		Title:     raw.Meta["title"],
+		Passwords: passwords,
+	}
+	if len(passwords) > 0 {
+		nzb.Password = passwords[0]
 	}
 	// Group files by base Name and type
 	fileGroups, par2Names := p.groupFiles(ctx, raw.Files)
@@ -298,14 +302,26 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 		}
 	}()
 
+	cfg := config.Get()
+
+	// The NZB's own passwords first, then the configured ones.
+	passwords := passwordCandidates(nzb.Passwords, []string{nzb.Password}, cfg.Usenet.ArchivePasswords)
+
 	// Parse each group (with deferred archive option)
-	files := p.processFileGroups(ctx, groups, nzb.Password)
+	files, groupErrs := p.processFileGroups(ctx, groups, passwords)
 
 	if len(files) == 0 {
+		if err := errors.Join(groupErrs...); err != nil {
+			return nil, fmt.Errorf("no valid files found in NZB: %w", err)
+		}
 		return nil, fmt.Errorf("no valid files found in NZB")
 	}
-
-	cfg := config.Get()
+	for _, file := range files {
+		if file.IsEncrypted && file.Password != "" {
+			nzb.Password = file.Password // the one that opened it
+			break
+		}
+	}
 
 	// Change file name if there's only one file
 	hasOneFile := len(files) == 1
@@ -1466,9 +1482,11 @@ func (p *NZBParser) isRarFile(filename string) bool {
 		rarVolumePattern.MatchString(filename)
 }
 
-func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*FileGroup, password string) []storage.NZBFile {
+// processFileGroups returns the files of every group that processed, and
+// the errors of those that did not.
+func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*FileGroup, passwords []string) ([]storage.NZBFile, []error) {
 	if len(groups) == 0 {
-		return nil
+		return nil, nil
 	}
 	rarCounts, sevenZCounts, zipCounts, mediaCounts, deferredCounts := 0, 0, 0, 0, 0
 
@@ -1483,23 +1501,31 @@ func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*Fi
 
 	// Use a Mapper with limited concurrency to prevent goroutine explosion
 	// when nested with RAR/archive parsers that also use parallel processing
-	mapper := iter.Mapper[FileGroup, []*storage.NZBFile]{
+	type groupResult struct {
+		files []*storage.NZBFile
+		err   error
+	}
+	mapper := iter.Mapper[FileGroup, groupResult]{
 		MaxGoroutines: p.maxConcurrent,
 	}
 
-	results := mapper.Map(fileGroups, func(g *FileGroup) []*storage.NZBFile {
-		files, err := p.processFileGroup(ctx, g, password)
+	results := mapper.Map(fileGroups, func(g *FileGroup) groupResult {
+		files, err := p.processFileGroup(ctx, g, passwords)
 		if err != nil {
 			p.logger.Warn().Err(err).Str("group", g.BaseName).Msg("Failed to process file group")
-			return nil
+			return groupResult{err: fmt.Errorf("%s: %w", g.BaseName, err)}
 		}
-		return files
+		return groupResult{files: files}
 	})
 
 	// Filter nils
 	var files []storage.NZBFile
-	for _, groupFiles := range results {
-		for _, f := range groupFiles {
+	var errs []error
+	for _, result := range results {
+		if result.err != nil {
+			errs = append(errs, result.err)
+		}
+		for _, f := range result.files {
 			if f != nil {
 				files = append(files, *f)
 				// Count types
@@ -1525,30 +1551,76 @@ func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*Fi
 		}
 	}
 
-	return files
+	return files, errs
 }
 
-// Simplified individual group processing
-func (p *NZBParser) processFileGroup(ctx context.Context, group *FileGroup, password string) ([]*storage.NZBFile, error) {
+// Simplified individual group processing. passwords are the candidates for
+// an encrypted archive, best first.
+func (p *NZBParser) processFileGroup(ctx context.Context, group *FileGroup, passwords []string) ([]*storage.NZBFile, error) {
 	if err := p.enrichGroupWithFileInfo(ctx, group); err != nil {
 		return nil, err
+	}
+	first := ""
+	if len(passwords) > 0 {
+		first = passwords[0]
 	}
 
 	switch group.Type {
 	case storage.NZBFileTypeMedia:
-		return wrapNZBFile(p.processMediaFile(group, password))
+		return wrapNZBFile(p.processMediaFile(group, first))
 	case storage.NZBFileTypeRar:
 		rarParser := NewRARParser(p.manager, p.maxConcurrent, p.logger)
-		return rarParser.Process(ctx, group, password)
+		return p.tryPasswords(group, passwords, func(password string) ([]*storage.NZBFile, error) {
+			return rarParser.Process(ctx, group, password)
+		})
 	case storage.NZBFileTypeSevenZip:
+		// Tries the candidates itself: one header read serves them all.
 		zipParser := NewSevenZParser(p.manager, p.maxConcurrent, p.logger)
-		return zipParser.Process(ctx, group, password)
+		return requireKeys(zipParser.Process(ctx, group, passwords))
 	case storage.NZBFileTypeZip:
 		zipParser := NewZIPParser(p.manager, p.maxConcurrent, p.logger)
-		return zipParser.Process(ctx, group, password)
+		return requireKeys(zipParser.Process(ctx, group, first))
 	default:
 		return nil, fmt.Errorf("unsupported file type: %v", group.Type)
 	}
+}
+
+// tryPasswords runs process with each password in turn until one opens the
+// archive. Only a password failure moves on to the next candidate; any other
+// result, success or error, is final.
+func (p *NZBParser) tryPasswords(group *FileGroup, passwords []string, process func(password string) ([]*storage.NZBFile, error)) ([]*storage.NZBFile, error) {
+	if len(passwords) == 0 {
+		passwords = []string{""}
+	}
+	var err error
+	for i, password := range passwords {
+		var files []*storage.NZBFile
+		files, err = requireKeys(process(password))
+		if errors.Is(err, ErrArchivePassword) {
+			continue
+		}
+		if err == nil && i > 0 {
+			// The position, never the password: logs are shared.
+			p.logger.Info().Str("group", group.BaseName).Int("candidate", i+1).Int("candidates", len(passwords)).
+				Msg("Encrypted archive opened by a later password candidate")
+		}
+		return files, err
+	}
+	return nil, err
+}
+
+// requireKeys fails a group holding an encrypted file without a key: its
+// bytes would be served as ciphertext, which no player or ffprobe can read.
+func requireKeys(files []*storage.NZBFile, err error) ([]*storage.NZBFile, error) {
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range files {
+		if f != nil && f.IsEncrypted && len(f.EncryptionKey) == 0 {
+			return nil, fmt.Errorf("%s: %w", f.Name, ErrArchivePassword)
+		}
+	}
+	return files, nil
 }
 
 func (p *NZBParser) enrichGroupWithFileInfo(ctx context.Context, group *FileGroup) error {

@@ -25,25 +25,34 @@ import (
 //
 // dropped names the subjects it kept a single copy of.
 func parseNZB(r io.Reader) (nzb *nzbparser.Nzb, dropped []string, err error) {
+	nzb, dropped, _, err = parseNZBWithPasswords(r)
+	return nzb, dropped, err
+}
+
+// parseNZBWithPasswords is parseNZB that also returns every password meta,
+// in document order. Meta values are character data: entities are decoded,
+// so a password with "&" is not handed on as "&amp;". Nzb.Meta keeps one
+// value per type and would drop all but the last password.
+func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, passwords []string, err error) {
 	var x struct {
-		XMLName  xml.Name `xml:"nzb"`
-		Comment  string   `xml:",comment"`
-		Metadata []struct {
-			Type  string `xml:"type,attr"`
-			Value string `xml:",innerxml"`
-		} `xml:"head>meta"`
-		Files nzbparser.NzbFiles `xml:"file"`
+		XMLName  xml.Name           `xml:"nzb"`
+		Comment  string             `xml:",comment"`
+		Metadata []nzbMeta          `xml:"head>meta"`
+		Files    nzbparser.NzbFiles `xml:"file"`
 	}
 	decoder := xml.NewDecoder(r)
 	decoder.CharsetReader = charset.NewReaderLabel
 	decoder.Strict = false // as nzbparser: ignore unknown or malformed character entities
 	if err := decoder.Decode(&x); err != nil {
-		return nil, nil, fmt.Errorf("unable to parse NZB file: %s", err.Error())
+		return nil, nil, nil, fmt.Errorf("unable to parse NZB file: %s", err.Error())
 	}
 
 	nzb = &nzbparser.Nzb{Comment: x.Comment, Meta: make(map[string]string, len(x.Metadata))}
 	for _, md := range x.Metadata {
 		nzb.Meta[md.Type] = md.Value
+		if md.isPassword() {
+			passwords = append(passwords, md.value())
+		}
 	}
 	nzb.Files, dropped = keepOneCopyPerSubject(x.Files)
 
@@ -55,7 +64,7 @@ func parseNZB(r io.Reader) (nzb *nzbparser.Nzb, dropped []string, err error) {
 		segs := nzb.Files[i].Segments
 		sort.SliceStable(segs, func(a, b int) bool { return segs[a].Number < segs[b].Number })
 	}
-	return nzb, dropped, nil
+	return nzb, dropped, passwords, nil
 }
 
 // keepOneCopyPerSubject returns files with each subject's duplicate <file>

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +13,16 @@ import (
 type rar5Encryption struct {
 	Encrypted bool
 	Key, IV   []byte
+}
+
+// rar5CheckIntact reports whether a RAR5 password check value is present
+// and undamaged: its last 4 bytes are the SHA-256 of its first 8.
+func rar5CheckIntact(check []byte) bool {
+	if len(check) != 12 {
+		return false
+	}
+	sum := sha256.Sum256(check[:8])
+	return bytes.Equal(sum[:4], check[8:])
 }
 
 // parseRAR5Extra reads each record within its declared size.
@@ -61,16 +72,23 @@ func parseRAR5Extra(data []byte, password string) (rar5Encryption, error) {
 		if _, err := io.ReadFull(record, iv); err != nil {
 			return rar5Encryption{}, fmt.Errorf("RAR5 IV: %w", err)
 		}
+		var check []byte
 		if flags&1 != 0 {
-			var check [12]byte
-			if _, err := io.ReadFull(record, check[:]); err != nil {
+			check = make([]byte, 12)
+			if _, err := io.ReadFull(record, check); err != nil {
 				return rar5Encryption{}, fmt.Errorf("RAR5 password check: %w", err)
 			}
 		}
 		encryption.Encrypted = true
 		encryption.IV = iv
 		if password != "" {
-			encryption.Key = crypto.DeriveKeys([]byte(password), salt[:], int(kdf)).Key
+			keys := crypto.DeriveKeys([]byte(password), salt[:], int(kdf))
+			// A wrong password gets no key, so the file is refused rather
+			// than served as ciphertext. As unrar does, a check value whose
+			// own checksum is wrong is damaged and proves nothing.
+			if !rar5CheckIntact(check) || crypto.VerifyPassword(keys, check) {
+				encryption.Key = keys.Key
+			}
 		}
 	}
 	return encryption, nil

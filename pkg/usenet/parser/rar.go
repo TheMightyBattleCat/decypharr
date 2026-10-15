@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Tensai75/nzbparser"
 	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/internal/crypto"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
@@ -113,6 +115,7 @@ type RARFileEntry struct {
 	IsStored         bool  // True if stored (method 0), false if compressed
 	IsDirectory      bool
 	IsEncrypted      bool                   // File data is encrypted
+	RAR4Encrypted    bool                   // RAR 2.9/3.x encryption (AES-128), which the reader cannot decrypt
 	EncryptionKey    []byte                 // AES-256 key for data decryption (derived from extra area salt)
 	EncryptionIV     []byte                 // AES IV for data decryption (16 bytes, from extra area)
 	VolumeParts      []*types.RARVolumePart // Parts across volumes
@@ -212,12 +215,15 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	namesOrder := namesOrderVolumes(group.Files)
 	archiveInfo, err := p.parseArchive(ctx, volumes, password, namesOrder)
 	if err != nil {
+		if errors.Is(err, crypto.ErrBadPassword) {
+			return nil, fmt.Errorf("failed to parse RAR archive: %w: %w", ErrArchivePassword, err)
+		}
 		return nil, fmt.Errorf("failed to parse RAR archive: %w", err)
 	}
 
 	// Check if archive has encrypted headers and we couldn't parse it
 	if archiveInfo.IsHeaderEncrypted && len(archiveInfo.Files) == 0 {
-		return nil, fmt.Errorf("RAR archive has encrypted headers; password required or incorrect")
+		return nil, fmt.Errorf("RAR archive has encrypted headers: %w", ErrArchivePassword)
 	}
 
 	// If parseArchive recovered a TRUE volume order that differs from the NZB
@@ -304,6 +310,9 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		name := utils.RemoveInvalidChars(path.Base(rarFile.Name))
 		if name == "" {
 			name = filename
+		}
+		if rarFile.RAR4Encrypted {
+			return nil, fmt.Errorf("%s: RAR4 (RAR 2.9/3.x) encryption is not supported", rarFile.Name)
 		}
 
 		// Volume sizes the parts do not fit make the whole set's geometry
@@ -1413,6 +1422,7 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 		DataOffset:       dataOffset,
 		IsStored:         isStored,
 		IsDirectory:      isDirectory,
+		RAR4Encrypted:    header.Flags&RAR4FileFlagEncrypted != 0,
 		CRC32:            crc32,
 		VolumeIndex:      volumeIndex,
 		VolumeParts: []*types.RARVolumePart{{
@@ -1707,6 +1717,7 @@ func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry
 			if len(file.VolumeParts) > 0 {
 				// Append volume parts (PartNumber already set correctly during parsing)
 				existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
+				existing.RAR4Encrypted = existing.RAR4Encrypted || file.RAR4Encrypted
 				// Update total packed size
 				existing.PackedSize += file.PackedSize
 			}

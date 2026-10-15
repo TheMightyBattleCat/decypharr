@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"crypto/aes"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +38,9 @@ func NewSevenZParser(manager *nntp.Client, maxConcurrent int, logger zerolog.Log
 	}
 }
 
-func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password string) ([]*storage.NZBFile, error) {
+// Process lists a 7z archive's entries and maps each to its segments.
+// passwords are the candidates for an encrypted archive, best first.
+func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, passwords []string) ([]*storage.NZBFile, error) {
 	sort.Slice(group.Files, func(i, j int) bool {
 		return group.Files[i].Filename < group.Files[j].Filename
 	})
@@ -65,14 +68,39 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password s
 	}
 	defer cleanup()
 
-	reader, err := sevenzip.NewReaderWithPassword(readerAt, size, password)
+	// An encrypted header (7z -mhe) needs the password before anything can
+	// be listed; a plain one opens with any candidate.
+	tries := passwords
+	if len(tries) == 0 {
+		tries = []string{""}
+	}
+	var reader *sevenzip.Reader
+	for _, candidate := range tries {
+		if reader, err = sevenzip.NewReaderWithPassword(readerAt, size, candidate); err == nil {
+			// The header's password first: it is the archive's.
+			passwords = passwordCandidates([]string{candidate}, passwords)
+			break
+		}
+	}
 	if err != nil {
+		if len(passwords) > 1 {
+			return nil, fmt.Errorf("failed to open sevenzip reader with any of %d passwords: %w", len(passwords), err)
+		}
 		return nil, fmt.Errorf("failed to open sevenzip reader: %w", err)
 	}
 
 	fileList, err := reader.ListFilesWithOffsets()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files with offsets: %w", err)
+	}
+
+	password, err := p.encryptionPassword(fileList, readerAt, passwords)
+	if err != nil {
+		return nil, err
+	}
+	folderFiles := make(map[int]int)
+	for _, file := range fileList {
+		folderFiles[file.FolderIndex]++
 	}
 
 	// Separate RAR files from non-RAR files
@@ -90,6 +118,13 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password s
 	var files []*storage.NZBFile
 
 	// Parse RAR files by reading their headers directly from readerAt
+	for _, file := range rarFiles {
+		if file.Encrypted {
+			// The RAR parser reads volume headers straight from the 7z's
+			// bytes, which here are ciphertext.
+			return nil, fmt.Errorf("RAR volumes inside an encrypted 7z are not supported (%s)", file.Name)
+		}
+	}
 	if len(rarFiles) > 0 {
 		rarNZBFiles, err := p.processRARFilesFromPositions(ctx, rarFiles, group, readerAt, baseSegments, volumeInfos, password)
 		if err != nil {
@@ -111,6 +146,18 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password s
 		name := utils.RemoveInvalidChars(filepath.Base(internal))
 		if name == "" {
 			name = path.Base(internal)
+		}
+
+		if file.Encrypted {
+			nzbFile, err := encrypted7zFile(file, folderFiles[file.FolderIndex], password, baseSegments)
+			if err != nil {
+				return nil, err
+			}
+			nzbFile.Name = name
+			nzbFile.InternalPath = internal
+			nzbFile.Groups = getGroupsList(group.Groups)
+			files = append(files, nzbFile)
+			continue
 		}
 
 		// Slice segments for this file's byte range using offset from sevenzip
@@ -150,6 +197,75 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, password s
 		Msg("7z archive processing complete")
 
 	return files, nil
+}
+
+// encryptionPassword returns the candidate that opens fileList's encrypted
+// entries, or the first candidate when none is encrypted. It reads one AES
+// block of each encrypted media entry - one article each - to tell.
+func (p *SevenZParser) encryptionPassword(fileList []sevenzip.FileInfo, readerAt io.ReaderAt, passwords []string) (string, error) {
+	heads := make(map[int][]byte)
+	encrypted := 0
+	for i, file := range fileList {
+		if !file.Encrypted || isRARFile(file.Name) {
+			continue
+		}
+		encrypted++
+		if known, _ := mediaHeadMatches(file.Name, make([]byte, 16)); !known || file.Offset < 0 || len(heads) >= 2 {
+			continue
+		}
+		head := make([]byte, 16)
+		if _, err := readerAt.ReadAt(head, file.Offset); err != nil {
+			return "", fmt.Errorf("read the first AES block of %s: %w", file.Name, err)
+		}
+		heads[i] = head
+	}
+	if encrypted == 0 {
+		if len(passwords) > 0 {
+			return passwords[0], nil
+		}
+		return "", nil
+	}
+	password, verified, err := choose7zPassword(fileList, heads, passwords)
+	if err != nil {
+		return "", fmt.Errorf("7z with %d encrypted entries, %d password candidates: %w", encrypted, len(passwords), err)
+	}
+	if !verified {
+		p.logger.Warn().Int("encrypted", encrypted).
+			Msg("Encrypted 7z holds no media whose opening proves a password; using the first candidate unverified")
+	}
+	return password, nil
+}
+
+// encrypted7zFile maps an encrypted 7z entry to its segments and AES
+// parameters. The segments cover the entry's packed bytes - its size padded
+// to whole AES blocks - since the last block decrypts only whole.
+func encrypted7zFile(file sevenzip.FileInfo, folderFiles int, password string, baseSegments []storage.NZBSegment) (*storage.NZBFile, error) {
+	if err := check7zStreamable(file, folderFiles); err != nil {
+		return nil, err
+	}
+	key, err := sevenZipKey(password, file.AESSalt, file.KDFIterations)
+	if err != nil {
+		return nil, err
+	}
+	if file.Offset < 0 {
+		return nil, fmt.Errorf("%s: encrypted 7z entry has no data offset", file.Name)
+	}
+	segments, err := sliceSegmentsForRangeSimple(baseSegments, file.Offset, int64(file.PackedSize))
+	if err != nil || len(segments) == 0 {
+		return nil, fmt.Errorf("%s: cannot map encrypted 7z entry to its segments: %v", file.Name, err)
+	}
+	iv := make([]byte, aes.BlockSize)
+	copy(iv, file.AESIV)
+	return &storage.NZBFile{
+		Size:          int64(file.Size),
+		IsStored:      true,
+		Segments:      segments,
+		Password:      password,
+		FileType:      storage.NZBFileTypeSevenZip,
+		IsEncrypted:   true,
+		EncryptionKey: key,
+		EncryptionIV:  iv,
+	}, nil
 }
 
 // sortRARFilesByVolumeOrder sorts RAR volumes by volume-name order (.rar
@@ -320,6 +436,9 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		if filename == "" {
 			filename = path.Base(rarEntry.Name)
 		}
+		if rarEntry.RAR4Encrypted {
+			return nil, fmt.Errorf("%s: RAR4 (RAR 2.9/3.x) encryption is not supported", rarEntry.Name)
+		}
 
 		// get segments for this file by processing all its volume parts
 		fileSegments, err := p.buildSegmentsForRARFile(rarEntry, rarFileOffsets, rarFileSizes, baseSegments, volumeInfos)
@@ -353,6 +472,10 @@ func (p *SevenZParser) processRARFilesFromPositions(
 			Groups:       getGroupsList(group.Groups),
 			Password:     password,
 			FileType:     storage.NZBFileTypeRar,
+			// requireKeys refuses an encrypted entry the password did not open.
+			IsEncrypted:   rarEntry.IsEncrypted,
+			EncryptionKey: rarEntry.EncryptionKey,
+			EncryptionIV:  rarEntry.EncryptionIV,
 		})
 	}
 

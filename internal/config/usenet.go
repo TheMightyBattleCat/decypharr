@@ -86,6 +86,12 @@ type Usenet struct {
 	// Backup servers are never reordered either way. *bool so unset means on.
 	// Read live, so a change applies without a restart.
 	PreferFasterServers *bool `json:"prefer_faster_servers,omitempty"`
+
+	// ArchivePasswords are tried, in order, on an encrypted archive after
+	// the passwords its NZB carries (meta, "{{password}}" name, the add
+	// call's password field). Read live, so an addition applies to the next
+	// grab without a restart.
+	ArchivePasswords []string `json:"archive_passwords,omitempty"`
 }
 
 // PreferFasterServersEnabled reports whether slow primaries may be tried after

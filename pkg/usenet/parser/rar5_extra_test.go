@@ -8,7 +8,34 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/sirrobot01/decypharr/internal/crypto"
 )
+
+// TestRAR5ExtraPasswordCheck: a wrong password against an intact check value
+// gets no key, so requireKeys refuses the file instead of serving ciphertext.
+func TestRAR5ExtraPasswordCheck(t *testing.T) {
+	salt := make([]byte, 16)
+	check := crypto.DeriveKeys([]byte("right"), salt, 1).PwCheck
+	if !rar5CheckIntact(check) {
+		t.Fatalf("derived check %x reads as damaged", check)
+	}
+	record := []byte{RAR5ExtraTypeEncryption, 0, 1, 1} // type, version 0, flags: check present, kdf 2^1
+	record = append(record, salt...)
+	record = append(record, bytes.Repeat([]byte{7}, 16)...)
+	record = append(record, check...)
+	data := append([]byte{byte(len(record))}, record...)
+
+	for _, test := range []struct {
+		password string
+		key      bool
+	}{{"right", true}, {"wrong", false}, {"", false}} {
+		result, err := parseRAR5Extra(data, test.password)
+		if err != nil || !result.Encrypted || (result.Key != nil) != test.key {
+			t.Errorf("password %q: encrypted=%v key=%x err=%v", test.password, result.Encrypted, result.Key, err)
+		}
+	}
+}
 
 func TestRAR5ExtraRecordBoundaries(t *testing.T) {
 	payload := append([]byte{0, 0, 1}, make([]byte, 16)...)
