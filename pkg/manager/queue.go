@@ -15,6 +15,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 type ImportType string
@@ -65,7 +66,10 @@ func NewTorrentRequest(debrid string, downloadFolder string, magnet *utils.Magne
 	}
 }
 
+// A "{{password}}" in name is moved into the NZB as a password meta, so
+// the stored NZB keeps it and the name used for folders and logs does not.
 func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr *arr.Arr, action config.DownloadAction, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
+	name, nzbContent = parser.MovePasswordIntoNZB(name, nzbContent)
 	return &ImportRequest{
 		Name:            name,
 		Id:              uuid.New().String(),

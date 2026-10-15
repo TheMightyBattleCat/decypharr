@@ -15,6 +15,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 // handleAPI is the main handler for all SABnzbd API requests
@@ -296,6 +297,7 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	urls := r.FormValue("name")
+	password := addPassword(r)
 
 	cfg := config.Get()
 	action := cfg.DefaultDownloadAction
@@ -319,7 +321,7 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		nzoID, err := s.addNZBURL(ctx, url, _arr, action)
+		nzoID, err := s.addNZBURL(ctx, url, _arr, action, password)
 		if err != nil {
 			s.logger.Error().Err(err).Str("url", url).Msg("Failed to add NZB from URL")
 			errors = append(errors, fmt.Sprintf("Failed to add %s: %v", url, err))
@@ -383,6 +385,7 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 
 	var nzoIDs []string
 	var errors []string
+	password := addPassword(r)
 
 	// Try to get multiple files from "name" field
 	if r.MultipartForm != nil && r.MultipartForm.File != nil {
@@ -396,7 +399,8 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		for _, fileHeader := range files {
 			file, err := fileHeader.Open()
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("Failed to open %s: %v", fileHeader.Filename, err))
+				shown, _ := parser.SplitNamePassword(fileHeader.Filename)
+				errors = append(errors, fmt.Sprintf("Failed to open %s: %v", shown, err))
 				continue
 			}
 
@@ -404,15 +408,17 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 			content, err := io.ReadAll(file)
 			file.Close()
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("Failed to read %s: %v", fileHeader.Filename, err))
+				shown, _ := parser.SplitNamePassword(fileHeader.Filename)
+				errors = append(errors, fmt.Sprintf("Failed to read %s: %v", shown, err))
 				continue
 			}
 
 			// Parse NZB file
-			nzbID, err := s.addNZBFile(ctx, content, fileHeader.Filename, _arr, action)
+			nzbID, err := s.addNZBFile(ctx, content, fileHeader.Filename, _arr, action, password)
 			if err != nil {
-				s.logger.Error().Err(err).Str("filename", fileHeader.Filename).Msg("Failed to add NZB file")
-				errors = append(errors, fmt.Sprintf("Failed to add %s: %v", fileHeader.Filename, err))
+				shown, _ := parser.SplitNamePassword(fileHeader.Filename)
+				s.logger.Error().Err(err).Str("filename", shown).Msg("Failed to add NZB file")
+				errors = append(errors, fmt.Sprintf("Failed to add %s: %v", shown, err))
 				continue
 			}
 			if nzbID != "" {
@@ -436,7 +442,7 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Parse NZB file
-		nzbID, err := s.addNZBFile(ctx, content, header.Filename, _arr, action)
+		nzbID, err := s.addNZBFile(ctx, content, header.Filename, _arr, action, password)
 		if err != nil {
 			s.writeError(w, fmt.Sprintf("Failed to add NZB file: %s", err.Error()), http.StatusInternalServerError)
 			return
@@ -575,7 +581,17 @@ func (s *SABnzbd) writeError(w http.ResponseWriter, message string, status int) 
 	utils.JSONResponse(w, response, status)
 }
 
-func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, action config.DownloadAction) (string, error) {
+// addPassword returns the archive password an add call supplies: SABnzbd's
+// "password" field, else a "{{password}}" in its "nzbname" field.
+func addPassword(r *http.Request) string {
+	if password := strings.TrimSpace(r.FormValue("password")); password != "" {
+		return password
+	}
+	_, password := parser.SplitNamePassword(r.FormValue("nzbname"))
+	return password
+}
+
+func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, action config.DownloadAction, password string) (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("URL is required")
 	}
@@ -590,13 +606,14 @@ func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, actio
 		s.logger.Warn().Str("url", url).Msg("Downloaded content is empty")
 		return "", fmt.Errorf("downloaded content is empty")
 	}
-	return s.addNZBFile(ctx, content, filename, arr, action)
+	return s.addNZBFile(ctx, content, filename, arr, action, password)
 }
 
-func (s *SABnzbd) addNZBFile(ctx context.Context, content []byte, filename string, arr *arr.Arr, action config.DownloadAction) (string, error) {
+func (s *SABnzbd) addNZBFile(ctx context.Context, content []byte, filename string, arr *arr.Arr, action config.DownloadAction, password string) (string, error) {
 	if len(content) == 0 {
 		return "", fmt.Errorf("NZB content is empty")
 	}
+	content = parser.WithPasswordMeta(content, password)
 
 	cfg := config.Get()
 
