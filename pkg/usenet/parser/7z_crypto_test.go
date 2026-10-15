@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -87,6 +88,48 @@ func TestEncrypted7zEntriesDecryptToTheLibrarysPlaintext(t *testing.T) {
 		if !bytes.Equal(packed[:e.Size], want[e.Name]) {
 			t.Fatalf("%s: decrypted bytes differ from the library's extraction", e.Name)
 		}
+	}
+}
+
+// TestSevenZipHeaderEncrypted builds the signature header and next header of
+// a minimal archive: an encoded header whose coder is AES reads as encrypted,
+// one whose coder is LZMA, a plain header, or a non-7z file does not.
+func TestSevenZipHeaderEncrypted(t *testing.T) {
+	archive := func(next []byte) []byte {
+		sig := make([]byte, 32)
+		copy(sig, sevenZipSignature)
+		binary.LittleEndian.PutUint64(sig[12:20], 4) // 4 bytes of packed data first
+		binary.LittleEndian.PutUint64(sig[20:28], uint64(len(next)))
+		return append(append(sig, 0, 0, 0, 0), next...)
+	}
+	aesCoder := []byte{0x17, 0x06, 0x00, 0x01, 0x09, 0x10, 0x00, 0x07, 0x0b, 0x01, 0x00, 0x01, 0x24, 0x06, 0xf1, 0x07, 0x01, 0x02, 0x13, 0x00}
+	lzmaCoder := []byte{0x17, 0x06, 0x00, 0x01, 0x09, 0x10, 0x00, 0x07, 0x0b, 0x01, 0x00, 0x01, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00}
+	for _, test := range []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"encrypted header", archive(aesCoder), true},
+		{"compressed header", archive(lzmaCoder), false},
+		{"plain header", archive([]byte{0x01, 0x06, 0xf1, 0x07, 0x01}), false},
+		{"header past the end", archive(aesCoder)[:40], false},
+		{"not a 7z", bytes.Repeat([]byte{1}, 64), false},
+	} {
+		if got := sevenZipHeaderEncrypted(bytes.NewReader(test.data), int64(len(test.data))); got != test.want {
+			t.Errorf("%s: got %v", test.name, got)
+		}
+	}
+	// The library's AES fixture encrypts its file list too: it does not
+	// open without the password.
+	fixture, err := os.ReadFile(aes7zFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sevenZipHeaderEncrypted(bytes.NewReader(fixture), int64(len(fixture))) {
+		t.Fatal("fixture's encrypted header not recognised")
+	}
+	if _, err := sevenzip.NewReaderWithPassword(bytes.NewReader(fixture), int64(len(fixture)), "wrong"); err == nil {
+		t.Fatal("fixture opened with a wrong password; the premise changed")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -139,6 +140,34 @@ func choose7zPassword(entries []sevenzip.FileInfo, heads map[int][]byte, candida
 		}
 	}
 	return "", false, ErrArchivePassword
+}
+
+var (
+	sevenZipSignature = []byte{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}
+	sevenZipAESMethod = []byte{0x06, 0xf1, 0x07, 0x01}
+)
+
+// sevenZipHeaderEncrypted reports whether a 7z archive's header - its file
+// list - is encrypted (7z -mhe), so that it cannot be listed without the
+// password. The library reports a wrong password there only as a decoding
+// error of the header; this tells that case apart from a damaged archive.
+// The signature header gives the next header's place; an encrypted one is
+// an encoded header (0x17) whose coders include 7-Zip's AES method.
+func sevenZipHeaderEncrypted(r io.ReaderAt, size int64) bool {
+	sig := make([]byte, 32)
+	if _, err := r.ReadAt(sig, 0); err != nil || !bytes.HasPrefix(sig, sevenZipSignature) {
+		return false
+	}
+	offset := binary.LittleEndian.Uint64(sig[12:20])
+	length := binary.LittleEndian.Uint64(sig[20:28])
+	if length == 0 || length > 1<<16 || offset > uint64(size) || 32+offset+length > uint64(size) {
+		return false
+	}
+	header := make([]byte, length)
+	if _, err := r.ReadAt(header, int64(32+offset)); err != nil {
+		return false
+	}
+	return header[0] == 0x17 && bytes.Contains(header, sevenZipAESMethod)
 }
 
 // check7zStreamable reports why an encrypted entry cannot be served by the

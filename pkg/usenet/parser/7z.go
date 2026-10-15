@@ -83,6 +83,9 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, passwords 
 		}
 	}
 	if err != nil {
+		if sevenZipHeaderEncrypted(readerAt, size) {
+			return nil, fmt.Errorf("7z file list is encrypted, %d password candidates: %w (last: %v)", len(passwords), ErrArchivePassword, err)
+		}
 		if len(passwords) > 1 {
 			return nil, fmt.Errorf("failed to open sevenzip reader with any of %d passwords: %w", len(passwords), err)
 		}
