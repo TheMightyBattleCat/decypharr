@@ -114,11 +114,7 @@ class RepairManager {
             (names) => this.replaceUnverified(names),
         );
         $('refreshHistoryBtn')?.addEventListener('click', () => this.loadHistory());
-<<<<<<< HEAD
-        $('refreshBrokenBtn')?.addEventListener('click', () => this.loadBroken());
         $('clearSupersededBtn')?.addEventListener('click', () => this.clearSuperseded());
-=======
->>>>>>> 249ac9e8 (Remove broken entries refresh button)
         $('clearHistoryBtn')?.addEventListener('click', () => this.clearHistory());
         $('runRepairForm')?.addEventListener('submit', (e) => {
             e.preventDefault();
