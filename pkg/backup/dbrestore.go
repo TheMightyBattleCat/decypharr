@@ -116,30 +116,9 @@ func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, o
 		return RestoreDBResponse{}, err
 	}
 
-	rep, err := storage.ImportStores(staged, open)
+	rep, counts, err := importAndOpen(staged, records, open)
 	if err != nil {
 		return RestoreDBResponse{}, err
-	}
-
-	total := 0
-	for _, n := range rep.Read {
-		total += n
-	}
-	if records != 0 && total != records {
-		return RestoreDBResponse{}, fmt.Errorf("restored database has %d records, the snapshot recorded %d", total, records)
-	}
-
-	// Reopen the staged folder the way startup will and compare counts.
-	st, err := storage.NewStorage(staged)
-	if err != nil {
-		return RestoreDBResponse{}, fmt.Errorf("staged database does not open: %w", err)
-	}
-	counts := st.StoreCounts()
-	_ = st.Close()
-	for name, want := range rep.Imported {
-		if counts[name] != want {
-			return RestoreDBResponse{}, fmt.Errorf("staged %s has %d records, expected %d", name, counts[name], want)
-		}
 	}
 
 	if err := writeJSONFile(filepath.Join(mainPath, PendingRestoreFile), PendingRestore{
@@ -157,6 +136,36 @@ func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, o
 		resp.Warnings = append(resp.Warnings, fmt.Sprintf("%d entries have no item record and were kept", rep.EntriesWithoutItems))
 	}
 	return resp, nil
+}
+
+// importAndOpen writes the exported stores into the empty folder dir, checks
+// the total against records (0 when unknown), then reopens the folder the
+// way startup will and checks each store's count. It is shared by staging a
+// restore and by the check's restore test.
+func importAndOpen(dir string, records int, open func(store string) (io.ReadCloser, error)) (*storage.ImportReport, map[string]int, error) {
+	rep, err := storage.ImportStores(dir, open)
+	if err != nil {
+		return nil, nil, err
+	}
+	total := 0
+	for _, n := range rep.Read {
+		total += n
+	}
+	if records != 0 && total != records {
+		return nil, nil, fmt.Errorf("restored database has %d records, the snapshot recorded %d", total, records)
+	}
+	st, err := storage.NewStorage(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("restored database does not open: %w", err)
+	}
+	counts := st.StoreCounts()
+	_ = st.Close()
+	for name, want := range rep.Imported {
+		if counts[name] != want {
+			return nil, nil, fmt.Errorf("restored %s has %d records, expected %d", name, counts[name], want)
+		}
+	}
+	return rep, counts, nil
 }
 
 // ApplyPendingRestore swaps in a staged database restore before storage

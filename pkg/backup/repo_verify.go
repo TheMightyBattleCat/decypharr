@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 )
 
 // Verify checks the repository. Without Full it checks that every blob the
@@ -61,7 +62,17 @@ func (r *FileRepo) Verify(ctx context.Context, opts VerifyOptions, p Progress) (
 	}
 	sort.Strings(shas)
 
+	var th *throttle
+	if opts.BytesPerSec > 0 {
+		th = &throttle{rate: opts.BytesPerSec, start: time.Now()}
+	}
 	for i, sha := range shas {
+		for opts.Full && opts.Pause != nil && opts.Pause() {
+			p.Report(ProgressUpdate{Phase: "verify", FilesDone: i, FilesTotal: len(shas), Paused: "waiting for playback to end"})
+			if err := sleepCtx(ctx, time.Second); err != nil {
+				return rep, err
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
@@ -78,7 +89,7 @@ func (r *FileRepo) Verify(ctx context.Context, opts VerifyOptions, p Progress) (
 		if !opts.Full {
 			continue
 		}
-		if !r.blobHashes(ctx, sha) {
+		if !r.blobHashes(ctx, sha, th) {
 			if ctx.Err() != nil {
 				return rep, ctx.Err()
 			}
@@ -91,14 +102,18 @@ func (r *FileRepo) Verify(ctx context.Context, opts VerifyOptions, p Progress) (
 }
 
 // blobHashes reports whether the blob decompresses and matches its name.
-func (r *FileRepo) blobHashes(ctx context.Context, sha string) bool {
+func (r *FileRepo) blobHashes(ctx context.Context, sha string, th *throttle) bool {
 	rc, err := r.OpenBlob(ctx, sha)
 	if err != nil {
 		return false
 	}
 	defer rc.Close()
+	var src io.Reader = rc
+	if th != nil {
+		src = &throttledReader{ctx: ctx, r: rc, th: th}
+	}
 	h := sha256.New()
-	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: rc}); err != nil {
+	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: src}); err != nil {
 		return false
 	}
 	return hex.EncodeToString(h.Sum(nil)) == sha

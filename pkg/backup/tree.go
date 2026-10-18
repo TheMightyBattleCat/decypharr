@@ -62,6 +62,44 @@ type WalkOptions struct {
 	Progress Progress
 }
 
+// rateWindow measures speed over the last span of a walk's unpaused time, so
+// the time left follows what the walk is doing now: files the cache skips go
+// by far faster than files that are read and compressed.
+type rateWindow struct {
+	span    time.Duration
+	samples []rateSample
+}
+
+type rateSample struct {
+	active time.Duration // unpaused time since the walk started
+	done   int64
+}
+
+func (w *rateWindow) add(active time.Duration, done int64) {
+	w.samples = append(w.samples, rateSample{active, done})
+	// Keep one sample at or before the start of the window.
+	drop := 0
+	for drop+1 < len(w.samples) && w.samples[drop+1].active <= active-w.span {
+		drop++
+	}
+	if drop > 0 {
+		w.samples = append(w.samples[:0], w.samples[drop:]...)
+	}
+}
+
+// rate is bytes per second across the window, or 0 until it covers a second.
+func (w *rateWindow) rate() int64 {
+	if len(w.samples) < 2 {
+		return 0
+	}
+	first, last := w.samples[0], w.samples[len(w.samples)-1]
+	d := last.active - first.active
+	if d < time.Second {
+		return 0
+	}
+	return int64(float64(last.done-first.done) / d.Seconds())
+}
+
 // WalkResult is what a walk stored.
 type WalkResult struct {
 	Tree      BlobRef
@@ -139,18 +177,23 @@ func WalkTree(ctx context.Context, bs BlobStore, opts WalkOptions) (WalkResult, 
 	start := time.Now()
 	var pausedFor time.Duration
 	var pausedAt time.Time // start of the pause in progress; zero when running
-	update := func(filesDone int) ProgressUpdate {
-		u := ProgressUpdate{Component: opts.Component, Phase: "walk", FilesDone: filesDone, FilesTotal: len(files),
-			BytesWritten: written, BytesDone: done, BytesTotal: total}
+	activeTime := func() time.Duration {
 		idle := pausedFor
 		if !pausedAt.IsZero() {
 			idle += time.Since(pausedAt)
 		}
-		if active := time.Since(start) - idle; active >= time.Second && done > 0 {
+		return time.Since(start) - idle
+	}
+	window := rateWindow{span: time.Minute}
+	update := func(filesDone int) ProgressUpdate {
+		u := ProgressUpdate{Component: opts.Component, Phase: "walk", FilesDone: filesDone, FilesTotal: len(files),
+			BytesWritten: written, BytesDone: done, BytesTotal: total}
+		u.RateBPS = window.rate()
+		if active := activeTime(); u.RateBPS == 0 && active >= time.Second && done > 0 {
 			u.RateBPS = int64(float64(done) / active.Seconds())
-			if u.RateBPS > 0 {
-				u.ETASeconds = (total - done) / u.RateBPS
-			}
+		}
+		if u.RateBPS > 0 {
+			u.ETASeconds = (total - done) / u.RateBPS
 		}
 		return u
 	}
@@ -183,6 +226,7 @@ func WalkTree(ctx context.Context, bs BlobStore, opts WalkOptions) (WalkResult, 
 			return res, err
 		}
 		done += f.size
+		window.add(activeTime(), done)
 		if skipped {
 			continue // vanished while walking
 		}

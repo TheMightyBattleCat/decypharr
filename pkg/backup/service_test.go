@@ -192,17 +192,52 @@ func TestRunJobUnknownAndBusy(t *testing.T) {
 	e.waitIdle()
 }
 
-func TestScheduledRunSkipsWhenAnotherIsRunning(t *testing.T) {
+// waitSnapshots waits until the repository holds n snapshots and nothing runs.
+func (e *testEnv) waitSnapshots(n int) []SnapshotInfo {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		e.svc.mu.Lock()
+		idle := e.svc.runningJob == ""
+		e.svc.mu.Unlock()
+		if snaps := e.snapshots(); idle && len(snaps) == n {
+			return snaps
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	e.t.Fatalf("want %d snapshots, have %d", n, len(e.snapshots()))
+	return nil
+}
+
+func TestScheduledRunWaitsForTheSlotThenRuns(t *testing.T) {
 	e := newEnv(t, nil)
 	e.block = make(chan struct{})
 	if _, err := e.svc.RunJob(context.Background(), "quick"); err != nil {
 		t.Fatal(err)
 	}
-	e.svc.runScheduled(context.Background(), "full") // returns at once, queues nothing
+	e.svc.runScheduled(context.Background(), "full") // busy: queued
+	e.svc.runScheduled(context.Background(), "full") // queued once
+	if q := e.svc.queuedFor("full"); q != queueSkipped {
+		t.Fatalf("full queued as %q", q)
+	}
+	b, err := os.ReadFile(filepath.Join(e.data, RunQueueFile))
+	if err != nil || !strings.Contains(string(b), `"job": "full"`) {
+		t.Fatalf("queue file: %v %s", err, b)
+	}
 	close(e.block)
-	e.waitIdle()
-	if n := len(e.snapshots()); n != 1 {
-		t.Fatalf("want only the manual run, got %d snapshots", n)
+	snaps := e.waitSnapshots(2)
+	triggers := map[string]bool{}
+	for _, s := range snaps {
+		triggers[s.Trigger] = true
+	}
+	if !triggers["manual:quick"] || !triggers["schedule:full"] {
+		t.Fatalf("triggers: %v", triggers)
+	}
+	if q := e.svc.queuedFor("full"); q != "" {
+		t.Fatalf("full still queued: %q", q)
+	}
+	if _, err := os.Stat(filepath.Join(e.data, RunQueueFile)); !os.IsNotExist(err) {
+		t.Fatalf("queue file left behind: %v", err)
 	}
 }
 
@@ -741,20 +776,26 @@ func startPausedFull(t *testing.T, e *testEnv) {
 	t.Fatal("the walk never reported a pause")
 }
 
-func TestStopRunEndsAPausedBackupWithoutASnapshot(t *testing.T) {
+func TestStopRunKeepsOnlyThePartialSnapshot(t *testing.T) {
 	e := newEnv(t, nil)
 	startPausedFull(t, e)
 	if err := e.svc.StopRun(); err != nil {
 		t.Fatal(err)
 	}
 	e.waitIdle()
-	if n := len(e.snapshots()); n != 0 {
-		t.Fatalf("a stopped run wrote %d snapshots", n)
+	snaps := e.snapshots()
+	if len(snaps) != 1 || snaps[0].Result != ResultPartial {
+		t.Fatalf("want the one partial snapshot the run saved before its walks, got %+v", snaps)
+	}
+	for _, c := range snaps[0].Components {
+		if isWalk(c) {
+			t.Fatalf("partial snapshot holds %s", c)
+		}
 	}
 	st, _ := e.svc.Status(context.Background())
 	for _, j := range st.Jobs {
-		if j.Name == "full" && j.LastError != "Stopped from the Backups page" {
-			t.Fatalf("full job last error %q", j.LastError)
+		if j.Name == "full" && (j.LastError != "Stopped from the Backups page" || j.LastSuccess != nil) {
+			t.Fatalf("full job: last error %q, last success %v", j.LastError, j.LastSuccess)
 		}
 	}
 	for _, ev := range e.events() {
@@ -764,6 +805,174 @@ func TestStopRunEndsAPausedBackupWithoutASnapshot(t *testing.T) {
 	}
 	if err := e.svc.StopRun(); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("stop with nothing running: %v", err)
+	}
+}
+
+func TestPartialIsNotASuccessAndAnyCompleteRunOfTheJobReplacesIt(t *testing.T) {
+	e := newEnv(t, nil)
+	startPausedFull(t, e) // a manual full
+	if err := e.svc.StopRun(); err != nil {
+		t.Fatal(err)
+	}
+	e.waitIdle()
+
+	// Only the partial exists, so the job still goes stale.
+	e.setCfg(func(c *config.Backup) { c.Notify.StaleHours = 1 })
+	e.advance(2 * time.Hour)
+	e.svc.checkStale(context.Background())
+	stale := false
+	for _, ev := range e.events() {
+		stale = stale || ev == config.EventBackupStale
+	}
+	if !stale {
+		t.Fatal("a partial snapshot reset the stale check")
+	}
+
+	// A scheduled full finishing later replaces the manual run's partial,
+	// although retention runs per trigger.
+	e.svc.deps.Streaming = func() bool { return false }
+	e.svc.runScheduled(context.Background(), "full")
+	snaps := e.waitSnapshots(1)
+	if snaps[0].Result != ResultOK || snaps[0].Trigger != "schedule:full" {
+		t.Fatalf("want only the complete scheduled snapshot, got %+v", snaps)
+	}
+}
+
+func TestStatusSaysWhenAlertsCannotBeDelivered(t *testing.T) {
+	e := newEnv(t, nil) // failure alerts on
+	e.svc.deps.Alerts = func() AlertState { return AlertState{Reason: "no Discord webhook or callback URL is set up"} }
+	st, _ := e.svc.Status(context.Background())
+	if st.Alerts == nil || st.Alerts.Deliverable || st.Alerts.Reason == "" {
+		t.Fatalf("alerts: %+v", st.Alerts)
+	}
+	e.setCfg(func(c *config.Backup) { c.Notify = config.BackupNotify{} })
+	if st, _ := e.svc.Status(context.Background()); st.Alerts != nil {
+		t.Fatalf("with both alerts off there is nothing to warn about: %+v", st.Alerts)
+	}
+}
+
+func TestScheduledCheckWaitsForTheSlotThenRuns(t *testing.T) {
+	e := newEnv(t, nil)
+	e.setCfg(func(c *config.Backup) { c.Check = config.BackupCheck{Enabled: true, Schedule: "0 5 * * 0"} })
+	e.block = make(chan struct{})
+	if _, err := e.svc.RunJob(context.Background(), "quick"); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.fireCheck() // busy: queued
+	if q := e.svc.queuedReason(queuedRun{Kind: kindCheck}.key()); q != queueSkipped {
+		t.Fatalf("check queued as %q", q)
+	}
+	close(e.block)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e.svc.mu.Lock()
+		res := e.svc.lastCheck
+		e.svc.mu.Unlock()
+		if res != nil {
+			if !res.OK || res.BlobsChecked == 0 || res.Trigger != "schedule:check" {
+				t.Fatalf("check after the backup: %+v", res)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the queued check never ran")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func fastResume(t *testing.T) {
+	old := resumeDelay
+	resumeDelay = 10 * time.Millisecond
+	t.Cleanup(func() { resumeDelay = old })
+}
+
+func TestShutdownInterruptsARunAndTheNextStartResumesIt(t *testing.T) {
+	fastResume(t)
+	e := newEnv(t, nil)
+	if err := e.svc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	startPausedFull(t, e)
+	e.svc.Stop() // a restart or deploy
+
+	for _, ev := range e.events() {
+		if ev == config.EventBackupFailed {
+			t.Fatal("a shutdown is not a failure")
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(e.data, RunQueueFile))
+	if err != nil || !strings.Contains(string(b), `"running"`) {
+		t.Fatalf("the run in progress should stay recorded: %v %s", err, b)
+	}
+
+	// The next start of the service resumes it.
+	e.advance(time.Minute)
+	deps := e.svc.deps
+	deps.Streaming = func() bool { return false }
+	e.svc = NewService(deps)
+	if err := e.svc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.svc.Stop()
+	var snaps []SnapshotInfo
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snaps = e.snapshots()
+		if len(snaps) == 1 && snaps[0].Result == ResultOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("want the resumed run's complete snapshot in place of the partial, got %+v", snaps)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if snaps[0].Trigger != "manual:full" {
+		t.Fatalf("resumed run should keep its trigger, got %q", snaps[0].Trigger)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(e.data, RunQueueFile)); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("queue file left behind after the resumed run finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestARunInterruptedThreeTimesIsNotResumed(t *testing.T) {
+	fastResume(t)
+	e := newEnv(t, nil)
+	doc := runQueueDoc{Running: &queuedRun{Job: "full", Trigger: "schedule:full", Attempts: maxRunAttempts}}
+	if err := writeJSONFile(filepath.Join(e.data, RunQueueFile), doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.svc.Stop()
+	time.Sleep(50 * time.Millisecond)
+	if n := len(e.snapshots()); n != 0 {
+		t.Fatalf("a run that kept being interrupted was resumed: %d snapshots", n)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		failed := false
+		for _, ev := range e.events() {
+			failed = failed || ev == config.EventBackupFailed
+		}
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("giving up on a run should send a failure notice")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(e.data, RunQueueFile)); !os.IsNotExist(err) {
+		t.Fatalf("queue file left behind: %v", err)
 	}
 }
 

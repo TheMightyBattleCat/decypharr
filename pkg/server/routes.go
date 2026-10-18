@@ -118,6 +118,8 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/backups/status", s.handleBackupStatus)
 			r.Post("/backups/hold/release", s.handleBackupReleaseHold)
 			r.Post("/backups/running/stop", s.handleBackupStopRun)
+			r.Post("/backups/check/run", s.handleBackupRunCheck)
+			r.Post("/backups/offsite/run", s.handleBackupRunOffsite)
 			r.Get("/backups/snapshots", s.handleBackupListSnapshots)
 			r.Get("/backups/snapshots/{id}", s.handleBackupGetSnapshot)
 			r.Delete("/backups/snapshots/{id}", s.handleBackupDeleteSnapshot)

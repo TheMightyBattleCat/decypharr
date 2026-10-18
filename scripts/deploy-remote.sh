@@ -20,6 +20,12 @@
 # Example (this run):
 #   scripts/deploy-remote.sh feature/padding-par2-overlay a03cda1
 #
+# The deploy refuses to restart the service while anyone is streaming through
+# Decypharr or a backup is running (checked before building and again just
+# before the restart):
+#   DEPLOY_WAIT_IDLE=1  wait until both have been idle for two checks in a row
+#   DEPLOY_FORCE=1      deploy anyway
+#
 # Rollback is binary-swap only: it restores the pre-deploy decypharr binary
 # and restarts the service. It does NOT revert config.json - this script
 # never writes config.json, so there is nothing there to revert.
@@ -128,6 +134,58 @@ preflight() {
 }
 
 # ---------------------------------------------------------------------------
+# Idle guard - a restart cuts off anyone watching through Decypharr and
+# interrupts a backup in progress (it resumes after the restart, but the
+# work since its last save is redone). Checked before anything is built and
+# again just before the service stops. DEPLOY_WAIT_IDLE=1 waits for idle
+# instead of refusing; DEPLOY_FORCE=1 deploys anyway.
+# ---------------------------------------------------------------------------
+
+# idle_state prints "<streams> <backup running yes|no|?>", one short SSH call
+# per check (a long-lived session can drop while waiting).
+idle_state() {
+    $SSH bash -s 2>/dev/null <<REMOTE || echo "? ?"
+set -uo pipefail
+TOKEN=\$(python3 -c "import json; print(json.load(open('${REMOTE_DEPLOY_DIR}/auth.json'))['api_token'])" 2>/dev/null || true)
+H=()
+[ -n "\$TOKEN" ] && H=(-H "Authorization: Bearer \$TOKEN")
+streams=\$(curl -s --max-time 15 "\${H[@]}" "http://127.0.0.1:${HEALTH_PORT}/debug/stats" | python3 -c "import json,sys; print(json.load(sys.stdin).get('active_streams',{}).get('count',0))" 2>/dev/null || echo "?")
+backup=\$(curl -s --max-time 15 "\${H[@]}" "http://127.0.0.1:${HEALTH_PORT}/api/backups/status" | python3 -c "import json,sys; d=json.load(sys.stdin); print('yes' if any(j.get('running') for j in d.get('jobs') or []) else 'no')" 2>/dev/null || echo "?")
+echo "\$streams \$backup"
+REMOTE
+}
+
+require_idle() {
+    local when="$1" state streams backup quiet=0
+    if [ "${DEPLOY_FORCE:-0}" = 1 ]; then
+        log "DEPLOY_FORCE=1: not checking for playback or a running backup ($when)"
+        return
+    fi
+    while true; do
+        state="$(idle_state)"
+        streams="${state%% *}"
+        backup="${state##* }"
+        [ "$backup" = "?" ] && backup=no # an older build without the backup API
+        if [ "$streams" = 0 ] && [ "$backup" = no ]; then
+            quiet=$((quiet + 1))
+            # Waiting: two idle checks in a row, so the gap between two
+            # episodes does not count as nobody watching.
+            if [ "${DEPLOY_WAIT_IDLE:-0}" != 1 ] || [ "$quiet" -ge 2 ]; then
+                log "Idle ($when): no Decypharr streams, no backup running"
+                return
+            fi
+        else
+            quiet=0
+            if [ "${DEPLOY_WAIT_IDLE:-0}" != 1 ]; then
+                fail "not deploying ($when): ${streams} Decypharr stream(s), backup running: ${backup}. Set DEPLOY_WAIT_IDLE=1 to wait for idle, or DEPLOY_FORCE=1 to deploy anyway"
+            fi
+            log "Waiting for idle ($when): ${streams} Decypharr stream(s), backup running: ${backup}"
+        fi
+        sleep 30
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Step 2 - sync branch content + rebuild frontend assets
 # ---------------------------------------------------------------------------
 
@@ -172,7 +230,9 @@ export GOPATH="\$HOME/go"
 export PATH="\$GOPATH/bin:\$GOROOT/bin:\$PATH"
 cd "$REMOTE_BUILD_DIR"
 rm -f decypharr_new
-go build -o decypharr_new .
+# Stamp the build, so /version, the start-up log and every backup snapshot
+# say which commit is running.
+go build -ldflags "-X github.com/sirrobot01/decypharr/pkg/version.Version=${TARGET_COMMIT:0:12} -X github.com/sirrobot01/decypharr/pkg/version.Channel=${BRANCH} -X github.com/sirrobot01/decypharr/pkg/version.Commit=${TARGET_COMMIT}" -o decypharr_new .
 REMOTE
     log "Build OK - decypharr_new ready in $REMOTE_BUILD_DIR (service not yet touched)"
 }
@@ -274,6 +334,7 @@ set -uo pipefail
 PORT="$HEALTH_PORT"
 MOUNT="$MOUNT_PATH"
 DEPLOY_DIR="$REMOTE_DEPLOY_DIR"
+WANT_COMMIT="$TARGET_COMMIT"
 
 TOKEN=\$(python3 -c "import json; print(json.load(open('\${DEPLOY_DIR}/auth.json'))['api_token'])" 2>/dev/null || true)
 AUTH_HEADER=()
@@ -327,6 +388,14 @@ if http_ok "\$code"; then
     echo "PASS http_root: HTTP \$code"
 else
     echo "FAIL http_root: HTTP \$code"
+fi
+
+# /version - the running binary is the commit just built (the build stamps it)
+running=\$(curl -s --max-time 10 "http://127.0.0.1:\${PORT}/version" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('commit',''))" 2>/dev/null || true)
+if [ "\$running" = "\$WANT_COMMIT" ]; then
+    echo "PASS version: running \${WANT_COMMIT:0:12}"
+else
+    echo "FAIL version: running '\${running:-unknown}', expected \${WANT_COMMIT:0:12}"
 fi
 
 # /repair
@@ -445,11 +514,13 @@ verify_precache_bounded() {
 
 main() {
     preflight
+    require_idle "before building"
     sync_and_build_assets
     build_binary
     start_vet
     backup_binary
     wait_vet
+    require_idle "before restarting"
     swap_and_restart
 
     local health_output failing

@@ -14,6 +14,30 @@ we are both after the same result, and in a few areas I think this fork gets a b
 It runs on one server, mine, and that is where all of it has been tested. If you want the version most people
 run, with support behind it, use upstream.
 
+## Contents
+
+- [What Decypharr does](#what-decypharr-does)
+- [The main differences](#the-main-differences)
+  - [A file that breaks while you are watching is repaired, not just replaced](#a-file-that-breaks-while-you-are-watching-is-repaired-not-just-replaced)
+  - [Bad downloads are caught before they reach the library](#bad-downloads-are-caught-before-they-reach-the-library)
+  - [Obfuscated releases are put together in the right order](#obfuscated-releases-are-put-together-in-the-right-order)
+  - [Password-protected releases](#password-protected-releases)
+  - [Repair sweeps look inside the file](#repair-sweeps-look-inside-the-file)
+  - [Pre-cache: finding broken files before you need them](#pre-cache-finding-broken-files-before-you-need-them)
+  - [Usenet providers](#usenet-providers)
+  - [Housekeeping](#housekeeping)
+  - [Backups and restore](#backups-and-restore)
+  - [Quality of life](#quality-of-life)
+  - [Smaller things](#smaller-things)
+- [What upstream has that this fork does not](#what-upstream-has-that-this-fork-does-not)
+- [Quick start](#quick-start)
+  - [Switching from upstream beta](#switching-from-upstream-beta)
+- [Settings this fork adds](#settings-this-fork-adds)
+- [Supported debrid providers](#supported-debrid-providers)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## What Decypharr does
 
 - Mock qBittorrent and SABnzbd APIs that the Arrs (Sonarr, Radarr, Lidarr and so on) use as download clients
@@ -38,6 +62,9 @@ have:
 3. **Re-grab.** A file PAR2 cannot fix is deleted, blocklisted and searched for again by the next repair
    sweep.
 
+An article that every provider serves damaged (the wrong size, or a failed checksum) is treated the same as a
+missing one: padded, then rebuilt from PAR2.
+
 Damage found at import or by a repair sweep is handled differently, because nobody is watching and the file
 is usually not in the cache. Rebuilding it from PAR2 would mean downloading most of the release, while a
 re-grab downloads next to nothing until someone plays the new copy. So by default it goes straight to a re-grab, with one exception:
@@ -57,18 +84,56 @@ an hour if the Arr sends it straight back.
 
 Padding and PAR2 repair are on by default. This is the largest difference between the two.
 
+![The overlay summary and file list on the Repair page](docs/src/assets/images/fork/overlay.png)
+
+*The Repair page. At the top, how many files carry padding or PAR2 patches and what that costs on disk.
+Below, each file with its dead (D), padded (P) and PAR2-patched (F) articles, a strip showing where in the
+file they sit, how much PAR2 recovery data the release has, and what its patch takes up on disk. Titles are
+blurred.*
+
+![The PAR2 repair history](docs/src/assets/images/fork/par2-history.png)
+
+*Each PAR2 repair: how much it read, how many slices it rebuilt and how many articles it patched.*
+
 ### Bad downloads are caught before they reach the library
 
 - Like upstream, a sample of a new NZB's articles is checked when it is added. This fork checks again once
   the download has finished, before Sonarr or Radarr is told it is complete, and padding cannot hide a gap
   from that check. If articles are missing, the release is rejected and blocklisted, and the Arr grabs
   another. On by default.
+- At the same point, every article of each video file is checked with STAT (asking the server whether an
+  article exists, without downloading it). It takes a few seconds and finds a missing article anywhere in the
+  file, not only in the sample. A check that cannot finish lets the import through.
 - Optionally, every import is also run through `ffprobe`. A file that will not open, or has no playable video
   or audio, is rejected the same way.
+- These checks cover every video file of 100 MiB or more, and a smaller one when it is at least a quarter of
+  the size of the release's largest video. An SD episode or a pack of small episodes is checked; a featurette
+  beside a film is not.
 - A file that was put together wrongly (as opposed to a damaged posting) is re-grabbed without blocklisting
   the release, because the release itself is fine.
 - An article that turns out to belong to a different upload, served under a reused message ID, is refused
   instead of being stitched into your file.
+- A RAR archive that holds compressed (not stored) video cannot be streamed. The import fails with that
+  reason instead of quietly bringing in only the files beside the video, such as the `.nfo`.
+- An NZB with no video in it at all, where every file's name makes its type clear, is marked unavailable: the
+  Arr blocklists it and searches again, instead of retrying the same grab forever.
+
+### Obfuscated releases are put together in the right order
+
+Many releases are posted under random names, so the names no longer say which part comes first, and a file
+put together in the wrong order plays until the first misplaced part, then jumps or stops. Before falling back
+to the order the parts were posted in, this fork looks for the real one:
+
+- **Names from PAR2.** The first 16 KB of each obfuscated RAR volume is matched against the file list in the
+  release's PAR2 data, which gives back the real names (`.part01.rar` and so on) and with them the order. If
+  a single volume cannot be matched, none are renamed.
+- **RAR4 volume numbers.** RAR5 volumes are ordered by the numbers in their headers (see Repair sweeps,
+  below). A RAR4 set whose names give no order is ordered by the number in each volume's end-of-archive
+  block.
+- **RAR sets inside a 7z.** Volumes packed inside a 7z posting are ordered by name (`.rar`, `.r00`, `.r01`
+  and so on, or `.001`, `.002`), or, for a RAR5 set with obfuscated names, by the numbers in their headers.
+  Each volume supplies only its own bytes.
+- **PAR2 files with obfuscated names** are still found and used when a repair runs.
 
 ### Password-protected releases
 
@@ -124,6 +189,11 @@ at the start of the file. This fork can go further:
 - Optionally, an article that fails for good during playback starts a repair of that file straight away
   instead of waiting for the next repair sweep (built-in DFS mount only).
 
+![The Health Checker and its run history](docs/src/assets/images/fork/sweeps.png)
+
+*The Health Checker: the state of the library, a recheck of one show or film by its id, and what each repair
+sweep probed, found broken, repaired and could not verify.*
+
 ### Pre-cache: finding broken files before you need them
 
 Pre-cache is not there to make things faster. It reads a file before you get to it, so that damage is found
@@ -152,6 +222,11 @@ Around that:
   thumbnail job does not set it off. The read-ahead for the file you are watching also stops about a minute
   after Plex no longer lists a session for it (pausing does not stop it), and picks up where it left off if
   you come back.
+
+![The pre-cache panel](docs/src/assets/images/fork/precache.png)
+
+*Pre-cache on the Repair page: its settings, and the files it has read ahead, with how much of each is
+cached and how it came out. Titles are blurred.*
 
 ### Usenet providers
 
@@ -191,6 +266,11 @@ millions of times over a large library. Servers differ a great deal in how quick
 - Usage is counted from the bytes actually received and survives restarts. The Stats page shows each
   provider's usage against its cap.
 
+![Usenet servers on the Stats page](docs/src/assets/images/fork/providers.png)
+
+*The Stats page: each server's tier and, for a server with a cap, its usage, reserve and reset. Server names
+are blurred.*
+
 ### Housekeeping
 
 **Tidying up after upgrades.** When Sonarr or Radarr upgrades a file (a WEB-DL replaced by a BluRay, or a
@@ -207,9 +287,10 @@ library full of downloads nothing points at. This fork clears them out:
   is nothing to repair. It is dropped from the broken list and skipped by later repair sweeps, instead of
   being checked and re-grabbed again and again. This matters most for season packs where single episodes have
   been upgraded one at a time. Optionally, the old download is deleted as well once none of it is in use.
-- **Or do it the moment it happens.** With the Arr webhook set up, Sonarr or Radarr deleting or upgrading a
-  file removes the matching old download straight away, without waiting for a cleanup. Opt-in, and the
-  endpoint can be protected with a token.
+- **Or do it the moment it happens.** With the Arr webhook set up (see below) and **Tear down usenet
+  downloads on file delete** ticked on its card, Sonarr or Radarr deleting or upgrading a file removes the
+  matching old Usenet download straight away, without waiting for a cleanup. Off by default, and torrent
+  downloads are never touched.
 
 It is careful about what it deletes:
 
@@ -225,9 +306,86 @@ Other clean-up tools:
 
 - **Debrid-gone:** torrent entries that no configured debrid can serve any more are listed and can be
   re-grabbed in bulk.
-- **Plex stale versions:** removes the "Unavailable" versions Plex keeps after a file is replaced, one title
-  at a time. Off by default, with a dry-run mode.
+- **Plex stale versions:** removes the "Unavailable" versions Plex keeps after a file is replaced by an Arr
+  upgrade or rename, or by a re-grab. It only touches the title that changed, or the titles you pick after
+  **Scan library**, never a whole library. Before removing a version it checks that Plex marked it
+  unavailable, its file is gone from disk, no Arr still tracks that file, the title keeps a working version
+  and nobody is playing it. Off by default, with a dry-run mode. It needs the Plex URL and token (Repair
+  page → Plex server), the Arr webhook, and "Allow media deletion" turned on in Plex.
 - **Wanted search:** run each Arr's "search all missing" on a schedule.
+
+**Setting up the Arr webhook.** The instant clean-up and the Plex clean-up both hear about changes from
+Sonarr and Radarr through a webhook:
+
+1. In Decypharr, open Settings → \*Arrs → Queue Management → Arr Webhook and press **Generate Token**. The
+   card then shows the webhook URL, with the token in it.
+2. If Sonarr and Radarr reach Decypharr at a different address from the one in your browser, set
+   **Application URL** (Settings → General) first, or change the host in the URL before you paste it.
+3. In each Sonarr and Radarr, add a Webhook connection (Settings → Connect) with that URL, and tick the
+   import, upgrade, rename and file-delete events, including the file delete for an upgrade.
+
+Regenerating the token stops the old URL working, so paste the new one into each Arr again. The same token
+also works on the Tautulli webhook as `?token=`, for callers that cannot send a header.
+
+### Backups and restore
+
+Everything Decypharr knows (its databases, settings, the NZB records, the overlay of repaired files and the
+library symlinks) can be backed up to a folder you choose. Backups stay off until you set that folder in
+Settings, on the Backups tab. Pointing it at a different disk is best; Settings warns when it shares one with
+the data folder.
+
+- **Small and repeatable.** Snapshots are deduplicated, so only what changed is stored, and compressed with
+  xz, which keeps NZB records at about three quarters of their size. After the first full copy, a quick
+  snapshot costs a few megabytes. Two jobs are set up by default: a Quick one every six hours (databases,
+  settings, links) and a Full one daily at 04:00 (the same plus NZB records and the overlay). Each job has its
+  own schedule and retention (last N, daily, weekly, monthly). Editing retention shows what would be deleted
+  before you save.
+- **It stays out of the way.** Backups are throttled and, by default, wait while anyone is streaming through
+  Decypharr. Turn "Pause while something is streaming" off in Settings to let them run during playback; the
+  change also applies to a backup already running. The Backups page shows a running backup's progress, speed
+  and time left, says when and why it is paused, and can stop it. Optional quiet hours hold scheduled jobs
+  back, and stopping the service waits for a run in progress.
+- **Nothing is lost to timing.** A scheduled run that finds another backup running waits and runs straight
+  after it. A run that a restart, crash or power cut cuts short carries on shortly after the next start,
+  reusing what it had already stored. A full backup saves the databases, settings and links first, as a
+  partial snapshot, before the hours its first NZB-record copy can take, so stopping or interrupting it
+  never loses those.
+- **Off-box copy.** Set an rclone remote and the backup folder is copied there after every backup, so losing
+  the machine does not lose the backups. The remote must be empty or already hold this backup, nothing on it
+  is ever overwritten, and snapshots that retention deletes locally are deleted there too. Use an encrypted
+  (crypt) remote: the backups hold your API keys and settings. The Backups page says whether it is.
+- **A snapshot before anything risky.** Before clearing state, a stale-NZB or link clean-up, a Replace, an
+  entry delete or a database upgrade, a small safety snapshot is taken (a few megabytes, taken in seconds).
+  If it cannot be taken the action still runs and says so, unless you set that action to be refused instead.
+- **Undelete.** The Backups page lists recently removed entries and brings one back, or exports a single NZB
+  record, without a restart.
+- **Settings history.** Every settings save is kept and can be browsed and reverted.
+- **Restore.** A database restore is staged and swapped in at the next start, after the snapshot has been
+  checked. After a restore, destructive jobs and auto-repair are held until you release them, so a restored
+  database that is behind reality cannot trigger deletions. Restores also work from the command line into a
+  stopped data folder, and from the setup wizard of a fresh install, from a backup folder or an uploaded
+  archive.
+- **Library Links.** A page checks every symlink in the Arr library folders against what the Arrs and the
+  mount expect. It shows what is healthy, what is missing (and which snapshot knew about it) and what is
+  dead, and cleans dead links up with a plan you confirm. Missing links can be re-created by hand, or
+  automatically after a check if you opt in, with a limit per check so a mount that is down cannot cause a
+  mass change.
+- **You are told.** Notifications for a failed backup, a failed off-box copy and a backup that has gone
+  stale, and a warning on the Backups page when notifications are not set up to deliver them. A weekly check
+  (Sundays at 05:00 server time by default) reads every stored blob back and test-restores the newest
+  database backup into a scratch folder; a problem is shown and alerted. A `verify` command does the same
+  reading from the command line.
+
+![The Backups page](docs/src/assets/images/fork/backups.png)
+
+*The Backups page: repository size, the two default jobs and the snapshot history.*
+
+![The Library Links page](docs/src/assets/images/fork/links.png)
+
+*Library Links: each Arr root folder's symlinks, how many are live, how many point at a download or file
+Decypharr no longer has, and how many point outside its mount. Paths are blurred.*
+
+Design and build notes are in `docs/design/backup.md` and `docs/design/backup-build-plan.md`.
 
 ### Quality of life
 
@@ -258,6 +416,8 @@ Most of the above comes down to the same idea: find out early, fix it quietly, a
 - The Docker image includes `ffmpeg`, so the `ffprobe` checks work without extra setup.
 - After an unclean shutdown, the disk cache drops any range it had recorded but never finished writing,
   instead of serving a hole.
+- Real-Debrid requests are retried after a 502 or 504 from its gateway (upstream retries only a 429), so a
+  single blip while a broken link is being re-added no longer gets the release re-grabbed.
 
 ## What upstream has that this fork does not
 
@@ -321,7 +481,47 @@ The image is built from the `usenet-improvements` branch on every push.
   start, with a backup written beside each file; older builds cannot read the upgraded files.
 - Padding, PAR2 repair, the import article check and "prefer faster servers" are on as soon as you start.
   The other options described above (the `ffprobe` checks, pre-cache, quotas, the clean-up tools and the
-  Plex features) stay off until you turn them on in Settings.
+  Plex features) stay off until you turn them on in Settings. [Settings this fork adds](#settings-this-fork-adds)
+  lists each one, where to find it and its default.
+
+## Settings this fork adds
+
+Settings the two versions share are covered by the [official documentation](https://docs.decypharr.com).
+"Repair page" means the Repair page in the menu, not the Repair tab in Settings. A setting marked
+`config.json` has no field in the UI yet: stop Decypharr, add it to `config.json`, and start it again. Saves
+from the Settings and Repair pages leave it as it is.
+
+| Setting | Where | Default |
+|---|---|---|
+| Playback padding (`repair.playback_padding`) | Repair page → Padding & PAR2 repair policy | On |
+| Max run segments, Max total segments, Max byte ratio (`repair.pad_max_run_segments`, `pad_max_total_segments`, `pad_max_byte_ratio`) | Repair page → Padding & PAR2 repair policy | 4, 64, 0.02 (2% of the file) |
+| PAR2 repair (`repair.par2_repair`) | Repair page → Padding & PAR2 repair policy | On |
+| PAR2 auto-repair trigger (`repair.par2_repair_mode`) | Repair page → Padding & PAR2 repair policy | Every degraded file (`auto_all`); or `auto_threshold`, `manual` |
+| PAR2 repair during sweeps (`repair.par2_repair_on_sweep`) | Repair page → Padding & PAR2 repair policy | Off |
+| Urgent PAR2 repairs at once (`repair.par2_urgent_concurrency`) | `config.json` | 2 |
+| Import article check (`repair.import_availability_check`) | `config.json` | On |
+| Validate new imports with ffprobe (`repair.ffprobe_on_import`) | Settings → Repair | Off |
+| Validate files with ffprobe during repair sweeps (`repair.ffprobe_check`) | Settings → Repair | Off |
+| Decode verification during sweeps (`repair.ffprobe_decode_check`) | Settings → Repair | On, once the sweep check above is on |
+| How long a decoded file is trusted (`repair.decode_verify_ttl`) | `config.json` | 30 days (`720h`) |
+| ffprobe verification connections, Decode head scan size, Decode seek-detect distance (`repair.verification_connections`, `decode_head_bytes`, `decode_detect_bytes`) | Settings → Repair | 32, 3GB, 2GB |
+| ffprobe time limit and binary (`repair.ffprobe_timeout`, `ffprobe_path`) | `config.json` | 3 minutes per probe; `ffprobe` on the PATH |
+| Auto-repair on playback failure (`repair.repair_on_playback_failure`) | Settings → Repair | Off |
+| Also delete superseded broken downloads (`repair.cleanup_superseded`) | `config.json` | Off |
+| Pre-cache ahead of playback (`repair.precache_read_ahead_enabled`) | Repair page → Pre-cache | Off |
+| Start at (% played) (`precache.precache_threshold_percent`) | Repair page → Pre-cache | 10 |
+| Episodes ahead, Whole season (`precache.precache_next_episodes`, `precache_whole_season`) | Repair page → Pre-cache | 1, but Whole season is on and goes to the end of the season |
+| Drop watched episodes from the cache (`precache.precache_evict_after_watched`) | `config.json` | Off |
+| Step back while other playback struggles (`precache.precache_yield_to_playback`) | `config.json` | On |
+| Plex Server URL and Token (`plex.plex_url`, `plex_token`) | Repair page → Plex server | Blank: pre-cache does not wait for Plex |
+| Remove stale versions (`plex.plex_reap_mode`) | Repair page → Plex server | Off; or `dry_run`, `on` |
+| Arr webhook token, Tear down usenet downloads on file delete (`webhook_token`, `arr_webhook_teardown`) | Settings → \*Arrs → Queue Management | No token; off |
+| Scheduled wanted search (`arrs[].wanted_search`) | Settings → \*Arrs → Applications, on each Arr | Off |
+| Prefer Faster Servers (`usenet.prefer_faster_servers`) | Settings → Providers → Usenet → Settings | On |
+| Quota Cap, Reserve and reset (`usenet.providers[].quota`, `reserve`, `quota_period`, `quota_reset_day`, `quota_reset_hour`) | Settings → Providers → Usenet → Servers, on each server | No cap; reserve 10% of the cap; weekly, Sunday at midnight server time |
+| Archive passwords (`usenet.archive_passwords`) | `config.json` | None |
+| Backups (`backup`) | Settings → Backups | Off until a backup folder is set |
+| Log File Level, Console Log Colour (`log_file_level`, `log_color`) | Settings → General | Same as Log Level; Auto |
 
 ## Supported debrid providers
 

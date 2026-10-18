@@ -28,7 +28,22 @@ const (
 func (s *BackupService) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	runCtx := s.ctx
 	s.mu.Unlock()
+	// Runs a restart or crash cut short, and scheduled runs that were
+	// waiting for the slot, start shortly after start-up.
+	s.recoverQueue()
+	s.removeDrills()
+	go func() {
+		t := time.NewTimer(resumeDelay)
+		defer t.Stop()
+		select {
+		case <-runCtx.Done():
+		case <-t.C:
+			s.kick()
+			s.uploadIfBehind(runCtx)
+		}
+	}()
 	if s.deps.Scheduler != nil {
 		_, err := s.deps.Scheduler.NewJob(gocron.DurationJob(time.Minute),
 			gocron.NewTask(s.reconcile), gocron.WithTags(watchTag), gocron.WithName("backup-watch"))
@@ -47,11 +62,14 @@ var stopWait = 10 * time.Second
 // stopWait) for it to finish.
 func (s *BackupService) Stop() {
 	if s.deps.Scheduler != nil {
-		s.deps.Scheduler.RemoveByTags(scheduleTag, watchTag, linksTag)
+		s.deps.Scheduler.RemoveByTags(scheduleTag, watchTag, linksTag, checkTag)
 	}
 	s.mu.Lock()
 	cancel := s.cancel
 	s.jobs = map[string]gocron.Job{}
+	if s.kickTimer != nil {
+		s.kickTimer.Stop()
+	}
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -76,7 +94,8 @@ func scheduleSignature(cfg config.Backup) string {
 		Jobs  []config.BackupJob
 		Link  config.BackupLinkCheck
 		Quiet config.BackupQuietHours
-	}{cfg.Dir, cfg.Jobs, cfg.LinkCheck, cfg.QuietHours})
+		Check config.BackupCheck
+	}{cfg.Dir, cfg.Jobs, cfg.LinkCheck, cfg.QuietHours, cfg.Check})
 	return string(b)
 }
 
@@ -107,8 +126,9 @@ func (s *BackupService) ApplyConfig() error {
 		return nil
 	}
 	sched := s.deps.Scheduler
-	sched.RemoveByTags(scheduleTag, linksTag)
+	sched.RemoveByTags(scheduleTag, linksTag, checkTag)
 	jobs := map[string]gocron.Job{}
+	var checkJob gocron.Job
 	var errs []error
 	if strings.TrimSpace(cfg.Dir) != "" {
 		for _, j := range cfg.Jobs {
@@ -130,6 +150,16 @@ func (s *BackupService) ApplyConfig() error {
 			jobs[name] = job
 		}
 	}
+	if strings.TrimSpace(cfg.Dir) != "" && cfg.Check.Enabled {
+		jd, err := utils.ConvertToClockOrCronJobDef(cfg.Check.Schedule)
+		if err == nil {
+			checkJob, err = sched.NewJob(jd, gocron.NewTask(s.fireCheck),
+				gocron.WithTags(checkTag), gocron.WithName("backup-check"))
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("backup check: %w", err))
+		}
+	}
 	if cfg.LinkCheck.Enabled && strings.TrimSpace(cfg.LinkCheck.Schedule) != "" {
 		jd, err := utils.ConvertToClockOrCronJobDef(cfg.LinkCheck.Schedule)
 		if err == nil {
@@ -142,6 +172,7 @@ func (s *BackupService) ApplyConfig() error {
 	}
 	s.mu.Lock()
 	s.jobs = jobs
+	s.checkJob = checkJob
 	s.applied = scheduleSignature(cfg)
 	s.mu.Unlock()
 	return errors.Join(errs...)
@@ -251,7 +282,7 @@ func (s *BackupService) checkStale(ctx context.Context) {
 		// A job with no snapshot yet counts from when this process started.
 		last := s.startedAt
 		for _, sn := range snaps {
-			if jobOfTrigger(sn.Trigger) == j.Name {
+			if jobOfTrigger(sn.Trigger) == j.Name && sn.Result != ResultPartial {
 				last = sn.CreatedAt
 				break
 			}

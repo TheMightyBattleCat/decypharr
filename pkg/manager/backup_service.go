@@ -26,12 +26,29 @@ func (m *Manager) initBackup() {
 			m.Notifications.Notify(notifications.Event{Type: ev, Status: status, Message: msg, Error: err})
 		}
 	}
+	d.Alerts = m.backupAlerts
 	d.Scheduler = m.scheduler
 	svc := backup.NewService(d)
 	m.wireBackupServices(svc)
 	m.backupSvc = svc
 	m.SetBackup(svc)
 	backup.SetPreActionHook(svc.PreAction)
+}
+
+// backupAlerts says whether a backup alert would reach anyone: notifications
+// on, a notifier (Discord webhook or callback URL) set up, and a backup event
+// among the enabled events.
+func (m *Manager) backupAlerts() backup.AlertState {
+	n := m.Notifications
+	switch {
+	case n == nil || !config.Get().Notifications.Enabled:
+		return backup.AlertState{Reason: "notifications are turned off"}
+	case !n.IsEnabled():
+		return backup.AlertState{Reason: "no Discord webhook or callback URL is set up"}
+	case !n.IsEventEnabled(config.EventBackupFailed) && !n.IsEventEnabled(config.EventBackupStale):
+		return backup.AlertState{Reason: "the backup events are not among the enabled notification events"}
+	}
+	return backup.AlertState{Deliverable: true}
 }
 
 // wireBackupServices gives the service its settings history and undelete
@@ -111,8 +128,8 @@ func NewOfflineBackupService(dataDir, repoDir string) (*backup.BackupService, fu
 }
 
 func backupBuildInfo() backup.BuildInfo {
-	bi := backup.BuildInfo{Version: version.GetInfo().String(), DBFormat: storage.DBFormat}
-	if info, ok := debug.ReadBuildInfo(); ok {
+	bi := backup.BuildInfo{Version: version.GetInfo().String(), Commit: version.Commit, DBFormat: storage.DBFormat}
+	if info, ok := debug.ReadBuildInfo(); ok && bi.Commit == "" {
 		for _, s := range info.Settings {
 			if s.Key == "vcs.revision" {
 				bi.Commit = s.Value

@@ -66,6 +66,9 @@ func (s *Server) writeBackupError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, backup.ErrBusy), errors.Is(err, backup.ErrNotConfigured):
 		status = http.StatusConflict
+	case errors.Is(err, context.Canceled):
+		// The browser went away (page closed or reloaded); nothing failed.
+		s.logger.Debug().Err(err).Msg("Backup request cancelled by the client")
 	default:
 		s.logger.Error().Err(err).Msg("Backup request failed")
 	}
@@ -127,6 +130,36 @@ func (s *Server) handleBackupStopRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.JSONResponse(w, map[string]bool{"stopping": true}, http.StatusAccepted)
+}
+
+// handleBackupRunCheck starts the check now. The Service contract has no
+// such method, so the real service is reached through backup.CheckRunner.
+func (s *Server) handleBackupRunCheck(w http.ResponseWriter, r *http.Request) {
+	cr, ok := s.backupService().(backup.CheckRunner)
+	if !ok {
+		s.writeBackupError(w, backup.ErrNotImplemented)
+		return
+	}
+	if err := cr.RunCheck(); err != nil {
+		s.writeBackupError(w, err)
+		return
+	}
+	utils.JSONResponse(w, map[string]bool{"started": true}, http.StatusAccepted)
+}
+
+// handleBackupRunOffsite starts an off-box copy now. The Service contract has
+// no such method, so the real service is reached through backup.OffsiteRunner.
+func (s *Server) handleBackupRunOffsite(w http.ResponseWriter, r *http.Request) {
+	or, ok := s.backupService().(backup.OffsiteRunner)
+	if !ok {
+		s.writeBackupError(w, backup.ErrNotImplemented)
+		return
+	}
+	if err := or.StartUpload(); err != nil {
+		s.writeBackupError(w, err)
+		return
+	}
+	utils.JSONResponse(w, map[string]bool{"started": true}, http.StatusAccepted)
 }
 
 func (s *Server) handleBackupListSnapshots(w http.ResponseWriter, r *http.Request) {

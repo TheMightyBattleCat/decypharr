@@ -345,6 +345,38 @@ func TestPrunePlanFreedBytesAndSharedBlob(t *testing.T) {
 	}
 }
 
+func TestPruneKeepsBlobsTheFileCachePointsTo(t *testing.T) {
+	r := newTestRepo(t)
+	ctx := context.Background()
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "a.meta"), "stored by a walk that was then interrupted\n", time.Unix(1_700_000_000, 0))
+	cache := r.LoadFileCache()
+	res, err := WalkTree(ctx, r, WalkOptions{Root: src, Cache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SaveFileCache(cache); err != nil {
+		t.Fatal(err)
+	}
+	tr, _ := ReadTree(ctx, r, res.Tree.SHA256)
+	file := tr.Files["a.meta"]
+
+	// No snapshot refers to anything; only the cache points at the file.
+	plan, err := r.PrunePlan(ctx, RetentionPolicy{Last: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Prune(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := r.HasBlob(ctx, file); !ok {
+		t.Fatal("prune deleted a blob the file cache points to")
+	}
+	if ok, _ := r.HasBlob(ctx, res.Tree.SHA256); ok {
+		t.Fatal("an orphan the cache does not point to should still go")
+	}
+}
+
 func TestPruneKeepsBlobsOfTreeChildren(t *testing.T) {
 	// Keep only "new": S is reachable only through its tree blob.
 	r, _, shaS, _ := pruneFixture(t)

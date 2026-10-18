@@ -113,10 +113,21 @@ type Snapshot struct {
 	Decypharr  BuildInfo                    `json:"decypharr"`
 	Components map[Component]ComponentEntry `json:"components"`
 	Stats      SnapshotStats                `json:"stats"`
-	// Result is "ok" or a short failure note; a snapshot is only written on
-	// success, so history rows for failed runs come from the job log.
+	// Result is ResultOK, or ResultPartial for a full run that saved its
+	// small components but did not finish its walks (it was stopped, failed
+	// or interrupted). Failed runs leave no other record here; their history
+	// comes from the job log.
 	Result string `json:"result,omitempty"`
 }
+
+const (
+	ResultOK = "ok"
+	// ResultPartial snapshots hold everything but the NZB records and the
+	// overlay. They are kept until a complete snapshot of the same job is
+	// newer, never count as the job's last success, and never count towards
+	// a retention policy's numbers.
+	ResultPartial = "partial"
+)
 
 // SnapshotInfo is a Snapshot summarised for lists.
 type SnapshotInfo struct {
@@ -128,6 +139,7 @@ type SnapshotInfo struct {
 	DurationMS int64       `json:"duration_ms"`
 	Commit     string      `json:"commit,omitempty"`
 	DBFormat   int         `json:"db_format,omitempty"`
+	Result     string      `json:"result,omitempty"`
 }
 
 // Info summarises s.
@@ -135,7 +147,7 @@ func (s *Snapshot) Info() SnapshotInfo {
 	info := SnapshotInfo{
 		ID: s.ID, CreatedAt: s.CreatedAt, Trigger: s.Trigger,
 		NewBytes: s.Stats.NewBytes, DurationMS: s.Stats.DurationMS,
-		Commit: s.Decypharr.Commit, DBFormat: s.Decypharr.DBFormat,
+		Commit: s.Decypharr.Commit, DBFormat: s.Decypharr.DBFormat, Result: s.Result,
 	}
 	for _, c := range AllComponents() {
 		if _, ok := s.Components[c]; ok {
@@ -219,6 +231,11 @@ type VerifyOptions struct {
 	// Full reads and re-hashes every blob; otherwise blob presence and size
 	// are checked.
 	Full bool `json:"full,omitempty"`
+	// BytesPerSec limits a full check's reading, and while Pause returns
+	// true it waits between blobs. The scheduled check sets both from the
+	// backup settings; they are not part of the API.
+	BytesPerSec int64       `json:"-"`
+	Pause       func() bool `json:"-"`
 }
 
 // VerifyReport is the result of Verify.
@@ -414,6 +431,9 @@ type JobStatus struct {
 	LastError   string      `json:"last_error,omitempty"`
 	NextRun     *time.Time  `json:"next_run,omitempty"`
 	Running     bool        `json:"running"`
+	// Queued is why the job is waiting for the run slot ("skipped" while
+	// another backup ran, "interrupted" by a restart), or empty.
+	Queued string `json:"queued,omitempty"`
 }
 
 // StatusResponse is GET /api/backups/status.
@@ -427,14 +447,39 @@ type StatusResponse struct {
 	LastNewBytes int64           `json:"last_new_bytes"`
 	Jobs         []JobStatus     `json:"jobs"`
 	Running      *ProgressUpdate `json:"running,omitempty"`
+	// Check is the scheduled check; nil until backups are set up.
+	Check *CheckStatus `json:"check,omitempty"`
+	// Offsite is the copy to an rclone remote; nil when none is set.
+	Offsite *OffsiteStatus `json:"offsite,omitempty"`
+	// Alerts says whether backup failure and stale alerts can reach anyone;
+	// nil when neither alert is turned on.
+	Alerts *AlertState `json:"alerts,omitempty"`
 	// Now is the server's clock, so the page can age progress timestamps
 	// without trusting the browser's clock.
-	Now         time.Time `json:"now"`
-	PostRestore bool      `json:"post_restore_hold"`
-	PendingSwap bool      `json:"pending_db_restore"`
+	Now time.Time `json:"now"`
+	// ServerTZ is the server's time zone; job schedules are read in it.
+	ServerTZ    string `json:"server_tz,omitempty"`
+	PostRestore bool   `json:"post_restore_hold"`
+	PendingSwap bool   `json:"pending_db_restore"`
 	// LinkRestoreApplied is true once a manual link restore has created or
 	// retargeted at least one link (see LinkRestoreApplied).
 	LinkRestoreApplied bool `json:"link_restore_applied"`
+}
+
+// CheckStatus is the scheduled check's line on the Backups page.
+type CheckStatus struct {
+	Enabled  bool         `json:"enabled"`
+	Schedule string       `json:"schedule,omitempty"`
+	NextRun  *time.Time   `json:"next_run,omitempty"`
+	Running  bool         `json:"running"`
+	Queued   string       `json:"queued,omitempty"`
+	Last     *CheckResult `json:"last,omitempty"`
+}
+
+// AlertState is whether a backup alert would be delivered, and if not, why.
+type AlertState struct {
+	Deliverable bool   `json:"deliverable"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 // RunJobResponse is POST /api/backups/jobs/{name}/run. The run continues in

@@ -16,7 +16,10 @@
     const esc = (s) => u().escapeHtml(String(s ?? ''));
     const toast = (m, t) => u().createToast(m, t || 'success');
     const bytes = (n) => u().formatBytes(n || 0);
-    const when = (t) => (t ? new Date(t).toLocaleString() : '');
+    const when = (t) => (t ? new Date(t).toLocaleString(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+    }) : '');
 
     async function api(path, opts) {
         const res = await u().fetcher(path, opts);
@@ -68,6 +71,7 @@
                 this.roots = (l.roots || []).map(r => r.root);
             } catch (_) { this.roots = []; }
             this.renderDestination();
+            this.renderAlertsWarning();
             this.renderHold();
             this.renderRoots();
             this.renderAutoRecreate();
@@ -105,8 +109,19 @@
                         <span class="text-sm opacity-70">Backups stay off until a folder is set. It must be on a different disk from the Decypharr data folder.</span>
                     </div>
                     <div>
-                        <label class="label" for="bk-rclone"><span class="font-medium">Rclone remote (optional)</span></label>
+                        <label class="label" for="bk-rclone"><span class="font-medium">Off-box copy: rclone remote (optional)</span></label>
                         <input type="text" class="input w-full" id="bk-rclone" placeholder="remote:path">
+                        <span class="text-sm opacity-70">After every backup the backup folder is copied here, so losing this machine does not lose the backups. Use an encrypted (crypt) remote: the backups hold your API keys and settings. The folder must be empty or already hold this backup; nothing on it is ever overwritten, and snapshots that retention deletes here are deleted there too.</span>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="label" for="bk-rclone-config"><span class="font-medium">Rclone config file (optional)</span></label>
+                        <input type="text" class="input w-full font-mono" id="bk-rclone-config" placeholder="rclone's default for this user">
+                    </div>
+                    <div>
+                        <label class="label" for="bk-rclone-bwlimit"><span class="font-medium">Upload limit (rclone --bwlimit, optional)</span></label>
+                        <input type="text" class="input w-full font-mono" id="bk-rclone-bwlimit" placeholder="for example 4M, or 08:00,1M 23:00,off">
                     </div>
                 </div>
                 <div id="bk-destination"></div>
@@ -157,7 +172,25 @@
             </div>
 
             <div class="space-y-3">
+                <h3 class="text-lg font-semibold">Check</h3>
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" id="bk-check-enabled">
+                    <span class="label-text font-medium">Check the backups on a schedule</span>
+                </label>
+                <div class="w-full max-w-md">
+                    <label class="label" for="bk-check-schedule"><span class="font-medium">Schedule (clock time or cron, server time; the default is Sundays at 05:00)</span></label>
+                    <input type="text" class="input w-full font-mono" id="bk-check-schedule" placeholder="0 5 * * 0">
+                </div>
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" id="bk-check-restore">
+                    <span class="label-text font-medium">Also test-restore the newest database backup</span>
+                </label>
+                <span class="text-sm opacity-70">The check reads every stored blob back and re-hashes it, at the I/O limit above and pausing for playback when that is on. The restore test restores the newest database backup into a scratch folder in the backup folder, opens it and deletes it again. A problem is reported on the Backups page and as a backup failure alert.</span>
+            </div>
+
+            <div class="space-y-3">
                 <h3 class="text-lg font-semibold">Notifications</h3>
+                <div id="bk-alerts-warning"></div>
                 <label class="label cursor-pointer justify-start gap-3">
                     <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" id="bk-notify-failure">
                     <span class="label-text font-medium">Notify when a backup fails</span>
@@ -216,12 +249,18 @@
             const chk = (id, v) => { const e = this.el(id); if (e) e.checked = !!v; };
             set('bk-dir', c.dir);
             set('bk-rclone', c.rclone_remote);
+            set('bk-rclone-config', c.rclone_config);
+            set('bk-rclone-bwlimit', c.rclone_bwlimit);
             set('bk-extra', (c.extra_link_folders || []).join('\n'));
             set('bk-throttle', c.throttle_mbps || 0);
             set('bk-quiet-start', (c.quiet_hours || {}).start);
             set('bk-quiet-end', (c.quiet_hours || {}).end);
             chk('bk-pause-streaming', c.pause_while_streaming);
             chk('bk-notify-failure', (c.notify || {}).on_failure);
+            const ck = c.check || {};
+            chk('bk-check-enabled', ck.enabled);
+            set('bk-check-schedule', ck.schedule);
+            chk('bk-check-restore', ck.restore_test);
             set('bk-stale', (c.notify || {}).stale_hours || 0);
             const p = c.pre_action || {};
             chk('bk-pre-enabled', p.enabled);
@@ -248,6 +287,17 @@
                     <span class="text-sm">The backup folder is on the same disk as the Decypharr data folder. A disk failure would take both.</span></div>`;
             }
             box.innerHTML = html;
+        },
+
+        renderAlertsWarning() {
+            const box = this.el('bk-alerts-warning');
+            if (!box) return;
+            const a = (this.status || {}).alerts;
+            box.innerHTML = a && !a.deliverable
+                ? `<div class="alert alert-warning"><i class="bi bi-bell-slash"></i>
+                    <span class="text-sm">These alerts cannot reach you: ${esc(a.reason || 'notifications are not set up')}.
+                    Set up a Discord webhook or callback URL under General → Notifications.</span></div>`
+                : '';
         },
 
         renderHold() {
@@ -327,7 +377,7 @@
                 </div>
                 <div class="flex flex-wrap gap-x-4">${comps}</div>
                 <div>
-                    <label class="label"><span class="font-medium text-sm">Schedule (clock time such as 04:00, or a cron expression)</span></label>
+                    <label class="label"><span class="font-medium text-sm">Schedule (clock time such as 04:00, or a cron expression), in the server's time${this.status && this.status.server_tz ? ' (' + esc(this.status.server_tz) + ')' : ''}</span></label>
                     <input type="text" class="input input-sm w-full max-w-md font-mono" data-bk-schedule value="${esc(j.schedule)}">
                     <div class="text-sm mt-1" data-bk-next></div>
                 </div>
@@ -519,10 +569,17 @@
             const c = JSON.parse(JSON.stringify(this.cfg));
             c.dir = this.el('bk-dir').value.trim();
             c.rclone_remote = this.el('bk-rclone').value.trim();
+            c.rclone_config = this.el('bk-rclone-config').value.trim();
+            c.rclone_bwlimit = this.el('bk-rclone-bwlimit').value.trim();
             c.extra_link_folders = this.el('bk-extra').value.split('\n').map(s => s.trim()).filter(Boolean);
             c.throttle_mbps = num('bk-throttle', 0);
             c.quiet_hours = {start: this.el('bk-quiet-start').value, end: this.el('bk-quiet-end').value};
             c.pause_while_streaming = this.el('bk-pause-streaming').checked;
+            c.check = {
+                enabled: this.el('bk-check-enabled').checked,
+                schedule: this.el('bk-check-schedule').value.trim() || '0 5 * * 0',
+                restore_test: this.el('bk-check-restore').checked,
+            };
             c.notify = Object.assign({}, c.notify, {
                 on_failure: this.el('bk-notify-failure').checked,
                 stale_hours: num('bk-stale', 0),

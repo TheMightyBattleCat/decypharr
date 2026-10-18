@@ -30,6 +30,15 @@
         </div>
     </div>
 
+    <div id="bkAlertsBanner" role="alert" class="alert alert-warning hidden">
+        <i class="bi bi-bell-slash"></i>
+        <div class="text-sm">
+            <span class="font-semibold">Backup alerts cannot reach you:</span> <span id="bkAlertsReason"></span>.
+            A failed or stale backup would go unnoticed. Set up a channel in
+            <a href="{{.URLBase}}settings#tab-general" class="link link-hover font-semibold">Settings → General → Notifications</a>.
+        </div>
+    </div>
+
     <div id="bkNotConfigured" role="alert" class="alert alert-warning hidden">
         <i class="bi bi-exclamation-triangle text-xl"></i>
         <div class="text-sm">No backup folder is set. Choose one in
@@ -48,6 +57,8 @@
             </div>
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4" id="bkSummary"></div>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 mt-4" id="bkJobs"></div>
+            <div class="mt-3" id="bkCheck"></div>
+            <div class="mt-3" id="bkOffsite"></div>
         </div>
     </div>
 

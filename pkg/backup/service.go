@@ -51,6 +51,8 @@ type Deps struct {
 	Streaming func() bool
 	// Notify sends a backup notification; nil sends nothing.
 	Notify func(ev config.NotificationEvent, status, msg string, err error)
+	// Alerts reports whether Notify can reach anyone; nil is not reported.
+	Alerts func() AlertState
 	// Scheduler is the manager's gocron scheduler; nil means no schedule.
 	Scheduler gocron.Scheduler
 	// Now is the clock; nil means time.Now.
@@ -118,6 +120,30 @@ type BackupService struct {
 
 	sizeAt    time.Time
 	sizeBytes int64
+
+	// The run queue (queue.go): runs waiting for the slot and the run holding
+	// it, mirrored in RunQueueFile. qmu guards them.
+	qmu       sync.Mutex
+	queue     []queuedRun
+	running   *queuedRun
+	kickTimer *time.Timer
+
+	// The last check (check.go), read from the repository once, and its
+	// scheduler job; mu guards them.
+	lastCheck   *CheckResult
+	checkLoaded bool
+	checkJob    gocron.Job
+
+	// The off-box copy (offsite.go); offMu guards it. rclone is nil outside
+	// tests (execRclone).
+	offMu      sync.Mutex
+	offRunning bool
+	offAgain   bool
+	offPhase   string
+	offLast    *OffsiteResult
+	offLoaded  bool
+	offTypes   map[string]string
+	rclone     rcloneRunner
 }
 
 var _ Service = (*BackupService)(nil)
@@ -142,6 +168,7 @@ func NewService(d Deps) *BackupService {
 		cleanPlans:  map[string]CleanupPlan{},
 		jobs:        map[string]gocron.Job{},
 		staleNotice: map[string]time.Time{},
+		offTypes:    map[string]string{},
 		startedAt:   d.Now(),
 	}
 }
@@ -185,6 +212,8 @@ func (s *BackupService) claim(label string) (release func(), err error) {
 		s.runningJob = ""
 		s.progress = nil
 		s.mu.Unlock()
+		// A run waiting for the slot can start now.
+		go s.kick()
 	}, nil
 }
 
@@ -218,6 +247,7 @@ func (s *BackupService) Status(ctx context.Context) (StatusResponse, error) {
 		PendingSwap: PendingRestoreExists(s.deps.DataDir),
 		Jobs:        []JobStatus{},
 		Now:         s.now(),
+		ServerTZ:    serverZone(s.now()),
 
 		LinkRestoreApplied: LinkRestoreApplied(s.deps.DataDir),
 	}
@@ -231,6 +261,7 @@ func (s *BackupService) Status(ctx context.Context) (StatusResponse, error) {
 	for k, v := range s.jobs {
 		jobs[k] = v
 	}
+	checkJob := s.checkJob
 	lastErr := make(map[string]string, len(s.lastErr))
 	for k, v := range s.lastErr {
 		lastErr[k] = v
@@ -242,22 +273,49 @@ func (s *BackupService) Status(ctx context.Context) (StatusResponse, error) {
 		if r, err := s.repo(); err == nil {
 			snaps, _ = r.ListSnapshots(ctx)
 			st.Snapshots = len(snaps)
-			if len(snaps) > 0 {
-				st.LastNewBytes = snaps[0].NewBytes
+			for _, sn := range snaps {
+				if sn.Result != ResultPartial {
+					st.LastNewBytes = sn.NewBytes
+					break
+				}
 			}
 			st.RepoBytes = s.repoBytes(r)
 		}
 		st.FreeBytes, st.SameDisk = diskInfo(st.Dir, s.deps.DataDir)
 	}
+	if st.Configured {
+		cs := &CheckStatus{Enabled: cfg.Check.Enabled, Schedule: cfg.Check.Schedule,
+			Running: running == checkLabel, Queued: s.queuedReason(queuedRun{Kind: kindCheck}.key())}
+		if r, err := s.repo(); err == nil {
+			cs.Last = s.loadCheck(r)
+		}
+		if checkJob != nil && cfg.Check.Enabled {
+			if t, err := checkJob.NextRun(); err == nil && !t.IsZero() {
+				cs.NextRun = &t
+			}
+		}
+		st.Check = cs
+		var repo Repo
+		if r, err := s.repo(); err == nil {
+			repo = r
+		}
+		st.Offsite = s.offsiteStatus(cfg, repo)
+	}
+	if s.deps.Alerts != nil && (cfg.Notify.OnFailure || cfg.Notify.StaleHours > 0) {
+		a := s.deps.Alerts()
+		st.Alerts = &a
+	}
 
 	for _, j := range cfg.Jobs {
 		js := JobStatus{Name: j.Name, Enabled: j.Enabled, Schedule: j.Schedule,
-			Running: running == "job:"+j.Name, LastError: lastErr[j.Name]}
+			Running: running == "job:"+j.Name, LastError: lastErr[j.Name], Queued: s.queuedFor(j.Name)}
 		for _, c := range j.Components {
 			js.Components = append(js.Components, Component(c))
 		}
 		for _, sn := range snaps {
-			if jobOfTrigger(sn.Trigger) == j.Name {
+			// A partial snapshot (a full run that did not finish its walks)
+			// is not a success.
+			if jobOfTrigger(sn.Trigger) == j.Name && sn.Result != ResultPartial {
 				t := sn.CreatedAt
 				js.LastSuccess = &t
 				break
@@ -271,6 +329,13 @@ func (s *BackupService) Status(ctx context.Context) (StatusResponse, error) {
 		st.Jobs = append(st.Jobs, js)
 	}
 	return st, nil
+}
+
+// serverZone names the zone job schedules are read in: the scheduler runs on
+// the server's local time.
+func serverZone(t time.Time) string {
+	name, _ := t.In(time.Local).Zone()
+	return name
 }
 
 // jobOfTrigger returns the job name of a "schedule:<job>" or "manual:<job>"

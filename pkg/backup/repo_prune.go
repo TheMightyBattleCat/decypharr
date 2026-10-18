@@ -72,10 +72,16 @@ func (r *FileRepo) PrunePlan(ctx context.Context, p RetentionPolicy) (PrunePlan,
 	}
 	keep := map[string]bool{}
 	var cand []*Snapshot
+	superseded := supersededPartials(snaps)
 	for _, s := range snaps {
-		if p.TriggerPrefix == "" || hasPrefix(s.Trigger, p.TriggerPrefix) {
+		switch {
+		case s.Result == ResultPartial:
+			// Partials stay out of the counts: kept until a complete
+			// snapshot of the same job is newer, then dropped.
+			keep[s.ID] = !superseded[s.ID]
+		case p.TriggerPrefix == "" || hasPrefix(s.Trigger, p.TriggerPrefix):
 			cand = append(cand, s)
-		} else {
+		default:
 			keep[s.ID] = true
 		}
 	}
@@ -114,7 +120,7 @@ func (r *FileRepo) PrunePlan(ctx context.Context, p RetentionPolicy) (PrunePlan,
 	}
 
 	plan := PrunePlan{Policy: p}
-	live := map[string]struct{}{}
+	live := r.cachedShas()
 	for _, s := range snaps {
 		if keep[s.ID] {
 			if err := r.snapshotShas(ctx, s, live); err != nil {
@@ -169,7 +175,7 @@ func (r *FileRepo) Prune(ctx context.Context, plan PrunePlan) (PruneResult, erro
 	if err != nil {
 		return res, err
 	}
-	live := map[string]struct{}{}
+	live := r.cachedShas()
 	for _, s := range snaps {
 		if !del[s.ID] {
 			if err := r.snapshotShas(ctx, s, live); err != nil {
@@ -216,6 +222,44 @@ func (r *FileRepo) Prune(ctx context.Context, plan PrunePlan) (PruneResult, erro
 }
 
 // cleanTemp removes spool files left by a crashed run.
+// supersededPartials lists the partial snapshots that a newer complete
+// snapshot of the same job (scheduled or manual) has replaced.
+func supersededPartials(snaps []*Snapshot) map[string]bool {
+	newest := map[string]time.Time{}
+	for _, s := range snaps {
+		if s.Result == ResultPartial {
+			continue
+		}
+		if job := jobOfTrigger(s.Trigger); job != "" && s.CreatedAt.After(newest[job]) {
+			newest[job] = s.CreatedAt
+		}
+	}
+	out := map[string]bool{}
+	for _, s := range snaps {
+		if s.Result != ResultPartial {
+			continue
+		}
+		if t, ok := newest[jobOfTrigger(s.Trigger)]; ok && t.After(s.CreatedAt) {
+			out[s.ID] = true
+		}
+	}
+	return out
+}
+
+// cachedShas is the blobs the file cache points to. Prune keeps them: they
+// are the files an interrupted walk already stored, which the resumed run
+// takes from the cache instead of reading and compressing them again.
+func (r *FileRepo) cachedShas() map[string]struct{} {
+	c := r.LoadFileCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]struct{}, len(c.entries))
+	for _, e := range c.entries {
+		out[e.SHA] = struct{}{}
+	}
+	return out
+}
+
 func (r *FileRepo) cleanTemp() {
 	dir := filepath.Join(r.dir, "tmp")
 	entries, err := os.ReadDir(dir)

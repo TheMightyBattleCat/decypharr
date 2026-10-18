@@ -68,6 +68,19 @@ type BackupQuietHours struct {
 	End   string `json:"end,omitempty"`
 }
 
+// BackupCheck schedules the check that reads every stored blob back and
+// re-hashes it, and test-restores the newest database backup.
+type BackupCheck struct {
+	Enabled  bool   `json:"enabled"`
+	Schedule string `json:"schedule"`
+	// RestoreTest also restores the newest database backup into a scratch
+	// folder in the repository and opens it.
+	RestoreTest bool `json:"restore_test"`
+}
+
+// DefaultBackupCheckSchedule is Sundays at 05:00, server time.
+const DefaultBackupCheckSchedule = "0 5 * * 0"
+
 // BackupNotify is the backup notification settings.
 type BackupNotify struct {
 	OnFailure bool `json:"on_failure"`
@@ -79,8 +92,16 @@ type BackupNotify struct {
 // Backup is the backup feature's settings (JSON key "backup").
 type Backup struct {
 	// Dir is the destination folder. Empty means backups are not set up.
-	Dir          string `json:"dir,omitempty"`
+	Dir string `json:"dir,omitempty"`
+	// RcloneRemote, when set, receives a copy of the backup folder after
+	// every successful backup job ("remote:path").
 	RcloneRemote string `json:"rclone_remote,omitempty"`
+	// RcloneConfig is the rclone config file; empty uses rclone's default
+	// for the user Decypharr runs as.
+	RcloneConfig string `json:"rclone_config,omitempty"`
+	// RcloneBwlimit is passed to rclone --bwlimit ("4M", or a timetable such
+	// as "08:00,1M 23:00,off"); empty is no limit.
+	RcloneBwlimit string `json:"rclone_bwlimit,omitempty"`
 
 	Jobs []BackupJob `json:"jobs,omitempty"`
 
@@ -94,6 +115,7 @@ type Backup struct {
 	AutoRecreate BackupAutoRecreate `json:"auto_recreate"`
 	QuietHours   BackupQuietHours   `json:"quiet_hours"`
 	Notify       BackupNotify       `json:"notify"`
+	Check        BackupCheck        `json:"check"`
 
 	ThrottleMBps        int  `json:"throttle_mbps"`
 	PauseWhileStreaming bool `json:"pause_while_streaming"`
@@ -122,6 +144,7 @@ func DefaultBackup() Backup {
 		PreAction:           BackupPreAction{Enabled: true, Keep: 20, MaxAgeDays: 14},
 		AutoRecreate:        BackupAutoRecreate{Enabled: false, Limit: 25},
 		Notify:              BackupNotify{OnFailure: true, StaleHours: 48},
+		Check:               BackupCheck{Enabled: true, Schedule: DefaultBackupCheckSchedule, RestoreTest: true},
 		ThrottleMBps:        20,
 		PauseWhileStreaming: true,
 		ConfigHistoryMax:    200,
@@ -133,13 +156,19 @@ func DefaultBackup() Backup {
 func (c *Config) setBackupDefaults() {
 	b := &c.Backup
 	if len(b.Jobs) == 0 && b.LinkCheck == (BackupLinkCheck{}) && b.PreAction.Keep == 0 {
-		dir, remote, extra, maps := b.Dir, b.RcloneRemote, b.ExtraLinkFolders, b.ArrPathMaps
+		keep := *b
 		*b = DefaultBackup()
-		b.Dir, b.RcloneRemote, b.ExtraLinkFolders, b.ArrPathMaps = dir, remote, extra, maps
+		b.Dir, b.RcloneRemote, b.RcloneConfig, b.RcloneBwlimit = keep.Dir, keep.RcloneRemote, keep.RcloneConfig, keep.RcloneBwlimit
+		b.ExtraLinkFolders, b.ArrPathMaps = keep.ExtraLinkFolders, keep.ArrPathMaps
 		return
 	}
 	if b.ConfigHistoryMax <= 0 {
 		b.ConfigHistoryMax = 200
+	}
+	// The check came after backups did: an install that has never set it
+	// gets the default, turned on.
+	if b.Check == (BackupCheck{}) {
+		b.Check = DefaultBackup().Check
 	}
 	if b.AutoRecreate.Limit <= 0 {
 		b.AutoRecreate.Limit = 25
@@ -188,6 +217,12 @@ func (b *Backup) Validate(checkSchedule func(string) error) error {
 			if err := checkSchedule(j.Schedule); err != nil {
 				return fmt.Errorf("backup job %q: schedule %w", j.Name, err)
 			}
+		}
+	}
+	b.Check.Schedule = strings.TrimSpace(b.Check.Schedule)
+	if b.Check.Enabled {
+		if err := checkSchedule(b.Check.Schedule); err != nil {
+			return fmt.Errorf("backup check schedule %w", err)
 		}
 	}
 	b.LinkCheck.Schedule = strings.TrimSpace(b.LinkCheck.Schedule)

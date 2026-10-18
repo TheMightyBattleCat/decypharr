@@ -182,3 +182,28 @@ func TestWalkTreeReportsPauseThenResumes(t *testing.T) {
 		t.Fatalf("last update: %+v", last)
 	}
 }
+
+func TestRateWindowFollowsTheRecentSpeed(t *testing.T) {
+	w := rateWindow{span: time.Minute}
+	if w.rate() != 0 {
+		t.Fatal("no rate before any sample")
+	}
+	// The first 10 seconds go through files the cache skips: 1 GB.
+	w.add(0, 0)
+	w.add(10*time.Second, 1<<30)
+	if r := w.rate(); r < 100<<20 {
+		t.Fatalf("cache-skip speed: %d", r)
+	}
+	// Then two minutes of compressing at 2 MB/s.
+	done := int64(1 << 30)
+	for s := 11; s <= 130; s++ {
+		done += 2 << 20
+		w.add(time.Duration(s)*time.Second, done)
+	}
+	if r := w.rate(); r < 2<<20-1<<16 || r > 2<<20+1<<16 {
+		t.Fatalf("want about 2 MB/s once the fast start is out of the window, got %d", r)
+	}
+	if len(w.samples) > 62 {
+		t.Fatalf("window keeps %d samples", len(w.samples))
+	}
+}

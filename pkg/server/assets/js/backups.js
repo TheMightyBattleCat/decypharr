@@ -34,10 +34,22 @@
         return n ? utils.formatBytes(n) : '0 B';
     }
 
+    // fmtTime shows a time in the browser's zone, named, so it never reads as
+    // the server's (job schedules are in the server's zone).
     function fmtTime(t) {
         if (!t || String(t).startsWith('0001')) return '-';
         const d = new Date(t);
-        return isNaN(d) ? '-' : d.toLocaleString();
+        return isNaN(d) ? '-' : d.toLocaleString(undefined, {
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+        });
+    }
+
+    // scheduleLabel names the zone a job's schedule is read in.
+    function scheduleLabel(schedule, tz) {
+        if (!schedule) return 'manual only';
+        const zone = tz || 'server time';
+        return /^\d{1,2}:\d{2}$/.test(schedule) ? `daily at ${schedule} ${zone}` : `${schedule} (cron, ${zone})`;
     }
 
     function fmtDuration(ms) {
@@ -144,6 +156,9 @@
         $('bkHoldBanner').classList.toggle('hidden', !st.post_restore_hold);
         $('bkSwapBanner').classList.toggle('hidden', !st.pending_db_restore);
         $('bkNotConfigured').classList.toggle('hidden', !!st.configured);
+        const alertsOff = !!(st.configured && st.alerts && !st.alerts.deliverable);
+        $('bkAlertsBanner').classList.toggle('hidden', !alertsOff);
+        if (alertsOff) $('bkAlertsReason').textContent = st.alerts.reason || 'notifications are not set up';
 
         const line = st.configured
             ? `${esc(st.dir)}${st.free_bytes ? ` · ${fmtBytes(st.free_bytes)} free` : ''}`
@@ -172,7 +187,7 @@
                 `<div class="flex items-center justify-between gap-2">` +
                 `<div><div class="font-semibold">${esc(j.name)}` +
                 `${j.enabled ? '' : ' <span class="badge badge-ghost badge-sm">disabled</span>'}</div>` +
-                `<div class="text-xs opacity-70">${esc(comps)} · ${esc(j.schedule || 'manual only')}</div></div>` +
+                `<div class="text-xs opacity-70">${esc(comps)} · ${esc(scheduleLabel(j.schedule, st.server_tz))}</div></div>` +
                 (j.running
                     ? `<button class="btn btn-sm btn-error btn-outline" data-stop="1"><i class="bi bi-stop-fill mr-1"></i>Stop</button></div>`
                     : `<button class="btn btn-sm btn-primary" data-run="${esc(j.name)}"` +
@@ -180,12 +195,113 @@
                 `<div class="text-xs mt-2">Last success: ${esc(fmtTime(j.last_success))} · ` +
                 `Next run: ${esc(fmtTime(j.next_run))}</div>` +
                 (j.last_error ? `<div class="text-xs text-error mt-1 break-all">${esc(j.last_error)}</div>` : '') +
+                (j.queued ? `<div class="text-xs mt-1"><span class="badge badge-info badge-sm mr-1">Waiting</span>` +
+                    `${esc(QUEUED[j.queued] || j.queued)}</div>` : '') +
                 progress + '</div></div>';
         }).join('') || '<div class="text-sm opacity-70">No jobs are set up.</div>';
+        $('bkCheck').innerHTML = checkHtml(st);
+        $('bkOffsite').innerHTML = offsiteHtml(st);
     }
 
+    // checkHtml is the scheduled check's card: its last result, when it runs
+    // next, and its progress while it runs.
+    function checkHtml(st) {
+        const c = st.check;
+        if (!c) return '';
+        let last = '<span class="opacity-70">Not run yet.</span>';
+        const r = c.last;
+        if (r && r.ok) {
+            const rt = r.restore_test
+                ? ` · test restore of the newest database backup opened ${r.restore_test.records} records` : '';
+            last = `<span class="badge badge-success badge-sm mr-1">passed</span>${esc(fmtTime(r.at))}: ` +
+                `read back all ${r.blobs_checked} blobs of ${r.snapshots} snapshots${rt}`;
+        } else if (r) {
+            const parts = [];
+            if (r.error) parts.push(r.error);
+            if (r.missing) parts.push(`${r.missing} blobs missing`);
+            if (r.corrupt) parts.push(`${r.corrupt} blobs damaged`);
+            if (r.restore_test && !r.restore_test.ok) parts.push(`test restore failed: ${r.restore_test.error}`);
+            last = `<span class="badge badge-error badge-sm mr-1">problem</span>${esc(fmtTime(r.at))}: ${esc(parts.join('; '))}` +
+                ((r.problems || []).length ? `<div class="font-mono text-xs opacity-70 mt-1 break-all">${(r.problems || []).map(esc).join('<br>')}</div>` : '');
+        }
+        const when = c.enabled
+            ? `Next check: ${esc(fmtTime(c.next_run))} (${esc(scheduleLabel(c.schedule, st.server_tz))})`
+            : 'The scheduled check is off (Settings → Backups).';
+        const button = c.running
+            ? '<button class="btn btn-sm btn-error btn-outline" data-stop="check"><i class="bi bi-stop-fill mr-1"></i>Stop</button>'
+            : `<button class="btn btn-sm btn-outline" data-check="1"${st.configured ? '' : ' disabled'}><i class="bi bi-shield-check mr-1"></i>Check now</button>`;
+        return `<div class="card bg-base-200"><div class="card-body p-4">` +
+            `<div class="flex items-center justify-between gap-2"><div>` +
+            `<div class="font-semibold">Check</div>` +
+            `<div class="text-xs opacity-70">Reads every stored blob back and test-restores the newest database backup</div></div>` +
+            button + '</div>' +
+            `<div class="text-xs mt-2">${last}</div>` +
+            `<div class="text-xs mt-1 opacity-70">${when}</div>` +
+            (c.queued ? `<div class="text-xs mt-1"><span class="badge badge-info badge-sm mr-1">Waiting</span>${esc(QUEUED[c.queued] || c.queued)}</div>` : '') +
+            (c.running ? progressHtml(st.running || {}, st.now) : '') +
+            '</div></div>';
+    }
+
+    // offsiteHtml is the off-box copy's card: the remote, the last upload and
+    // the one in progress.
+    function offsiteHtml(st) {
+        const o = st.offsite;
+        if (!o) return '';
+        const type = o.remote_type
+            ? (o.remote_type === 'crypt'
+                ? ' <span class="badge badge-success badge-sm">encrypted</span>'
+                : ` <span class="badge badge-warning badge-sm" title="The backups hold your API keys and settings">not encrypted (${esc(o.remote_type)})</span>`)
+            : '';
+        let last = '<span class="opacity-70">Nothing copied yet.</span>';
+        const r = o.last;
+        if (r && r.ok) {
+            last = `<span class="badge badge-success badge-sm mr-1">copied</span>${esc(fmtTime(r.at))}: ` +
+                `${r.snapshots} snapshots, ${r.blobs} blobs` + (r.deleted ? `, ${r.deleted} old files removed` : '') +
+                ` in ${esc(fmtDuration(r.duration_ms))}`;
+        } else if (r) {
+            last = `<span class="badge badge-error badge-sm mr-1">failed</span>${esc(fmtTime(r.at))}: <span class="break-all">${esc(r.error)}</span>`;
+        }
+        const button = o.running
+            ? '<button class="btn btn-sm btn-outline" disabled><span class="loading loading-spinner loading-xs mr-1"></span>Copying</button>'
+            : `<button class="btn btn-sm btn-outline" data-offsite="1"><i class="bi bi-cloud-upload mr-1"></i>Copy now</button>`;
+        return `<div class="card bg-base-200"><div class="card-body p-4">` +
+            `<div class="flex items-center justify-between gap-2"><div>` +
+            `<div class="font-semibold">Off-box copy</div>` +
+            `<div class="text-xs opacity-70 break-all">${esc(o.remote)}${type}</div></div>` + button + '</div>' +
+            `<div class="text-xs mt-2">${last}</div>` +
+            (o.running && o.phase ? `<div class="text-xs mt-1 opacity-70">${esc(o.phase)}</div>` : '') +
+            '</div></div>';
+    }
+
+    async function runOffsite() {
+        try {
+            await call('POST', '/offsite/run');
+            toast('Off-box copy started');
+            schedulePoll(2000);
+        } catch (e) {
+            toast(esc(e.message), 'error');
+        }
+    }
+
+    async function runCheck() {
+        try {
+            await call('POST', '/check/run');
+            toast('Check started');
+            state.wasRunning = true;
+            refreshStatus();
+        } catch (e) {
+            toast(esc(e.message), 'error');
+        }
+    }
+
+    // Why a job is waiting for the run slot (JobStatus.queued).
+    const QUEUED = {
+        skipped: 'Its scheduled run came while another backup was running; it starts when that one finishes.',
+        interrupted: 'A restart interrupted it; it carries on shortly after start-up.',
+    };
+
     function anyRunning(st) {
-        return !!(st && ((st.jobs || []).some((j) => j.running) || st.running));
+        return !!(st && ((st.jobs || []).some((j) => j.running) || st.running || (st.offsite && st.offsite.running)));
     }
 
     async function refreshStatus() {
@@ -222,10 +338,13 @@
         }
     }
 
-    async function stopRun() {
-        const ok = await confirmDialog('Stop the backup?',
-            '<p>This run\'s snapshot is not saved. What it has already stored is reused by the next run.</p>',
-            'Stop', true);
+    async function stopRun(what) {
+        const ok = what === 'check'
+            ? await confirmDialog('Stop the check?', '<p>Nothing is changed; the check can be run again with Check now.</p>', 'Stop', true)
+            : await confirmDialog('Stop the backup?',
+                '<p>A full backup keeps the database, settings and links it has already saved, as a partial snapshot. ' +
+                'The NZB records and overlay it has not finished are not saved; what it stored of them is reused by the next run.</p>',
+                'Stop', true);
         if (!ok) return;
         try {
             await call('POST', '/running/stop');
@@ -274,7 +393,9 @@
             `<td>${esc(s.trigger)}</td>` +
             `<td>${(s.components || []).map((c) => `<span class="badge badge-outline badge-sm mr-1">${esc(c)}</span>`).join('')}</td>` +
             `<td>${esc(fmtBytes(s.new_bytes))}</td><td>${esc(fmtDuration(s.duration_ms))}</td>` +
-            `<td><span class="badge badge-success badge-sm">ok</span></td>` +
+            (s.result === 'partial'
+                ? `<td><span class="badge badge-warning badge-sm" title="The run stopped before its NZB records and overlay were saved">partial</span></td>`
+                : `<td><span class="badge badge-success badge-sm">ok</span></td>`) +
             `<td><button class="btn btn-xs btn-outline" data-open="${esc(s.id)}">Open</button></td></tr>`).join('');
     }
 
@@ -546,7 +667,9 @@
         const t = ev.target.closest('button, a');
         if (!t) return;
         if (t.dataset.run) runJob(t.dataset.run);
-        else if (t.dataset.stop) stopRun();
+        else if (t.dataset.stop) stopRun(t.dataset.stop);
+        else if (t.dataset.check) runCheck();
+        else if (t.dataset.offsite) runOffsite();
         else if (t.dataset.open) openSnapshot(t.dataset.open);
         else if (t.dataset.verify) verify(t.dataset.verify === 'full');
         else if (t.dataset.restoreRemoved) restoreRemoved(t.dataset.restoreRemoved, t.dataset.name);

@@ -54,20 +54,29 @@ type fileCacheRepo interface {
 	SaveFileCache(*FileCache) error
 }
 
-// order puts wanted components in the stable AllComponents order.
+// orderComponents puts wanted components in the stable AllComponents order,
+// with the two walks (NZB records and the overlay) last, so a full run can
+// save everything else before it starts on them.
 func orderComponents(want []Component) []Component {
 	set := map[Component]bool{}
 	for _, c := range want {
 		set[c] = true
 	}
-	var out []Component
+	var out, walks []Component
 	for _, c := range AllComponents() {
-		if set[c] {
+		switch {
+		case !set[c]:
+		case isWalk(c):
+			walks = append(walks, c)
+		default:
 			out = append(out, c)
 		}
 	}
-	return out
+	return append(out, walks...)
 }
+
+// isWalk reports whether c is stored by walking a folder of files.
+func isWalk(c Component) bool { return c == ComponentNZB || c == ComponentOverlay }
 
 // snapshot takes one snapshot. The caller holds the run slot. The repository
 // lock is held from before the first blob is written until the manifest is
@@ -90,7 +99,7 @@ func (s *BackupService) snapshot(ctx context.Context, repo Repo, opts runOptions
 		Trigger:    opts.trigger,
 		Decypharr:  s.deps.Build,
 		Components: map[Component]ComponentEntry{},
-		Result:     "ok",
+		Result:     ResultOK,
 	}
 	cache := NewFileCache()
 	fcr, hasCache := repo.(fileCacheRepo)
@@ -116,9 +125,29 @@ func (s *BackupService) snapshot(ctx context.Context, repo Repo, opts runOptions
 	progress := Progress(func(u ProgressUpdate) { s.report(u) })
 	w := walkSettings{cache: cache, rate: rate, pause: pause, progress: progress}
 
+	stats := func() SnapshotStats {
+		return SnapshotStats{
+			NewBlobs:   int(store.blobs.Load()),
+			NewBytes:   store.bytes.Load(),
+			DurationMS: s.now().Sub(started).Milliseconds(),
+		}
+	}
+	partial := false
 	for _, c := range orderComponents(opts.components) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if isWalk(c) && opts.walks && !partial && len(snap.Components) > 0 {
+			// Save what is done before the walks, which can take hours on a
+			// first run: if they are stopped or interrupted, the database,
+			// settings and links are still backed up. The finished snapshot
+			// replaces this one under the same id.
+			snap.Result, snap.Stats = ResultPartial, stats()
+			if err := repo.WriteSnapshot(ctx, snap); err != nil {
+				return nil, err
+			}
+			partial = true
+			s.log.Info().Str("snapshot", snap.ID).Msg("Backup saved everything but the NZB records and overlay; storing those now")
 		}
 		s.report(ProgressUpdate{Component: c, Phase: "start"})
 		entry, err := s.capture(ctx, store, c, w)
@@ -127,11 +156,7 @@ func (s *BackupService) snapshot(ctx context.Context, repo Repo, opts runOptions
 		}
 		snap.Components[c] = entry
 	}
-	snap.Stats = SnapshotStats{
-		NewBlobs:   int(store.blobs.Load()),
-		NewBytes:   store.bytes.Load(),
-		DurationMS: s.now().Sub(started).Milliseconds(),
-	}
+	snap.Result, snap.Stats = ResultOK, stats()
 	if err := repo.WriteSnapshot(ctx, snap); err != nil {
 		return nil, err
 	}
@@ -319,7 +344,7 @@ func (s *BackupService) RunJob(_ context.Context, name string) (RunJobResponse, 
 	}
 	go func() {
 		defer release()
-		s.runClaimed(s.runContext(), job, "manual:"+name)
+		s.runJob(s.runContext(), job, "manual:"+name, 0)
 	}()
 	return RunJobResponse{Job: name, Started: true}, nil
 }
@@ -334,14 +359,18 @@ func (s *BackupService) runContext() context.Context {
 	return context.Background()
 }
 
-// runClaimed runs a job in a claimed slot: snapshot, then prune, then notify
-// on failure.
-func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, trigger string) {
+// runJob runs a job in a claimed slot: snapshot, then prune, then notify on
+// failure. attempts is how many times this run was started before (an
+// interrupted run being resumed). The run is recorded in the queue file while
+// it lasts, so a restart, crash or power cut in the middle resumes it at the
+// next start; a run a shutdown cancels keeps that record on purpose.
+func (s *BackupService) runJob(ctx context.Context, job config.BackupJob, trigger string, attempts int) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s.mu.Lock()
 	s.runCancel, s.stopRequested = cancel, false
 	s.mu.Unlock()
+	s.markRunning(queuedRun{Job: job.Name, Trigger: trigger, Since: s.now(), Attempts: attempts + 1})
 
 	err := func() error {
 		repo, err := s.repo()
@@ -361,11 +390,15 @@ func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, tr
 		return nil
 	}()
 	s.mu.Lock()
-	stopped := s.stopRequested && errors.Is(err, context.Canceled)
+	cancelled := errors.Is(err, context.Canceled)
+	stopped := s.stopRequested && cancelled
+	interrupted := !stopped && cancelled && s.ctx != nil && s.ctx.Err() != nil
 	s.runCancel, s.stopRequested = nil, false
 	switch {
 	case stopped:
 		s.lastErr[job.Name] = "Stopped from the Backups page"
+	case interrupted:
+		s.lastErr[job.Name] = "Interrupted by a shutdown; it resumes after the next start"
 	case err != nil:
 		s.lastErr[job.Name] = err.Error()
 	default:
@@ -373,6 +406,15 @@ func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, tr
 		delete(s.staleNotice, job.Name)
 	}
 	s.mu.Unlock()
+	if interrupted {
+		// The run record stays in the queue file; recoverQueue resumes it.
+		s.log.Warn().Str("job", job.Name).Msg("Backup interrupted by a shutdown; it resumes after the next start")
+		return
+	}
+	s.clearRunning()
+	if err == nil && strings.TrimSpace(s.cfg().RcloneRemote) != "" {
+		s.upload() // outside the run slot
+	}
 	if stopped {
 		s.log.Info().Str("job", job.Name).Msg("Backup stopped by the user")
 		return
@@ -385,7 +427,8 @@ func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, tr
 	}
 }
 
-// runScheduled is a scheduled firing: busy means skipped, not queued.
+// runScheduled is a scheduled firing. When another backup holds the run slot
+// the run is queued and starts as soon as the slot is free.
 func (s *BackupService) runScheduled(ctx context.Context, name string) {
 	job, ok := s.jobByName(name)
 	if !ok || !job.Enabled {
@@ -396,9 +439,10 @@ func (s *BackupService) runScheduled(ctx context.Context, name string) {
 	}
 	release, err := s.claim("job:" + name)
 	if err != nil {
-		s.log.Warn().Str("job", name).Msg("Scheduled backup skipped: another backup is running")
+		s.log.Info().Str("job", name).Msg("Scheduled backup waits for the running backup to finish")
+		s.enqueue(queuedRun{Job: name, Trigger: "schedule:" + name, Reason: queueSkipped})
 		return
 	}
 	defer release()
-	s.runClaimed(ctx, job, "schedule:"+name)
+	s.runJob(ctx, job, "schedule:"+name, 0)
 }
