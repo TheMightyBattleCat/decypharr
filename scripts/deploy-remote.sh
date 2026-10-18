@@ -144,7 +144,16 @@ export NVM_DIR="\$HOME/.nvm"
 source "\$NVM_DIR/nvm.sh"
 nvm use 20 >/dev/null
 cd "$REMOTE_BUILD_DIR"
-npm ci
+# node_modules survives between deploys (tar -x only adds files), so the
+# install is skipped when the lockfile is the one it was last installed from.
+lock_hash=\$(sha256sum package-lock.json | cut -d' ' -f1)
+if [ -d node_modules ] && [ "\$(cat .npm-lock.sha256 2>/dev/null || true)" = "\$lock_hash" ]; then
+    echo "package-lock.json unchanged - skipping npm ci"
+else
+    rm -f .npm-lock.sha256
+    npm ci
+    echo "\$lock_hash" > .npm-lock.sha256
+fi
 npm run build
 REMOTE
     log "Frontend assets rebuilt"
@@ -164,9 +173,34 @@ export PATH="\$GOPATH/bin:\$GOROOT/bin:\$PATH"
 cd "$REMOTE_BUILD_DIR"
 rm -f decypharr_new
 go build -o decypharr_new .
+REMOTE
+    log "Build OK - decypharr_new ready in $REMOTE_BUILD_DIR (service not yet touched)"
+}
+
+# go vet needs the built assets but not the binary, so it runs alongside the
+# backup and the staging copy (step 4) instead of in series with the build.
+# wait_vet gates the swap: a vet failure still aborts before the service stops.
+start_vet() {
+    log "go vet on $REMOTE_HOST (in the background) ..."
+    VET_LOG="$(mktemp)"
+    $SSH bash -s >"$VET_LOG" 2>&1 <<REMOTE &
+set -euo pipefail
+export GOROOT=/usr/local/go
+export GOPATH="\$HOME/go"
+export PATH="\$GOPATH/bin:\$GOROOT/bin:\$PATH"
+cd "$REMOTE_BUILD_DIR"
 go vet ./...
 REMOTE
-    log "Build + vet OK - decypharr_new ready in $REMOTE_BUILD_DIR (service not yet touched)"
+    VET_PID=$!
+}
+
+wait_vet() {
+    if ! wait "$VET_PID"; then
+        cat "$VET_LOG" >&2
+        fail "go vet failed - service not touched"
+    fi
+    rm -f "$VET_LOG"
+    log "go vet OK"
 }
 
 # ---------------------------------------------------------------------------
@@ -181,6 +215,10 @@ cd "$REMOTE_DEPLOY_DIR"
 ts=\$(date +%s)
 name="decypharr.bak.\${ts}"
 cp decypharr "\$name"
+# Stage the new binary next to the live one now, so the swap while the
+# service is stopped is a same-filesystem rename, not a copy.
+cp "$REMOTE_BUILD_DIR/decypharr_new" decypharr.new
+chmod +x decypharr.new
 # Keep the last $KEEP_BACKUPS backups, prune older.
 ls -t decypharr.bak.* | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f
 echo "\$name"
@@ -199,17 +237,30 @@ swap_and_restart() {
     $SSH bash -s <<REMOTE
 set -euo pipefail
 sudo systemctl stop $SERVICE
-mv "$REMOTE_BUILD_DIR/decypharr_new" "$REMOTE_BIN"
-chmod +x "$REMOTE_BIN"
+mv -f "$REMOTE_DEPLOY_DIR/decypharr.new" "$REMOTE_BIN"
 sudo systemctl start $SERVICE
 # The process goes active in ~1s, but its /api/* JSON layer (precache,
 # overlay disk-usage) takes 20-30s more to warm up after a restart. The
-# health checks that follow hit those endpoints - give them time to settle
-# first, or a cold-but-fine deploy gets rolled back.
-sleep 30
+# health checks that follow hit those endpoints - wait until both answer
+# (up to 90s) instead of sleeping a fixed 30s, or a cold-but-fine deploy
+# gets rolled back. If they never answer, carry on: the health checks decide.
+set +e
+PORT="$HEALTH_PORT"
+TOKEN=\$(python3 -c "import json; print(json.load(open('${REMOTE_DEPLOY_DIR}/auth.json'))['api_token'])" 2>/dev/null || true)
+AUTH_HEADER=()
+[ -n "\$TOKEN" ] && AUTH_HEADER=(-H "Authorization: Bearer \$TOKEN")
+ready=no
+for i in \$(seq 1 45); do
+    a=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/precache/status" 2>/dev/null)
+    b=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "\${AUTH_HEADER[@]}" "http://127.0.0.1:\${PORT}/api/overlay/disk-usage" 2>/dev/null)
+    if [ "\$a" = 200 ] && [ "\$b" = 200 ]; then ready=yes; break; fi
+    sleep 2
+done
+echo "api warmup: ready=\$ready after \$i polls"
+set -e
 systemctl is-active $SERVICE
 REMOTE
-    log "Service restarted with new binary (waited 30s for API warmup)"
+    log "Service restarted with new binary (API warmup polled, not slept)"
 }
 
 # ---------------------------------------------------------------------------
@@ -396,7 +447,9 @@ main() {
     preflight
     sync_and_build_assets
     build_binary
+    start_vet
     backup_binary
+    wait_vet
     swap_and_restart
 
     local health_output failing
