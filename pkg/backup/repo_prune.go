@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ func (r *FileRepo) listBlobs(ctx context.Context) (map[string]blobFile, error) {
 		name := d.Name()
 		ext := filepath.Ext(name)
 		sha := strings.TrimSuffix(name, ext)
-		if (ext != extZstd && ext != extRaw) || !validSHA(sha) {
+		if !slices.Contains(blobExts, ext) || !validSHA(sha) {
 			return nil
 		}
 		info, err := d.Info()
@@ -194,7 +195,7 @@ func (r *FileRepo) Prune(ctx context.Context, plan PrunePlan) (PruneResult, erro
 			continue
 		}
 		deleted := false
-		for _, ext := range []string{extZstd, extRaw} {
+		for _, ext := range blobExts {
 			p := r.blobBase(sha) + ext
 			st, err := os.Stat(p)
 			if err != nil {

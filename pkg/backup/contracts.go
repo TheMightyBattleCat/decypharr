@@ -58,8 +58,10 @@ func (c Component) Valid() bool {
 	return false
 }
 
-// RepoFormatVersion is the value written to repo.json.
-const RepoFormatVersion = 1
+// RepoFormatVersion is the value written to repo.json. Format 2 added xz
+// blobs; opening a format 1 repository upgrades its repo.json so an older
+// build refuses it rather than missing the xz blobs.
+const RepoFormatVersion = 2
 
 // BlobRef names one stored blob.
 type BlobRef struct {
@@ -185,6 +187,22 @@ type ProgressUpdate struct {
 	FilesDone    int       `json:"files_done"`
 	FilesTotal   int       `json:"files_total"`
 	BytesWritten int64     `json:"bytes_written"`
+	// BytesDone and BytesTotal are the source bytes a walk has gone through
+	// (files taken from the cache included) and will go through.
+	BytesDone  int64 `json:"bytes_done,omitempty"`
+	BytesTotal int64 `json:"bytes_total,omitempty"`
+	// RateBPS is the walk's speed while it was not paused, and ETASeconds
+	// the time left at that speed.
+	RateBPS    int64 `json:"rate_bps,omitempty"`
+	ETASeconds int64 `json:"eta_seconds,omitempty"`
+	// Paused says why the walk is waiting, and PausedSince since when. A
+	// paused walk keeps reporting, so UpdatedAt stays fresh.
+	Paused      string     `json:"paused,omitempty"`
+	PausedSince *time.Time `json:"paused_since,omitempty"`
+	// UpdatedAt is when the update was reported and RunStarted when the run
+	// began; the service fills both in.
+	UpdatedAt  *time.Time `json:"updated_at,omitempty"`
+	RunStarted *time.Time `json:"run_started,omitempty"`
 }
 
 // Report calls p when it is not nil.
@@ -224,12 +242,15 @@ type BlobStore interface {
 	HasBlob(ctx context.Context, sha string) (bool, error)
 }
 
-// CompressionLevel picks the zstd level for a blob.
+// CompressionLevel picks how a blob is compressed. Default and Best use xz,
+// the smallest of the codecs measured on NZB records; Fast uses zstd for
+// snapshots taken while the user waits.
 type CompressionLevel int
 
 const (
 	CompressDefault CompressionLevel = iota
 	CompressBest
+	CompressFast
 )
 
 // Repo is one backup repository (a destination folder).
@@ -406,8 +427,11 @@ type StatusResponse struct {
 	LastNewBytes int64           `json:"last_new_bytes"`
 	Jobs         []JobStatus     `json:"jobs"`
 	Running      *ProgressUpdate `json:"running,omitempty"`
-	PostRestore  bool            `json:"post_restore_hold"`
-	PendingSwap  bool            `json:"pending_db_restore"`
+	// Now is the server's clock, so the page can age progress timestamps
+	// without trusting the browser's clock.
+	Now         time.Time `json:"now"`
+	PostRestore bool      `json:"post_restore_hold"`
+	PendingSwap bool      `json:"pending_db_restore"`
 	// LinkRestoreApplied is true once a manual link restore has created or
 	// retargeted at least one link (see LinkRestoreApplied).
 	LinkRestoreApplied bool `json:"link_restore_applied"`

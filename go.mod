@@ -25,6 +25,7 @@ require (
 	github.com/sirrobot01/hearsay v0.6.4
 	github.com/sourcegraph/conc v0.3.0
 	github.com/stanNthe5/stringbuf v0.0.3
+	github.com/ulikunitz/xz v0.5.15
 	github.com/winfsp/cgofuse v1.6.0
 	go.uber.org/ratelimit v0.3.1
 	go4.org v0.0.0-20200411211856-f5505b9728dd
@@ -116,7 +117,6 @@ require (
 	github.com/spf13/afero v1.14.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
-	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
 	go.etcd.io/bbolt v1.3.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

@@ -114,6 +114,21 @@ func (s *Server) handleBackupReleaseHold(w http.ResponseWriter, r *http.Request)
 	utils.JSONResponse(w, map[string]bool{"post_restore_hold": rel.HoldActive()}, http.StatusOK)
 }
 
+// handleBackupStopRun stops the backup job in progress. The Service contract
+// has no such method, so the real service is reached through backup.RunStopper.
+func (s *Server) handleBackupStopRun(w http.ResponseWriter, r *http.Request) {
+	st, ok := s.backupService().(backup.RunStopper)
+	if !ok {
+		s.writeBackupError(w, backup.ErrNotImplemented)
+		return
+	}
+	if err := st.StopRun(); err != nil {
+		s.writeBackupError(w, err)
+		return
+	}
+	utils.JSONResponse(w, map[string]bool{"stopping": true}, http.StatusAccepted)
+}
+
 func (s *Server) handleBackupListSnapshots(w http.ResponseWriter, r *http.Request) {
 	res, err := s.backupService().ListSnapshots(r.Context())
 	if err == nil && res == nil {

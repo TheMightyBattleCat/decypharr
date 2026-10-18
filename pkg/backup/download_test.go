@@ -75,6 +75,27 @@ func TestDownloadTarsConfigAndDB(t *testing.T) {
 	}
 }
 
+func TestDownloadLinksIsPlainTSV(t *testing.T) {
+	e := newEnv(t, nil)
+	id := writeLinkSnapshot(t, e, "/tv/a.mkv", "/tv/b.mkv")
+	res, err := e.svc.Download(context.Background(), id, ComponentLinks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(res.Filename, "-links.tsv") || res.ContentType != "text/tab-separated-values" {
+		t.Errorf("filename %q type %q", res.Filename, res.ContentType)
+	}
+	text := string(b)
+	if !strings.HasPrefix(text, manifestMagic+"\n") || !strings.Contains(text, "/tv/a.mkv") || !strings.Contains(text, "/tv/b.mkv") {
+		t.Fatalf("download is not the plain manifest: %q", text)
+	}
+}
+
 func TestRestoreNZBPutsTheRecordBackAndKeepsNewerFiles(t *testing.T) {
 	e := newEnv(t, nil)
 	id := runFull(t, e)

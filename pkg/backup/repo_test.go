@@ -61,6 +61,88 @@ func TestPutBlobDedup(t *testing.T) {
 	}
 }
 
+func TestPutBlobCodecByLevel(t *testing.T) {
+	r := newTestRepo(t)
+	ctx := context.Background()
+	for _, c := range []struct {
+		level CompressionLevel
+		ext   string
+	}{{CompressDefault, ".xz"}, {CompressBest, ".xz"}, {CompressFast, ".zst"}} {
+		data := bytes.Repeat([]byte("codec "+c.ext+strconv.Itoa(int(c.level))+" "), 2000)
+		ref, _, err := r.PutBlob(ctx, bytes.NewReader(data), c.level)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, raw, err := r.blobPath(ref.SHA256)
+		if err != nil || raw || filepath.Ext(p) != c.ext || ref.Stored >= ref.Size {
+			t.Fatalf("level %d: path=%s raw=%v ref=%+v err=%v", c.level, p, raw, ref, err)
+		}
+		rc, err := r.OpenBlob(ctx, ref.SHA256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(rc)
+		rc.Close()
+		if !bytes.Equal(got, data) {
+			t.Fatalf("level %d: round trip mismatch", c.level)
+		}
+	}
+	if rep, err := r.Verify(ctx, VerifyOptions{Full: true}, nil); err != nil || rep.Corrupt != nil {
+		t.Fatalf("full verify: %v %+v", err, rep)
+	}
+}
+
+func TestFastStoreForcesZstd(t *testing.T) {
+	r := newTestRepo(t)
+	cs := &countingStore{BlobStore: r, fast: true}
+	ref, _, err := cs.PutBlob(context.Background(), bytes.NewReader(bytes.Repeat([]byte("pre-action "), 2000)), CompressBest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _, _ := r.blobPath(ref.SHA256); filepath.Ext(p) != ".zst" {
+		t.Fatalf("pre-action blob stored as %s, want .zst", p)
+	}
+}
+
+func TestOpenRepoUpgradesFormat1(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo")
+	for _, sub := range []string{"blobs/ab", "snapshots", "index", "tmp"} {
+		_ = os.MkdirAll(filepath.Join(dir, sub), 0o700)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "repo.json"), []byte(`{"format":1,"compression":"zstd","min_saving_percent":3}`), 0o600)
+	// A blob a format 1 build wrote.
+	data := bytes.Repeat([]byte("old zstd blob "), 500)
+	z, err := zstdCompress(data, CompressDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := "ab" + strings.Repeat("0", 62)
+	_ = os.WriteFile(filepath.Join(dir, "blobs", "ab", sha+".zst"), z, 0o600)
+
+	r, err := OpenRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "repo.json"))
+	if !strings.Contains(string(b), `"format": 2`) || !strings.Contains(string(b), `"compression": "xz"`) {
+		t.Fatalf("repo.json not upgraded: %s", b)
+	}
+	rc, err := r.OpenBlob(context.Background(), sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, data) {
+		t.Fatal("format 1 zstd blob no longer reads")
+	}
+
+	_ = os.WriteFile(filepath.Join(dir, "repo.json"), []byte(`{"format":3}`), 0o600)
+	if _, err := OpenRepo(dir); err == nil {
+		t.Fatal("a newer format should be refused")
+	}
+}
+
 func TestRawStoreWhenIncompressible(t *testing.T) {
 	r := newTestRepo(t)
 	data := make([]byte, 64<<10)

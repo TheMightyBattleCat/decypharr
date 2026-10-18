@@ -39,10 +39,18 @@ func (s *BackupService) Download(ctx context.Context, id string, component Compo
 		if ce.Manifest == "" {
 			return DownloadResult{}, fmt.Errorf("%w: snapshot %s has no link manifest", ErrNotFound, id)
 		}
-		body, err := r.OpenBlob(ctx, ce.Manifest)
+		blob, err := r.OpenBlob(ctx, ce.Manifest)
 		if err != nil {
 			return DownloadResult{}, err
 		}
+		// The manifest is zstd-encoded inside its blob (EncodeManifest);
+		// the download is the plain text file.
+		dec, err := zstd.NewReader(blob, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxZstdWindow))
+		if err != nil {
+			blob.Close()
+			return DownloadResult{}, err
+		}
+		body := &blobReader{Reader: dec, closers: []func() error{func() error { dec.Close(); return nil }, blob.Close}}
 		return DownloadResult{Filename: id + "-links.tsv", ContentType: "text/tab-separated-values", Body: body}, nil
 	case ComponentDB, ComponentConfig, ComponentState, ComponentHearsay:
 		files := ce.Files

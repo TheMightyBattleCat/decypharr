@@ -143,3 +143,42 @@ func TestWalkTreeThrottle(t *testing.T) {
 		t.Fatalf("20 kB at 100 kB/s should take ~200ms, took %v", el)
 	}
 }
+
+func TestWalkTreeReportsPauseThenResumes(t *testing.T) {
+	r := newTestRepo(t)
+	src := t.TempDir()
+	mt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	writeFile(t, filepath.Join(src, "a.meta"), "aaaa", mt)
+	writeFile(t, filepath.Join(src, "b.meta"), "bbbbbb", mt)
+
+	polls := 0
+	var updates []ProgressUpdate
+	_, err := WalkTree(context.Background(), r, WalkOptions{
+		Root: src, PauseInterval: time.Millisecond, PauseReason: "waiting for playback to end",
+		// Streaming during the first three polls, then not.
+		Pause:    func() bool { polls++; return polls <= 3 },
+		Progress: func(u ProgressUpdate) { updates = append(updates, u) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) == 0 || updates[0].FilesDone != 0 || updates[0].BytesTotal != 10 {
+		t.Fatalf("first update should announce the totals: %+v", updates)
+	}
+	paused := 0
+	for _, u := range updates {
+		if u.Paused != "" {
+			paused++
+			if u.Paused != "waiting for playback to end" || u.PausedSince == nil || u.FilesDone != 0 {
+				t.Fatalf("paused update: %+v", u)
+			}
+		}
+	}
+	if paused < 2 {
+		t.Fatalf("want a report on each paused poll, got %d", paused)
+	}
+	last := updates[len(updates)-1]
+	if last.Paused != "" || last.FilesDone != 2 || last.BytesDone != 10 || last.BytesTotal != 10 {
+		t.Fatalf("last update: %+v", last)
+	}
+}

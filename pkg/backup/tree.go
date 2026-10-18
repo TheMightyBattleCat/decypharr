@@ -49,8 +49,10 @@ type WalkOptions struct {
 	Level CompressionLevel
 	// BytesPerSec throttles reading; 0 is unlimited.
 	BytesPerSec int64
-	// Pause is polled before each file; while it returns true the walk waits.
-	Pause func() bool
+	// Pause is polled before each file; while it returns true the walk waits,
+	// reporting PauseReason with each poll.
+	Pause       func() bool
+	PauseReason string
 	// PauseInterval is how often a paused walk polls again (default 1s).
 	PauseInterval time.Duration
 	// Match picks files by slash-separated relative path; nil takes all
@@ -130,13 +132,48 @@ func WalkTree(ctx context.Context, bs BlobStore, opts WalkOptions) (WalkResult, 
 	th := &throttle{rate: opts.BytesPerSec, start: time.Now()}
 	tree := Tree{Files: make(map[string]string, len(files))}
 	seen := make(map[string]struct{}, len(files))
-	var written int64
+	var written, done, total int64
+	for _, f := range files {
+		total += f.size
+	}
+	start := time.Now()
+	var pausedFor time.Duration
+	var pausedAt time.Time // start of the pause in progress; zero when running
+	update := func(filesDone int) ProgressUpdate {
+		u := ProgressUpdate{Component: opts.Component, Phase: "walk", FilesDone: filesDone, FilesTotal: len(files),
+			BytesWritten: written, BytesDone: done, BytesTotal: total}
+		idle := pausedFor
+		if !pausedAt.IsZero() {
+			idle += time.Since(pausedAt)
+		}
+		if active := time.Since(start) - idle; active >= time.Second && done > 0 {
+			u.RateBPS = int64(float64(done) / active.Seconds())
+			if u.RateBPS > 0 {
+				u.ETASeconds = (total - done) / u.RateBPS
+			}
+		}
+		return u
+	}
+	opts.Progress.Report(update(0))
 
 	for i, f := range files {
-		for opts.Pause != nil && opts.Pause() {
-			if err := sleepCtx(ctx, interval); err != nil {
-				return res, err
+		if opts.Pause != nil && opts.Pause() {
+			since := time.Now()
+			pausedAt = since
+			reason := opts.PauseReason
+			if reason == "" {
+				reason = "paused"
 			}
+			for opts.Pause() {
+				u := update(i)
+				u.Paused, u.PausedSince = reason, &since
+				opts.Progress.Report(u)
+				if err := sleepCtx(ctx, interval); err != nil {
+					return res, err
+				}
+			}
+			pausedFor += time.Since(since)
+			pausedAt = time.Time{}
 		}
 		if err := ctx.Err(); err != nil {
 			return res, err
@@ -145,6 +182,7 @@ func WalkTree(ctx context.Context, bs BlobStore, opts WalkOptions) (WalkResult, 
 		if err != nil {
 			return res, err
 		}
+		done += f.size
 		if skipped {
 			continue // vanished while walking
 		}
@@ -159,7 +197,7 @@ func WalkTree(ctx context.Context, bs BlobStore, opts WalkOptions) (WalkResult, 
 		} else {
 			res.Reused++
 		}
-		opts.Progress.Report(ProgressUpdate{Component: opts.Component, Phase: "walk", FilesDone: i + 1, FilesTotal: len(files), BytesWritten: written})
+		opts.Progress.Report(update(i + 1))
 	}
 	if opts.Cache != nil {
 		opts.Cache.retainUnder(root, seen)

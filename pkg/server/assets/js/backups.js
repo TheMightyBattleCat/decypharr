@@ -45,7 +45,51 @@
         if (ms < 1000) return `${ms} ms`;
         const s = Math.round(ms / 1000);
         if (s < 60) return `${s} s`;
-        return `${Math.floor(s / 60)} min ${s % 60} s`;
+        if (s < 3600) return `${Math.floor(s / 60)} min ${s % 60} s`;
+        return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+    }
+
+    // msBetween is b - a for two server timestamps, 0 when either is missing.
+    function msBetween(a, b) {
+        const ta = Date.parse(a || ''), tb = Date.parse(b || '');
+        return isNaN(ta) || isNaN(tb) ? 0 : Math.max(0, tb - ta);
+    }
+
+    // progressHtml renders a running job's progress line and bar. Ages are
+    // measured against the server's clock (st.now).
+    function progressHtml(p, now) {
+        const parts = [`${esc(p.component || '')} ${esc(p.phase || 'working')}`];
+        const total = p.files_total || 0;
+        if (total) parts.push(`${p.files_done || 0} / ${total} files`);
+        if (p.bytes_total) parts.push(`${fmtBytes(p.bytes_done)} of ${fmtBytes(p.bytes_total)} read`);
+        parts.push(`${fmtBytes(p.bytes_written)} written`);
+        if (!p.paused && p.rate_bps) parts.push(`${fmtBytes(p.rate_bps)}/s`);
+        if (!p.paused && p.eta_seconds) parts.push(`about ${fmtDuration(p.eta_seconds * 1000)} left`);
+
+        const meta = [];
+        const ran = msBetween(p.run_started, now);
+        if (ran) meta.push(`running for ${fmtDuration(ran)}`);
+        // Long single steps (the database export, the Arr lookups) report
+        // nothing for a while, so only say so once it is noticeable.
+        const quiet = msBetween(p.updated_at, now);
+        if (quiet > 15000) meta.push(`last update ${fmtDuration(quiet)} ago`);
+
+        let paused = '';
+        if (p.paused) {
+            const since = msBetween(p.paused_since, now);
+            paused = `<div class="text-xs mt-1"><span class="badge badge-warning badge-sm mr-1">Paused</span>` +
+                `${esc(p.paused)}${since ? ` · for ${fmtDuration(since)}` : ''} · ` +
+                `<a href="${window.urlBase || '/'}settings#tab-backups" class="link link-hover">turn off pausing in Settings</a>` +
+                ` to carry on now</div>`;
+        }
+
+        const done = p.bytes_total ? (p.bytes_done || 0) / p.bytes_total : (total ? (p.files_done || 0) / total : -1);
+        const cls = p.paused ? 'progress-warning' : 'progress-primary';
+        const bar = done >= 0
+            ? `<progress class="progress ${cls} w-full" value="${Math.min(100, Math.round(100 * done))}" max="100"></progress>`
+            : `<progress class="progress ${cls} w-full"></progress>`;
+        return `<div class="mt-2"><div class="text-xs opacity-70">${parts.join(' · ')}</div>` + paused +
+            (meta.length ? `<div class="text-xs opacity-50">${meta.join(' · ')}</div>` : '') + bar + '</div>';
     }
 
     // ---- confirm dialog ----
@@ -122,22 +166,17 @@
             const comps = (j.components || []).join(', ');
             let progress = '';
             if (j.running) {
-                const p = run || {};
-                const total = p.files_total || 0;
-                const pct = total ? Math.min(100, Math.round(100 * (p.files_done || 0) / total)) : 0;
-                progress = `<div class="mt-2"><div class="text-xs opacity-70">` +
-                    `${esc(p.component || '')} ${esc(p.phase || 'working')} · ` +
-                    `${p.files_done || 0} / ${total || '?'} files · ${fmtBytes(p.bytes_written)} written</div>` +
-                    (total ? `<progress class="progress progress-primary w-full" value="${pct}" max="100"></progress>` :
-                        `<progress class="progress progress-primary w-full"></progress>`) + '</div>';
+                progress = progressHtml(run || {}, st.now);
             }
             return `<div class="card bg-base-200"><div class="card-body p-4">` +
                 `<div class="flex items-center justify-between gap-2">` +
                 `<div><div class="font-semibold">${esc(j.name)}` +
                 `${j.enabled ? '' : ' <span class="badge badge-ghost badge-sm">disabled</span>'}</div>` +
                 `<div class="text-xs opacity-70">${esc(comps)} · ${esc(j.schedule || 'manual only')}</div></div>` +
-                `<button class="btn btn-sm btn-primary" data-run="${esc(j.name)}"` +
-                `${j.running || !st.configured ? ' disabled' : ''}><i class="bi bi-play-fill mr-1"></i>Run now</button></div>` +
+                (j.running
+                    ? `<button class="btn btn-sm btn-error btn-outline" data-stop="1"><i class="bi bi-stop-fill mr-1"></i>Stop</button></div>`
+                    : `<button class="btn btn-sm btn-primary" data-run="${esc(j.name)}"` +
+                      `${!st.configured ? ' disabled' : ''}><i class="bi bi-play-fill mr-1"></i>Run now</button></div>`) +
                 `<div class="text-xs mt-2">Last success: ${esc(fmtTime(j.last_success))} · ` +
                 `Next run: ${esc(fmtTime(j.next_run))}</div>` +
                 (j.last_error ? `<div class="text-xs text-error mt-1 break-all">${esc(j.last_error)}</div>` : '') +
@@ -177,6 +216,20 @@
             await call('POST', `/jobs/${encodeURIComponent(name)}/run`);
             toast(`Started ${name}`);
             state.wasRunning = true;
+            refreshStatus();
+        } catch (e) {
+            toast(esc(e.message), 'error');
+        }
+    }
+
+    async function stopRun() {
+        const ok = await confirmDialog('Stop the backup?',
+            '<p>This run\'s snapshot is not saved. What it has already stored is reused by the next run.</p>',
+            'Stop', true);
+        if (!ok) return;
+        try {
+            await call('POST', '/running/stop');
+            toast('Stopping the backup');
             refreshStatus();
         } catch (e) {
             toast(esc(e.message), 'error');
@@ -493,6 +546,7 @@
         const t = ev.target.closest('button, a');
         if (!t) return;
         if (t.dataset.run) runJob(t.dataset.run);
+        else if (t.dataset.stop) stopRun();
         else if (t.dataset.open) openSnapshot(t.dataset.open);
         else if (t.dataset.verify) verify(t.dataset.verify === 'full');
         else if (t.dataset.restoreRemoved) restoreRemoved(t.dataset.restoreRemoved, t.dataset.name);

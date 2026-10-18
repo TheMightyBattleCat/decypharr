@@ -24,14 +24,19 @@ type runOptions struct {
 	walks bool
 }
 
-// countingStore counts what a run writes.
+// countingStore counts what a run writes. With fast set every blob uses
+// CompressFast, for snapshots the user is waiting on.
 type countingStore struct {
 	BlobStore
+	fast  bool
 	blobs atomic.Int64
 	bytes atomic.Int64
 }
 
 func (c *countingStore) PutBlob(ctx context.Context, r io.Reader, level CompressionLevel) (BlobRef, bool, error) {
+	if c.fast {
+		level = CompressFast
+	}
 	ref, created, err := c.BlobStore.PutBlob(ctx, r, level)
 	if err == nil && created {
 		c.blobs.Add(1)
@@ -76,7 +81,9 @@ func (s *BackupService) snapshot(ctx context.Context, repo Repo, opts runOptions
 
 	cfg := s.cfg()
 	started := s.now()
-	store := &countingStore{BlobStore: repo}
+	// Pre-action snapshots (no walks) run while the user waits on the
+	// action, so they trade some size for speed.
+	store := &countingStore{BlobStore: repo, fast: !opts.walks}
 	snap := &Snapshot{
 		ID:         newSnapshotID(started),
 		CreatedAt:  started.UTC(),
@@ -100,8 +107,10 @@ func (s *BackupService) snapshot(ctx context.Context, repo Repo, opts runOptions
 	var pause func() bool
 	if opts.walks {
 		rate = int64(cfg.ThrottleMBps) << 20
-		if cfg.PauseWhileStreaming && s.deps.Streaming != nil {
-			pause = s.deps.Streaming
+		if s.deps.Streaming != nil {
+			// The setting is read on every poll, so turning it off in
+			// Settings lets a paused backup carry on straight away.
+			pause = func() bool { return s.cfg().PauseWhileStreaming && s.deps.Streaming() }
 		}
 	}
 	progress := Progress(func(u ProgressUpdate) { s.report(u) })
@@ -193,7 +202,7 @@ func (s *BackupService) capture(ctx context.Context, bs BlobStore, c Component, 
 
 func (s *BackupService) walkOpts(root string, c Component, w walkSettings, match func(string) bool) WalkOptions {
 	return WalkOptions{Root: root, Component: c, Cache: w.cache, Level: CompressDefault,
-		BytesPerSec: w.rate, Pause: w.pause, Match: match, Progress: w.progress}
+		BytesPerSec: w.rate, Pause: w.pause, PauseReason: "waiting for playback to end", Match: match, Progress: w.progress}
 }
 
 // captureOverlay walks the overlay and the volume-order backups into one
@@ -328,6 +337,12 @@ func (s *BackupService) runContext() context.Context {
 // runClaimed runs a job in a claimed slot: snapshot, then prune, then notify
 // on failure.
 func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, trigger string) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.mu.Lock()
+	s.runCancel, s.stopRequested = cancel, false
+	s.mu.Unlock()
+
 	err := func() error {
 		repo, err := s.repo()
 		if err != nil {
@@ -346,13 +361,22 @@ func (s *BackupService) runClaimed(ctx context.Context, job config.BackupJob, tr
 		return nil
 	}()
 	s.mu.Lock()
-	if err != nil {
+	stopped := s.stopRequested && errors.Is(err, context.Canceled)
+	s.runCancel, s.stopRequested = nil, false
+	switch {
+	case stopped:
+		s.lastErr[job.Name] = "Stopped from the Backups page"
+	case err != nil:
 		s.lastErr[job.Name] = err.Error()
-	} else {
+	default:
 		delete(s.lastErr, job.Name)
 		delete(s.staleNotice, job.Name)
 	}
 	s.mu.Unlock()
+	if stopped {
+		s.log.Info().Str("job", job.Name).Msg("Backup stopped by the user")
+		return
+	}
 	if err != nil {
 		s.log.Error().Err(err).Str("job", job.Name).Msg("Backup failed")
 		if s.cfg().Notify.OnFailure {

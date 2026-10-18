@@ -75,12 +75,17 @@ type BackupService struct {
 
 	mu         sync.Mutex
 	runningJob string // label of the run holding the claim; "" when idle
+	runStarted time.Time
 	progress   *ProgressUpdate
-	lastErr    map[string]string
-	deferred   map[string]bool
-	repoDir    string
-	repoVal    Repo
-	startedAt  time.Time
+	// runCancel cancels the backup job in progress (nil when none), and
+	// stopRequested records that StopRun asked for it.
+	runCancel     context.CancelFunc
+	stopRequested bool
+	lastErr       map[string]string
+	deferred      map[string]bool
+	repoDir       string
+	repoVal       Repo
+	startedAt     time.Time
 
 	// plans
 	linkPlans    map[string]LinkPlan
@@ -173,6 +178,7 @@ func (s *BackupService) claim(label string) (release func(), err error) {
 		return nil, ErrBusy
 	}
 	s.runningJob = label
+	s.runStarted = s.now()
 	s.progress = nil
 	return func() {
 		s.mu.Lock()
@@ -183,7 +189,13 @@ func (s *BackupService) claim(label string) (release func(), err error) {
 }
 
 func (s *BackupService) report(p ProgressUpdate) {
+	now := s.now()
+	p.UpdatedAt = &now
 	s.mu.Lock()
+	if !s.runStarted.IsZero() {
+		started := s.runStarted
+		p.RunStarted = &started
+	}
 	s.progress = &p
 	s.mu.Unlock()
 }
@@ -205,6 +217,7 @@ func (s *BackupService) Status(ctx context.Context) (StatusResponse, error) {
 		PostRestore: s.HoldActive(),
 		PendingSwap: PendingRestoreExists(s.deps.DataDir),
 		Jobs:        []JobStatus{},
+		Now:         s.now(),
 
 		LinkRestoreApplied: LinkRestoreApplied(s.deps.DataDir),
 	}

@@ -703,3 +703,76 @@ func TestDirChangeAppliesWithoutRebuildingService(t *testing.T) {
 		t.Errorf("snapshots: old %d, new %d; want 1 and 1", count(dirA), count(dirB))
 	}
 }
+
+func TestStatusCarriesHeartbeatAndServerClock(t *testing.T) {
+	e := newEnv(t, nil)
+	release, err := e.svc.claim("job:quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	e.svc.report(ProgressUpdate{Component: ComponentNZB, Phase: "walk", FilesDone: 1, FilesTotal: 2})
+	st, err := e.svc.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Now.IsZero() || st.Running == nil || st.Running.UpdatedAt == nil || st.Running.RunStarted == nil {
+		t.Fatalf("status: now=%v running=%+v", st.Now, st.Running)
+	}
+}
+
+// startPausedFull starts the full job with something always streaming and
+// waits until its walk reports the pause.
+func startPausedFull(t *testing.T, e *testEnv) {
+	t.Helper()
+	e.setCfg(func(c *config.Backup) { c.PauseWhileStreaming = true })
+	e.svc.deps.Streaming = func() bool { return true }
+	if _, err := e.svc.RunJob(context.Background(), "full"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, _ := e.svc.Status(context.Background())
+		if st.Running != nil && st.Running.Paused != "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the walk never reported a pause")
+}
+
+func TestStopRunEndsAPausedBackupWithoutASnapshot(t *testing.T) {
+	e := newEnv(t, nil)
+	startPausedFull(t, e)
+	if err := e.svc.StopRun(); err != nil {
+		t.Fatal(err)
+	}
+	e.waitIdle()
+	if n := len(e.snapshots()); n != 0 {
+		t.Fatalf("a stopped run wrote %d snapshots", n)
+	}
+	st, _ := e.svc.Status(context.Background())
+	for _, j := range st.Jobs {
+		if j.Name == "full" && j.LastError != "Stopped from the Backups page" {
+			t.Fatalf("full job last error %q", j.LastError)
+		}
+	}
+	for _, ev := range e.events() {
+		if ev == config.EventBackupFailed {
+			t.Fatal("stopping a backup should not send a failure notice")
+		}
+	}
+	if err := e.svc.StopRun(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stop with nothing running: %v", err)
+	}
+}
+
+func TestTurningPauseOffLetsAPausedBackupFinish(t *testing.T) {
+	e := newEnv(t, nil)
+	startPausedFull(t, e)
+	e.setCfg(func(c *config.Backup) { c.PauseWhileStreaming = false })
+	e.waitIdle()
+	if n := len(e.snapshots()); n != 1 {
+		t.Fatalf("want the run to finish with 1 snapshot, got %d", n)
+	}
+}

@@ -153,6 +153,7 @@
                     <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" id="bk-pause-streaming">
                     <span class="label-text font-medium">Pause while something is streaming</span>
                 </label>
+                <span class="text-sm opacity-70">On: scheduled and manual backups wait while anyone plays something through Decypharr, so playback keeps the disks to itself. Off: backups carry on during playback, using some disk and CPU while people watch. Changing this also applies to a backup that is already running.</span>
             </div>
 
             <div class="space-y-3">
