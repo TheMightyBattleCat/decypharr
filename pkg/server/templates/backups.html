@@ -1,0 +1,133 @@
+{{ define "backups" }}
+<div class="space-y-6" id="backups-page">
+    {{ if .SetupError }}
+    <div role="alert" class="alert alert-warning">
+        <i class="bi bi-exclamation-triangle text-xl"></i>
+        <div>
+            <h3 class="font-bold">Configuration Required</h3>
+            <div class="text-sm">Your configuration is incomplete ({{ .SetupError }}). Please complete the setup in the
+                <a href="{{.URLBase}}settings" class="link link-hover font-semibold">Settings page</a>.
+            </div>
+        </div>
+    </div>
+    {{ end }}
+
+    <div id="bkHoldBanner" role="alert" class="alert alert-warning hidden">
+        <i class="bi bi-pause-circle text-xl"></i>
+        <div class="flex-1">
+            <h3 class="font-bold">Post-restore hold is active</h3>
+            <div class="text-sm">A database restore was just applied. Background work that changes files is held until
+                you have checked the result. Release the hold when you are happy with it.
+            </div>
+        </div>
+        <button id="bkReleaseHoldBtn" class="btn btn-sm btn-primary">Release hold</button>
+    </div>
+
+    <div id="bkSwapBanner" role="alert" class="alert alert-info hidden">
+        <i class="bi bi-arrow-repeat text-xl"></i>
+        <div class="text-sm">A database restore is staged. It is swapped in the next time Decypharr starts, so restart
+            it to finish the restore.
+        </div>
+    </div>
+
+    <div id="bkNotConfigured" role="alert" class="alert alert-warning hidden">
+        <i class="bi bi-exclamation-triangle text-xl"></i>
+        <div class="text-sm">No backup folder is set. Choose one in
+            <a href="{{.URLBase}}settings#tab-backups" class="link link-hover font-semibold">Settings → Backups</a>.
+        </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <div class="flex flex-col lg:flex-row gap-4 lg:items-center lg:justify-between">
+                <div>
+                    <h2 class="card-title text-2xl"><i class="bi bi-archive mr-2 text-primary"></i>Backups</h2>
+                    <p class="text-sm opacity-70 mt-1" id="bkStatusLine">Loading…</p>
+                </div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4" id="bkSummary"></div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 mt-4" id="bkJobs"></div>
+        </div>
+    </div>
+
+    <!-- History -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <h3 class="card-title"><i class="bi bi-clock-history mr-2"></i>Snapshot history</h3>
+            <div class="overflow-x-auto">
+                <table class="table table-sm">
+                    <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Trigger</th>
+                        <th>Components</th>
+                        <th>Added</th>
+                        <th>Duration</th>
+                        <th>Result</th>
+                        <th></th>
+                    </tr>
+                    </thead>
+                    <tbody id="bkHistoryBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recently removed -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <h3 class="card-title"><i class="bi bi-trash3 mr-2"></i>Recently removed</h3>
+            <p class="text-sm opacity-70">Entries an older snapshot has that Decypharr no longer does. Restoring one
+                adds it back without a restart.</p>
+            <div class="flex flex-wrap gap-2 mt-2">
+                <input id="bkRemovedName" type="text" class="input input-sm" placeholder="Name">
+                <input id="bkRemovedCategory" type="text" class="input input-sm" placeholder="Category">
+                <input id="bkRemovedSince" type="date" class="input input-sm" title="Removed since">
+                <button id="bkRemovedSearch" class="btn btn-sm btn-outline"><i class="bi bi-search mr-1"></i>Search
+                </button>
+            </div>
+            <div class="overflow-x-auto mt-2">
+                <table class="table table-sm">
+                    <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Category</th>
+                        <th>Removed between</th>
+                        <th>Size</th>
+                        <th>Links</th>
+                        <th></th>
+                    </tr>
+                    </thead>
+                    <tbody id="bkRemovedBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Snapshot detail -->
+    <dialog id="bkDetailModal" class="modal">
+        <div class="modal-box w-full max-w-6xl">
+            <h3 class="font-bold text-lg" id="bkDetailTitle">Snapshot</h3>
+            <div class="text-sm opacity-70 mt-1 break-all" id="bkDetailMeta"></div>
+            <div id="bkDetailBody" class="space-y-4 mt-4"></div>
+            <div class="modal-action">
+                <form method="dialog"><button class="btn btn-sm">Close</button></form>
+            </div>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+
+    <!-- Confirm / result -->
+    <dialog id="bkConfirmModal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg" id="bkConfirmTitle">Confirm</h3>
+            <div class="py-3 text-sm space-y-2" id="bkConfirmBody"></div>
+            <div class="modal-action">
+                <button id="bkConfirmCancel" class="btn btn-sm">Cancel</button>
+                <button id="bkConfirmOk" class="btn btn-sm btn-primary">OK</button>
+            </div>
+        </div>
+    </dialog>
+</div>
+{{ end }}

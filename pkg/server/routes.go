@@ -30,6 +30,9 @@ func (s *Server) WebRoutes() http.Handler {
 	// Setup wizard - public, no auth required
 	r.Get("/setup", s.SetupHandler)
 	r.Post("/api/setup/complete", s.setupCompleteHandler)
+	r.Post("/api/setup/restore/snapshots", s.setupRestoreListHandler)
+	r.Post("/api/setup/restore", s.setupRestoreHandler)
+	r.Post("/api/setup/restore/upload", s.setupRestoreUploadHandler)
 
 	// Protected routes - require auth
 	r.Group(func(r chi.Router) {
@@ -39,6 +42,8 @@ func (s *Server) WebRoutes() http.Handler {
 		r.Get("/browse", s.BrowseHandler)
 		r.Get("/download", s.DownloadHandler)
 		r.Get("/repair", s.RepairHandler)
+		r.Get("/backups", s.BackupsHandler)
+		r.Get("/links", s.LinksHandler)
 		r.Get("/stats", s.StatsHandler)
 		r.Get("/settings", s.ConfigHandler)
 
@@ -108,6 +113,35 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/plex/reap/status", s.handlePlexReapStatus)
 			r.Post("/plex/reap/scan", s.handlePlexReapScan)
 			r.Post("/plex/reap/apply", s.handlePlexReapApply)
+
+			// Backups
+			r.Get("/backups/status", s.handleBackupStatus)
+			r.Post("/backups/hold/release", s.handleBackupReleaseHold)
+			r.Get("/backups/snapshots", s.handleBackupListSnapshots)
+			r.Get("/backups/snapshots/{id}", s.handleBackupGetSnapshot)
+			r.Delete("/backups/snapshots/{id}", s.handleBackupDeleteSnapshot)
+			r.Post("/backups/jobs/{name}/run", s.handleBackupRunJob)
+			r.Post("/backups/snapshots/{id}/verify", s.handleBackupVerify)
+			r.Get("/backups/snapshots/{id}/download", s.handleBackupDownload)
+			r.Post("/backups/snapshots/{id}/restore/db", s.handleBackupRestoreDB)
+			r.Post("/backups/snapshots/{id}/restore/nzb", s.handleBackupRestoreNZB)
+			r.Post("/backups/snapshots/{id}/restore/links/plan", s.handleBackupLinksPlan)
+			r.Post("/backups/snapshots/{id}/restore/links/apply", s.handleBackupLinksApply)
+			r.Get("/backups/config-history", s.handleBackupConfigHistory)
+			r.Get("/backups/config-history/{id}/diff", s.handleBackupConfigDiff)
+			r.Post("/backups/config-history/{id}/revert", s.handleBackupConfigRevert)
+			r.Get("/backups/removed", s.handleBackupListRemoved)
+			r.Post("/backups/removed/{key}/restore", s.handleBackupRestoreRemoved)
+			r.Post("/backups/retention/preview", s.handleBackupRetentionPreview)
+			r.Post("/backups/schedule/check", s.handleBackupScheduleCheck)
+
+			// Library Links
+			r.Get("/links/status", s.handleLinksStatus)
+			r.Post("/links/check", s.handleLinksCheck)
+			r.Get("/links", s.handleLinksList)
+			r.Get("/links/missing", s.handleLinksMissing)
+			r.Post("/links/cleanup/plan", s.handleLinksCleanupPlan)
+			r.Post("/links/cleanup/apply", s.handleLinksCleanupApply)
 
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)

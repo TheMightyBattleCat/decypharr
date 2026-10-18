@@ -133,6 +133,21 @@ func NewStorage(dbPath string) (*Storage, error) {
 	return s, nil
 }
 
+// WriteCount is the number of writes and deletes the stores have taken since
+// they were opened. It only ever goes up, so two equal readings mean the
+// database did not change in between.
+func (s *Storage) WriteCount() int64 {
+	var n int64
+	for _, store := range []*appendstore.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard, s.pendingDeletes} {
+		if store == nil {
+			continue
+		}
+		st := store.Stats()
+		n += st.Writes + st.Deletes
+	}
+	return n
+}
+
 func (s *Storage) Close() error {
 	var errs []error
 	stores := []*appendstore.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.par2Repairs, s.par2RepairState, s.regrabGuard, s.pendingDeletes}

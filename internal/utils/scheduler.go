@@ -100,3 +100,37 @@ func parseClockTime(s string) (time.Time, bool) {
 	)
 	return t, true
 }
+
+// NextScheduleRuns returns the next n times a clock time ("04:00") or cron
+// expression fires after from, in from's location. It refuses what
+// ConvertToClockOrCronJobDef refuses.
+func NextScheduleRuns(schedule string, from time.Time, n int) ([]time.Time, error) {
+	if _, err := ConvertToClockOrCronJobDef(schedule); err != nil {
+		return nil, err
+	}
+	s := strings.TrimSpace(schedule)
+	out := make([]time.Time, 0, n)
+	if t, ok := parseClockTime(s); ok {
+		next := time.Date(from.Year(), from.Month(), from.Day(), t.Hour(), t.Minute(), 0, 0, from.Location())
+		if !next.After(from) {
+			next = next.AddDate(0, 0, 1)
+		}
+		for len(out) < n {
+			out = append(out, next)
+			next = next.AddDate(0, 0, 1)
+		}
+		return out, nil
+	}
+	sched, err := parseCron(s)
+	if err != nil {
+		return nil, err
+	}
+	for t := from; len(out) < n; {
+		t = sched.Next(t)
+		if t.IsZero() {
+			break
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}

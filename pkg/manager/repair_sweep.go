@@ -1575,9 +1575,9 @@ type autoRepairFollowsConfigKey struct{}
 // Auto-repair mid-sweep left an hours-long sweep deleting and re-searching
 // until it finished. When the value came from the settings it is re-read
 // here; a per-run override ("Run now" with auto-repair on) is honoured as
-// given.
+// given. The post-restore hold turns it off whatever the source.
 func (r *Repair) autoRepairStillOn(ctx context.Context, autoRepair bool) bool {
-	if !autoRepair {
+	if !autoRepair || r.manager.PostRestoreHold() {
 		return false
 	}
 	if ctx != nil {
@@ -2530,6 +2530,10 @@ type autoRepairOutcome struct {
 // handleAutoDamage consults decideAutoRepairAction for source and carries
 // the action out - see HandlePlaybackFailure.
 func (r *Repair) handleAutoDamage(ctx context.Context, source RepairSource, entryName, fileName string, proximity time.Duration) (autoRepairOutcome, error) {
+	if r.manager.PostRestoreHold() {
+		r.logger.Warn().Str("entry", entryName).Msg("Automatic repair paused: the post-restore hold is on")
+		return autoRepairOutcome{reason: "post-restore hold"}, nil
+	}
 	entry, err := r.manager.GetEntryByName(entryName, fileName)
 	if err != nil || entry == nil || entry.InfoHash == "" || r.manager.usenet == nil {
 		// Can't resolve enough to consult the policy (non-NZB entry, no

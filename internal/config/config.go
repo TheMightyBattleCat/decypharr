@@ -603,6 +603,9 @@ type Config struct {
 
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
+
+	// Backup is the backup feature - see Backup.
+	Backup Backup `json:"backup,omitzero"`
 }
 
 func (c *Config) JsonFile() string {
@@ -897,6 +900,7 @@ func (c *Config) setDefaults() {
 	}
 
 	c.QueueCleanup.Rules = mergeQueueCleanupRules(c.QueueCleanup.Rules)
+	c.setBackupDefaults()
 
 	// Basic defaults
 	if c.URLBase == "" {
@@ -1130,6 +1134,9 @@ func (c *Config) Save() error {
 		fmt.Printf("Failed to write config file: %v\n", err)
 		return err
 	}
+	if hook := OnSaved; hook != nil {
+		hook(data)
+	}
 	return nil
 }
 
@@ -1176,6 +1183,12 @@ func clearHotFields(c *Config) {
 	c.Precache = PrecacheConfig{}
 	// Read live by the NNTP client when it takes its body-routing verdicts.
 	c.Usenet.PreferFasterServers = nil
+
+	// Backup settings are read live through config.Get() on every run, walk
+	// and status call (the repository handle is reopened when Dir changes,
+	// the history trim reads ConfigHistoryMax each time), and the schedule is
+	// re-registered by ApplySavedConfig and the backup service's watcher.
+	c.Backup = Backup{}
 
 	// STRM settings are read live on every URL build, stream request, and
 	// reconciler pass; a config change triggers a resweep, not a restart.

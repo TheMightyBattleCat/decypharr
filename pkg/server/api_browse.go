@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -322,6 +323,9 @@ func (s *Server) handleDeleteBrowseTorrent(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if s.preActionRefused(w, r, backup.ActionDeleteEntry) {
+		return
+	}
 	if err := s.manager.DeleteEntry(id, true); err != nil {
 		s.logger.Error().Err(err).Str("id", id).Msg("Failed to delete entry")
 		http.Error(w, "Failed to delete entry", http.StatusInternalServerError)
@@ -350,6 +354,9 @@ func (s *Server) handleBatchDeleteBrowseTorrents(w http.ResponseWriter, r *http.
 		return
 	}
 
+	if s.preActionRefused(w, r, backup.ActionDeleteEntries) {
+		return
+	}
 	if err := s.manager.DeleteTorrents(req.IDs, true); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to delete torrents")
 		http.Error(w, "Failed to delete torrents", http.StatusInternalServerError)
@@ -419,6 +426,9 @@ func (s *Server) handleStaleNZBsCleanup(w http.ResponseWriter, r *http.Request) 
 	if svc == nil {
 		s.logger.Error().Msg("StaleNZB: cleanup request failed - repair service not available")
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	if s.preActionRefused(w, r, backup.ActionStaleNZBCleanup) {
 		return
 	}
 	result, err := svc.CleanupStaleNZBs(r.Context(), req.EntryIDs, req.OrphanIDs)

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -22,6 +23,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/hearsay"
@@ -141,12 +143,23 @@ type Manager struct {
 
 	// Hearsay network participation; nil when disabled.
 	hearsay *hearsay.Service
+
+	// backup is the backup service; nil until one is installed, in which
+	// case Backup returns the not-implemented service.
+	backup atomic.Pointer[backupHolder]
+	// backupSvc is the concrete service, for Start and Stop.
+	backupSvc *backup.BackupService
 }
 
 // New creates a new Manager instance
 func New() *Manager {
 	cfg := config.Get()
 	_logger := logger.New("manager")
+
+	if err := backup.ApplyPendingRestore(config.GetMainPath()); err != nil {
+		_logger.Error().Err(err).Msg("Failed to apply the pending database restore")
+		panic(fmt.Errorf("failed to apply pending database restore: %w", err))
+	}
 
 	strg, err := storage.NewStorage(filepath.Join(config.GetMainPath(), "db"))
 	if err != nil {
@@ -336,9 +349,13 @@ func (m *Manager) init() {
 	// Plex stale-version reaper (see plex_reap.go), consulting one Arr per
 	// distinct host so an Arr configured under two names is asked once.
 	m.plexReaper = NewPlexReaper(m.arr.DistinctByHost)
+	m.plexReaper.hold = m.PostRestoreHold
 
 	// Scheduled per-Arr wanted search; registers its jobs in StartWorker.
 	m.wantedSearch = NewWantedSearch(m.scheduler, m.arr.Get)
+
+	// Backup jobs; registered in StartWorker.
+	m.initBackup()
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
@@ -647,6 +664,10 @@ func (m *Manager) Stop() error {
 		m.wantedSearch.Stop()
 	}
 
+	if m.backupSvc != nil {
+		m.backupSvc.Stop()
+	}
+
 	// Close usenet connection manager if active
 	if m.usenet != nil {
 		m.logger.Info().Msg("Closing usenet connections")
@@ -684,6 +705,10 @@ func (m *Manager) Reset() error {
 	}
 
 	// Reopen storage database (it was closed by Stop)
+	if err := backup.ApplyPendingRestore(config.GetMainPath()); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to apply the pending database restore")
+		return fmt.Errorf("failed to apply pending database restore: %w", err)
+	}
 	strg, err := storage.NewStorage(filepath.Join(config.GetMainPath(), "db"))
 	if err != nil {
 		return fmt.Errorf("failed to reopen storage after reset: %w", err)

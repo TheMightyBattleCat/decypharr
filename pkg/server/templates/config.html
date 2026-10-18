@@ -59,6 +59,12 @@
                             <i class="bi bi-broadcast text-lg"></i>
                             <span>Hearsay</span>
                         </button>
+                        <button type="button"
+                                class="tab-button cursor-pointer flex items-center gap-2 py-3 px-1 border-b-2 border-transparent text-base-content/70 hover:text-base-content hover:border-base-300 font-medium text-sm transition-colors"
+                                data-tab="backups">
+                            <i class="bi bi-archive text-lg"></i>
+                            <span>Backups</span>
+                        </button>
                     </nav>
                 </div>
 
@@ -1918,6 +1924,8 @@ fe80::/10</textarea>
                         </div>
                     </div>
                 </div>
+
+                <div class="tab-content hidden" data-tab-content="backups" id="backups-settings"></div>
 
                 <div class="tab-content hidden" data-tab-content="hearsay">
                     <div class="space-y-6">

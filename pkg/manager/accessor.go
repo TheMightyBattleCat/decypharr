@@ -5,7 +5,9 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/hearsay"
@@ -133,4 +135,39 @@ func (m *Manager) Par2Repair() *Par2Repair {
 // GetDebridSpeedTestResult returns stored speed test result for a specific debrid provider
 func (m *Manager) GetDebridSpeedTestResult(provider string) (debridTypes.SpeedTestResult, bool) {
 	return m.debridSpeedTestResults.Load(provider)
+}
+
+// Backup returns the backup service. Until the real one is installed it is a
+// service whose every call returns backup.ErrNotImplemented, so callers never
+// need a nil check.
+func (m *Manager) Backup() backup.Service {
+	if m == nil {
+		return backup.NotImplemented()
+	}
+	if h := m.backup.Load(); h != nil && h.svc != nil {
+		return h.svc
+	}
+	return backup.NotImplemented()
+}
+
+// backupHolder lets the service be swapped atomically: handlers read it while
+// startup installs it.
+type backupHolder struct{ svc backup.Service }
+
+// PostRestoreHold reports whether the first start after a database restore is
+// still holding back overlay reap, Plex reap, repair auto-fix, stale-NZB
+// cleanup and webhook deletes. It is true while the marker the database swap
+// leaves in the data folder exists, and ends when the user releases the hold.
+func (m *Manager) PostRestoreHold() bool {
+	return m != nil && backup.PostRestoreHoldActive(config.GetMainPath())
+}
+
+// SetBackup installs the backup service (nil restores the not-implemented
+// one).
+func (m *Manager) SetBackup(svc backup.Service) {
+	if svc == nil {
+		m.backup.Store(nil)
+		return
+	}
+	m.backup.Store(&backupHolder{svc: svc})
 }

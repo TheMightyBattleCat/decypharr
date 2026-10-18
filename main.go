@@ -13,6 +13,8 @@ import (
 	"syscall"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/backup"
+	"github.com/sirrobot01/decypharr/pkg/manager"
 
 	"github.com/sirrobot01/decypharr/cmd/decypharr"
 )
@@ -24,6 +26,13 @@ func main() {
 			debug.PrintStack()
 		}
 	}()
+
+	// "decypharr backup ..." restores without starting the server.
+	if backup.IsCLICommand(os.Args[1:]) {
+		os.Exit(backup.RunCLI(context.Background(), os.Args[2:], backup.CLIEnv{
+			Out: os.Stdout, Err: os.Stderr, NewService: manager.NewOfflineBackupService,
+		}))
+	}
 
 	var configPath string
 	var pprofAddr string

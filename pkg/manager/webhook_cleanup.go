@@ -73,6 +73,10 @@ type ArrWebhookEvent struct {
 //   - no code path checks whether the file being torn down is actively
 //     being streamed before removing it.
 func (m *Manager) HandleArrWebhookCleanup(ev ArrWebhookEvent) (action string, entryName string, matchedBy string) {
+	if m.PostRestoreHold() {
+		m.logger.Warn().Msg("Arr webhook delete ignored: the post-restore hold is on")
+		return "held", "", ""
+	}
 	entry, fileName, matchedBy := m.resolveArrWebhookEntry(ev)
 	if entry == nil {
 		return "no-match", "", ""

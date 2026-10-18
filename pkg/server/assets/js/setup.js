@@ -116,6 +116,120 @@ class SetupWizard {
         document.getElementById('mount-type-none').addEventListener('change', () => this.toggleMountOptions());
         document.getElementById('overview-back-btn').addEventListener('click', () => this.goToStep(5));
         document.getElementById('finish-btn').addEventListener('click', () => this.handleFinish());
+        document.getElementById('restore-toggle-btn').addEventListener('click', () => {
+            document.getElementById('restore-panel').classList.toggle('hidden');
+        });
+        document.getElementById('restore-list-btn').addEventListener('click', () => this.handleRestoreList());
+        document.getElementById('restore-run-btn').addEventListener('click', () => this.handleRestoreRun());
+        document.getElementById('restore-upload-btn').addEventListener('click', () => this.handleRestoreUpload());
+    }
+
+    async restoreCall(path, body) {
+        const response = await window.decypharrUtils.fetcher(path, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data.error || 'Request failed');
+        }
+        return data;
+    }
+
+    async handleRestoreList() {
+        this.hideError();
+        const dir = document.getElementById('restore-dir').value.trim();
+        if (!dir) {
+            this.showError('Backup folder is required');
+            return;
+        }
+        try {
+            const data = await this.restoreCall('/api/setup/restore/snapshots', {dir});
+            const list = data.snapshots || [];
+            const select = document.getElementById('restore-snapshot');
+            select.textContent = '';
+            list.forEach(snap => {
+                const opt = document.createElement('option');
+                opt.value = snap.id;
+                opt.textContent = `${new Date(snap.created_at).toLocaleString()}  ${snap.trigger}  (${(snap.components || []).join(', ')})`;
+                select.appendChild(opt);
+            });
+            if (list.length === 0) {
+                this.showError('That folder has no snapshots');
+            }
+            document.getElementById('restore-snapshots').classList.toggle('hidden', list.length === 0);
+        } catch (error) {
+            this.showError(error.message || 'Could not list snapshots');
+        }
+    }
+
+    async handleRestoreRun() {
+        this.hideError();
+        const dir = document.getElementById('restore-dir').value.trim();
+        const snapshotId = document.getElementById('restore-snapshot').value;
+        const btn = document.getElementById('restore-run-btn');
+        btn.disabled = true;
+        try {
+            const data = await this.restoreCall('/api/setup/restore', {dir, snapshot_id: snapshotId});
+            const parts = Object.entries(data.restored || {}).map(([name, n]) => `${name}: ${n}`);
+            let text = `Restored from ${data.snapshot_id} (${parts.join(', ')}). Restart Decypharr to finish; the database is swapped in at the next start.`;
+            if ((data.warnings || []).length > 0) {
+                text += ' ' + data.warnings.join(' ');
+            }
+            document.getElementById('restore-result-text').textContent = text;
+            document.getElementById('restore-result').classList.remove('hidden');
+            this.lockAfterRestore();
+        } catch (error) {
+            this.showError(error.message || 'Restore failed');
+            btn.disabled = false;
+        }
+    }
+
+    // Uploads every chosen .tar.zst in one request; the server checks them all
+    // before it writes anything, applies the database archive first, streams
+    // each to disk and restores them the way the folder restore does.
+    async handleRestoreUpload() {
+        this.hideError();
+        const files = Array.from(document.getElementById('restore-file').files || []);
+        if (files.length === 0) {
+            this.showError('Choose a backup file first');
+            return;
+        }
+        const btn = document.getElementById('restore-upload-btn');
+        btn.disabled = true;
+        try {
+            const form = new FormData();
+            files.forEach(file => form.append('file', file));
+            const response = await window.decypharrUtils.fetcher('/api/setup/restore/upload', {
+                method: 'POST',
+                body: form,
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || 'Upload failed');
+            }
+            const parts = Object.entries(data.restored || {}).map(([name, n]) => `${name}: ${n}`);
+            const text = `Restored from ${files.map(f => f.name).join(', ')} (${parts.join(', ')}). ${(data.warnings || []).join(' ')}`.trim();
+            document.getElementById('restore-result-text').textContent =
+                `${text} Restart Decypharr to finish; the database is swapped in at the next start.`;
+            document.getElementById('restore-result').classList.remove('hidden');
+            this.lockAfterRestore();
+        } catch (error) {
+            this.showError(error.message || 'Restore failed');
+            btn.disabled = false;
+        }
+    }
+
+    // After a restore the restored files are the config; saving the wizard's
+    // in-memory settings now would overwrite them, so the wizard stops here
+    // until Decypharr is restarted.
+    lockAfterRestore() {
+        this.restored = true;
+        document.querySelectorAll('.setup-step button, .setup-step input, .setup-step select, .setup-step textarea')
+            .forEach(el => {
+                el.disabled = true;
+            });
     }
 
     showLoading() {
@@ -137,6 +251,7 @@ class SetupWizard {
     }
 
     goToStep(step) {
+        if (this.restored) return;
         this.currentStep = step;
         this.showStep(step);
     }
@@ -474,6 +589,10 @@ class SetupWizard {
     }
 
     async handleFinish() {
+        if (this.restored) {
+            this.showError('Restart Decypharr to finish restoring; setup cannot be completed until then.');
+            return;
+        }
         const finishBtn = document.getElementById('finish-btn');
         const finishBtnText = document.getElementById('finish-btn-text');
         const finishBtnLoading = document.getElementById('finish-btn-loading');

@@ -147,6 +147,9 @@ type PlexReaper struct {
 	sections  []plexSection
 	sectAt    time.Time
 
+	// hold reports the post-restore hold; due jobs wait while it is on.
+	hold func() bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -388,6 +391,9 @@ func (r *PlexReaper) cachedSections(ctx context.Context) ([]plexSection, error) 
 func (r *PlexReaper) runDue(ctx context.Context) {
 	if r.mode() == config.PlexReapOff {
 		return
+	}
+	if r.hold != nil && r.hold() {
+		return // post-restore hold: jobs stay queued
 	}
 	now := r.now()
 	r.mu.Lock()

@@ -30,6 +30,14 @@ const (
 	// finishes (see pkg/manager.Precache) - "next episode cached, clean" or
 	// "next episode cached, N segments repaired ahead of time".
 	EventPrecacheReady NotificationEvent = "precache_ready"
+
+	// Backup events (see pkg/backup): a run failed; a job has had no
+	// success for its threshold; the Arr cross-check found library files
+	// with no symlink; the live link count fell sharply since the last check.
+	EventBackupFailed       NotificationEvent = "backup_failed"
+	EventBackupStale        NotificationEvent = "backup_stale"
+	EventBackupLinksMissing NotificationEvent = "backup_links_missing"
+	EventLinksDropped       NotificationEvent = "links_dropped"
 )
 
 // Notifications holds all notification configuration

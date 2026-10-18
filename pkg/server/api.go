@@ -2,9 +2,9 @@ package server
 
 import (
 	"fmt"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	"io"
 	"net/http"
-	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -240,6 +240,9 @@ func (s *Server) handleDeleteTorrent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.preActionRefused(w, r, backup.ActionDeleteEntry) {
+		return
+	}
 	if err := s.manager.Queue().Delete(hash, true, cleanup); err != nil {
 		s.logger.Error().Err(err).Str("hash", hash).Msg("Failed to delete entry from queue")
 		http.Error(w, "Failed to delete entry from queue", http.StatusInternalServerError)
@@ -268,6 +271,9 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 			go s.manager.RemoveTorrentPlacements(t)
 			return nil
 		}
+	}
+	if s.preActionRefused(w, r, backup.ActionDeleteEntries) {
+		return
 	}
 	if err := s.manager.Queue().DeleteWhere("", config.ProtocolAll, "", hashes, cleanup); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to delete torrents")
@@ -412,6 +418,14 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		// Precache/Repair preserves above.
 		newConfig.Plex = current.Plex
 
+		if err := newConfig.Backup.Validate(func(sc string) error {
+			_, err := utils.ConvertToClockOrCronJobDef(sc)
+			return err
+		}); err != nil {
+			invalid = true
+			return err
+		}
+
 		keepUnsentArrWantedSearch(body, current.Arrs, newConfig.Arrs)
 		if err := validateArrWantedSearch(newConfig.Arrs); err != nil {
 			invalid = true
@@ -445,45 +459,16 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sync arr storage with the new configuration
-	s.manager.Arr().SyncFromConfig(updated.Arrs, previous.Arrs)
+	// Sync arr storage and apply what is live; a restart is needed only when
+	// a field that requires it changed.
 	s.logConfigChanges("settings", before, updated)
-
-	// A base-URL or STRM settings change moves the desired content of every
-	// .strm file; resweep now that the new config is published.
-	strmChanged := previous.AppURL != updated.AppURL ||
-		!reflect.DeepEqual(previous.Strm, updated.Strm)
-
-	// Only restart when a field that needs it actually changed (HTTP bind,
-	// debrid/usenet clients, or the mount). Everything else is already live:
-	// Update published the new config, so users aren't disrupted by a full
-	// restart on every save.
-	restarted := previous.RequiresRestart(updated)
+	restarted, err := s.manager.ApplySavedConfig(&previous, updated)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if restarted {
 		go s.Restart()
-	} else {
-		if strmChanged {
-			s.manager.Strm().SweepAsync("config_change")
-		}
-		if err := s.manager.ApplyVirtualFolders(updated.VirtualFolders); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to apply virtual folders after live config update")
-			http.Error(w, "Configuration was saved, but virtual folders could not be applied: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// Reschedule the repair sweep from the saved settings. A sweep already
-		// running carries on (see Repair.ApplyConfig); the new settings apply
-		// from the next sweep.
-		if svc := s.manager.Repair(); svc != nil {
-			if err := svc.ApplyConfig(); err != nil {
-				s.logger.Warn().Err(err).Msg("Failed to apply repair config after live update")
-			}
-		}
-		// Re-register each Arr's scheduled wanted search.
-		if ws := s.manager.WantedSearch(); ws != nil {
-			if err := ws.ApplyConfig(); err != nil {
-				s.logger.Warn().Err(err).Msg("Failed to schedule a wanted search after live update")
-			}
-		}
 	}
 
 	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": restarted}, http.StatusOK)
@@ -1090,6 +1075,9 @@ func (s *Server) handleGetRepairRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClearRepairRuns(w http.ResponseWriter, r *http.Request) {
+	if s.preActionRefused(w, r, backup.ActionClearRepairRuns) {
+		return
+	}
 	if err := s.manager.Storage().ClearRepairRuns(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1383,6 +1371,9 @@ func (s *Server) handleReplaceUnverified(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
+	if s.preActionRefused(w, r, backup.ActionReplaceUnverified) {
+		return
+	}
 	res, err := svc.ReplaceUnverified(s.manager.Context(), req.Names, req.Limit)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -1473,6 +1464,9 @@ func (s *Server) handleClearRepairState(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
+	if s.preActionRefused(w, r, backup.ActionClearRepairState) {
+		return
+	}
 	result, err := svc.ClearStates(statuses)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -1493,6 +1487,9 @@ func (s *Server) handleClearDecodeVerification(w http.ResponseWriter, r *http.Re
 	svc := s.manager.Repair()
 	if svc == nil {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
+		return
+	}
+	if s.preActionRefused(w, r, backup.ActionClearDecodeVerification) {
 		return
 	}
 	cleared, err := svc.ClearDecodeVerification()

@@ -8,6 +8,7 @@ import (
 	json "github.com/bytedance/sonic"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -117,6 +118,12 @@ func (s *Server) setupCompleteHandler(w http.ResponseWriter, r *http.Request) {
 	// Prevent re-running setup once it has already been completed
 	if err := cfg.SetupComplete(); err == nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	// A restore from a backup is waiting for a restart. Finishing now would
+	// save the wizard's settings over the restored config and auth files.
+	if backup.PendingRestoreExists(config.GetMainPath()) {
+		http.Error(w, "a restore is waiting for a restart; restart Decypharr to finish restoring", http.StatusConflict)
 		return
 	}
 

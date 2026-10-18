@@ -9,6 +9,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/sirrobot01/decypharr/pkg/backup"
 	"net/http"
 	"os"
 	"sort"
@@ -547,6 +548,9 @@ func (s *Server) handleGetPar2RepairHistoryEntry(w http.ResponseWriter, r *http.
 // handleClearPar2RepairHistory deletes every persisted PAR2 repair attempt -
 // mirrors handleClearRepairRuns.
 func (s *Server) handleClearPar2RepairHistory(w http.ResponseWriter, r *http.Request) {
+	if s.preActionRefused(w, r, backup.ActionClearPar2History) {
+		return
+	}
 	if err := s.manager.Storage().ClearPar2RepairAttempts(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -1,6 +1,9 @@
 package utils
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestConvertToClockOrCronJobDef(t *testing.T) {
 	for _, s := range []string{"12:00", " 04:30 ", "0 3 * * *", "30 2 * * 1-5", "@daily"} {
@@ -56,5 +59,20 @@ func TestScheduleThatNeverRunsIsRefused(t *testing.T) {
 		if _, err := ConvertToClockOrCronJobDef(s); err == nil {
 			t.Errorf("%q: accepted, want an error", s)
 		}
+	}
+}
+
+func TestNextScheduleRuns(t *testing.T) {
+	from := time.Date(2026, 10, 17, 3, 30, 0, 0, time.UTC)
+	got, err := NextScheduleRuns("04:00", from, 3)
+	if err != nil || len(got) != 3 || !got[0].Equal(time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)) || !got[1].Equal(time.Date(2026, 10, 18, 4, 0, 0, 0, time.UTC)) {
+		t.Fatalf("clock: %v, %v", got, err)
+	}
+	got, err = NextScheduleRuns("0 */6 * * *", from, 3)
+	if err != nil || len(got) != 3 || got[0].Hour() != 6 || got[1].Hour() != 12 {
+		t.Fatalf("cron: %v, %v", got, err)
+	}
+	if _, err := NextScheduleRuns("6h", from, 3); err == nil {
+		t.Fatal("an interval was accepted")
 	}
 }

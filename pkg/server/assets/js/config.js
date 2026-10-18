@@ -179,6 +179,9 @@ class ConfigManager {
 
         // Load hearsay config
         this.populateHearsaySettings(config.hearsay);
+
+        // Load backup config (Settings -> Backups tab, config-backups.js)
+        window.configBackups?.populate(config.backup);
     }
 
     populateHearsaySettings(hearsay) {
@@ -1587,6 +1590,9 @@ class ConfigManager {
             disable_webdav: document.querySelector('[name="disable_webdav"]').checked,
             refresh_dirs: document.querySelector('[name="refresh_dirs"]')?.value || "",
             virtual_folders: this.collectVirtualFolders(),
+
+            // Backups tab; undefined (left out of the save) until it has loaded
+            backup: window.configBackups?.collect(),
 
             // Debrid configurations
             debrids: this.collectDebridConfigs(),

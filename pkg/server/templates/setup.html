@@ -74,6 +74,40 @@
                     <button type="button" class="btn btn-ghost w-full" id="skip-auth-btn">Skip Authentication</button>
                     <button type="button" class="btn btn-primary w-full" id="auth-next-btn">Next</button>
                 </div>
+
+                <div class="mt-6 border-t border-base-300 pt-4">
+                    <button type="button" class="btn btn-ghost btn-sm" id="restore-toggle-btn">Restore from a backup instead</button>
+                    <div id="restore-panel" class="hidden mt-4 space-y-4">
+                        <p class="text-sm text-gray-500">Enter the backup folder. Config, state, NZB records and the
+                            database are restored into this data folder, then you restart Decypharr.</p>
+                        <div>
+                            <label class="label" for="restore-dir">
+                                <span>Backup folder</span>
+                            </label>
+                            <input type="text" class="input input-bordered w-full" id="restore-dir"
+                                   placeholder="/path/to/backups">
+                        </div>
+                        <button type="button" class="btn btn-primary btn-sm" id="restore-list-btn">List snapshots</button>
+                        <div id="restore-snapshots" class="hidden space-y-4">
+                            <select class="select select-bordered w-full" id="restore-snapshot"></select>
+                            <button type="button" class="btn btn-primary w-full" id="restore-run-btn">Restore this snapshot</button>
+                        </div>
+                        <div class="divider text-xs">or</div>
+                        <div>
+                            <label class="label" for="restore-file">
+                                <span>Restore from a backup file</span>
+                            </label>
+                            <input type="file" class="file-input w-full" id="restore-file" multiple
+                                   accept=".zst,.tar.zst,application/zstd">
+                            <p class="text-xs text-gray-500 mt-1">Choose the .tar.zst files you downloaded from the
+                                Backups page (database, config, state, hearsay). They are restored one after another.</p>
+                        </div>
+                        <button type="button" class="btn btn-primary btn-sm" id="restore-upload-btn">Restore from file</button>
+                        <div id="restore-result" class="alert alert-success hidden">
+                            <span id="restore-result-text"></span>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Step 2: Provider Account -->

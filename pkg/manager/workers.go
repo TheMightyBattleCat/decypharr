@@ -230,6 +230,14 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		}
 	}
 
+	// Register the backup jobs and the settings watcher that reschedules
+	// them after a save.
+	if m.backupSvc != nil {
+		if err := m.backupSvc.Start(ctx); err != nil {
+			m.logger.Warn().Err(err).Msg("Some backup jobs were not scheduled")
+		}
+	}
+
 	// Start the scheduler
 	m.scheduler.Start()
 	m.cetScheduler.Start()

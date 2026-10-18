@@ -248,3 +248,29 @@ func (s *Server) BrowseHandler(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn().Err(err).Msg("error rendering /browse template")
 	}
 }
+
+func (s *Server) BackupsHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	data := map[string]any{
+		"URLBase":    cfg.URLBase,
+		"Page":       "backups",
+		"Title":      "Backups",
+		"SetupError": cfg.SetupError(),
+	}
+	if err := s.templates.ExecuteTemplate(w, "layout", data); err != nil {
+		s.logger.Warn().Err(err).Msg("error rendering /backups template")
+	}
+}
+
+func (s *Server) LinksHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	data := map[string]any{
+		"URLBase":    cfg.URLBase,
+		"Page":       "links",
+		"Title":      "Library Links",
+		"SetupError": cfg.SetupError(),
+	}
+	if err := s.templates.ExecuteTemplate(w, "layout", data); err != nil {
+		s.logger.Warn().Err(err).Msg("error rendering /links template")
+	}
+}

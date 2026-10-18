@@ -8,6 +8,8 @@ const (
 	// record is still the live owner of its (entry, file) slot, so nothing
 	// is touched regardless of the execute flag. The load-bearing guard.
 	ReapModeRefusedLive = "refused_live"
+	// ReapModeHeld means the post-restore hold is on and nothing was reaped.
+	ReapModeHeld = "held_post_restore"
 	// ReapModeDryRun means the verdict allowed reaping but execute was
 	// false - nothing is touched, this only reports what would happen.
 	ReapModeDryRun = "dry_run"
@@ -45,6 +47,12 @@ func (m *Manager) ReapOverlay(nzbID, file string, execute bool) (OverlayReapResu
 	}
 	if !execute {
 		result.Mode = ReapModeDryRun
+		return result, nil
+	}
+
+	if m.PostRestoreHold() {
+		m.logger.Warn().Msg("Overlay reap paused: the post-restore hold is on")
+		result.Mode = ReapModeHeld
 		return result, nil
 	}
 

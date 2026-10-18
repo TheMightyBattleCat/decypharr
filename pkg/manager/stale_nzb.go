@@ -278,6 +278,11 @@ func (r *Repair) CleanupStaleNZBs(ctx context.Context, entryIDs []string, orphan
 	}
 	start := time.Now()
 	defer r.clearStaleNZBProgress()
+	if r.manager.PostRestoreHold() {
+		err := errors.New("stale NZB cleanup is paused while the post-restore hold is on; release the hold first")
+		r.logger.Warn().Err(err).Msg("StaleNZB: cleanup refused")
+		return result, err
+	}
 	if len(entryIDs) == 0 && len(orphanIDs) == 0 {
 		err := errors.New("no entry or orphan ids provided")
 		r.logger.Error().Err(err).Msg("StaleNZB: cleanup failed - empty request")

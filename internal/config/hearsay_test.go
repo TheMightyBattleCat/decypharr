@@ -122,3 +122,27 @@ func TestHearsaySeededTorrentLimitEnvironment(t *testing.T) {
 		})
 	}
 }
+
+func TestBackupOnlyChangesDoNotRequireRestart(t *testing.T) {
+	base := func() *Config { c := &Config{}; c.Backup = DefaultBackup(); return c }
+	changes := map[string]func(*Config){
+		"dir":       func(c *Config) { c.Backup.Dir = "/srv/backups" },
+		"schedule":  func(c *Config) { c.Backup.Jobs[0].Schedule = "30 3 * * *" },
+		"retention": func(c *Config) { c.Backup.Jobs[1].Retention.Last = 9 },
+		"throttle":  func(c *Config) { c.Backup.ThrottleMBps = 5 },
+		"pre":       func(c *Config) { c.Backup.PreAction.Keep = 3 },
+		"history":   func(c *Config) { c.Backup.ConfigHistoryMax = 50 },
+	}
+	for name, f := range changes {
+		after := base()
+		f(after)
+		if base().RequiresRestart(after) {
+			t.Errorf("%s: backup change required a restart", name)
+		}
+		// A cold field changing alongside still forces one.
+		after.Port = "9999"
+		if !base().RequiresRestart(after) {
+			t.Errorf("%s: cold change next to it did not require a restart", name)
+		}
+	}
+}

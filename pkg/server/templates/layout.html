@@ -57,6 +57,12 @@
                 <li><a href="{{.URLBase}}repair" class="{{if eq .Page " repair"}}menu-active{{end}}">
                     <i class="bi bi-wrench-adjustable text-accent"></i>Repair
                     </a></li>
+                <li><a href="{{.URLBase}}backups" class="{{if eq .Page "backups"}}menu-active{{end}}">
+                    <i class="bi bi-archive text-success"></i>Backups
+                    </a></li>
+                <li><a href="{{.URLBase}}links" class="{{if eq .Page "links"}}menu-active{{end}}">
+                    <i class="bi bi-link-45deg text-secondary"></i>Links
+                    </a></li>
                 <li><a href="{{.URLBase}}settings" class="{{if eq .Page " config"}}menu-active{{end}}">
                     <i class="bi bi-gear text-info"></i>Settings
                     </a></li>
@@ -92,6 +98,16 @@
                 data-tip="Repair Media">
                 <i class="bi bi-wrench-adjustable"></i>
                 <span class="hidden xl:inline">Repair</span>
+                </a></li>
+            <li><a href="{{.URLBase}}backups" class="{{if eq .Page "backups"}}menu-active{{end}} tooltip tooltip-bottom"
+                data-tip="Backups">
+                <i class="bi bi-archive"></i>
+                <span class="hidden xl:inline">Backups</span>
+                </a></li>
+            <li><a href="{{.URLBase}}links" class="{{if eq .Page "links"}}menu-active{{end}} tooltip tooltip-bottom"
+                data-tip="Library Links">
+                <i class="bi bi-link-45deg"></i>
+                <span class="hidden xl:inline">Links</span>
                 </a></li>
             <li><a href="{{.URLBase}}settings" class="{{if eq .Page " config"}}menu-active{{end}} tooltip
                 tooltip-bottom" data-tip="Settings">
@@ -141,6 +157,10 @@
     {{ template "download" . }}
     {{ else if eq .Page "repair" }}
     {{ template "repair" . }}
+    {{ else if eq .Page "backups" }}
+    {{ template "backups" . }}
+    {{ else if eq .Page "links" }}
+    {{ template "links" . }}
     {{ else if eq .Page "stats" }}
     {{ template "stats" . }}
     {{ else if eq .Page "config" }}
@@ -195,8 +215,13 @@
 <script src="{{.URLBase}}assets/js/download.js"></script>
 {{ else if eq .Page "repair" }}
 <script src="{{.URLBase}}assets/js/repair.js"></script>
+{{ else if eq .Page "backups" }}
+<script src="{{.URLBase}}assets/js/backups.js"></script>
+{{ else if eq .Page "links" }}
+<script src="{{.URLBase}}assets/js/links.js"></script>
 {{ else if eq .Page "config" }}
 <script src="{{.URLBase}}assets/js/config.js"></script>
+<script src="{{.URLBase}}assets/js/config-backups.js"></script>
 {{ else if eq .Page "setup" }}
 <script src="{{.URLBase}}assets/js/setup.js"></script>
 {{ end }}
