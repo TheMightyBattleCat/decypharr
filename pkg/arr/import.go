@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -139,7 +140,9 @@ func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
 	query.Add("downloadId", downloadID)
 	url := "api/v3/manualimport" + "?" + query.Encode()
 	var data []ImportResponseSchema
-	_, err := a.Request(http.MethodGet, url, nil, &data)
+	ctx, cancel := context.WithTimeout(context.Background(), manualImportScanTimeout)
+	defer cancel()
+	_, err := a.requestWith(ctx, getImportClient(), http.MethodGet, url, nil, &data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to import: %w", err)
 	}

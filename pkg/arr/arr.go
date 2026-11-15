@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	json "github.com/bytedance/sonic"
 	"github.com/puzpuzpuz/xsync/v4"
@@ -45,6 +48,38 @@ func getSharedClient() *request.Client {
 		)
 	})
 	return sharedClient
+}
+
+var (
+	importOnce   sync.Once
+	importClient *request.Client
+)
+
+// manualImportScanTimeout bounds a manualimport scan. Sonarr ffprobes every
+// file in the download before it answers, so a season pack on a busy box can
+// take minutes, far past the shared transport's 30 s header timeout.
+const manualImportScanTimeout = 10 * time.Minute
+
+// getImportClient returns the client used for manualimport scans. It never
+// retries: a retry does not cancel the scan Sonarr is already running, it
+// starts another one beside it.
+func getImportClient() *request.Client {
+	importOnce.Do(func() {
+		transport := &http.Transport{
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
+			MaxIdleConnsPerHost:   4,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: manualImportScanTimeout,
+			ForceAttemptHTTP2:     true,
+		}
+		importClient = request.New(
+			request.WithTimeout(manualImportScanTimeout),
+			request.WithMaxRetries(0),
+			request.WithTransport(transport),
+		)
+	})
+	return importClient
 }
 
 const (
@@ -84,6 +119,10 @@ func New(name, host, token string, skipRepair bool, downloadUncached *bool, sele
 // cancels the in-flight HTTP call — this is what lets the repair pipeline
 // abort long Sonarr enumerations when a user presses Stop.
 func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload any, res any) (*http.Response, error) {
+	return a.requestWith(ctx, getSharedClient(), method, endpoint, payload, res)
+}
+
+func (a *Arr) requestWith(ctx context.Context, client *request.Client, method, endpoint string, payload any, res any) (*http.Response, error) {
 	if a.Token == "" || a.Host == "" {
 		return nil, fmt.Errorf("arr not configured")
 	}
@@ -112,7 +151,7 @@ func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload a
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", a.Token)
 
-	resp, err := getSharedClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -318,15 +357,17 @@ func (s *Storage) Monitor() {
 	wg := sync.WaitGroup{}
 	wg.Add(s.arrs.Size())
 	s.arrs.Range(func(name string, arr *Arr) bool {
-		_, _, _ = s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
-			go func() {
-				defer wg.Done()
+		// The cleanup runs inside Do, so a tick that lands while the last
+		// one is still waiting on the arr joins it instead of stacking.
+		go func() {
+			defer wg.Done()
+			_, _, _ = s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
 				if err := arr.CleanupQueue(); err != nil {
 					s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
 				}
-			}()
-			return nil, nil
-		})
+				return nil, nil
+			})
+		}()
 		return true
 	})
 	wg.Wait()

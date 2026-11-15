@@ -6,6 +6,8 @@ import (
 	gourl "net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
@@ -339,12 +341,69 @@ func (a *Arr) removeQueueItems(items map[int]bool, blocklist, skipRedownload boo
 	return nil
 }
 
+// manualImportCooldown is how long a download waits before decypharr asks
+// the arr to import it again. Each attempt makes the arr ffprobe every file
+// in the download, and the queue cleanup runs every 10 s.
+const manualImportCooldown = 30 * time.Minute
+
+// manualImportGate keeps one manual import per download in flight, across
+// every arr entry (two entries can point at the same arr), and spaces out
+// repeat attempts on the same download.
+type manualImportGate struct {
+	mu       sync.Mutex
+	inflight map[string]bool
+	last     map[string]time.Time
+	now      func() time.Time
+}
+
+var importGate = newManualImportGate()
+
+func newManualImportGate() *manualImportGate {
+	return &manualImportGate{inflight: map[string]bool{}, last: map[string]time.Time{}, now: time.Now}
+}
+
+// acquire reports whether downloadID may be imported now, and marks it in
+// flight if so. The caller must call release when done.
+func (g *manualImportGate) acquire(downloadID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.now()
+	for id, t := range g.last {
+		if !g.inflight[id] && now.Sub(t) >= manualImportCooldown {
+			delete(g.last, id)
+		}
+	}
+	if g.inflight[downloadID] {
+		return false
+	}
+	if t, ok := g.last[downloadID]; ok && now.Sub(t) < manualImportCooldown {
+		return false
+	}
+	g.inflight[downloadID] = true
+	g.last[downloadID] = now
+	return true
+}
+
+func (g *manualImportGate) release(downloadID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.inflight, downloadID)
+	g.last[downloadID] = g.now()
+}
+
 func (a *Arr) ManualImportItems(items map[string]bool) error {
+	l := logger.New("arr")
 	for downloadId := range items {
-		_, err := a.Import(downloadId)
+		if !importGate.acquire(downloadId) {
+			continue
+		}
+		body, err := a.Import(downloadId)
+		importGate.release(downloadId)
+		if body != nil {
+			_ = body.Close()
+		}
 		if err != nil {
-			// log error
-			fmt.Println(err)
+			l.Warn().Err(err).Str("arr", a.Name).Str("download_id", downloadId).Msg("queue cleanup: manual import attempt failed")
 		}
 	}
 	return nil
