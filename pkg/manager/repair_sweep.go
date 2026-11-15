@@ -713,7 +713,7 @@ func rollupDecode(results []fileResult, skipDecode bool) (decodeRan bool, covera
 
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
 // use the provider CheckFile endpoint unless this run requests unrestrict-link
-// probing. When the protocol probe passes and an ffprobe checker is attached
+// probing. When an NZB file's probe passes and an ffprobe checker is attached
 // to ctx (Repair.FFProbeCheck), the file is additionally validated by reading
 // it back over WebDAV - this is the only check that can catch a STAT-alive,
 // BODY-dead file or a mis-assembled container, since NNTP/provider CheckFile
@@ -754,7 +754,13 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			return reconciled
 		}
 	} else {
-		res = r.probeTorrentFile(ctx, entry, file, name, res, opts)
+		// A torrent gets the debrid link check and nothing more: the debrid
+		// service hash-checked it, so an ffprobe read would only pull the
+		// file through the mount, and a broken verdict could only re-insert
+		// the same bytes or re-grab a good release (a 404 on the WebDAV
+		// path was enough). It ends healthy without a decode stamp, as with
+		// the ffprobe check off.
+		return r.probeTorrentFile(ctx, entry, file, name, res, opts)
 	}
 
 	if res.healthy {

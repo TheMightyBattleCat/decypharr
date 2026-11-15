@@ -377,6 +377,14 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		}
 	}()
 
+	// Usenet only, like the other import gates. A torrent was hash-checked
+	// by the debrid service, so probing it only adds reads through the mount;
+	// and a fresh torrent's file can 404 on the WebDAV path the probe opens,
+	// which rejected good downloads as unreadable.
+	if entry.Protocol != config.ProtocolNZB {
+		return nil
+	}
+
 	checker := d.importFFProbeChecker()
 	if checker == nil {
 		return nil

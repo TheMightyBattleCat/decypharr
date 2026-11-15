@@ -345,14 +345,16 @@ type RepairConfig struct {
 	// headers still exist but whose assembled stream is unplayable: purged bodies, mis-assembled
 	// containers with bogus durations, and files with no decodable video/audio streams. Requires
 	// the ffprobe binary on PATH (or FFProbePath) and WebDAV enabled. Default off - it reads real
-	// bytes per file, so repair sweeps take longer and use provider bandwidth.
+	// bytes per file, so repair sweeps take longer and use provider bandwidth. Usenet files only:
+	// a torrent gets the debrid link check alone.
 	FFProbeCheck bool `json:"ffprobe_check,omitempty"`
 	// FFProbeTimeout bounds a single ffprobe invocation (e.g. "90s"). Default 90s.
 	FFProbeTimeout string `json:"ffprobe_timeout,omitempty"`
 	// FFProbePath overrides the ffprobe binary location. Default: find "ffprobe" on PATH.
 	FFProbePath string `json:"ffprobe_path,omitempty"`
-	// FFProbeOnImport, when true, validates each newly imported download with ffprobe (same checks
-	// as FFProbeCheck, minus the runtime comparison) BEFORE it is reported complete to
+	// FFProbeOnImport, when true, validates each newly imported Usenet download with ffprobe (same
+	// checks as FFProbeCheck, minus the runtime comparison; torrents are not probed, as the debrid
+	// service has already hash-checked them) BEFORE it is reported complete to
 	// Sonarr/Radarr. A file that fails twice is rejected, so the Arr blocklists the release and
 	// grabs another - corrupt downloads never enter the library. Adds seconds and real reads per
 	// import; requires the ffprobe binary and WebDAV. Default off.

@@ -104,8 +104,9 @@ blurred.*
 - At the same point, every article of each video file is checked with STAT (asking the server whether an
   article exists, without downloading it). It takes a few seconds and finds a missing article anywhere in the
   file, not only in the sample. A check that cannot finish lets the import through.
-- Optionally, every import is also run through `ffprobe`. A file that will not open, or has no playable video
-  or audio, is rejected the same way.
+- Optionally, every Usenet import is also run through `ffprobe`. A file that will not open, or has no playable
+  video or audio, is rejected the same way. Torrent and debrid imports are not probed: the debrid service has
+  already checked them against the torrent's hashes.
 - These checks cover every video file of 100 MiB or more, and a smaller one when it is at least a quarter of
   the size of the release's largest video. An SD episode or a pack of small episodes is checked; a featurette
   beside a film is not.
@@ -159,8 +160,9 @@ Releases posted as password-protected archives stream like any other, decrypted 
 Upstream's repair sweep checks that a file's articles still exist and can optionally check the container signature
 at the start of the file. This fork can go further:
 
-- Optional `ffprobe` checks in the repair sweep, which find files whose articles all exist but which do not
-  play. There are two, and you can run the first without the second:
+- Optional `ffprobe` checks in the repair sweep, which find Usenet files whose articles all exist but which do
+  not play. Torrent and debrid files only get the debrid link check. There are two, and you can run the first
+  without the second:
   - **The cheap check.** `ffprobe` opens the file and reads its headers. That is enough to catch a file that
     will not open, has no video stream, has no duration, or whose running time is wildly different from what
     Sonarr or Radarr expects for that title. It reads very little and takes a few seconds.
@@ -500,7 +502,7 @@ from the Settings and Repair pages leave it as it is.
 | PAR2 repair during sweeps (`repair.par2_repair_on_sweep`) | Repair page → Padding & PAR2 repair policy | Off |
 | Urgent PAR2 repairs at once (`repair.par2_urgent_concurrency`) | `config.json` | 2 |
 | Import article check (`repair.import_availability_check`) | `config.json` | On |
-| Validate new imports with ffprobe (`repair.ffprobe_on_import`) | Settings → Repair | Off |
+| Validate new Usenet imports with ffprobe (`repair.ffprobe_on_import`) | Settings → Repair | Off |
 | Validate files with ffprobe during repair sweeps (`repair.ffprobe_check`) | Settings → Repair | Off |
 | Decode verification during sweeps (`repair.ffprobe_decode_check`) | Settings → Repair | On, once the sweep check above is on |
 | How long a decoded file is trusted (`repair.decode_verify_ttl`) | `config.json` | 30 days (`720h`) |
