@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -52,6 +53,62 @@ func TestCensusPar2VolumesSplitsUnnamedPostingBySize(t *testing.T) {
 	if want := estimateUnnamedRecovery(files); total != want {
 		t.Errorf("census total %d slices, estimateUnnamedRecovery says %d", total, want)
 	}
+	if got, want := par2PostedRecoverySlices(files), estimateUnnamedRecovery(files); got != want {
+		t.Errorf("par2PostedRecoverySlices = %d, want the estimate %d", got, want)
+	}
+}
+
+// A season pack with a short special: the special's index is the smallest
+// PAR2 file and every full episode's index is over twice its size. They are
+// still index files (under par2UnnamedVolumeFloor), so the set choice sees
+// every episode's set; before the floor they were census-ed as volumes and
+// the pass ended "could not be tied".
+func TestCensusPar2VolumesKeepsEpisodeIndexesBesideASpecial(t *testing.T) {
+	const mib = 1 << 20
+	files := []storage.Par2FileRef{
+		unnamedPar2File("special.par2", 30_000),
+		unnamedPar2File("ep1.par2", 90_000),
+		unnamedPar2File("ep2.par2", 95_000),
+		unnamedPar2File("ep3.par2", 92_000),
+		unnamedPar2File("v1.par2", 30_000+8*mib),
+		unnamedPar2File("v2.par2", 30_000+16*mib),
+	}
+	vols, indexFiles := censusPar2Volumes(files)
+	if len(indexFiles) != 4 {
+		t.Errorf("index files = %+v, want the special and the three episode indexes", indexFiles)
+	}
+	if len(vols) != 2 || vols[0].ref.Name != "v1.par2" || vols[1].ref.Name != "v2.par2" {
+		t.Errorf("volumes = %+v, want v1 then v2", vols)
+	}
+}
+
+// Volumes under par2UnnamedVolumeFloor are fetched with the index files; the
+// larger ones stay volumes with their counts unchanged (the floor does not
+// change the size step), and the posted total still counts every one.
+func TestCensusPar2VolumesKeepsSmallVolumesWithTheIndex(t *testing.T) {
+	const mib = 1 << 20
+	slice := int64(mib + par2RecoveryPacketOverhead)
+	files := []storage.Par2FileRef{unnamedPar2File("idx.par2", 100_000)}
+	for _, n := range []int64{1, 2, 4, 8, 16} {
+		files = append(files, unnamedPar2File(fmt.Sprintf("v%02d.par2", n), 100_000+n*slice))
+	}
+	vols, indexFiles := censusPar2Volumes(files)
+	// 1-, 2- and 3.9 MiB-ish files: v01 and v02 are under 4 MiB, v04 is just over.
+	if len(indexFiles) != 3 {
+		t.Fatalf("index files = %+v, want idx, v01 and v02", indexFiles)
+	}
+	want := map[string]uint32{"v04.par2": 4, "v08.par2": 8, "v16.par2": 16}
+	if len(vols) != len(want) {
+		t.Fatalf("volumes = %+v, want v04, v08, v16", vols)
+	}
+	for _, v := range vols {
+		if want[v.ref.Name] != v.count {
+			t.Errorf("%s: count %d, want %d", v.ref.Name, v.count, want[v.ref.Name])
+		}
+	}
+	if got := par2PostedRecoverySlices(files); got != 31 {
+		t.Errorf("par2PostedRecoverySlices = %d, want all 31 posted slices", got)
+	}
 }
 
 // A season pack's per-episode index files are similar sizes: all stay index
@@ -62,8 +119,8 @@ func TestCensusPar2VolumesKeepsSeasonPackIndexes(t *testing.T) {
 		unnamedPar2File("ep1.par2", 40_000),
 		unnamedPar2File("ep2.par2", 43_500),
 		unnamedPar2File("ep3.par2", 41_200),
-		unnamedPar2File("v1.par2", 4_040_000),
-		unnamedPar2File("v2.par2", 8_040_000),
+		unnamedPar2File("v1.par2", 5_040_000),
+		unnamedPar2File("v2.par2", 10_040_000),
 	}
 	vols, indexFiles := censusPar2Volumes(files)
 	if len(indexFiles) != 3 {
@@ -81,42 +138,37 @@ func TestCensusPar2VolumesKeepsSeasonPackIndexes(t *testing.T) {
 }
 
 // countingPar2Fetch serves every article as zero bytes of its file's size and
-// counts the fetches per message ID.
+// counts the fetches per message ID. The body is one byte: only which files
+// are fetched matters here.
 type countingPar2Fetch struct {
 	mu    sync.Mutex
-	sizes map[string]int64
 	calls map[string]int
 }
 
-func newCountingPar2Fetch(files []storage.Par2FileRef) *countingPar2Fetch {
-	c := &countingPar2Fetch{sizes: map[string]int64{}, calls: map[string]int{}}
-	for _, f := range files {
-		c.sizes[f.Name] = f.Size
-	}
-	return c
+func newCountingPar2Fetch() *countingPar2Fetch {
+	return &countingPar2Fetch{calls: map[string]int{}}
 }
 
 func (c *countingPar2Fetch) fetch(_ context.Context, id string) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls[id]++
-	return make([]byte, c.sizes[id]), nil
+	return []byte{0}, nil
 }
 
 // A pass on an obfuscated posting fetches the index file and then volumes
 // smallest first, only as many as the damage needs (plus fetchMoreVolumes'
 // one slack volume) - never the largest volumes.
 func TestUnnamedPostingFetchesOnlyTheVolumesNeeded(t *testing.T) {
-	// Same proportions as 1, 10, 20, 40, 80 MiB, in KiB.
-	const kib = 1 << 10
+	const mib = 1 << 20
 	files := []storage.Par2FileRef{
-		unnamedPar2File("idx.par2", 1*kib),
-		unnamedPar2File("v10.par2", 10*kib),
-		unnamedPar2File("v20.par2", 20*kib),
-		unnamedPar2File("v40.par2", 40*kib),
-		unnamedPar2File("v80.par2", 80*kib),
+		unnamedPar2File("idx.par2", 1*mib),
+		unnamedPar2File("v10.par2", 10*mib),
+		unnamedPar2File("v20.par2", 20*mib),
+		unnamedPar2File("v40.par2", 40*mib),
+		unnamedPar2File("v80.par2", 80*mib),
 	}
-	f := newCountingPar2Fetch(files)
+	f := newCountingPar2Fetch()
 	vols, indexFiles := censusPar2Volumes(files)
 	ctx := context.Background()
 	sources, indexErr := fetchPar2IndexFiles(ctx, zerolog.Nop(), f.fetch, indexFiles, "test")
@@ -158,7 +210,7 @@ func TestUnnamedPostingFetchesOnlyTheVolumesNeeded(t *testing.T) {
 func TestFetchPar2IndexFilesRefusesOversizedIndex(t *testing.T) {
 	small := unnamedPar2File("small.par2", 1000)
 	huge := unnamedPar2File("huge.par2", par2MaxIndexFileBytes+1)
-	f := newCountingPar2Fetch([]storage.Par2FileRef{small})
+	f := newCountingPar2Fetch()
 	sources, indexErr := fetchPar2IndexFiles(context.Background(), zerolog.Nop(), f.fetch, []storage.Par2FileRef{small, huge}, "test")
 	if f.calls["huge.par2"] != 0 {
 		t.Errorf("oversized index file fetched %d times, want 0", f.calls["huge.par2"])

@@ -889,13 +889,7 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 		return false, fmt.Sprintf("%d damaged segments exceeds the %d-slice repair cap", needed, par2.MaxRepairSlices)
 	}
 
-	// An obfuscated posting's volumes are census-ed by size, with estimated
-	// counts (censusUnnamedVolumes).
-	vols, _ := censusPar2Volumes(nzb.Par2Files)
-	var available uint32
-	for _, v := range vols {
-		available += v.count
-	}
+	available := par2PostedRecoverySlices(nzb.Par2Files)
 	if available < needed {
 		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
 	}
@@ -1019,12 +1013,24 @@ func (p *Par2Repair) par2RecoveryCapacity(nzbID string) int {
 	if err != nil || len(nzb.Par2Files) == 0 {
 		return -1
 	}
-	vols, _ := censusPar2Volumes(nzb.Par2Files)
-	var available int
-	for _, v := range vols {
-		available += int(v.count)
+	return int(par2PostedRecoverySlices(nzb.Par2Files))
+}
+
+// par2PostedRecoverySlices is the recovery slices files were posted with,
+// from names and sizes alone: the named volumes' counts, or for an
+// obfuscated posting unnamedRecoveryEstimate's size steps. Unlike summing
+// censusPar2Volumes' volumes, it also counts the small unnamed volumes the
+// census keeps as index files (see censusUnnamedVolumes).
+func par2PostedRecoverySlices(files []storage.Par2FileRef) uint32 {
+	vols, _ := censusNamedPar2Volumes(files)
+	if len(vols) == 0 {
+		return estimateUnnamedRecovery(files)
 	}
-	return available
+	var n uint32
+	for _, v := range vols {
+		n += v.count
+	}
+	return n
 }
 
 // postedLayoutMatches reports whether posted and nzbFile are the same
@@ -2301,11 +2307,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		earlyIdx = nil
 	}
 	// An index file can hold recovery slices too (an obfuscated posting's
-	// files under twice the smallest stay index files, see
-	// censusUnnamedVolumes): they are already here. Count them, or "no PAR2
-	// recovery volumes retained" goes terminal on data in hand.
-	if earlyIdx != nil && uint32(len(earlyIdx.Recovery)) > available {
-		available = uint32(len(earlyIdx.Recovery))
+	// volumes under par2UnnamedVolumeFloor stay index files, see
+	// censusUnnamedVolumes): they are already here, and in no file of vols.
+	// Add them, or "no PAR2 recovery volumes retained" goes terminal on data
+	// in hand.
+	if earlyIdx != nil {
+		available += uint32(len(earlyIdx.Recovery))
 	}
 	if available == 0 {
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource, tally,
@@ -3622,11 +3629,12 @@ type par2Volume struct {
 //
 // When no name carries a volume marker (an obfuscated posting), the files
 // are split by size instead, as unnamedRecoveryEstimate counts them: a file
-// at least twice the smallest is a recovery volume with an estimated slice
-// count, the rest are index files. Census-ed as index files, every one of
-// them was fetched whole before any gate - the whole recovery set, several
-// GB for a remux, to repair one slice. As volumes they are fetched smallest
-// first and only as far as the damage needs.
+// at least twice the smallest and at least par2UnnamedVolumeFloor is a
+// recovery volume with an estimated slice count, the rest are index files.
+// Census-ed as index files, every one of them was fetched whole before any
+// gate - the whole recovery set, several GB for a remux, to repair one
+// slice. As volumes they are fetched smallest first and only as far as the
+// damage needs.
 func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFiles []storage.Par2FileRef) {
 	vols, indexFiles = censusNamedPar2Volumes(files)
 	if len(vols) == 0 {
@@ -3635,12 +3643,26 @@ func censusPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, indexFil
 	return vols, indexFiles
 }
 
+// par2UnnamedVolumeFloor is the smallest unnamed PAR2 file censusPar2Volumes
+// takes for a recovery volume. An index file holds only metadata - about 20
+// bytes per slice plus a packet per file, a few hundred KiB for an episode -
+// so nothing under the floor is fetched as a volume. Without it, a season
+// pack whose episode index files differ in size by 2x (a short special
+// beside full episodes, or a fixed slice size where the index tracks the
+// episode's length) had episode indexes census-ed as volumes: the recovery
+// sets they describe were invisible to choosePar2Set, and the pass ended
+// "could not be tied". Small volumes kept as index files cost a few MiB of
+// fetch and are parsed with the index.
+const par2UnnamedVolumeFloor = 4 << 20
+
 // censusUnnamedVolumes moves the files unnamedRecoveryEstimate counts as
-// recovery volumes out of indexFiles, each with its share of that estimate
-// (at least one slice), so the census total equals the estimate. Files
-// under twice the smallest stay index files: a season pack's per-episode
-// index files are similar sizes. The counts only size the fetch and the
-// early capacity gate; the solve gates on the slices actually parsed.
+// recovery volumes, at or over par2UnnamedVolumeFloor, out of indexFiles,
+// each with its share of that estimate (at least one slice). Files under
+// twice the smallest stay index files: a season pack's per-episode index
+// files are similar sizes. Volumes under the floor stay index files too,
+// still counted by the estimate, so the census total plus their slices
+// equals it. The counts only size the fetch and the early capacity gate;
+// the solve gates on the slices actually parsed.
 func censusUnnamedVolumes(indexFiles []storage.Par2FileRef) ([]par2Volume, []storage.Par2FileRef) {
 	base, step := unnamedRecoveryGeometry(indexFiles)
 	if step == 0 {
@@ -3650,7 +3672,7 @@ func censusUnnamedVolumes(indexFiles []storage.Par2FileRef) ([]par2Volume, []sto
 	kept := indexFiles[:0:0]
 	for _, f := range indexFiles {
 		n := unnamedVolumeSlices(f.Size, base, step)
-		if n == 0 {
+		if n == 0 || f.Size < par2UnnamedVolumeFloor {
 			kept = append(kept, f)
 			continue
 		}
