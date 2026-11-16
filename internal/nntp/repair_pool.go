@@ -196,9 +196,11 @@ func (p *RepairPool) Stop() {
 }
 
 // worker pulls chunks until the pool stops. A worker with a home takes chunks
-// only while that home is STAT-eligible; otherwise it waits, except for the
-// one explorer per home that takes a chunk to re-measure it (see tryExplore
-// and exploreDone for how often) - none for a home over its hard quota. The pool's worker count is the
+// only while that home is STAT-eligible (fast enough, or not measured yet);
+// otherwise it waits, except for the one explorer per home that takes a chunk
+// to re-measure it (see tryExplore and exploreDone for how often) - none for a
+// home over its hard quota. An explorer whose task had already expired gives
+// the role back without counting the turn. The pool's worker count is the
 // concurrency cap; no token accounting.
 func (p *RepairPool) worker(c *Client, home *ProviderPool) {
 	defer p.wg.Done()
@@ -212,7 +214,10 @@ func (p *RepairPool) worker(c *Client, home *ProviderPool) {
 				// samples: the next drop-out starts from the short wait.
 				home.stat.exploreWait.Store(0)
 			}
-			if home.stat.eligible.Swap(ok) != ok {
+			// An unmeasured home takes chunks but is not recorded as
+			// eligible, so its first measurement must meet the join
+			// cutoff (statSlowFactor), not the laxer leave cutoff.
+			if measured := ok && lat > 0; home.stat.eligible.Swap(measured) != measured {
 				msg := "STAT routing: provider is fast enough, taking BatchStat chunks"
 				switch {
 				case blocked:
@@ -242,26 +247,34 @@ func (p *RepairPool) worker(c *Client, home *ProviderPool) {
 			}
 			return
 		case t := <-p.tasks:
-			p.run(c, home, t)
+			worked := p.run(c, home, t)
 			if exploring {
-				ok, _, _ := c.statEligible(home)
-				home.stat.exploreDone(ok)
+				if worked {
+					ok, _, _ := c.statEligible(home)
+					home.stat.exploreDone(ok)
+				} else {
+					// The task's caller had already gone: nothing was
+					// measured, so the turn is neither used up nor the
+					// re-test wait lengthened.
+					home.stat.exploring.Store(false)
+				}
 			}
 		}
 	}
 }
 
 // run processes one chunk for a worker homed on home (nil: the priority-1
-// provider).
-func (p *RepairPool) run(c *Client, home *ProviderPool, t repairTask) {
+// provider). It reports whether it asked any provider: false when the task's
+// context had already ended, so the chunk was answered with that error unasked.
+func (p *RepairPool) run(c *Client, home *ProviderPool, t repairTask) (worked bool) {
 	if t.done == nil {
-		return
+		return false
 	}
 	// Caller may have cancelled while we were waiting. Surface it as the
 	// task's error without doing the work.
 	if err := t.ctx.Err(); err != nil {
 		t.done(nil, err)
-		return
+		return false
 	}
 	var homeCfg config.UsenetProvider
 	if home != nil {
@@ -271,4 +284,5 @@ func (p *RepairPool) run(c *Client, home *ProviderPool, t repairTask) {
 	}
 	results, err := c.batchStatAcrossProviders(t.ctx, t.msgIDs, homeCfg, t.hint)
 	t.done(results, err)
+	return true
 }

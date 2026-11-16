@@ -206,13 +206,22 @@ func TestStatEligible(t *testing.T) {
 		{Host: "new", Priority: 4, MaxConnections: 10},
 		{Host: "backup", Priority: 5, MaxConnections: 10, Backup: true},
 	}
-	c := newStatTestClient(t, providers, 80)
+	// No repair pool: a running worker that reads "slow" between the
+	// setLatency calls below stores it as eligible, and the laxer leave
+	// cutoff then keeps it eligible.
+	c := &Client{pools: map[string]*ProviderPool{}, providers: providers, logger: zerolog.Nop()}
+	for _, p := range providers {
+		c.pools[p.Host] = &ProviderPool{slots: make(chan struct{}, p.MaxConnections), max: p.MaxConnections, config: p}
+	}
+	c.statHomes = c.statHomePools()
 	setLatency(c, "slow", 125*time.Millisecond)
 	setLatency(c, "fast", 12*time.Millisecond)
 	setLatency(c, "mid", 30*time.Millisecond)
 	setLatency(c, "backup", time.Microsecond) // not a home: must not set the cutoff
 
-	for host, want := range map[string]bool{"slow": false, "fast": true, "mid": true, "new": false} {
+	// "new" has no measurement yet: nothing to compare it against, so it
+	// takes chunks until its first hit says otherwise.
+	for host, want := range map[string]bool{"slow": false, "fast": true, "mid": true, "new": true} {
 		if ok, _, _ := c.statEligible(c.pools[host]); ok != want {
 			t.Errorf("%s eligible = %v, want %v", host, ok, want)
 		}
@@ -400,7 +409,18 @@ func TestRepairPoolRoutesAwayFromSlowProvider(t *testing.T) {
 	slow := startFakeNNTP(t, 200*time.Millisecond)
 	fast := startFakeNNTP(t, 0)
 	ps, pf := twoLocalProviders(t, slow, fast)
-	c := newStatTestClient(t, []config.UsenetProvider{ps, pf}, 100)
+	// Both measured before the pool starts (an unmeasured home takes chunks):
+	// fast just now, slow long enough ago that its explorer may re-test it.
+	c := &Client{pools: map[string]*ProviderPool{}, providers: []config.UsenetProvider{ps, pf}, logger: zerolog.Nop()}
+	for _, p := range c.providers {
+		c.pools[p.Host] = &ProviderPool{slots: make(chan struct{}, p.MaxConnections), max: p.MaxConnections, config: p}
+	}
+	c.statHomes = c.statHomePools()
+	setLatency(c, pf.Host, time.Millisecond)
+	c.pools[ps.Host].stat.nsPerStat.Store(int64(200 * time.Millisecond))
+	c.pools[ps.Host].stat.sampledAt.Store(time.Now().Add(-statExploreAfter - time.Second).UnixNano())
+	c.repairPool = c.newRepairPool(100)
+	t.Cleanup(func() { _ = c.Close() })
 
 	msgIDs := ids("first", 400)
 	batch := pickStatBatchSize(len(msgIDs), c.repairPool.Capacity(), 50, 10)
@@ -412,7 +432,7 @@ func TestRepairPoolRoutesAwayFromSlowProvider(t *testing.T) {
 		t.Fatalf("slow provider served %d STATs on the first call, want at most one chunk (%d)", got, batch)
 	}
 	if ok, _, _ := c.statEligible(c.pools[ps.Host]); ok {
-		t.Fatalf("slow provider still eligible after being measured")
+		t.Fatalf("slow provider eligible after its re-test")
 	}
 	// Its re-test found it slow, so the next one waits twice as long. The
 	// explorer finishes its turn just after the chunk's results are handed back.
@@ -508,6 +528,12 @@ func TestStatEligibleHardQuota(t *testing.T) {
 	c.bw = quotaTracker("capped", 100, 100, 10)
 	if ok, _, _ := c.statEligible(c.pools["capped"]); ok {
 		t.Error("provider over its hard quota still eligible")
+	}
+	// Not even when it has no measurement (an unmeasured home is otherwise
+	// eligible).
+	c.pools["capped"].stat.nsPerStat.Store(0)
+	if ok, _, _ := c.statEligible(c.pools["capped"]); ok {
+		t.Error("unmeasured provider over its hard quota eligible")
 	}
 	if ok, _, _ := c.statEligible(c.pools["slower"]); !ok {
 		t.Error("a hard-quota provider still sets the cutoff for the others")

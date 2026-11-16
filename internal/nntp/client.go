@@ -1656,7 +1656,9 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// is found definitively missing (not-found across all providers), so the
 	// remaining sample's workers stop at their per-chunk ctx.Err() checks
 	// instead of completing the full STAT sweep. defer cancel() also covers
-	// the normal return path.
+	// the normal return path. parent is the caller's context: the call
+	// returns when it ends (see the wait below), not when the bailout fires.
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1697,8 +1699,15 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// by the pool's worker count, NOT by a per-call pool — so M concurrent
 	// BatchStat calls share the same pool.Capacity() workers in FIFO
 	// arrival order instead of each spinning up its own bank-sized pool.
-	// Tasks write disjoint index ranges of allResults; the only shared
-	// mutable state is the early-bailout cancel.
+	// Tasks write disjoint index ranges of allResults under resMu: once the
+	// caller's context ends the call returns without waiting for chunks still
+	// queued or running, and returned/finished stop their late callbacks from
+	// writing into a result already handed back.
+	var (
+		resMu    sync.Mutex
+		returned bool
+		finished = make([]bool, len(chunks))
+	)
 	markChunkErr := func(startIdx, n int, e error) {
 		for i := startIdx; i < startIdx+n; i++ {
 			allResults[i].Available = false
@@ -1717,19 +1726,27 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	}()
 	var bailOnce sync.Once
 	var wg sync.WaitGroup
-	for _, ch := range chunks {
+	for ci, ch := range chunks {
 		wg.Add(1)
 		err := c.repairPool.Submit(ctx, ch.messageIDs, hint, func(results []StatResult, taskErr error) {
 			defer wg.Done()
+			resMu.Lock()
+			if returned {
+				resMu.Unlock()
+				return
+			}
+			finished[ci] = true
 			if taskErr != nil {
 				// Mirrors the previous behaviour: a chunk-level connection
 				// error fails the whole chunk (partial results discarded).
 				markChunkErr(ch.startIdx, len(ch.messageIDs), taskErr)
+				resMu.Unlock()
 				return
 			}
 			for i := range results {
 				allResults[ch.startIdx+i] = results[i]
 			}
+			resMu.Unlock()
 			ReportStatProgress(ctx, len(results))
 			// Bail out the rest of the sample as soon as one segment is
 			// definitively missing — not-found on every provider, so the
@@ -1751,11 +1768,36 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 			// Submit refused the task — caller's ctx expired before a worker
 			// took it, or the pool is shutting down. Synthesize a chunk-wide
 			// error so the result vector still has the right shape.
+			resMu.Lock()
+			finished[ci] = true
 			markChunkErr(ch.startIdx, len(ch.messageIDs), err)
+			resMu.Unlock()
 			wg.Done()
 		}
 	}
-	wg.Wait()
+	// Wait for every chunk, or for the caller's context to end. A chunk can
+	// sit queued for a long time when no worker's home is eligible for it;
+	// the caller's deadline still holds. Chunks not answered by then carry
+	// its error (counted as errors, not as missing).
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+	select {
+	case <-allDone:
+	case <-parent.Done():
+	}
+	resMu.Lock()
+	returned = true
+	if err := parent.Err(); err != nil {
+		for ci, ch := range chunks {
+			if !finished[ci] {
+				markChunkErr(ch.startIdx, len(ch.messageIDs), err)
+			}
+		}
+	}
+	resMu.Unlock()
 
 	result := &BatchStatResult{
 		Results:    allResults,
