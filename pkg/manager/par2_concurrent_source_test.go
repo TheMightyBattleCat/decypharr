@@ -342,3 +342,158 @@ func TestConcurrentSliceSourceStopsFetchingWhenCancelled(t *testing.T) {
 		t.Fatalf("fetches after cancel: %d then %d of %d, want them stopped", settled, after, n)
 	}
 }
+
+// One slow article must not let the other workers run ahead: with slice 0
+// held back (a fetch waiting on failover while the rest come from the DFS
+// cache), only slices inside the read-ahead window may be fetched, and
+// ReadSlice may park no more than that window. Before the window was bounded
+// by position, 3999 of 4000 slices were fetched and parked behind slice 0.
+func TestConcurrentSliceSourceBoundsReadAheadBehindSlowSlice(t *testing.T) {
+	const (
+		total       = 4000
+		concurrency = 8
+		window      = 2 * concurrency
+	)
+	order := make([]int64, total)
+	for i := range order {
+		order[i] = int64(i)
+	}
+	release := make(chan struct{})
+	var startedBeforeRelease atomic.Int64
+	var released atomic.Bool
+	fetch := func(i int64) ([]byte, error) {
+		if !released.Load() {
+			startedBeforeRelease.Add(1)
+		}
+		if i == 0 {
+			<-release
+		}
+		return []byte{byte(i)}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := newConcurrentSliceSource(ctx, order, concurrency, fetch)
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		released.Store(true)
+		close(release)
+	}()
+	if _, err := src.ReadSlice(0); err != nil {
+		t.Fatal(err)
+	}
+	if parked := len(src.pending); parked > window {
+		t.Errorf("ReadSlice parked %d slices while slice 0 was outstanding, want at most the window of %d", parked, window)
+	}
+	if started := startedBeforeRelease.Load(); started > window {
+		t.Errorf("%d fetches started while slice 0 was outstanding, want at most the window of %d", started, window)
+	}
+
+	// The window moves with the consumer: every slice still arrives, in
+	// order, with its own data.
+	for _, idx := range order[1:] {
+		data, err := src.ReadSlice(idx)
+		if err != nil {
+			t.Fatalf("ReadSlice(%d): %v", idx, err)
+		}
+		if len(data) != 1 || data[0] != byte(idx) {
+			t.Fatalf("ReadSlice(%d) = %v, want [%d]", idx, data, byte(idx))
+		}
+	}
+}
+
+// Error results hand back their read-ahead slot like good ones. A pass that
+// carries on past unreadable slices (par2.ErrSliceUnavailable) must not hang
+// once more of them than the window have been read.
+func TestConcurrentSliceSourceFailingSlicesDoNotStallTheWindow(t *testing.T) {
+	const (
+		total       = 200
+		concurrency = 2 // window of 4, far fewer than the failing slices
+	)
+	order := make([]int64, total)
+	for i := range order {
+		order[i] = int64(i)
+	}
+	fetch := func(i int64) ([]byte, error) {
+		if i < 50 || i%3 == 0 {
+			return nil, &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
+		}
+		return []byte{byte(i)}, nil
+	}
+	src := newConcurrentSliceSource(context.Background(), order, concurrency, fetch)
+
+	done := make(chan error, 1)
+	go func() {
+		for _, idx := range order {
+			_, err := src.ReadSlice(idx)
+			wantFail := idx < 50 || idx%3 == 0
+			if wantFail && !errors.Is(err, par2.ErrSliceUnavailable) {
+				done <- fmt.Errorf("ReadSlice(%d) error = %v, want ErrSliceUnavailable", idx, err)
+				return
+			}
+			if !wantFail && err != nil {
+				done <- fmt.Errorf("ReadSlice(%d): %v", idx, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading through failing slices hung: an error result did not give back its read-ahead slot")
+	}
+}
+
+// A pass that stops reading early leaves the read-ahead window full, so run()
+// is waiting for a slot. Cancelling the context must free that wait, close
+// the result channel, and let ReadSlice report the cancellation promptly.
+func TestConcurrentSliceSourceCancelReleasesAFullWindow(t *testing.T) {
+	const total = 1000
+	order := make([]int64, total)
+	for i := range order {
+		order[i] = int64(i)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	src := newConcurrentSliceSource(ctx, order, 2, func(i int64) ([]byte, error) {
+		return []byte{byte(i)}, nil
+	})
+	for i := int64(0); i < 3; i++ {
+		if _, err := src.ReadSlice(i); err != nil {
+			t.Fatalf("ReadSlice(%d): %v", i, err)
+		}
+	}
+	// Let the workers fill the window so run() is blocked on a slot.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	closed := make(chan struct{})
+	go func() {
+		// Drain without consuming slots; ends when run() closes the channel.
+		for range src.resultCh {
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("result channel not closed after cancel: run() is still waiting for a read-ahead slot")
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := src.ReadSlice(3)
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReadSlice after cancel = %v, want a wrapped context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadSlice after cancel did not return")
+	}
+}
