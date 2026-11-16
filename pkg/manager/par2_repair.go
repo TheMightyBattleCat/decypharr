@@ -93,9 +93,6 @@ const (
 	// that could run alongside another before still can.
 	largeRepairBytes = 512 << 20
 
-	// par2ArticleFetchTimeout bounds a single article fetch within a job.
-	par2ArticleFetchTimeout = 60 * time.Second
-
 	// par2JobIdleTimeout cancels a repair that has made no forward progress
 	// for this long WHILE in a network phase (fetching recovery or streaming
 	// intact data). It intentionally does not apply during queued, solving
@@ -148,6 +145,10 @@ const (
 	// watchdog ignores, so this ceiling is the only bound that applies.
 	par2PostedStatTimeout = 5 * time.Minute
 )
+
+// par2ArticleFetchTimeout bounds a single article fetch within a job. A
+// variable only so tests can shorten it.
+var par2ArticleFetchTimeout = 60 * time.Second
 
 // repairLane distinguishes the two Par2Repair worker lanes - see the package
 // doc comment above.
@@ -2126,13 +2127,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// pass, so a recovery shortfall that follows one says nothing about
 	// whether the recovery data exists - see recoveryShortfall.
 	var transportFails atomic.Int32
-	fetch := func(fctx context.Context, messageID string) ([]byte, error) {
-		data, err := fetchPosted(fctx, messageID, nil)
-		if err != nil && !nntp.IsArticleNotFoundError(err) && fctx.Err() == nil {
-			transportFails.Add(1)
-		}
-		return data, err
-	}
+	fetch := countPar2TransportFails(ctx, func(fctx context.Context, messageID string) ([]byte, error) {
+		return fetchPosted(fctx, messageID, nil)
+	}, &transportFails)
 	recoveryShortfall := func(damaged, got int) error {
 		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()))
 	}
@@ -4295,6 +4292,24 @@ func fetchMoreVolumes(
 		return nextVolIdx, fetchedSlices, sources, added, err
 	}
 	return nextVolIdx, fetchedSlices, sources, added, nil
+}
+
+// countPar2TransportFails wraps a PAR2 article fetch so that every failure
+// other than a 430 adds one to fails while the job context jobCtx is still
+// live. The context a fetch is handed is the per-article timeout context
+// (see fetchPar2FileConcurrent), so it has always ended by the time a
+// timeout returns: testing it instead of jobCtx skipped every timeout as if
+// the job had been cancelled, and one slow recovery article made the
+// shortfall terminal. Siblings cancelled after a real failure are counted
+// too; that is harmless, as the count only needs to be non-zero.
+func countPar2TransportFails(jobCtx context.Context, fetch articleFetchFunc, fails *atomic.Int32) articleFetchFunc {
+	return func(fctx context.Context, messageID string) ([]byte, error) {
+		data, err := fetch(fctx, messageID)
+		if err != nil && !nntp.IsArticleNotFoundError(err) && jobCtx.Err() == nil {
+			fails.Add(1)
+		}
+		return data, err
+	}
 }
 
 // fetchWholePar2File downloads and concatenates every segment of a retained
