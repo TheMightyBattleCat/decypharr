@@ -494,27 +494,56 @@ func (s *Store) lockFor(nzbID string) *sync.Mutex {
 	return l
 }
 
-func (s *Store) entryDir(nzbID string) string {
-	return filepath.Join(s.root, nzbID)
+// ErrInvalidNZBID is returned for an nzbID that is not a single, ordinary
+// path element under the store root.
+var ErrInvalidNZBID = errors.New("overlay: invalid nzb id")
+
+// validNZBID reports whether nzbID names one directory directly under the
+// store root. An empty ID, "." or "..", or one containing a path separator
+// would let a join leave the root (".." is <data>/usenet, the NZB records).
+func validNZBID(nzbID string) error {
+	if nzbID == "" || nzbID == "." || nzbID == ".." || strings.ContainsAny(nzbID, `/\`) {
+		return fmt.Errorf("%w: %q", ErrInvalidNZBID, nzbID)
+	}
+	return nil
 }
 
-func (s *Store) manifestPath(nzbID string) string {
-	return filepath.Join(s.entryDir(nzbID), manifestFileName)
+func (s *Store) entryDir(nzbID string) (string, error) {
+	if err := validNZBID(nzbID); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.root, nzbID), nil
+}
+
+func (s *Store) manifestPath(nzbID string) (string, error) {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, manifestFileName), nil
 }
 
 // patchPath names a patch blob deterministically from the logical filename's
 // FNV-1a hash plus its segment index, so arbitrary filenames (any character,
 // any length) never need sanitizing into a filesystem-safe path component.
-func (s *Store) patchPath(nzbID, file string, segIndex int) string {
+func (s *Store) patchPath(nzbID, file string, segIndex int) (string, error) {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return "", err
+	}
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(file))
-	return filepath.Join(s.entryDir(nzbID), fmt.Sprintf("patch_%x_%d.bin", h.Sum64(), segIndex))
+	return filepath.Join(dir, fmt.Sprintf("patch_%x_%d.bin", h.Sum64(), segIndex)), nil
 }
 
 // loadManifestLocked reads the manifest for nzbID, or returns a fresh empty
 // one if none exists yet. Caller must hold lockFor(nzbID).
 func (s *Store) loadManifestLocked(nzbID string) (*Manifest, error) {
-	data, err := os.ReadFile(s.manifestPath(nzbID))
+	path, err := s.manifestPath(nzbID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Manifest{Version: manifestVersion, Files: make(map[string]*FileEntry)}, nil
@@ -538,7 +567,10 @@ func (s *Store) loadManifestLocked(nzbID string) (*Manifest, error) {
 // crash or concurrent read never observes a partially-written manifest.
 // Caller must hold lockFor(nzbID).
 func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
-	dir := s.entryDir(nzbID)
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("overlay: create entry dir: %w", err)
 	}
@@ -560,7 +592,7 @@ func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: close tmp manifest: %w", err)
 	}
-	if err := os.Rename(tmpPath, s.manifestPath(nzbID)); err != nil {
+	if err := os.Rename(tmpPath, filepath.Join(dir, manifestFileName)); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: rename tmp manifest: %w", err)
 	}
@@ -668,7 +700,11 @@ func (s *Store) PatchBytes(nzbID, file string, segIndex int) ([]byte, bool) {
 	if !patched {
 		return nil, false
 	}
-	data, err := os.ReadFile(s.patchPath(nzbID, file, segIndex))
+	path, err := s.patchPath(nzbID, file, segIndex)
+	if err != nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
 	}
@@ -745,8 +781,15 @@ func (s *Store) WritePatch(nzbID, file string, segIndex int, data []byte) error 
 		}
 	}
 
-	path := s.patchPath(nzbID, file, segIndex)
-	if err := writeFileAtomic(s.entryDir(nzbID), path, data); err != nil {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
+	path, err := s.patchPath(nzbID, file, segIndex)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(dir, path, data); err != nil {
 		return err
 	}
 
@@ -883,7 +926,11 @@ func (s *Store) DiskUsage(nzbID string) (patchBytes, manifestBytes int64, err er
 	if s == nil {
 		return 0, 0, nil
 	}
-	entries, err := os.ReadDir(s.entryDir(nzbID))
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return 0, 0, err
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, 0, nil
@@ -918,7 +965,11 @@ func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
 		if d.Status != StatusPatched {
 			continue
 		}
-		if info, err := os.Stat(s.patchPath(nzbID, file, d.Index)); err == nil {
+		path, err := s.patchPath(nzbID, file, d.Index)
+		if err != nil {
+			return 0
+		}
+		if info, err := os.Stat(path); err == nil {
 			total += info.Size()
 		}
 	}
@@ -927,10 +978,14 @@ func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
 
 // EntryExists reports whether nzbID has an overlay directory on disk.
 func (s *Store) EntryExists(nzbID string) bool {
-	if s == nil || nzbID == "" {
+	if s == nil {
 		return false
 	}
-	_, err := os.Stat(s.entryDir(nzbID))
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(dir)
 	return err == nil
 }
 
@@ -938,9 +993,13 @@ func (s *Store) EntryExists(nzbID string) bool {
 // patch blob). Called wherever a stored NZB record is torn down - keyed by
 // nzbID (unique), avoiding the name-twin hazard the DFS cache has.
 func (s *Store) DeleteEntry(nzbID string) error {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
-	err := os.RemoveAll(s.entryDir(nzbID))
+	err = os.RemoveAll(dir)
 	mu.Unlock()
 	// The mutex stays in s.locks: goroutines may still hold or wait on it,
 	// and deleting it let a later lockFor mint a second mutex for the same
@@ -984,7 +1043,11 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if len(patched) == 0 {
 		delete(m.Files, file)
 		if len(m.Files) == 0 {
-			if rmErr := os.RemoveAll(s.entryDir(nzbID)); rmErr != nil && !os.IsNotExist(rmErr) {
+			dir, dirErr := s.entryDir(nzbID)
+			if dirErr != nil {
+				return false, dirErr
+			}
+			if rmErr := os.RemoveAll(dir); rmErr != nil && !os.IsNotExist(rmErr) {
 				return false, fmt.Errorf("overlay: clear file damage (last in entry): %w", rmErr)
 			}
 			return false, nil
@@ -1075,13 +1138,19 @@ func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	}
 	for _, d := range fe.DeadSegments {
 		if d.Status == StatusPatched {
-			_ = os.Remove(s.patchPath(nzbID, file, d.Index))
+			if path, err := s.patchPath(nzbID, file, d.Index); err == nil {
+				_ = os.Remove(path)
+			}
 		}
 	}
 	delete(m.Files, file)
 
 	if len(m.Files) == 0 {
-		if err := os.RemoveAll(s.entryDir(nzbID)); err != nil && !os.IsNotExist(err) {
+		dir, err := s.entryDir(nzbID)
+		if err != nil {
+			return false, err
+		}
+		if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("overlay: delete file (last in entry): %w", err)
 		}
 		return true, nil

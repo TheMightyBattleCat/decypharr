@@ -1123,6 +1123,12 @@ func (s *Server) handleOverlayReap(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nzb_id and file are required", http.StatusBadRequest)
 		return
 	}
+	// Only an existing overlay entry can be reaped. The store also refuses an
+	// ID that is not a single path element, so ".." never reaches a delete.
+	if u := s.manager.Usenet(); u == nil || !u.OverlayEntryExists(req.NzbID) {
+		http.Error(w, "no overlay entry for that nzb_id", http.StatusNotFound)
+		return
+	}
 
 	result, err := s.manager.ReapOverlay(req.NzbID, req.File, req.Execute)
 	if err != nil {
