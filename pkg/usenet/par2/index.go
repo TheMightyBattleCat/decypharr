@@ -69,6 +69,11 @@ type Index struct {
 	// partially-unreadable source set.
 	SkippedPackets []SkippedPacket
 
+	// OtherSetPackets counts packets of other recovery sets that the parse
+	// ignored: a release can carry one set per episode, and a source list
+	// built from it mixes them. Not a fault, unlike SkippedPackets.
+	OtherSetPackets int
+
 	// fileBase[i] is the global slice index at which FileOrder[i]'s slices
 	// begin. Same length and order as FileOrder; built once by finalize.
 	fileBase  []int64
@@ -89,6 +94,11 @@ type Source struct {
 // recognized by packet MD5 and only processed once. RecvSlic packet bodies
 // are never copied - only their location is recorded (RecoverySliceRef) -
 // so scanning even a source that includes large recovery volumes stays cheap.
+//
+// A source list that mixes recovery sets (a season pack posted as one PAR2
+// set per episode) is parsed as the set of the first Main packet found, in
+// source order; packets of the other sets are counted in OtherSetPackets and
+// ignored. Use ParseIndexSet to choose the set.
 func ParseIndex(sources []Source) (*Index, error) {
 	return parseIndex(sources, nil)
 }
@@ -96,8 +106,7 @@ func ParseIndex(sources []Source) (*Index, error) {
 // ParseIndexSet is ParseIndex restricted to one recovery set: packets of any
 // other set are ignored rather than failing the parse. A release that carries
 // several PAR2 sets (a season pack posted as one PAR2 set per episode) has
-// them all in its source list; ParseIndex refuses such a mix outright. A zero
-// setID behaves exactly like ParseIndex.
+// them all in its source list. A zero setID behaves exactly like ParseIndex.
 func ParseIndexSet(sources []Source, setID [16]byte) (*Index, error) {
 	if setID == ([16]byte{}) {
 		return parseIndex(sources, nil)
@@ -120,10 +129,40 @@ func SourceSetIDs(sources []Source) [][16]byte {
 
 var errStopWalk = fmt.Errorf("par2: stop walk")
 
+// firstMainSetID returns the recovery set of the first valid Main packet, in
+// source order. A recovery volume often starts with recovery-slice packets,
+// and in a mixed list the first packet of all can belong to a set whose Main
+// packet was never fetched; the Main packet names a set the index can be
+// built from.
+func firstMainSetID(sources []Source) ([16]byte, bool) {
+	for _, src := range sources {
+		var id [16]byte
+		found := false
+		_ = walkPackets(src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+			if h.Type != typeMain {
+				return nil
+			}
+			id, found = h.RecoverySetID, true
+			return errStopWalk
+		})
+		if found {
+			return id, true
+		}
+	}
+	return [16]byte{}, false
+}
+
 func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 	idx := &Index{
 		Files:  make(map[[16]byte]*FileDesc),
 		Slices: make(map[[16]byte][]SliceChecksum),
+	}
+	if want == nil {
+		// With no Main packet anywhere, the parse below fails with "no Main
+		// packet found" (or "no PAR2 packets") as before.
+		if id, ok := firstMainSetID(sources); ok {
+			want = &id
+		}
 	}
 	seen := make(map[[16]byte]struct{})
 	haveSetID := false
@@ -138,7 +177,8 @@ func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 		}
 		err := walkPackets(src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
 			if want != nil && h.RecoverySetID != *want {
-				return nil // another recovery set in the same release
+				idx.OtherSetPackets++ // another recovery set in the same release
+				return nil
 			}
 			if !haveSetID {
 				idx.SetID = h.RecoverySetID

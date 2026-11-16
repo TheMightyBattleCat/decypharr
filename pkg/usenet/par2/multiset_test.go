@@ -2,7 +2,6 @@ package par2
 
 import (
 	"encoding/binary"
-	"strings"
 	"testing"
 )
 
@@ -26,15 +25,21 @@ func secondSetIndex(t *testing.T, setByte byte, name string) (Source, [16]byte) 
 	return Source{Name: "Show.S01E02.par2", Data: data}, set
 }
 
-// A season pack carries one PAR2 set per episode. ParseIndex still refuses
-// the mix; ParseIndexSet parses just the set it is asked for.
+// A season pack carries one PAR2 set per episode. ParseIndex parses the set
+// of the first Main packet and skips the rest; ParseIndexSet parses just the
+// set it is asked for.
 func TestParseIndexSetPicksOneSetOfSeveral(t *testing.T) {
 	episode1 := loadFixtureSources(t)
 	ep2, set2 := secondSetIndex(t, 0xE2, "e02.rar")
 	sources := append([]Source{ep2}, episode1...)
 
-	if _, err := ParseIndex(sources); err == nil || !strings.Contains(err.Error(), "different recovery set") {
-		t.Fatalf("ParseIndex over two sets: err=%v, want the different-set error", err)
+	mixed, err := ParseIndex(sources)
+	if err != nil {
+		t.Fatalf("ParseIndex over two sets: %v, want the first Main packet's set", err)
+	}
+	if mixed.SetID != set2 || len(mixed.Files) != 1 || mixed.OtherSetPackets == 0 || len(mixed.SkippedPackets) != 0 {
+		t.Fatalf("ParseIndex over two sets: set=%x files=%d other=%d skipped=%d, want set %x, 1 file, the other set counted and nothing skipped as bad",
+			mixed.SetID, len(mixed.Files), mixed.OtherSetPackets, len(mixed.SkippedPackets), set2)
 	}
 
 	ids := SourceSetIDs(sources)
@@ -67,7 +72,32 @@ func TestParseIndexSetPicksOneSetOfSeveral(t *testing.T) {
 	}
 
 	// A zero set id is plain ParseIndex.
-	if _, err := ParseIndexSet(sources, [16]byte{}); err == nil {
-		t.Fatal("ParseIndexSet with a zero set id should behave like ParseIndex")
+	if got0, err := ParseIndexSet(sources, [16]byte{}); err != nil || got0.SetID != set2 {
+		t.Fatalf("ParseIndexSet with a zero set id: %v, want ParseIndex's choice %x", err, set2)
+	}
+}
+
+// The first packet of the list belongs to a set whose Main packet is not in
+// it (a recovery volume of another episode, with that episode's index not
+// fetched). The parse adopts the set that has a Main packet instead of
+// failing on the first packet's set.
+func TestParseIndexAdoptsTheFirstMainPacketsSet(t *testing.T) {
+	episode1 := loadFixtureSources(t)
+	var set2 [16]byte
+	set2[0] = 0xE2
+	strayRecovery := Source{Name: "Show.S01E02.vol00+01.par2", Data: buildPacket(t, set2, typeRecvSlic, make([]byte, 4+4096))}
+	sources := append([]Source{strayRecovery}, episode1...)
+
+	want, err := ParseIndex(episode1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseIndex(sources)
+	if err != nil {
+		t.Fatalf("ParseIndex with another set's recovery packet first: %v", err)
+	}
+	if got.SetID != want.SetID || len(got.Recovery) != len(want.Recovery) || got.OtherSetPackets != 1 {
+		t.Fatalf("set=%x recovery=%d other=%d, want set %x, recovery %d, 1 other-set packet",
+			got.SetID, len(got.Recovery), got.OtherSetPackets, want.SetID, len(want.Recovery))
 	}
 }

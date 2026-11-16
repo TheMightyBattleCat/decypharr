@@ -12,8 +12,9 @@ import (
 // par2SetChoice is how runRepair narrows a release that carries more than
 // one PAR2 recovery set - a season pack posted as one set per episode - to
 // the set protecting the damaged files. Handing every set's files to one
-// ParseIndex fails ("belongs to a different recovery set"), which is
-// terminal, so such a pack could never be repaired and was re-grabbed whole.
+// ParseIndex parses only the first set it meets, which need not be the one
+// the damage is in; before that it failed ("belongs to a different recovery
+// set"), which is terminal, so such a pack was re-grabbed whole.
 type par2SetChoice struct {
 	setID   [16]byte // zero when the release has one set, or none could be chosen
 	sources []par2.Source
@@ -169,6 +170,42 @@ func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.Po
 		out.vols = vols
 	}
 	return out
+}
+
+// par2SetAfterVolumes chooses the recovery set again once the first recovery
+// volumes are among sources. The first choice saw only the index files: when
+// one of them failed to fetch, or a set was posted with no index file, the
+// volumes are the first sign of a second set. ok is false when the volumes
+// show no more than one set, and nothing changes.
+//
+// vols[:nextVolIdx] are the volumes already fetched (or tried). The chosen
+// set's volumes keep their order, so its fetched ones stay a prefix; next is
+// their count, the index later fetches resume from in the narrowed list.
+func par2SetAfterVolumes(sources []par2.Source, vols []par2Volume, nextVolIdx int, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) (c par2SetChoice, next int, ok bool) {
+	seen := make(map[[16]byte]bool)
+	for _, id := range par2.SourceSetIDs(sources) {
+		if id != ([16]byte{}) {
+			seen[id] = true
+		}
+	}
+	if len(seen) < 2 {
+		return par2SetChoice{}, nextVolIdx, false
+	}
+	c = choosePar2Set(sources, vols, posted, pending)
+	if c.setID == ([16]byte{}) {
+		return c, nextVolIdx, true
+	}
+	tried := make(map[string]bool, nextVolIdx)
+	for _, v := range vols[:min(nextVolIdx, len(vols))] {
+		tried[v.ref.Name] = true
+	}
+	for _, v := range c.vols {
+		if !tried[v.ref.Name] {
+			break
+		}
+		next++
+	}
+	return c, next, true
 }
 
 // par2BaseName strips a PAR2 file name's volume suffix and extension:

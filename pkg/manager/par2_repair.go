@@ -1105,10 +1105,9 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 		return false, "", fmt.Errorf("failed to fetch any par2 index file")
 	}
 	// Several recovery sets (a season pack): parse the one protecting this file.
-	var verifySet [16]byte
-	if len(posted.Segments) > 0 {
-		verifySet = choosePar2Set(sources, nil, nzb.Par2Source,
-			map[string][]overlay.DeadSegment{file: {{MessageID: posted.Segments[0].MessageID}}}).setID
+	verifySet, err := par2VerifySet(sources, nzb.Par2Source, *posted, file)
+	if err != nil {
+		return false, "", err
 	}
 	idx, err := par2.ParseIndexSet(sources, verifySet)
 	if err != nil {
@@ -1179,6 +1178,33 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 		return false, Par2VerifyMismatch, nil
 	}
 	return true, "", nil
+}
+
+// par2VerifySet is the recovery set Verify checks posted against: zero when
+// the release has one set. With several sets and none tied to this file it
+// is an error, as the parse of the mix was before: ParseIndexSet with a zero
+// ID now parses the first set it meets, and a same-length file of another
+// episode there would match by length alone and report the whole-file MD5
+// as a mismatch.
+func par2VerifySet(sources []par2.Source, postedFiles []storage.PostedFileRef, posted storage.PostedFileRef, file string) ([16]byte, error) {
+	var set [16]byte
+	if len(posted.Segments) > 0 {
+		set = choosePar2Set(sources, nil, postedFiles,
+			map[string][]overlay.DeadSegment{file: {{MessageID: posted.Segments[0].MessageID}}}).setID
+	}
+	if set != ([16]byte{}) {
+		return set, nil
+	}
+	seen := make(map[[16]byte]bool)
+	for _, id := range par2.SourceSetIDs(sources) {
+		if id != ([16]byte{}) {
+			seen[id] = true
+		}
+	}
+	if len(seen) > 1 {
+		return set, fmt.Errorf("parse par2 index: the release carries %d PAR2 recovery sets and none could be tied to this file", len(seen))
+	}
+	return set, nil
 }
 
 // Par2VerifyMismatch is the reason Verify gives when the bytes were checked
@@ -2212,46 +2238,49 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// recovery volumes to plausibly cover every dead segment - "fully
 	// reading the small vols is acceptable v1" per the design; we don't
 	// attempt to skip individual articles within a volume file.
-	var sources []par2.Source
-	for _, f := range indexFiles {
-		data, err := fetchWholePar2File(ctx, fetch, f)
-		if err != nil {
-			p.logger.Debug().Err(err).Str("entry", entryName).Str("file", f.Name).Msg("par2: index file fetch failed; relying on volume-embedded metadata")
-			continue
-		}
-		sources = append(sources, par2.Source{Name: f.Name, Data: data})
-	}
+	// indexFetchErr is set when an index file failed for a reason other than
+	// a 430: the set it describes may be the one protecting the damage, so
+	// the set-dependent failures below are not final - see
+	// par2IndexFetchTransient.
+	sources, indexFetchErr := fetchPar2IndexFiles(ctx, p.logger, fetch, indexFiles, entryName)
 
 	// A release with several PAR2 sets (one per episode of a season pack):
 	// work on the set protecting the damaged files, and leave damage another
 	// set protects for the next pass. See choosePar2Set.
-	setChoice := choosePar2Set(sources, vols, nzb.Par2Source, pending)
-	if setChoice.unattributed > 0 {
-		return par2FetchShortfall(fmt.Sprintf("the damaged files could not be tied to one of the release's %d PAR2 recovery sets", setChoice.unattributed),
-			int(transportFails.Load()))
-	}
-	par2Set := setChoice.setID
-	if par2Set != ([16]byte{}) {
-		sources, vols, pending = setChoice.sources, setChoice.vols, setChoice.pending
+	var par2Set [16]byte
+	deferredDead := 0
+	defer func() {
+		// A pass that repaired this set still leaves the other set's damage:
+		// report it (transient) so the entry is retried soon rather than
+		// recorded as fully repaired.
+		if retErr == nil && deferredDead > 0 {
+			retErr = fmt.Errorf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", deferredDead)
+		}
+	}()
+	applySetChoice := func(c par2SetChoice) error {
+		if c.unattributed > 0 {
+			return par2FetchShortfall(fmt.Sprintf("the damaged files could not be tied to one of the release's %d PAR2 recovery sets", c.unattributed),
+				int(transportFails.Load()))
+		}
+		deferredDead = c.deferred
+		if c.setID == ([16]byte{}) {
+			return nil
+		}
+		par2Set = c.setID
+		sources, vols, pending = c.sources, c.vols, c.pending
 		available = 0
 		for _, v := range vols {
 			available += v.count
 		}
-		p.logger.Info().Str("entry", entryName).Int("volumes", len(vols)).Int("deferred_dead_segments", setChoice.deferred).
+		p.logger.Info().Str("entry", entryName).Int("volumes", len(vols)).Int("deferred_dead_segments", c.deferred).
 			Msg("par2: release carries several recovery sets; repairing the one protecting the damaged files")
 		if len(pending) == 0 {
 			return fmt.Errorf("every dead segment is in another PAR2 set (transient: chosen set has none)")
 		}
+		return nil
 	}
-	if setChoice.deferred > 0 {
-		// A pass that repaired this set still leaves the other set's damage:
-		// report it (transient) so the entry is retried soon rather than
-		// recorded as fully repaired.
-		defer func() {
-			if retErr == nil {
-				retErr = fmt.Errorf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", setChoice.deferred)
-			}
-		}()
+	if err := applySetChoice(choosePar2Set(sources, vols, nzb.Par2Source, pending)); err != nil {
+		return err
 	}
 
 	// Early arithmetic-impossibility gate. The Main/FileDesc/IFSC packets are
@@ -2318,9 +2347,30 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return par2FetchShortfall("failed to fetch any PAR2 file", int(transportFails.Load()))
 	}
 
+	// The index files showed one set, or none could be chosen from them, but
+	// the volumes just fetched may belong to another: an index that did not
+	// fetch, or a set posted with no index file. Choose again now that every
+	// fetched file's set is visible.
+	rechosen := false
+	if par2Set == ([16]byte{}) {
+		if c, next, ok := par2SetAfterVolumes(sources, vols, nextVolIdx, nzb.Par2Source, pending); ok {
+			if err := applySetChoice(c); err != nil {
+				return err
+			}
+			nextVolIdx = next
+			rechosen = par2Set != ([16]byte{})
+		}
+	}
+
 	idx, err := par2.ParseIndexSet(sources, par2Set)
 	if err != nil {
-		return fmt.Errorf("parse PAR2 index: %w", err)
+		return par2IndexFetchTransient(fmt.Errorf("parse PAR2 index: %w", err), indexFetchErr)
+	}
+	// applySetChoice counted only the chosen set's named volumes. As at the
+	// early gate, recovery slices already in hand (from files with no volume
+	// marker) are available too.
+	if rechosen && uint32(len(idx.Recovery)) > available {
+		available = uint32(len(idx.Recovery))
 	}
 	logSkippedPar2Packets(p.logger, entryName, idx)
 
@@ -2395,7 +2445,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			// a retry can match them.
 			return fmt.Errorf("no posted file matched the PAR2 recovery set (transient: %d posted file(s) failed to fetch/hash during matching)", len(skipped))
 		}
-		return fmt.Errorf("no posted file matched the PAR2 recovery set")
+		return par2IndexFetchTransient(errors.New("no posted file matched the PAR2 recovery set"), indexFetchErr)
 	}
 
 	// Posted files MatchFiles couldn't attempt this pass because breaking
@@ -2508,7 +2558,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				if _, transient := transientUnmatch[pn]; isPosted && transient {
 					return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file (transient: posted file %q failed to fetch/hash during matching)", seg.MessageID, file, pn)
 				}
-				return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file)
+				return par2IndexFetchTransient(fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file), indexFetchErr)
 			}
 			if _, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end); err != nil {
 				return fmt.Errorf("map dead segment %s to slices: %w", seg.MessageID, err)
@@ -4455,6 +4505,37 @@ func countPar2TransportFails(jobCtx context.Context, fetch articleFetchFunc, fai
 		}
 		return data, err
 	}
+}
+
+// fetchPar2IndexFiles fetches every index (non-volume) PAR2 file. A file
+// that fails is left out: the volumes carry the same metadata. indexErr is
+// the first failure that was not a 430 while ctx was still live (a timeout,
+// a reset): the file may well still be on the servers.
+func fetchPar2IndexFiles(ctx context.Context, logger zerolog.Logger, fetch articleFetchFunc, indexFiles []storage.Par2FileRef, entryName string) (sources []par2.Source, indexErr error) {
+	for _, f := range indexFiles {
+		data, err := fetchWholePar2File(ctx, fetch, f)
+		if err != nil {
+			logger.Debug().Err(err).Str("entry", entryName).Str("file", f.Name).Msg("par2: index file fetch failed; relying on volume-embedded metadata")
+			if indexErr == nil && !nntp.IsArticleNotFoundError(err) && ctx.Err() == nil {
+				indexErr = fmt.Errorf("index file %q failed to fetch without a 430: %v", f.Name, err)
+			}
+			continue
+		}
+		sources = append(sources, par2.Source{Name: f.Name, Data: data})
+	}
+	return sources, indexErr
+}
+
+// par2IndexFetchTransient tags err, a failure that depends on which recovery
+// set the pass works on, transient when an index file failed to fetch
+// without a 430: with that file missing the pass may have picked the wrong
+// set, or seen too few sets to pick one. err is formatted with %v so the
+// classifier sees the tag rather than a wrapped error it checks first.
+func par2IndexFetchTransient(err, indexErr error) error {
+	if err == nil || indexErr == nil {
+		return err
+	}
+	return fmt.Errorf("%v (transient: PAR2 %v)", err, indexErr)
 }
 
 // fetchWholePar2File downloads and concatenates every segment of a retained

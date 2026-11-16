@@ -71,8 +71,10 @@ func multisetFixture(t *testing.T) (sources []par2.Source, set1, set2 [16]byte, 
 
 func TestChoosePar2SetPicksTheDamagedFilesSet(t *testing.T) {
 	sources, set1, set2, vols, posted := multisetFixture(t)
-	if _, err := par2.ParseIndex(sources); err == nil {
-		t.Fatal("precondition: plain ParseIndex over two sets should fail")
+	// Plain ParseIndex over two sets takes the first Main packet's set
+	// (episode 2's, listed first), whatever the damage.
+	if idx, err := par2.ParseIndex(sources); err != nil || idx.SetID != set2 {
+		t.Fatalf("precondition: plain ParseIndex over two sets: %v, want episode 2's set", err)
 	}
 
 	// Episode 2 damaged only.
@@ -114,8 +116,8 @@ func TestChoosePar2SetBreaksTiesAndLeavesSingleSetAlone(t *testing.T) {
 
 	// One damaged file in each set: a tie. The lower set ID wins, the same way
 	// on every pass, and the other set's damage waits for the next pass.
-	// Before, a tie handed every set to one ParseIndex, which fails ("belongs
-	// to a different recovery set") and was terminal.
+	// Before, a tie handed every set to one ParseIndex, which failed
+	// ("belongs to a different recovery set") and was terminal.
 	want, other := set1, set2
 	if bytes.Compare(set2[:], set1[:]) < 0 {
 		want, other = set2, set1
