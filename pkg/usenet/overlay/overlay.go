@@ -297,6 +297,11 @@ func (s *Store) ClearRejected(nzbID string) {
 // down (MarkRejected) while a repair was still running for it.
 var ErrEntryRejected = errors.New("overlay: entry was deleted; patch not written")
 
+// ErrPatchGeometry is wrapped by WritePatch's refusal of a patch whose length
+// is not the reader's slot for that segment. The refusal is structural: the
+// same pass run again cuts the same bytes and meets it again.
+var ErrPatchGeometry = errors.New("repair and reader segment geometry disagree")
+
 // isRejected reports whether MarkRejected was called for nzbID.
 func (s *Store) isRejected(nzbID string) bool {
 	if s == nil {
@@ -776,8 +781,8 @@ func (s *Store) WritePatch(nzbID, file string, segIndex int, data []byte) error 
 	}
 	if idx >= 0 {
 		if want := fe.DeadSegments[idx].Bytes; want > 0 && int64(len(data)) != want {
-			return fmt.Errorf("patch for segment %d is %d bytes but the reader's slot is %d (repair and reader segment geometry disagree by %+d; refusing to record a patch that cannot be served)",
-				segIndex, len(data), want, int64(len(data))-want)
+			return fmt.Errorf("patch for segment %d is %d bytes but the reader's slot is %d (%w by %+d; refusing to record a patch that cannot be served)",
+				segIndex, len(data), want, ErrPatchGeometry, int64(len(data))-want)
 		}
 	}
 

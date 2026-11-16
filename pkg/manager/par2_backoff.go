@@ -137,6 +137,11 @@ var par2TerminalSubstrings = []string{
 	// The same, for intact articles every provider serves CRC-bad (see
 	// causeCorrupt): no retry fetches a good copy.
 	"corrupt on every provider",
+	// The solve rebuilt a dead segment but its patch cannot be placed: the
+	// reader's slot and the posted article disagree (see
+	// writeRecordedPatches). Every pass cuts the same bytes into the same
+	// slot, so a retry repeats the full read only to be refused again.
+	"cannot be patched: reader slot and article disagree",
 }
 
 // par2SuspectSubstrings are failures classified suspect (see

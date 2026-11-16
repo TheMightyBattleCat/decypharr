@@ -2899,27 +2899,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			p.invalidateRepairedRanges(nzb, nzbID, entryName, deadRefsByFile(written))
 		}
 	}()
-	for _, dr := range placeableRefs {
-		start, end, werr := readerPatchWindow(nzb, dr)
-		if werr != nil {
-			return fmt.Errorf("patch window for %s segment %d: %w", dr.file, dr.seg.Index, werr)
-		}
-		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, start, end)
-		if err != nil {
-			return fmt.Errorf("extract repaired bytes for %s: %w", dr.seg.MessageID, err)
-		}
-		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
-			return fmt.Errorf("write patch for %s segment %d: %w", dr.file, dr.seg.Index, err)
-		}
-		// A prior playback read may have permanently cached this file as
-		// failed (see Usenet.shouldPoisonFailedFile) before this repair
-		// patched its damage. Un-poison it now so the next read builds a
-		// fresh reader against the now-repaired file instead of
-		// short-circuiting on a stale cause. Covers both automatic repair
-		// and a manual "repair now" (RunNow runs this exact same path).
-		u.ClearFailedFile(nzbID, dr.file)
-		written = append(written, dr)
-		tally.addPatchedRecorded(1)
+	recorded, unwritable, err := p.writeRecordedPatches(nzbID, entryName, nzb, idx, repairedByIndex, placeableRefs)
+	written = append(written, recorded...)
+	tally.addPatchedRecorded(len(recorded))
+	if err != nil {
+		return err
 	}
 
 	// Articles this pass itself found gone or corrupt everywhere: their
@@ -2960,8 +2944,78 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 
 	// Segments whose boundaries were never measured stay recorded dead, and
-	// the pass reports them rather than claiming a full repair.
-	return unplaced
+	// the pass reports them rather than claiming a full repair. Only when
+	// they are the sole damage left does an unwritable segment decide the
+	// verdict: the unplaced error keeps its own class (a timed-out geometry
+	// probe is retried), and the next pass meets the unwritable one again.
+	if unplaced != nil {
+		return unplaced
+	}
+	return unwritable
+}
+
+// writeRecordedPatches writes the repaired bytes of each placeable recorded
+// dead segment to the overlay, sorting refs by file and segment so every
+// pass writes them in the same order. It returns the refs it patched.
+//
+// A segment whose patch cannot be placed - the NZB record no longer has
+// it, its reader slot does not fit the article, a covering slice was not
+// rebuilt, or the overlay refuses the length (overlay.ErrPatchGeometry) -
+// is skipped, and the rest are still written: the solve has already rebuilt
+// their bytes. Those refusals come out the same on every pass, so
+// unwritable reports them with text par2TerminalSubstrings lists. Any other
+// write error (the entry was deleted, an I/O failure) is returned as err at
+// once.
+func (p *Par2Repair) writeRecordedPatches(nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, repairedByIndex map[int64][]byte, refs []par2DeadRef) (written []par2DeadRef, unwritable, err error) {
+	u := p.manager.usenet
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].file != refs[j].file {
+			return refs[i].file < refs[j].file
+		}
+		return refs[i].seg.Index < refs[j].seg.Index
+	})
+	skipped := 0
+	var first error
+	skip := func(dr par2DeadRef, cause error) {
+		p.logger.Warn().Err(cause).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+			Msg("par2 repair: repaired bytes for a dead segment cannot be patched; writing the others")
+		skipped++
+		if first == nil {
+			first = cause
+		}
+	}
+	for _, dr := range refs {
+		start, end, werr := readerPatchWindow(nzb, dr)
+		if werr != nil {
+			skip(dr, fmt.Errorf("patch window for %s segment %d: %w", dr.file, dr.seg.Index, werr))
+			continue
+		}
+		data, xerr := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, start, end)
+		if xerr != nil {
+			skip(dr, fmt.Errorf("extract repaired bytes for %s: %w", dr.seg.MessageID, xerr))
+			continue
+		}
+		if perr := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); perr != nil {
+			perr = fmt.Errorf("write patch for %s segment %d: %w", dr.file, dr.seg.Index, perr)
+			if errors.Is(perr, overlay.ErrPatchGeometry) {
+				skip(dr, perr)
+				continue
+			}
+			return written, nil, perr
+		}
+		// A prior playback read may have permanently cached this file as
+		// failed (see Usenet.shouldPoisonFailedFile) before this repair
+		// patched its damage. Un-poison it now so the next read builds a
+		// fresh reader against the now-repaired file instead of
+		// short-circuiting on a stale cause. Covers both automatic repair
+		// and a manual "repair now" (RunNow runs this exact same path).
+		u.ClearFailedFile(nzbID, dr.file)
+		written = append(written, dr)
+	}
+	if skipped > 0 {
+		unwritable = fmt.Errorf("%d dead segment(s) cannot be patched: reader slot and article disagree (first: %w)", skipped, first)
+	}
+	return written, unwritable, nil
 }
 
 // par2RoundShouldStop decides whether runRepair's round loop ends with the
