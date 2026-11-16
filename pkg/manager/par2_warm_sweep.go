@@ -145,6 +145,9 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	}
 	var sources []par2.Source
 	for _, f := range indexFiles {
+		if par2IndexFileTooLarge(f) {
+			continue
+		}
 		data, ferr := fetchWholePar2File(preflightCtx, u.FetchArticle, f)
 		if ferr != nil {
 			return false

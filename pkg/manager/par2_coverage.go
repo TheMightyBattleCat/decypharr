@@ -39,7 +39,9 @@ const par2RecoveryPacketOverhead = 68
 // An obfuscated posting falls back to unnamedRecoveryEstimate's size steps.
 // false when there is nothing to estimate from.
 func Par2CoverageFor(files []storage.Par2FileRef) (Par2Coverage, bool) {
-	vols, indexFiles := censusPar2Volumes(files)
+	// Named volumes only: an obfuscated posting's size-split volumes have no
+	// set stem to group by, so it keeps the estimator below.
+	vols, indexFiles := censusNamedPar2Volumes(files)
 	var posted, perSlice int64
 	sets := 1
 	if len(vols) > 0 {
