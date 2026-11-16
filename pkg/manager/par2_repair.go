@@ -1682,7 +1682,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 				}
 			}
 			if lane == laneUrgent {
-				p.regrabOnTerminal(entry, entryName, pending)
+				p.regrabOnTerminal(entry, entryName, p.pendingAfterPass(nzbID, entryName, pending))
 			}
 		}
 		return
@@ -1870,6 +1870,22 @@ func (p *Par2Repair) notifyFailed(entryName string, err error, crcCanary bool) {
 	})
 }
 
+// pendingAfterPass re-reads nzbID's pending damage once a pass has ended.
+// runRepair often patches part of the damage before it fails (the heal of
+// recorded-dead articles that turn out alive, the placeable segments written
+// before an unplaced error), so the map read before the pass can name files
+// that have nothing left to repair. The pre-pass map is returned only when
+// the overlay can't be read; an empty result means nothing is still damaged.
+func (p *Par2Repair) pendingAfterPass(nzbID, entryName string, prePass map[string][]overlay.DeadSegment) map[string][]overlay.DeadSegment {
+	after, err := p.manager.usenet.OverlayPendingRepair(nzbID)
+	if err != nil {
+		p.logger.Debug().Err(err).Str("entry", entryName).
+			Msg("par2 repair: could not re-read the overlay's pending damage after the pass; using the damage read before it")
+		return prePass
+	}
+	return after
+}
+
 // regrabOnTerminal is the URGENT lane's fast path for a PAR2 verdict that
 // classifyPar2Failure just marked terminal: an immediate Arr file delete +
 // blocklist + re-search, instead of leaving the file broken until the
@@ -1900,19 +1916,23 @@ func (p *Par2Repair) regrabOnTerminal(entry *storage.Entry, entryName string, pe
 		return
 	}
 
-	// A PAR2 verdict is a whole-NZB outcome, so every still-damaged file is
-	// re-grabbed - in a season pack each episode is its own Arr file. This
-	// used to take one file in map order and leave the rest padded for the
-	// sweep. The bulk form skips the per-entry cooldown, which would refuse
-	// every file after the first, and the cache-only warm PAR2 pass, which
-	// can't succeed where this full pass just failed; the regrab guard still
-	// applies (auto=true).
+	// A PAR2 verdict is a whole-NZB outcome, so every file that still has
+	// damage is re-grabbed - in a season pack each episode is its own Arr
+	// file. pending is read after the pass (see pendingAfterPass), so a file
+	// the failed pass still patched in full (a healed article, a placed
+	// segment) is not in it and keeps its import. This used to take one file
+	// in map order and leave the rest padded for the sweep. The bulk form
+	// skips the per-entry cooldown, which would refuse every file after the
+	// first, and the cache-only warm PAR2 pass, which can't succeed where
+	// this full pass just failed; the regrab guard still applies (auto=true).
+	if len(pending) == 0 {
+		p.logger.Info().Str("entry", entryName).
+			Msg("par2 repair: terminal verdict on urgent lane, but the pass patched every recorded dead segment; nothing to re-grab")
+		return
+	}
 	files := make([]string, 0, len(pending))
 	for name := range pending {
 		files = append(files, name)
-	}
-	if len(files) == 0 {
-		files = append(files, entryName)
 	}
 	sort.Strings(files)
 
