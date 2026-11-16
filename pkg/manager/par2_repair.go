@@ -2537,15 +2537,39 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return err
 	}
 	tally.addHealed(recordedRefs - len(deadRefs))
+	// Every recorded dead segment healed. Articles the STAT sweep settled as
+	// missing are still gone: returning here reported the release repaired
+	// and left them for the reader to pad one at a time. Record each one the
+	// reader serves and run the solve for them; the discovered-article step
+	// after it patches them. With none served by the reader, there is
+	// nothing to repair for playback.
+	sweepOnly := false
+	var sweptUnplaced error
 	if len(deadRefs) == 0 {
-		return nil // every dead segment healed; the heal invalidated them
+		if len(statMissing) == 0 {
+			return nil // every dead segment healed; the heal invalidated them
+		}
+		swept := p.recordSweepMisses(nzbID, entryName, discoveredDeadRefs(nzb, matches, fetchers, msgIDRange, nil))
+		if len(swept) == 0 {
+			return nil
+		}
+		var placeable []par2DeadRef
+		if placeable, sweptUnplaced = splitPlaceableDeadRefs(fetchers, swept); len(placeable) == 0 {
+			return sweptUnplaced
+		}
+		sweepOnly = true
 	}
 	// Only segments on measured geometry can be patched (see
 	// splitPlaceableDeadRefs). When none can, the solve - a full read of the
 	// release - would produce nothing writable; stop before it.
 	placeableRefs, unplaced := splitPlaceableDeadRefs(fetchers, deadRefs)
-	if len(placeableRefs) == 0 {
+	if len(placeableRefs) == 0 && !sweepOnly {
 		return unplaced
+	}
+	if sweepOnly {
+		// Swept articles that cannot be placed stay recorded dead; the pass
+		// reports them as it would recorded ones.
+		unplaced = sweptUnplaced
 	}
 	for _, dr := range deadRefs {
 		slices, err := idx.DamagedSlices(dr.rng.fileID, dr.rng.start, dr.rng.end)
@@ -2579,6 +2603,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Str(par2NoteField, fmt.Sprintf("%d more slices on top of %d recorded • budget %d • without %s", found, overlayDamaged, statBudget, strings.Join(statExcluded, ", "))).
 			Msg("par2 repair: damage found with a provider left out is over the recovery budget; leaving it for the solve to confirm")
 		tally.setStatSweep(statSweepState(statSwept, statExcluded, true))
+	}
+	if sweepOnly && len(damagedSet) == 0 {
+		// Found with a provider left out and over the recovery budget, so
+		// not seeded (see foldStatSlices). They are recorded: the next pass
+		// takes them as recorded damage.
+		return fmt.Errorf("%d article(s) the STAT sweep found missing were recorded but not repaired (transient: found with %s left out, and over the recovery budget of %d slices)",
+			len(statMissing), strings.Join(statExcluded, ", "), statBudget)
 	}
 	if extra := len(damagedSet) - overlayDamaged; extra > 0 {
 		if deadDiscovered != nil {
@@ -3075,6 +3106,30 @@ func splitPlaceableDeadRefs(fetchers map[[16]byte]*postedFileFetcher, deadRefs [
 		cause = errors.New("no article could be measured")
 	}
 	return placeable, fmt.Errorf("%d dead segment(s) left unpatched: article boundaries of %q were not measured, so a patch cannot be placed: %w", skipped, file, cause)
+}
+
+// recordSweepMisses records in the overlay each article the STAT sweep
+// settled as missing that the reader serves (refs from discoveredDeadRefs),
+// before a pass with no other damage runs the solve for them. If that solve
+// fails, they stay recorded and the next pass takes them as recorded
+// damage. Returns the refs it recorded.
+func (p *Par2Repair) recordSweepMisses(nzbID, entryName string, refs []par2DeadRef) []par2DeadRef {
+	u := p.manager.usenet
+	recorded := refs[:0:0]
+	for _, dr := range refs {
+		if err := u.RecordOverlayDead(nzbID, dr.file, dr.seg.Index, dr.seg.MessageID, dr.seg.Bytes); err != nil {
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: could not record an article the STAT sweep found missing")
+			continue
+		}
+		recorded = append(recorded, dr)
+	}
+	if len(recorded) > 0 {
+		p.logger.Info().Str("entry", entryName).Int("articles", len(recorded)).
+			Str(par2NoteField, logger.Count(len(recorded), "article")).
+			Msg("par2 repair: recorded damage healed; repairing articles the STAT sweep found missing")
+	}
+	return recorded
 }
 
 // healFetchableDeadSegments patches every dead segment whose article can be
