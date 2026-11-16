@@ -2831,8 +2831,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the short-read case, and one that made a geometry bug on intact data
 		// indistinguishable from genuine provider damage.
 		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
-		if par2RoundShouldStop(len(newlyDamaged), round, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize))) {
-			return par2RoundCapError(confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr)
+		if stopErr := par2RoundStopError(len(newlyDamaged), round, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize)),
+			confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr); stopErr != nil {
+			return stopErr
 		}
 		p.logger.Info().
 			Str("entry", entryName).
@@ -2941,10 +2942,51 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 // again and the next round's opening capacity gate returned "more damage
 // than recorded" - terminal - so a short-read or checksum-bad pass, which
 // classifyPar2Failure treats as suspect, went terminal on its first attempt.
-func par2RoundShouldStop(newlyDamaged, round, k, budget int) bool {
-	return newlyDamaged == 0 ||
-		round >= maxIntactRepairRounds-1 ||
-		k+newlyDamaged > budget
+//
+// The reason says which of the three fired. Only par2RoundStopCap can stop
+// with the enlarged set still inside the budget.
+func par2RoundShouldStop(newlyDamaged, round, k, budget int) (bool, par2RoundStop) {
+	switch {
+	case newlyDamaged == 0:
+		return true, par2RoundStopNothingNew
+	case k+newlyDamaged > budget:
+		return true, par2RoundStopOverBudget
+	case round >= maxIntactRepairRounds-1:
+		return true, par2RoundStopCap
+	}
+	return false, par2RoundContinue
+}
+
+// par2RoundStop is why runRepair's round loop ended.
+type par2RoundStop int
+
+const (
+	par2RoundContinue par2RoundStop = iota
+	par2RoundStopNothingNew
+	par2RoundStopOverBudget
+	par2RoundStopCap
+)
+
+// par2RoundStopError returns nil when the round loop should fold the newly
+// damaged slices in and go round again, and otherwise the error the pass
+// ends with. A stop at the round cap with the enlarged damaged set still
+// inside the budget is transient: with providers timing out, each round can
+// be cut short before it has read everything, so it finds a few more dead
+// slices each time. That says nothing about whether the damage fits, and one
+// more read (after the backoff) can repair it. The cause text is kept for the
+// log, but repairErr is not wrapped, so a 430 inside it cannot make
+// classifyPar2Failure treat the stop as terminal before it sees the tag.
+func par2RoundStopError(newlyDamaged, round, k, budget, confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
+	stop, why := par2RoundShouldStop(newlyDamaged, round, k, budget)
+	if !stop {
+		return nil
+	}
+	capErr := par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad, repairErr)
+	if why != par2RoundStopCap {
+		return capErr
+	}
+	return fmt.Errorf("%v (transient: stopped after %d reads with the damage still inside the recovery budget, %d of %d slices)",
+		capErr, round+1, k+newlyDamaged, budget)
 }
 
 // par2RoundCapError names why intact slices were unreadable when the round
