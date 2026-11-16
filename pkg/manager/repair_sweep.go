@@ -1500,6 +1500,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 			Path:      bf.SourcePath,
 			Size:      bf.Size,
 			IsBroken:  true,
+			InfoHash:  bf.InfoHash,
 		})
 	}
 	if len(byArr) == 0 {
@@ -1647,6 +1648,12 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// when "Redownload Failed" is on — the default). Files with no grab record
 	// (history trimmed, manual import) fall back to an explicit SearchMissing.
 	//
+	// The grab is looked up by the file's own download ID first, so the grab
+	// that produced the broken file is the one blocklisted. The newest grab of
+	// the episode or movie is only the fallback, for when the Arr has no record
+	// of that ID (a season split's generated ID, or trimmed history): it can be
+	// a different download, such as an upgrade still in flight.
+	//
 	// HistoryIDs are deduped per arr — a season-pack grab covers multiple broken
 	// files but only needs one history/failed POST.
 	historyIDs := make(map[int]struct{})
@@ -1667,7 +1674,11 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			needSearch = append(needSearch, f)
 			continue
 		}
-		id, _, herr := a.FindGrabHistoryID(mediaID)
+		id := a.FindGrabHistoryIDForDownload(f.InfoHash, mediaID)
+		var herr error
+		if id == 0 {
+			id, _, herr = a.FindGrabHistoryID(mediaID)
+		}
 		if herr != nil || id == 0 {
 			needSearch = append(needSearch, f)
 			continue

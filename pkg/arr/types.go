@@ -48,6 +48,10 @@ type ContentFile struct {
 	// Arr episode mapping rather than a filename guess (e.g. an "E01-E02"
 	// span parse). Callers should require a wider safety margin when false.
 	EpisodeCountConfirmed bool `json:"episodeCountConfirmed,omitempty"`
+	// InfoHash is the download ID the Arr was given for the grab that
+	// produced this file (empty when unknown). Repair uses it to blocklist
+	// that grab rather than the newest grab of the episode or movie.
+	InfoHash string `json:"infoHash,omitempty"`
 }
 
 func (file *ContentFile) Delete() {
