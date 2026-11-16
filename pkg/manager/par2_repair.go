@@ -2181,14 +2181,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if mgr := p.manager.MountManager(); mgr != nil {
 		cacheReader, _ = mgr.(dfsCacheRangeReader)
 	}
-	cacheSource := &cacheSlicedSource{
-		reader:      cacheReader,
-		entryName:   entryName,
-		byMessageID: buildCacheSegmentMap(nzb),
-		deadRanges:  buildDeadOutputRanges(nzb, pending),
-		cacheBytes:  cacheBytes,
-		progress:    progress,
-	}
+	cacheSource := p.newCacheSource(nzbID, entryName, cacheReader, nzb, pending, cacheBytes, progress)
 
 	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
 
@@ -3326,7 +3319,8 @@ func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName
 	}
 	var forget func(file string, off, length int64)
 	if fw := p.dfsCacheForgetter(); fw != nil {
-		forget = func(file string, off, length int64) { fw.ForgetCachedRange(entryName, file, off, length) }
+		folder := p.dfsCacheFolder(nzbID, entryName)
+		forget = func(file string, off, length int64) { fw.ForgetCachedRange(folder, file, off, length) }
 	}
 	invalidateRepaired(nzb, pending, refresh, forget, func(d time.Duration, f func()) { time.AfterFunc(d, f) })
 

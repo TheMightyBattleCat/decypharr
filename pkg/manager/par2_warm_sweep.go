@@ -112,13 +112,12 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	if err != nil || entry == nil {
 		return false
 	}
-	// Resolved independently from GetEntry, NOT taken from the caller's
-	// EntryHealth.EntryName - a deleted/superseded grab and its same-named
-	// replacement share an EntryName but not an nzbID, and PeekCachedRange
-	// below is keyed by entryName against the CURRENT mount's cache. Using
-	// any other source for this string risks peeking a stale or unrelated
-	// cache item.
-	entryName := entry.Name
+	// The cache folder comes from this nzbID's entry (newCacheSource), NOT
+	// from the caller's EntryHealth.EntryName - a deleted/superseded grab and
+	// its same-named replacement share an EntryName but not an nzbID, and
+	// PeekCachedRange below is keyed against the CURRENT mount's cache. It is
+	// the mount folder, not entry.Name: the two differ under a non-default
+	// folder_naming (see dfsCacheFolder).
 
 	stage = "no PAR2 data in the NZB record"
 	nzb, err := u.GetNZB(nzbID)
@@ -195,15 +194,10 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 		// "warm," so there is nothing this preflight can prove.
 		return false
 	}
-	cacheSource := &cacheSlicedSource{
-		reader:      cacheReader,
-		entryName:   entryName,
-		byMessageID: buildCacheSegmentMap(nzb),
-		deadRanges:  buildDeadOutputRanges(nzb, pending),
-		// cacheBytes/progress deliberately nil: this is a read-only peek,
-		// not real job progress - see cacheSlicedSource.readCached's nil
-		// handling of both fields.
-	}
+	// cacheBytes/progress deliberately nil: this is a read-only peek, not
+	// real job progress - see cacheSlicedSource.readCached's nil handling of
+	// both fields.
+	cacheSource := p.newCacheSource(nzbID, entry.Name, cacheReader, nzb, pending, nil, nil)
 
 	// noFetch never actually fetches; ReadRange below only reaches it on a
 	// cache miss (see postedFileFetcher.ReadRange), at which point the

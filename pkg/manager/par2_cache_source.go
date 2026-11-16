@@ -37,6 +37,23 @@ type dfsCacheRangeForgetter interface {
 	ForgetCachedRange(entryName, filename string, off, length int64)
 }
 
+// dfsCacheFolder returns the name the DFS cache files nzbID's entry under:
+// the mount folder, entry.GetFolder(), which follows folder_naming. That is
+// entry.Name only with the default naming, so PAR2 must not use the name
+// it logs. A season split out of a multi-season NZB has no folder of its
+// own: its files are served from the parent's folder, and the parent is the
+// entry stored under nzbID. fallback is used when the entry can't be read.
+func (p *Par2Repair) dfsCacheFolder(nzbID, fallback string) string {
+	if p.manager != nil {
+		if entry, err := p.manager.GetEntry(nzbID); err == nil && entry != nil {
+			if folder := entry.GetFolder(); folder != "" && folder != "." {
+				return folder
+			}
+		}
+	}
+	return fallback
+}
+
 // dfsCacheForgetter resolves the DFS range-invalidation seam via the same
 // MountManager() type-assertion dfsCacheRangeReader uses. nil when no DFS
 // mount is available - callers treat that as "no durable cache to
@@ -150,11 +167,25 @@ func outputRangeOverlapsAny(rs []outputByteRange, start, end int64) bool {
 // exactly.
 type cacheSlicedSource struct {
 	reader      dfsCacheRangeReader
-	entryName   string
+	entryName   string // the DFS cache folder (dfsCacheFolder), not the entry's display name
 	byMessageID map[string][]cacheMapEntry
 	deadRanges  map[string][]outputByteRange
 	cacheBytes  *int64
 	progress    *par2JobProgressState // nil-safe; live cache_bytes for the progress API
+}
+
+// newCacheSource builds a pass's cacheSlicedSource, keyed by the entry's DFS
+// cache folder (dfsCacheFolder; entryName is the fallback). reader,
+// cacheBytes and progress may be nil.
+func (p *Par2Repair) newCacheSource(nzbID, entryName string, reader dfsCacheRangeReader, nzb *storage.NZB, pending map[string][]overlay.DeadSegment, cacheBytes *int64, progress *par2JobProgressState) *cacheSlicedSource {
+	return &cacheSlicedSource{
+		reader:      reader,
+		entryName:   p.dfsCacheFolder(nzbID, entryName),
+		byMessageID: buildCacheSegmentMap(nzb),
+		deadRanges:  buildDeadOutputRanges(nzb, pending),
+		cacheBytes:  cacheBytes,
+		progress:    progress,
+	}
 }
 
 // readCached returns exactly n bytes if [dataStart, dataStart+n) of
