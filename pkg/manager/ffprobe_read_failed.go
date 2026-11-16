@@ -4,6 +4,8 @@ import "strings"
 
 // ffprobeReadFailedTag marks an ffprobe_unreadable reason whose stderr shows
 // the read itself failing rather than the container failing to parse.
+// checkConfirmed retries such a read and, if it fails again with no dead
+// segment seen, ends inconclusive instead of broken.
 const ffprobeReadFailedTag = " (read failed)"
 
 // ffprobeReadFailedMarkers are what ffmpeg prints when the bytes stop coming

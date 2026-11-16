@@ -486,7 +486,8 @@ func (f *ffprobeChecker) check(ctx context.Context, entryFolder, fileName string
 		if ffprobeReadFailed(stderr.String()) {
 			// The body stopped short (a transport error behind a response
 			// whose headers were already sent), not a container that
-			// cannot be parsed: marked so checkConfirmed retries it.
+			// cannot be parsed: marked so checkConfirmed retries it, and
+			// treats a second failed read as inconclusive, not broken.
 			return false, ffprobeReasonUnreadable + ffprobeReadFailedTag + ": " + firstLine(stderr.String()), true, ""
 		}
 		return false, ffprobeReasonUnreadable + ": " + firstLine(stderr.String()), true, ""
@@ -1498,6 +1499,12 @@ func (f *ffprobeChecker) detectLead(ctx context.Context, entryFolder, fileName s
 // can lead to an automatic delete + re-search, a single bad read is never
 // enough. Only a second consecutive broken verdict is returned as broken.
 //
+// A read that failed on both passes is not broken either: it ends
+// inconclusive (ok=true, conclusive=false), like a timeout. When no news
+// server can be reached the body stops at byte 0 for every file, and the
+// file says nothing about itself. A real missing article still forces
+// broken through deadSignal below.
+//
 // The one exception is an "ffprobe_unreadable" failure: the container could
 // not be opened at all (dead header segments, permanently broken assembly).
 // That is structural and permanent within the same NZB - the retry 2s later
@@ -1582,6 +1589,16 @@ func (f *ffprobeChecker) checkConfirmed(ctx context.Context, entryFolder, fileNa
 	}
 	if ok {
 		return true, "", conclusive, coverage
+	}
+	// Two failed reads with no 430 seen: the bytes never arrived (news
+	// servers unreachable, connections refused, every provider over its
+	// quota), which proves nothing about the file. Broken here would
+	// delete and blocklist every file a sweep probes during an outage.
+	if strings.Contains(reason, ffprobeReadFailedTag) {
+		f.logger.Debug().Str("entry", entryFolder).Str("file", fileName).Str("reason", reason).
+			Msg("Repair: ffprobe read failed twice with no dead segment seen; treating as inconclusive")
+		noteUnverified(ctx, unverifiedInconclusive)
+		return true, "", false, ""
 	}
 	return false, reason, conclusive, coverage
 }
