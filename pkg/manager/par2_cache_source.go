@@ -144,10 +144,31 @@ func buildDeadOutputRanges(nzb *storage.NZB, pending map[string][]overlay.DeadSe
 				continue
 			}
 			seg := nf.Segments[d.Index]
-			out[file] = append(out[file], outputByteRange{start: seg.StartOffset, end: seg.EndOffset + 1})
+			r := outputByteRange{start: seg.StartOffset, end: seg.EndOffset + 1}
+			if nf.IsEncrypted {
+				r = widenForCBC(r, nf.Size)
+			}
+			out[file] = append(out[file], r)
 		}
 	}
 	return out
+}
+
+// widenForCBC widens a padded ciphertext range to every plaintext byte the
+// pad can have corrupted. The reader decrypts AES-CBC above the segment
+// cache, and a plaintext block depends on its own ciphertext block and the
+// one before it. A zero-filled [start, end) therefore spoils plaintext from
+// the start of the block holding start to the end of the block after the
+// one holding end-1: up to 15 bytes before and 16 to 31 after. size <= 0
+// leaves the end unclamped.
+func widenForCBC(r outputByteRange, size int64) outputByteRange {
+	const block = 16
+	r.start &^= block - 1
+	r.end = ((r.end + block - 1) &^ (block - 1)) + block
+	if size > 0 && r.end > size {
+		r.end = size
+	}
+	return r
 }
 
 func outputRangeOverlapsAny(rs []outputByteRange, start, end int64) bool {

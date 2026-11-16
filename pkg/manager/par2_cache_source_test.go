@@ -244,3 +244,40 @@ func TestReadCachedIncrementsCacheByteCounter(t *testing.T) {
 		t.Errorf("cacheBytes counter = %d, want 42", counted)
 	}
 }
+
+// On an encrypted member the reader decrypts AES-CBC above the segment
+// cache, so a zero-filled ciphertext segment spoils plaintext from the start
+// of its first 16-byte block to the end of the block after its last one. The
+// dead range must cover all of it, clamped to the file size.
+func TestBuildDeadOutputRangesWidensEncryptedToCBCBlocks(t *testing.T) {
+	nzb := &storage.NZB{
+		Files: []storage.NZBFile{{
+			Name:        "movie.mkv",
+			Size:        1000,
+			IsEncrypted: true,
+			Segments: []storage.NZBSegment{
+				{MessageID: "<a>", StartOffset: 0, EndOffset: 99},
+				{MessageID: "<b>", StartOffset: 100, EndOffset: 249}, // [100,250)
+				{MessageID: "<c>", StartOffset: 250, EndOffset: 949},
+				{MessageID: "<d>", StartOffset: 950, EndOffset: 999}, // [950,1000), the tail
+			},
+		}},
+	}
+	pending := map[string][]overlay.DeadSegment{
+		"movie.mkv": {{Index: 1, Status: overlay.StatusPadded}, {Index: 3, Status: overlay.StatusPadded}},
+	}
+
+	rs := buildDeadOutputRanges(nzb, pending)["movie.mkv"]
+	want := []outputByteRange{
+		{start: 96, end: 272},   // block of 100 starts at 96; block of 249 ends at 256, plus the next block
+		{start: 944, end: 1000}, // 1024 clamped to the file size
+	}
+	if len(rs) != len(want) {
+		t.Fatalf("dead ranges = %+v, want %+v", rs, want)
+	}
+	for i := range want {
+		if rs[i] != want[i] {
+			t.Errorf("dead range %d = [%d,%d), want [%d,%d)", i, rs[i].start, rs[i].end, want[i].start, want[i].end)
+		}
+	}
+}
