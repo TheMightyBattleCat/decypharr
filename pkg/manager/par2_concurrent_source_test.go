@@ -483,9 +483,12 @@ func TestConcurrentSliceSourceCancelReleasesAFullWindow(t *testing.T) {
 		t.Fatal("result channel not closed after cancel: run() is still waiting for a read-ahead slot")
 	}
 
+	// Ask for a slice far beyond the read-ahead window: it cannot have been
+	// fetched before the cancel, so the only possible answer is the cancellation.
+	// (A slice near the window may already be parked and is rightly served.)
 	errc := make(chan error, 1)
 	go func() {
-		_, err := src.ReadSlice(3)
+		_, err := src.ReadSlice(total - 1)
 		errc <- err
 	}()
 	select {
