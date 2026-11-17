@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -1080,6 +1081,10 @@ func (p *RARParser) parseRAR5FileHeader(data []byte, extraSize uint64, volumeInd
 	if err != nil {
 		return nil
 	}
+	// A size above MaxInt64 turns negative as an int64: corrupt or hostile.
+	if unpackedSize > math.MaxInt64 || packedSize < 0 {
+		return nil
+	}
 
 	// Read file attributes (vint)
 	if _, err := readVInt(r); err != nil {
@@ -1382,6 +1387,11 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 	} else {
 		packedSize = int64(packedSizeLow)
 		unpackedSize = int64(unpackedSizeLow)
+	}
+	// A high word with its top bit set makes the combined size negative.
+	// No real file is that large, so the header is corrupt or hostile.
+	if packedSize < 0 || unpackedSize < 0 {
+		return nil
 	}
 
 	// Read filename
