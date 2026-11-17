@@ -56,6 +56,10 @@ func TestReadFileHeaderStart(t *testing.T) {
 		{"rar5 continued volume", emberly2, FileHeaderStart{DataAt: 138, SplitBefore: true}, true},
 		{"not a volume start", "b3fa5947243ca88903f53162bf162acaaa2b1a79a78d7e3da5ad2ed2e4273f43", FileHeaderStart{}, false},
 		{"rar4 cut inside the file header", tosRar[:80], FileHeaderStart{}, false},
+		// A fuzz find (header size) and its hand-made twin (data size): a vint
+		// near 2^64 turned negative as an int and walked off prefix (panic).
+		{"rar5 header size near 2^64", "526172211a07010030303030fd90bc9dfcd7c9ffa631303030", FileHeaderStart{}, false},
+		{"rar5 data size of 2^63", "526172211a07010000000000" + "0c" + "03" + "02" + "80808080808080808001" + "00000000", FileHeaderStart{}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
