@@ -596,6 +596,13 @@ func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: write tmp manifest: %w", err)
 	}
+	// Flush before the rename: without it a crash can keep the rename but
+	// not the data, leaving an empty manifest.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("overlay: sync tmp manifest: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: close tmp manifest: %w", err)
@@ -620,6 +627,13 @@ func writeFileAtomic(dir, finalPath string, data []byte) error {
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: write tmp patch: %w", err)
+	}
+	// Flush before the rename: without it a crash can keep the rename but
+	// not the data, leaving an empty patch under a "patched" record.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("overlay: sync tmp patch: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
@@ -698,14 +712,14 @@ func (s *Store) PatchBytes(nzbID, file string, segIndex int) ([]byte, bool) {
 	if fe == nil {
 		return nil, false
 	}
-	patched := false
+	want := int64(-1)
 	for _, d := range fe.DeadSegments {
 		if d.Index == segIndex && d.Status == StatusPatched {
-			patched = true
+			want = expectedPatchLen(d)
 			break
 		}
 	}
-	if !patched {
+	if want < 0 {
 		return nil, false
 	}
 	path, err := s.patchPath(nzbID, file, segIndex)
@@ -713,10 +727,83 @@ func (s *Store) PatchBytes(nzbID, file string, segIndex int) ([]byte, bool) {
 		return nil, false
 	}
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, false
 	}
-	return data, true
+	if err == nil && (want == 0 || int64(len(data)) == want) {
+		return data, true
+	}
+	// Missing or the wrong length: a crash after the rename can leave a
+	// patch file empty or short under a manifest that says "patched".
+	// Serving it would give the player a short segment, and nothing would
+	// repair it again (sweeps and the reader skip patched segments).
+	s.unpatchBroken(nzbID, file, segIndex)
+	return nil, false
+}
+
+// expectedPatchLen is the length a patched record's blob must have: the
+// PatchBytes WritePatch stored from len(data). Zero (a manifest written
+// before PatchBytes existed) means unknown, and the length is not checked.
+func expectedPatchLen(d DeadSegment) int64 {
+	return d.PatchBytes
+}
+
+// unpatchBroken flips segIndex's patched record back to dead and removes
+// its patch file, after PatchBytes found the file missing or the wrong
+// length. The file is checked again under the lock, so a WritePatch that
+// replaced it in the meantime is left alone.
+func (s *Store) unpatchBroken(nzbID, file string, segIndex int) {
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return
+	}
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return
+	}
+	idx := -1
+	for i := range fe.DeadSegments {
+		if fe.DeadSegments[i].Index == segIndex && fe.DeadSegments[i].Status == StatusPatched {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	want := expectedPatchLen(fe.DeadSegments[idx])
+	path, err := s.patchPath(nzbID, file, segIndex)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(path)
+	if err == nil && (want == 0 || info.Size() == want) {
+		return
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	got := int64(0)
+	if err == nil {
+		got = info.Size()
+	}
+	s.logger.Warn().Str("nzb", nzbID).Str("file", file).Int("segment", segIndex).
+		Int64("patch_bytes", got).Int64("want_bytes", want).
+		Msg("overlay: patch file missing or the wrong length; segment marked dead for repair")
+	fe.DeadSegments[idx].Status = StatusDead
+	fe.DeadSegments[idx].PatchBytes = 0
+	recomputeVerdictLocked(fe)
+	if err := s.saveManifestLocked(nzbID, m); err != nil {
+		s.logger.Warn().Err(err).Str("nzb", nzbID).Msg("overlay: save manifest after unpatching a broken patch")
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // PatchedSegments returns the indices of file's segments PAR2 has written a
