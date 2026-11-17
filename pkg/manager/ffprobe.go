@@ -1163,6 +1163,14 @@ func (f *ffprobeChecker) runDecodeProbe(ctx context.Context, entryFolder, fileNa
 			noteDecodeErrors(ctx, stderrStr, lines)
 			return true, ffprobeReasonDecodedThrough, false
 		}
+		if ffprobeReadFailed(stderrStr) {
+			// The window's body stopped short (a fetch that failed behind
+			// already-sent headers), not a frame the codec could not
+			// decode: tagged so checkConfirmed retries it and treats a
+			// second failed read with no 430 seen as inconclusive.
+			evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check stopped on a failed read")
+			return false, ffprobeReasonDecodeError + ffprobeReadFailedTag + ": " + firstLine(stderrStr), true
+		}
 		evt().Int("stderr_lines", n).Str("stderr", lines).Msg("Repair: ffprobe decode check found a decode error")
 		return false, ffprobeReasonDecodeError + ": " + firstLine(stderrStr), true
 	}
