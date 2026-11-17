@@ -484,6 +484,13 @@ func oneLine(s string) string {
 // when par2cmdline is not installed.
 func newP2eEnv(t *testing.T, n int) ([]*p2eServer, *p2eFixture) {
 	t.Helper()
+	return newP2eEnvSets(t, n)
+}
+
+// newP2eEnvSets is newP2eEnv with the release's PAR2 recovery sets given
+// (see buildP2eFixture).
+func newP2eEnvSets(t *testing.T, n int, sets ...p2eSet) ([]*p2eServer, *p2eFixture) {
+	t.Helper()
 	par2Bin, err := exec.LookPath("par2")
 	if err != nil {
 		t.Skip("par2 (par2cmdline) not installed")
@@ -501,7 +508,7 @@ func newP2eEnv(t *testing.T, n int) ([]*p2eServer, *p2eFixture) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	fx, err := buildP2eFixture(t.TempDir(), par2Bin)
+	fx, err := buildP2eFixture(t.TempDir(), par2Bin, sets...)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}

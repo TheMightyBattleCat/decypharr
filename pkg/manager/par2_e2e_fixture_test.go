@@ -108,8 +108,16 @@ func (f *p2eFile) cut(all map[string]*p2eArticle) {
 	}
 }
 
-// buildP2eFixture writes the release into dir and runs par2cmdline on it.
-func buildP2eFixture(dir, par2Bin string) (*p2eFixture, error) {
+// p2eSet is one PAR2 recovery set of a fixture: the set's base name and the
+// indexes into p2eFixture.posted of the files it protects.
+type p2eSet struct {
+	base  string
+	files []int
+}
+
+// buildP2eFixture writes the release into dir and runs par2cmdline on it,
+// once per set. With no sets, one set named p2eRelease protects every file.
+func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 	rng := rand.New(rand.NewSource(20261116))
 	mk := func(name string, size int) (*p2eFile, error) {
 		d := make([]byte, size)
@@ -134,14 +142,19 @@ func buildP2eFixture(dir, par2Bin string) (*p2eFixture, error) {
 		}
 		fx.posted = append(fx.posted, f)
 	}
-	args := []string{"create", "-q", "-s16384", "-r20", "-n3", p2eRelease + ".par2"}
-	for _, f := range fx.posted {
-		args = append(args, f.name)
+	if len(sets) == 0 {
+		sets = []p2eSet{{base: p2eRelease, files: []int{0, 1, 2}}}
 	}
-	cmd := exec.Command(par2Bin, args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("par2 create: %v: %s", err, out)
+	for _, set := range sets {
+		args := []string{"create", "-q", "-s16384", "-r20", "-n3", set.base + ".par2"}
+		for _, i := range set.files {
+			args = append(args, fx.posted[i].name)
+		}
+		cmd := exec.Command(par2Bin, args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("par2 create %s: %v: %s", set.base, err, out)
+		}
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {

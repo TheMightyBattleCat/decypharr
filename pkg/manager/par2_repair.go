@@ -612,6 +612,53 @@ func (p *Par2Repair) followUpMerged(nzbID, entryName string, merged int, proximi
 	}
 }
 
+// followUpDeferredSets queues the next pass for an entry whose pass repaired
+// one PAR2 recovery set and left dead segments another set protects. It runs
+// once the pass has released its handler claim, as followUpMerged does, and
+// goes through the same gate.
+func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int, proximity time.Duration) {
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
+	if entryName == "" {
+		entryName = nzbID
+	}
+	ev := p.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Int("dead_segments", deferred).
+		Str(par2NoteField, logger.Count(deferred, "dead segment")+" in another recovery set")
+	switch p.enqueueUrgent(nzbID, proximity) {
+	case urgentQueued, urgentMerged:
+		ev.Msg("par2 repair: one recovery set repaired; queued the next pass for the damage another set protects")
+	case urgentRefusedGate:
+		ev.Msg("par2 repair: one recovery set repaired; the damage another set protects is left, the entry is backing off or unrepairable")
+	case urgentRefusedRegrab:
+		ev.Msg("par2 repair: one recovery set repaired; the damage another set protects is left, a re-grab now owns the entry")
+	}
+}
+
+// par2SetsDeferredError is runRepair's result when it repaired the PAR2
+// recovery set it chose and left dead segments another set protects for the
+// next pass. Its text is classified transient (see classifyPar2Failure).
+type par2SetsDeferredError struct {
+	dead int
+}
+
+func (e *par2SetsDeferredError) Error() string {
+	return fmt.Sprintf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", e.dead)
+}
+
+// par2DeferredSetsSuccess returns how many dead segments err leaves to
+// another PAR2 set when the pass that returned it repaired its own set: 0
+// for any other error, and 0 when the pass wrote nothing. A pass that wrote
+// nothing keeps the failure and its backoff; queueing it again at once
+// would choose the same set and loop.
+func par2DeferredSetsSuccess(err error, tally *par2PassTally) int {
+	var d *par2SetsDeferredError
+	if !errors.As(err, &d) || tally.patched() == 0 {
+		return 0
+	}
+	return d.dead
+}
+
 // AutoEnqueue is the automatic-trigger entry point - called from the reader's
 // padding path (via overlay.Store's repair-enqueue callback) and the repair
 // sweep, never from an explicit GUI action (see Enqueue for that). A no-op
@@ -1488,11 +1535,19 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			Msg("par2 repair: a pass is already running for this entry; skipping duplicate")
 		return
 	}
+	// setsDeferred is set when the pass repaired one PAR2 set and left
+	// another set's damage: the follow-up for it is queued below, and covers
+	// merged requests too.
+	setsDeferred := 0
 	// Registered first among the job's own defers, so it runs last: after
 	// the handler claim below is released, which a follow-up pass needs to
 	// take.
 	defer func() {
 		merged, proximity, name := p.releaseRunNamed(nzbID, job)
+		if setsDeferred > 0 {
+			p.followUpDeferredSets(nzbID, name, setsDeferred, proximity)
+			return
+		}
 		p.followUpMerged(nzbID, name, merged, proximity)
 	}()
 
@@ -1627,7 +1682,16 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	var slicesRepaired int
 	var deadSlicesDiscovered int // distinct dead slices the repair engine found across all rounds, beyond what the overlay already recorded
 	tally := &par2PassTally{recorded: deadSegments}
-	if err := p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress, tally); err != nil {
+	err = p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress, tally)
+	if deferredDead := par2DeferredSetsSuccess(err, tally); deferredDead > 0 && !job.preempted.Load() && (p.ctx == nil || p.ctx.Err() == nil) {
+		// The chosen set is repaired; the damage another set protects waits
+		// for the next pass, queued as this one ends. Recording this as a
+		// failure armed a backoff, kept the repaired files failed and queued
+		// nothing.
+		setsDeferred = deferredDead
+		err = nil
+	}
+	if err != nil {
 		if job.preempted.Load() {
 			preempted = true
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
@@ -1711,6 +1775,7 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 		Dur("duration", time.Since(start)).
 		Int64("cache_bytes", cacheBytes).
 		Int64("usenet_bytes", readBytes).
+		Int("deferred_dead_segments", setsDeferred).
 		Msg("par2 repair completed")
 	progress.SetPhase(Par2PhaseCompleted)
 	p.recordAttempt(&storage.Par2RepairAttempt{
@@ -2294,10 +2359,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	deferredDead := 0
 	defer func() {
 		// A pass that repaired this set still leaves the other set's damage:
-		// report it (transient) so the entry is retried soon rather than
-		// recorded as fully repaired.
+		// report it so it is not recorded as fully repaired. runJob counts
+		// the set it repaired as a success and queues the next pass at once
+		// (see par2DeferredSetsSuccess).
 		if retErr == nil && deferredDead > 0 {
-			retErr = fmt.Errorf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", deferredDead)
+			retErr = &par2SetsDeferredError{dead: deferredDead}
 		}
 	}()
 	applySetChoice := func(c par2SetChoice) error {
