@@ -506,10 +506,19 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 				}
 			}
 
-			// Commit (updates cache state to StateOnDisk).
+			// Commit (updates cache state to StateOnDisk). A body no longer
+			// than the segment's header skip stores nothing; that is missing
+			// like the zero-byte case above, so failover and then the overlay
+			// decide instead of the slot staying Fetching with no owner.
 			commitStart := time.Now()
-			writer.Finalize()
+			committed := writer.Finalize()
 			phases.store += time.Since(commitStart)
+			if !committed {
+				return &nntp.Error{
+					Type:    nntp.ErrorTypeArticleNotFound,
+					Message: "article stored no data after its header skip",
+				}
+			}
 			if meta != nil && meta.Part > 0 && meta.Part == int64(seg.Number) && sf.partNumbersMatched.Load() < partNumberTrust {
 				sf.partNumbersMatched.Add(1)
 			}

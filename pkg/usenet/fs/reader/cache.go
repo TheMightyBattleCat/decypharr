@@ -436,9 +436,12 @@ func (sc *SegmentCache) Put(segIdx int, data []byte) error {
 
 // segmentWriter is the contract doFetch uses to stream a segment body into
 // the cache. Exactly one of Finalize/Discard is called per writer.
+// Finalize reports whether it committed the segment: false means nothing was
+// stored (the body was no longer than the header skip) and the slot is left
+// as it was, for the caller to fail or release.
 type segmentWriter interface {
 	Write(p []byte) (int, error)
-	Finalize()
+	Finalize() bool
 	Discard()
 }
 
@@ -516,10 +519,11 @@ func (w *bufferStreamWriter) Write(p []byte) (int, error) {
 func (w *bufferStreamWriter) Discard() {}
 
 // Finalize commits the segment to the cache: state to OnDisk, length
-// recorded, waiters woken.
-func (w *bufferStreamWriter) Finalize() {
+// recorded, waiters woken. It returns false, changing nothing, when no bytes
+// were stored.
+func (w *bufferStreamWriter) Finalize() bool {
 	if w.cache == nil || w.segIdx < 0 || w.written <= 0 {
-		return
+		return false
 	}
 	w.cache.curDisk.Add(w.written)
 	w.cache.segLengths[w.segIdx].Store(w.written)
@@ -527,6 +531,7 @@ func (w *bufferStreamWriter) Finalize() {
 	w.cache.touchSegment(w.segIdx)
 	w.cache.wakeWaiters(w.segIdx)
 	w.cache.signalEvict()
+	return true
 }
 
 // PinRange marks segments as in-use, preventing eviction.
