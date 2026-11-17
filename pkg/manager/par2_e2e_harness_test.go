@@ -480,20 +480,26 @@ func oneLine(s string) string {
 // newP2eEnv starts n fake servers holding every fixture article, builds the
 // release fixture with par2cmdline and configures one provider per server,
 // in priority order. Providers are told apart by host, so the first is
-// 127.0.0.1 and the rest are "localhost" (n is at most 2). It skips the test
-// when par2cmdline is not installed.
+// 127.0.0.1 and the rest are "localhost" (n is at most 2). The PAR2 set
+// comes from testdata, so it needs no par2cmdline.
 func newP2eEnv(t *testing.T, n int) ([]*p2eServer, *p2eFixture) {
 	t.Helper()
 	return newP2eEnvSets(t, n)
 }
 
 // newP2eEnvSets is newP2eEnv with the release's PAR2 recovery sets given
-// (see buildP2eFixture).
+// (see buildP2eFixture). With sets it skips the test when par2cmdline is not
+// installed.
 func newP2eEnvSets(t *testing.T, n int, sets ...p2eSet) ([]*p2eServer, *p2eFixture) {
 	t.Helper()
-	par2Bin, err := exec.LookPath("par2")
-	if err != nil {
-		t.Skip("par2 (par2cmdline) not installed")
+	// The default set comes from testdata; only other sets need par2cmdline.
+	par2Bin := ""
+	if len(sets) > 0 {
+		bin, err := exec.LookPath("par2")
+		if err != nil {
+			t.Skip("par2 (par2cmdline) not installed")
+		}
+		par2Bin = bin
 	}
 	// Production starts the cached clock at boot; nntp deadlines are built
 	// from utils.Now(), which is frozen at package init without this. The

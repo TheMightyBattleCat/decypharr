@@ -117,8 +117,16 @@ type p2eSet struct {
 	redundancy int
 }
 
+// p2eTestdata holds the default set (p2eDefaultSet) as par2cmdline 1.2.0
+// made it for this fixture, so tests that use it need no par2 binary.
+// TestP2eTestdataMatchesPar2cmdline checks it against a fresh run.
+const p2eTestdata = "testdata/p2e"
+
+var p2eDefaultSet = p2eSet{base: p2eRelease, files: []int{0, 1, 2}}
+
 // buildP2eFixture writes the release into dir and runs par2cmdline on it,
-// once per set. With no sets, one set named p2eRelease protects every file.
+// once per set. With no sets, one set named p2eRelease protects every file;
+// it is copied from p2eTestdata when par2Bin is "".
 func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 	rng := rand.New(rand.NewSource(20261116))
 	mk := func(name string, size int) (*p2eFile, error) {
@@ -144,8 +152,12 @@ func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 		}
 		fx.posted = append(fx.posted, f)
 	}
-	if len(sets) == 0 {
-		sets = []p2eSet{{base: p2eRelease, files: []int{0, 1, 2}}}
+	if len(sets) == 0 && par2Bin == "" {
+		if err := p2eCopyTestdata(dir); err != nil {
+			return nil, err
+		}
+	} else if len(sets) == 0 {
+		sets = []p2eSet{p2eDefaultSet}
 	}
 	for _, set := range sets {
 		redundancy := set.redundancy
@@ -194,6 +206,26 @@ func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 		f.cut(fx.all)
 	}
 	return fx, nil
+}
+
+func p2eCopyTestdata(dir string) error {
+	entries, err := os.ReadDir(p2eTestdata)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".par2") {
+			continue
+		}
+		d, err := os.ReadFile(filepath.Join(p2eTestdata, e.Name()))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, e.Name()), d, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (fx *p2eFixture) file(name string) *p2eFile {
