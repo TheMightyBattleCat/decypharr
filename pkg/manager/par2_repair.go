@@ -2159,6 +2159,11 @@ func par2MatchFromCache(idx *par2.Index, par2Source []storage.PostedFileRef, cac
 // but ONLY when that result fully resolved the release: no skips, and one
 // distinct match per posted file. A partial result returns nil (not cached)
 // so a later cache hit can never mask a file MatchFiles couldn't pair.
+//
+// A result with an unconfirmed pairing (par2.Match.Unconfirmed) is not
+// cached either: the cache keeps no evidence, so a hit would hand runRepair
+// the pairing as proven and its patches would skip the confirmation they
+// need. Matching runs again on the next pass instead.
 func par2MatchToCache(par2Source []storage.PostedFileRef, matches []par2.Match, skipped []par2.MatchSkip) []storage.Par2MatchRef {
 	if len(skipped) != 0 || len(matches) != len(par2Source) {
 		return nil
@@ -2167,7 +2172,7 @@ func par2MatchToCache(par2Source []storage.PostedFileRef, matches []par2.Match, 
 	seenFID := make(map[[16]byte]bool, len(matches))
 	out := make([]storage.Par2MatchRef, 0, len(matches))
 	for _, m := range matches {
-		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) || seen[m.PostedIndex] || seenFID[m.FileID] {
+		if m.PostedIndex < 0 || m.PostedIndex >= len(par2Source) || seen[m.PostedIndex] || seenFID[m.FileID] || m.Unconfirmed() {
 			return nil
 		}
 		seen[m.PostedIndex] = true
@@ -3133,6 +3138,14 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	progress.SetPhase(Par2PhaseWriting)
 
+	// A file paired with its FileDesc by elimination (or by a differing
+	// name) has nothing read behind the pairing. The solve rebuilt the
+	// FileDesc's bytes; written over a posted file that is some other file
+	// of the same length they would be served as verified data. Its patches
+	// wait until a pass reads one of its slices through the pairing.
+	unconfirmed := unconfirmedPairings(idx, matches, damagedPos)
+	placeableRefs, withheld := withholdUnconfirmedRefs(placeableRefs, unconfirmed)
+
 	repairedByIndex := make(map[int64][]byte, len(repaired))
 	for _, rs := range repaired {
 		repairedByIndex[rs.Index] = rs.Data
@@ -3159,6 +3172,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// written is logged and left, never failing a pass that repaired what
 	// it was asked to.
 	discovered, _ := splitPlaceableDeadRefs(fetchers, discoveredDeadRefs(nzb, matches, fetchers, msgIDRange, deadRefs))
+	discovered, withheldDiscovered := withholdUnconfirmedRefs(discovered, unconfirmed)
+	withheld = append(withheld, withheldDiscovered...)
 	patchedDiscovered := 0
 	for _, dr := range discovered {
 		start, end, werr := readerPatchWindow(nzb, dr)
@@ -3198,7 +3213,84 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if unplaced != nil {
 		return unplaced
 	}
+	if len(withheld) > 0 {
+		return unconfirmedPairingErr(withheld, matches, nzb)
+	}
 	return unwritable
+}
+
+// unconfirmedPairings returns the FileIDs whose pairing no content backs
+// (par2.Match.Unconfirmed) and of which this pass read no slice: every
+// slice of the file was in the damaged set and rebuilt from parity. A
+// successful par2.RepairWith read every slice outside damaged and checked
+// it against its IFSC, so one such slice proves the posted file is the
+// FileDesc it was paired with.
+func unconfirmedPairings(idx *par2.Index, matches []par2.Match, damaged map[int64]struct{}) map[[16]byte]bool {
+	var out map[[16]byte]bool
+	for _, m := range matches {
+		if !m.Unconfirmed() {
+			continue
+		}
+		fd := idx.Files[m.FileID]
+		if fd == nil {
+			continue
+		}
+		slices, err := idx.DamagedSlices(m.FileID, 0, fd.Length)
+		confirmed := false
+		if err == nil {
+			for _, s := range slices {
+				if _, dmg := damaged[s]; !dmg {
+					confirmed = true
+					break
+				}
+			}
+		}
+		if !confirmed {
+			if out == nil {
+				out = make(map[[16]byte]bool)
+			}
+			out[m.FileID] = true
+		}
+	}
+	return out
+}
+
+// withholdUnconfirmedRefs splits off the refs in a file of unconfirmed (see
+// unconfirmedPairings), which must not be patched.
+func withholdUnconfirmedRefs(refs []par2DeadRef, unconfirmed map[[16]byte]bool) (kept, withheld []par2DeadRef) {
+	if len(unconfirmed) == 0 {
+		return refs, nil
+	}
+	kept = refs[:0:0]
+	for _, dr := range refs {
+		if unconfirmed[dr.rng.fileID] {
+			withheld = append(withheld, dr)
+			continue
+		}
+		kept = append(kept, dr)
+	}
+	return kept, withheld
+}
+
+// unconfirmedPairingErr is the pass's error when patches were withheld for
+// an unconfirmed pairing. Transient: the segments stay recorded dead, and a
+// later pass that reads one slice of the file confirms the pairing.
+func unconfirmedPairingErr(withheld []par2DeadRef, matches []par2.Match, nzb *storage.NZB) error {
+	fid := withheld[0].rng.fileID
+	posted, how := withheld[0].file, "elimination"
+	for _, m := range matches {
+		if m.FileID != fid {
+			continue
+		}
+		if m.PostedIndex >= 0 && m.PostedIndex < len(nzb.Par2Source) {
+			posted = nzb.Par2Source[m.PostedIndex].Name
+		}
+		if m.Evidence == par2.EvidenceName {
+			how = "a name that differs from the PAR2 file's"
+		}
+		break
+	}
+	return par2Failf(par2Transient, "%d dead segment(s) left unpatched: posted file %q was paired with its PAR2 file by %s and no slice of it could be read to confirm the pairing (transient: a pass that reads one confirms it)", len(withheld), posted, how)
 }
 
 // writeRecordedPatches writes the repaired bytes of each placeable recorded

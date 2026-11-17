@@ -108,11 +108,13 @@ func (f *p2eFile) cut(all map[string]*p2eArticle) {
 	}
 }
 
-// p2eSet is one PAR2 recovery set of a fixture: the set's base name and the
-// indexes into p2eFixture.posted of the files it protects.
+// p2eSet is one PAR2 recovery set of a fixture: the set's base name, the
+// indexes into p2eFixture.posted of the files it protects, and its
+// redundancy in percent (0 means 20).
 type p2eSet struct {
-	base  string
-	files []int
+	base       string
+	files      []int
+	redundancy int
 }
 
 // buildP2eFixture writes the release into dir and runs par2cmdline on it,
@@ -146,7 +148,11 @@ func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 		sets = []p2eSet{{base: p2eRelease, files: []int{0, 1, 2}}}
 	}
 	for _, set := range sets {
-		args := []string{"create", "-q", "-s16384", "-r20", "-n3", set.base + ".par2"}
+		redundancy := set.redundancy
+		if redundancy == 0 {
+			redundancy = 20
+		}
+		args := []string{"create", "-q", "-s16384", fmt.Sprintf("-r%d", redundancy), "-n3", set.base + ".par2"}
 		for _, i := range set.files {
 			args = append(args, fx.posted[i].name)
 		}
