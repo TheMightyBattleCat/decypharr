@@ -199,13 +199,35 @@ func (reg *repairHandlerRegistry) TryAcquireRegrab(nzbID string) (release func()
 		wasTerminal = true
 	}
 	reg.entries[nzbID] = &repairHandlerState{kind: handlerRegrab, since: reg.nowFn()}
-	return func() {
-		if wasTerminal {
-			reg.MarkTerminal(nzbID)
-			return
-		}
-		reg.Release(nzbID)
-	}, true
+	return func() { reg.releaseRegrab(nzbID, wasTerminal) }, true
+}
+
+// ReleaseRegrab clears nzbID's claim only if it is a re-grab claim: a
+// re-grab that ends must not free a PAR2 pass's claim taken over it
+// meanwhile, or a second re-grab could claim and delete the entry under the
+// running pass (the counterpart of ReleasePar2).
+func (reg *repairHandlerRegistry) ReleaseRegrab(nzbID string) {
+	reg.releaseRegrab(nzbID, false)
+}
+
+// releaseRegrab is ReleaseRegrab; restoreTerminal puts back the terminal
+// mark a TryAcquireRegrab took over, again only while the re-grab claim is
+// still the one in place.
+func (reg *repairHandlerRegistry) releaseRegrab(nzbID string, restoreTerminal bool) {
+	if nzbID == "" {
+		return
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	e, ok := reg.entries[nzbID]
+	if !ok || e.terminal || e.kind != handlerRegrab {
+		return
+	}
+	if restoreTerminal {
+		reg.entries[nzbID] = &repairHandlerState{kind: handlerNone, since: reg.nowFn(), terminal: true}
+		return
+	}
+	delete(reg.entries, nzbID)
 }
 
 // Set unconditionally claims nzbID for kind, overwriting any existing
@@ -220,6 +242,22 @@ func (reg *repairHandlerRegistry) Set(nzbID string, kind repairHandlerKind) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	reg.entries[nzbID] = &repairHandlerState{kind: kind, since: reg.nowFn()}
+}
+
+// SetUnlessRegrab is Set, except that it refuses (returns false) while a
+// live re-grab claim holds nzbID: that re-grab is about to delete the entry.
+func (reg *repairHandlerRegistry) SetUnlessRegrab(nzbID string, kind repairHandlerKind) bool {
+	if nzbID == "" {
+		return false
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.reapIfStaleLocked(nzbID)
+	if e, ok := reg.entries[nzbID]; ok && !e.terminal && e.kind == handlerRegrab {
+		return false
+	}
+	reg.entries[nzbID] = &repairHandlerState{kind: kind, since: reg.nowFn()}
+	return true
 }
 
 // Transition updates an already-claimed, non-terminal entry's kind in place

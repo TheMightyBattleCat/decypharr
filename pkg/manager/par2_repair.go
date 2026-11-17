@@ -881,13 +881,19 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 	p.queued[nzbID] = struct{}{}
 	p.mu.Unlock()
 
-	// Manual override: force-claim the handler registry regardless of
-	// whatever it currently holds (including a terminal mark from a prior
-	// automatic PAR2 failure) - a user-initiated "repair now" always
-	// proceeds and always re-evaluates from scratch, same as
-	// par2ShouldAutoEnqueue's terminal gate not applying here either.
+	// Manual override: force-claim the handler registry over whatever it
+	// currently holds (including a terminal mark from a prior automatic
+	// PAR2 failure) - a user-initiated "repair now" re-evaluates from
+	// scratch, same as par2ShouldAutoEnqueue's terminal gate not applying
+	// here either. The one exception is a live re-grab: it is about to
+	// delete the entry, so a pass would run on a vanishing release.
 	if p.repair != nil && p.repair.handlers != nil {
-		p.repair.handlers.Set(nzbID, handlerPar2Running)
+		if !p.repair.handlers.SetUnlessRegrab(nzbID, handlerPar2Running) {
+			p.mu.Lock()
+			delete(p.queued, nzbID)
+			p.mu.Unlock()
+			return fmt.Errorf("a re-grab is handling this entry")
+		}
 	}
 
 	p.wg.Add(1)

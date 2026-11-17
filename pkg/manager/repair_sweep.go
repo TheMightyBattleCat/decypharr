@@ -1665,9 +1665,7 @@ func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
 			continue
 		}
 		seen[bf.InfoHash] = struct{}{}
-		if kind, terminal, exists := r.handlers.State(bf.InfoHash); exists && !terminal && kind == handlerRegrab {
-			r.handlers.Release(bf.InfoHash)
-		}
+		r.handlers.ReleaseRegrab(bf.InfoHash)
 	}
 }
 
@@ -2684,7 +2682,7 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 	if r == nil || r.handlers == nil || nzbID == "" {
 		return
 	}
-	r.handlers.Release(nzbID)
+	r.handlers.ReleaseRegrab(nzbID)
 }
 
 // RepairPlaybackFileNow repairs a file that just failed playback WITHOUT
@@ -2941,7 +2939,7 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 				Msg("Import: entry already being handled; skipping re-grab")
 			return nil
 		}
-		defer r.handlers.Release(nzbID)
+		defer r.handlers.ReleaseRegrab(nzbID)
 	}
 
 	a := r.manager.arr.GetOrCreate(entry.Category)
