@@ -58,6 +58,9 @@ type Decision int
 const (
 	DecisionFail Decision = iota
 	DecisionPad
+	// DecisionPatch: the segment already has a PAR2 patch (written after
+	// the caller last looked). Nothing was changed; serve the patch.
+	DecisionPatch
 )
 
 // DeadSegment is one confirmed-missing article recorded against a logical file.
