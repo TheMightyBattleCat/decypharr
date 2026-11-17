@@ -2685,6 +2685,19 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			recoveryShortfall(deadCount, 0))
 	}
 
+	// The repair stream checks every intact slice against its IFSC checksum,
+	// so a file with no checksums fails the pass part-way through, and every
+	// later pass fails the same way on the same volumes. Every PAR2 file of
+	// the set carries the packet: fetch further volumes until each file has
+	// its checksums or none are left.
+	idx, nextVolIdx, sources, err = topUpSliceChecksums(ctx, p.logger, fetch, vols, nextVolIdx, idx, sources, entryName, u.ProcessingMaxConnections(), progress)
+	if err != nil {
+		return err
+	}
+	if missing := idx.MissingChecksums(); len(missing) > 0 {
+		return par2FetchShortfall(fmt.Sprintf("PAR2 set has no slice checksums for %d file(s)", len(missing)), int(transportFails.Load()))
+	}
+
 	// Match every posted file in the release (not just the ones with dead
 	// segments - intact slices needed for the streaming pass can belong to
 	// ANY file in the recovery set) to its PAR2 FileID.
@@ -4790,6 +4803,53 @@ func topUpParsedRecovery(
 		if progress != nil {
 			progress.SetRecoverySlices(len(idx.Recovery), want)
 		}
+	}
+	return idx, nextVolIdx, sources, nil
+}
+
+// topUpSliceChecksums fetches recovery volumes, one batch at a time, while a
+// file of the set has no slice checksums (idx.MissingChecksums) and volumes
+// remain, re-parsing the index after each batch that added a source. Every
+// PAR2 file carries the IFSC packets, so any further volume can supply them.
+// A batch that adds nothing (its volumes 430'd or failed) does not stop the
+// search: nextVolIdx advances past every volume tried, so the loop is bounded
+// by len(vols). Files still missing checksums on return are not an error
+// here; the caller turns that into the verdict.
+func topUpSliceChecksums(
+	ctx context.Context,
+	logger zerolog.Logger,
+	fetch articleFetchFunc,
+	vols []par2Volume,
+	nextVolIdx int,
+	idx *par2.Index,
+	sources []par2.Source,
+	entryName string,
+	maxConc int,
+	progress *par2JobProgressState,
+) (*par2.Index, int, []par2.Source, error) {
+	for len(idx.MissingChecksums()) > 0 && nextVolIdx < len(vols) {
+		logger.Info().Str("entry", entryName).Int("files", len(idx.MissingChecksums())).
+			Msg("par2: fetched PAR2 files hold no slice checksums for some files, fetching another volume")
+		var added int
+		var err error
+		// A shortfall of one slice: the next volume, plus one slack volume.
+		nextVolIdx, _, sources, added, err = fetchMoreVolumes(
+			ctx, logger, fetch, vols, nextVolIdx, 1, 0, sources, entryName, maxConc)
+		if err != nil {
+			return idx, nextVolIdx, sources, par2Failf(par2Transient, "fetch recovery volumes: %w", err)
+		}
+		if progress != nil {
+			progress.SetRecoveryVolsFetched(nextVolIdx)
+		}
+		if added == 0 {
+			continue
+		}
+		next, err := par2.ParseIndexSet(ctx, sources, idx.SetID)
+		if err != nil {
+			return idx, nextVolIdx, sources, par2IndexParseErr(err)
+		}
+		idx = next
+		logSkippedPar2Packets(logger, entryName, idx)
 	}
 	return idx, nextVolIdx, sources, nil
 }

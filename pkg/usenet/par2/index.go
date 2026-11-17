@@ -364,6 +364,25 @@ func (idx *Index) finalize() error {
 	return nil
 }
 
+// MissingChecksums returns, in FileOrder, the files of the set that do not
+// hold exactly one IFSC checksum per slice. The IFSC packet is copied into
+// every PAR2 file, so a file listed here had every copy of it unreadable in
+// the sources parsed; a repair stream fails at that file's first intact slice.
+// Other volumes of the set carry the packet too. Call after a successful parse.
+func (idx *Index) MissingChecksums() [][16]byte {
+	var missing [][16]byte
+	for _, id := range idx.FileOrder {
+		fd, ok := idx.Files[id]
+		if !ok {
+			continue
+		}
+		if int64(len(idx.Slices[id])) != ceilDiv(fd.Length, idx.SliceSize) {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
 // NumSlices returns the total number of input slices across every file in
 // the recovery set.
 func (idx *Index) NumSlices() int64 { return idx.numSlices }
