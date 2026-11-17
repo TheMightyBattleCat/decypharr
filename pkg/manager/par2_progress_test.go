@@ -131,3 +131,17 @@ func TestPar2JobProgressStateConcurrentUpdatesDoNotRace(t *testing.T) {
 		t.Errorf("IntactSlicesRead = %d, want 50", snap.IntactSlicesRead)
 	}
 }
+
+func TestPar2ProgressRecoveryVolsFetchedNeverDecreases(t *testing.T) {
+	s := &par2JobProgressState{}
+	s.SetRecoveryVolsFetched(5)
+	// A late set re-choice narrows the volume list and remaps the index.
+	s.SetRecoveryVolsFetched(2)
+	if got := s.Snapshot().RecoveryVolsFetched; got != 5 {
+		t.Errorf("RecoveryVolsFetched = %d after a smaller value, want 5", got)
+	}
+	s.SetRecoveryVolsFetched(7)
+	if got := s.Snapshot().RecoveryVolsFetched; got != 7 {
+		t.Errorf("RecoveryVolsFetched = %d, want 7", got)
+	}
+}

@@ -161,11 +161,19 @@ func (s *par2JobProgressState) Touch() {
 	s.touch()
 }
 
+// SetRecoveryVolsFetched records how many recovery volumes have been fetched.
+// The count never goes down: a late re-choice of the PAR2 set narrows the
+// volume list, so the caller's own index can be smaller than before.
 func (s *par2JobProgressState) SetRecoveryVolsFetched(n int) {
 	if s == nil {
 		return
 	}
-	s.recoveryVolsFetched.Store(int64(n))
+	for {
+		old := s.recoveryVolsFetched.Load()
+		if int64(n) <= old || s.recoveryVolsFetched.CompareAndSwap(old, int64(n)) {
+			break
+		}
+	}
 	s.touch()
 }
 

@@ -3234,7 +3234,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		// Each round's source gets its own context, cancelled as soon as the
 		// pass returns. An early-stopped or failed pass otherwise left its
-		// workers holding fetched slices (up to 3x the connection count x
+		// workers holding fetched slices (up to 2x the connection count x
 		// SliceSize) and their connections until the whole job ended. The
 		// workers' fetches run on it too (trackedFetch's fctx), so the cancel
 		// aborts the ones still in flight.
