@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -175,11 +176,73 @@ func NewStore(root string, logger zerolog.Logger) (*Store, error) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return nil, fmt.Errorf("overlay: create root dir: %w", err)
 	}
+	removeStaleTempFiles(root, staleTempAge, time.Now(), logger)
 	return &Store{
 		root:   root,
 		logger: logger,
 		locks:  make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// staleTempAge is how old a leftover patch/manifest temp file must be before
+// NewStore removes it. A live write renames its temp file within moments, so
+// anything this old was left by a crash or a kill mid-write.
+const staleTempAge = time.Hour
+
+// removeStaleTempFiles deletes the patch-*.tmp and manifest-*.tmp files that
+// writeFileAtomic and saveManifestLocked leave in an entry directory when the
+// process dies between create and rename. Only regular files directly inside
+// an entry directory, matching those two patterns and last modified before
+// now-maxAge, are removed; anything else is left alone. Errors are logged and
+// skipped: a stray temp file is harmless, so it never fails the store open.
+func removeStaleTempFiles(root string, maxAge time.Duration, now time.Time, logger zerolog.Logger) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		logger.Warn().Err(err).Str("root", root).Msg("overlay: list entries for temp-file cleanup")
+		return
+	}
+	cutoff := now.Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			logger.Warn().Err(err).Str("dir", dir).Msg("overlay: list entry for temp-file cleanup")
+			continue
+		}
+		for _, f := range files {
+			if !f.Type().IsRegular() || !isOverlayTempName(f.Name()) {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			path := filepath.Join(dir, f.Name())
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				logger.Warn().Err(err).Str("path", path).Msg("overlay: remove stale temp file")
+				continue
+			}
+			removed++
+		}
+	}
+	if removed > 0 {
+		logger.Info().Int("removed", removed).Msg("overlay: removed stale temp files left by an interrupted write")
+	}
+}
+
+// isOverlayTempName reports whether name is a temp file from
+// writeFileAtomic ("patch-*.tmp") or saveManifestLocked ("manifest-*.tmp").
+func isOverlayTempName(name string) bool {
+	for _, pattern := range []string{"patch-*.tmp", "manifest-*.tmp"} {
+		if ok, _ := filepath.Match(pattern, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // SetRepairEnqueuer installs the callback EnqueueRepair invokes after a
