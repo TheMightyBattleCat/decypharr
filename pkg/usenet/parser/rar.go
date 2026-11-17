@@ -100,9 +100,11 @@ type RARArchiveInfo struct {
 	// the (otherwise NZB-ordered) volumes/segments to the correct sequence. Nil
 	// means "ordering unknown — keep NZB/upload order" (the safe default).
 	VolumeOrder []int
-	// VolumeOrderKnown reports that every volume's number was read and they
-	// are distinct, so the order is verified even when VolumeOrder is nil
-	// because the volumes were already in order.
+	// VolumeOrderKnown reports that every volume's number was read (or, for
+	// the one unnumbered RAR5 volume, is known to be the first) and the
+	// numbers are distinct and contiguous, so the order is verified even when
+	// VolumeOrder is nil because the volumes were already in order. A gap in
+	// the numbers (a volume missing from the NZB) leaves it false.
 	VolumeOrderKnown bool
 }
 
@@ -584,7 +586,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		}
 		entries = append(entries, volEntry{idx: r.index, num: num, hasNum: hasNum})
 	}
-	volumeOrder := p.resolveVolumeOrder(entries, len(results))
+	volumeOrder := p.resolveVolumeOrderFor(entries, len(results), version == RARVersion5)
 	orderKnown := orderEstablished(entries, len(results))
 
 	// Sort results by index to maintain NZB/upload order and collect files.
@@ -677,12 +679,23 @@ type volEntry struct {
 //
 // Robustness: real obfuscated postings can have ONE volume whose main header
 // lacks the volume-number bit (observed: 62 of 63 volumes numbered cleanly,
-// one with the bit unset). We tolerate exactly one such hole by inferring it
-// from the single missing value in the otherwise-contiguous sequence. Any
-// more ambiguity than that (2+ missing, duplicates, non-contiguous) → keep
-// posting order rather than risk corrupting an archive that currently
-// assembles.
+// one with the bit unset). RAR5 writes the number in every volume except the
+// first, so that one volume is the first: it is given minNum-1 even when the
+// numbered run has a gap (a volume missing from the NZB), and
+// orderEstablished then reports the gap. Any more ambiguity than that (2+
+// unnumbered, duplicates) → keep posting order rather than risk corrupting an
+// archive that currently assembles.
 func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []int {
+	return p.resolveVolumeOrderFor(entries, totalVolumes, true)
+}
+
+// resolveVolumeOrderFor is resolveVolumeOrder with the meaning of an
+// unnumbered volume given by the caller. unnumberedIsFirst is true for RAR5,
+// where only the first volume lacks a number. It is false for RAR4, where a
+// volume is unnumbered because its end-of-archive header could not be read,
+// so it may sit anywhere: the single missing value in the run is inferred
+// (an interior hole, or minNum-1 when the run is complete).
+func (p *RARParser) resolveVolumeOrderFor(entries []volEntry, totalVolumes int, unnumberedIsFirst bool) []int {
 	numbered := 0
 	unnumbered := 0
 	for _, e := range entries {
@@ -708,8 +721,7 @@ func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []i
 			seen[e.num] = true
 		}
 	}
-	// Resolve unnumbered volumes. We allow at most one, inferred as the single
-	// missing value in the contiguous span [min..min+len-1] of the numbering.
+	// Resolve unnumbered volumes. We allow at most one.
 	if canOrder && unnumbered > 0 {
 		if unnumbered != 1 {
 			canOrder = false // more than one hole — too ambiguous
@@ -729,38 +741,36 @@ func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []i
 					maxNum = e.num
 				}
 			}
-			// The numbered volumes should form a contiguous run. The single
-			// unnumbered volume is the one hole. There are two cases:
+			// RAR5: the unnumbered volume is the first (the base archive), so
+			// it belongs at minNum-1, before the run, NOT in an interior gap
+			// and NOT at maxNum+1. A gap in the numbered run is a volume
+			// missing from the NZB; filling it with the first volume moves
+			// the first volume into the middle. orderEstablished reports the
+			// gap instead.
 			//
-			//  1. Interior gap: some value strictly inside [minNum..maxNum] is
-			//     missing. That value is unambiguously the hole.
-			//
-			//  2. No interior gap: [minNum..maxNum] is fully present, so the
-			//     numbered run is already complete and the hole is at a
-			//     BOUNDARY (either minNum-1 or maxNum+1). In RAR multi-volume
-			//     archives the FIRST volume (the base archive) is the one whose
-			//     main header commonly lacks the volume-number field, while the
-			//     continuation volumes carry an incrementing number. So when the
-			//     run is complete, the unnumbered volume belongs at minNum-1
-			//     (before the run), NOT maxNum+1. Placing it after the run
-			//     rotates the true first volume to the end and corrupts assembly.
+			// RAR4 (unnumberedIsFirst false): a unique interior gap is the
+			// hole; with a complete run the hole is at minNum-1 (the first
+			// volume's number is 0, so an unread first volume is the common
+			// case).
 			missing := -1
-			interiorMissing := -1
-			interiorCount := 0
-			for v := minNum; v <= maxNum; v++ {
-				if !present[v] {
-					interiorMissing = v
-					interiorCount++
-				}
-			}
-			if interiorCount == 1 {
-				// Case 1: unique interior hole.
-				missing = interiorMissing
-			} else if interiorCount == 0 {
-				// Case 2: complete run → hole is the base volume, before the run.
+			if unnumberedIsFirst {
 				missing = minNum - 1
+			} else {
+				interiorMissing := -1
+				interiorCount := 0
+				for v := minNum; v <= maxNum; v++ {
+					if !present[v] {
+						interiorMissing = v
+						interiorCount++
+					}
+				}
+				if interiorCount == 1 {
+					missing = interiorMissing
+				} else if interiorCount == 0 {
+					missing = minNum - 1
+				}
+				// (interiorCount > 1 leaves missing = -1 → cannot place uniquely.)
 			}
-			// (interiorCount > 1 leaves missing = -1 → cannot place uniquely.)
 			if missing >= 0 {
 				// Assign the inferred number to the single unnumbered volume.
 				for i := range entries {

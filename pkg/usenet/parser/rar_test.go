@@ -96,3 +96,73 @@ func TestResolveVolumeOrder_AmbiguousInputsFallBackToNil(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveVolumeOrder_FirstVolumeNotPlacedInAGap covers a RAR5 set whose
+// NZB lacks one numbered volume. RAR5 writes a volume number in every volume
+// except the first, so the unnumbered volume is the first: it must get
+// minNum-1, not the number missing from the run, and the gap must leave the
+// order unverified so the sweep's volume-order check still reads the files.
+func TestResolveVolumeOrder_FirstVolumeNotPlacedInAGap(t *testing.T) {
+	p := &RARParser{logger: zerolog.New(io.Discard)}
+
+	numOf := func(entries []volEntry, idx int) int {
+		for _, e := range entries {
+			if e.idx == idx {
+				return e.num
+			}
+		}
+		t.Fatalf("idx %d not in entries", idx)
+		return -1
+	}
+
+	t.Run("gap in the numbered run", func(t *testing.T) {
+		entries := []volEntry{
+			{idx: 0, hasNum: false}, // the first volume
+			{idx: 1, num: 1, hasNum: true},
+			{idx: 2, num: 2, hasNum: true},
+			// volume 3 is not in the NZB
+			{idx: 3, num: 4, hasNum: true},
+			{idx: 4, num: 5, hasNum: true},
+		}
+		order := p.resolveVolumeOrder(entries, 5)
+		established := orderEstablished(entries, 5)
+		if got := numOf(entries, 0); got != 0 {
+			t.Errorf("unnumbered first volume given number %d, want 0", got)
+		}
+		if len(order) > 0 && order[0] != 0 {
+			t.Errorf("volumeOrder = %v, want the first volume (idx 0) first", order)
+		}
+		if established {
+			t.Errorf("order established with volume 3 missing from the NZB, want not established")
+		}
+	})
+
+	t.Run("complete run still established", func(t *testing.T) {
+		entries := []volEntry{
+			{idx: 0, hasNum: false},
+			{idx: 1, num: 1, hasNum: true},
+			{idx: 2, num: 2, hasNum: true},
+			{idx: 3, num: 3, hasNum: true},
+			{idx: 4, num: 4, hasNum: true},
+		}
+		if order := p.resolveVolumeOrder(entries, 5); order != nil {
+			t.Errorf("volumeOrder = %v, want nil (already in order)", order)
+		}
+		if !orderEstablished(entries, 5) {
+			t.Errorf("complete run not established")
+		}
+	})
+
+	t.Run("all numbered with a gap", func(t *testing.T) {
+		entries := []volEntry{
+			{idx: 0, num: 0, hasNum: true},
+			{idx: 1, num: 1, hasNum: true},
+			{idx: 2, num: 3, hasNum: true},
+			{idx: 3, num: 4, hasNum: true},
+		}
+		p.resolveVolumeOrder(entries, 4)
+		if orderEstablished(entries, 4) {
+			t.Errorf("order established with volume 2 missing, want not established")
+		}
+	})
+}

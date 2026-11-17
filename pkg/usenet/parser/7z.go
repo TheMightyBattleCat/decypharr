@@ -423,7 +423,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		}
 		volEntries = append(volEntries, volEntry{idx: r.index, num: r.num, hasNum: r.hasNum})
 	}
-	if volumeOrder := p.rarParser.resolveVolumeOrder(volEntries, len(results)); volumeOrder != nil {
+	if volumeOrder := p.rarParser.resolveVolumeOrderFor(volEntries, len(results), version == RARVersion5); volumeOrder != nil {
 		if inverse := buildInversePermutation(volumeOrder, len(rarFiles)); inverse != nil {
 			p.rarParser.renumberVolumeParts(rarFileEntries, inverse)
 			p.logger.Debug().
