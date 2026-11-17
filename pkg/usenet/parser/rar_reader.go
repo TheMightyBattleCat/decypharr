@@ -365,6 +365,12 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 				if err == io.EOF {
 					break
 				}
+				// The skip ends inside the volume's last article. If that
+				// article cannot be fetched, the file headers already read
+				// are still good: keep them rather than dropping the volume.
+				if len(result.Files) > 0 {
+					break
+				}
 				return nil, fmt.Errorf("failed to skip data section: %w", err)
 			}
 		}
