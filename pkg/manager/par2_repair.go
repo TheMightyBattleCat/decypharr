@@ -2589,8 +2589,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource, tally,
 			par2FetchShortfall("no PAR2 recovery volumes retained", int(transportFails.Load())))
 	}
+	earlyNeeded := 0
 	if earlyIdx != nil {
 		if earlyK := earlyDamagedSliceCheck(earlyIdx, pending, nzb.Par2Source, nzb.Par2Match, p.logger); earlyK > 0 {
+			earlyNeeded = earlyK
 			if earlyK > par2.MaxRepairSlicesFor(earlyIdx.SliceSize) || uint32(earlyK) > available {
 				p.logger.Info().
 					Int("early_k", earlyK).
@@ -2610,7 +2612,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
-	needed := estimateNeededSlices(pending)
+	needed := firstFetchSlices(estimateNeededSlices(pending), earlyNeeded)
 	// fetchedSlices is the name-advertised slice count of the volumes fetched
 	// so far. It's only good enough to size and report this first fetch; from
 	// here on the code measures recovery coverage by len(idx.Recovery) (the
@@ -3977,6 +3979,17 @@ func par2JobTimeoutFor(releaseBytes int64) time.Duration {
 		d += time.Duration(par2JobPasses*releaseBytes/par2JobPassFloor) * time.Second
 	}
 	return min(d, par2JobTimeoutMax)
+}
+
+// firstFetchSlices sizes the first recovery fetch. An early lower bound from
+// the parsed index wins (the top-up loop fetches more if the exact count is
+// higher). Without one the dead-article estimate is capped at what a repair
+// can use, so a missing index cannot make the pass fetch hundreds of slices.
+func firstFetchSlices(estimate uint32, earlyK int) uint32 {
+	if earlyK > 0 {
+		return uint32(earlyK)
+	}
+	return min(estimate, uint32(par2.MaxRepairSlices))
 }
 
 // estimateNeededSlices is a cheap upper bound (one slice per dead segment)
