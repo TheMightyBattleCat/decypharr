@@ -645,6 +645,13 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 		return true
 	}
 
+	// Playback padding is switched off: the patch above is served whatever
+	// that setting says, but zero-fill (and the dead record and repair queue
+	// that come with the decision) belongs to it.
+	if sf.config.PaddingOff {
+		return false
+	}
+
 	logicalLen := sf.cache.SegmentDataSize(segIdx)
 	if logicalLen <= 0 {
 		return false

@@ -544,23 +544,30 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}
 
-	var overlayOpts []reader.Option
-	if u.overlay != nil && file.NzbID != "" && config.Get().Repair.PlaybackPaddingEnabled() {
-		overlayOpts = []reader.Option{reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name)}
-	}
-
-	// Every line the reader logs names its file: a playback stall or a slow
-	// fetch could otherwise be tied to a title only by working back from
-	// segment numbers. Passed here rather than with the overlay options,
-	// which are absent when playback padding is off.
-	readerLog := u.logger.With().Str("nzb_id", file.NzbID).Str("file", file.Name).Logger()
-	readerOpts := append([]reader.Option{reader.WithLogger(readerLog)}, overlayOpts...)
-
 	return &fsEntry{
 		fs:         usenetFS,
 		volumes:    volumes,
-		readerOpts: readerOpts,
+		readerOpts: u.readerOptions(file),
 	}, nil
+}
+
+// readerOptions are the single-volume reader's options for file. The overlay
+// handle is attached whatever playback_padding says: a PAR2 patch is the
+// file's real bytes, so it is served with padding off too. Only the zero-fill
+// of a segment with no patch follows the setting (reader.WithPadding).
+func (u *Usenet) readerOptions(file *storage.NZBFile) []reader.Option {
+	// Every line the reader logs names its file: a playback stall or a slow
+	// fetch could otherwise be tied to a title only by working back from
+	// segment numbers. Passed apart from the overlay options, which are
+	// absent when there is no overlay store or NZB ID.
+	readerLog := u.logger.With().Str("nzb_id", file.NzbID).Str("file", file.Name).Logger()
+	opts := []reader.Option{reader.WithLogger(readerLog)}
+	if u.overlay != nil && file.NzbID != "" {
+		opts = append(opts,
+			reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name),
+			reader.WithPadding(config.Get().Repair.PlaybackPaddingEnabled()))
+	}
+	return opts
 }
 
 // getOrCreateEntry returns the fsEntry and its cache key to avoid redundant key computation.
