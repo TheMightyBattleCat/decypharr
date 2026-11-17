@@ -121,6 +121,11 @@ type fileResult struct {
 	// no decode check was due. shortBytes is the tail-truncation shortfall.
 	unverifiedReason string
 	shortBytes       int64
+
+	// readFailed is set when the ffprobe read failed twice with no article
+	// reported missing (checkConfirmed's inconclusive end), whether or not a
+	// decode check was due. Only the sweep brake reads it.
+	readFailed bool
 	// unverifiedCause and unverifiedDetail say what ffprobe printed, for a
 	// decoded_with_errors reason.
 	unverifiedCause  string
@@ -149,6 +154,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 
 	ctx = r.attachFFProbeChecker(ctx, log)
 	ctx = contextWithSampleBudget(ctx, newSweepSampleBudget(stickyFailedSampleBudget))
+	ctx = r.withSweepBrake(ctx, run)
 
 	// Resolve auto-repair once: when off, the repair sweep is a pure health check —
 	// it probes and records broken state but attempts no debrid re-insert and
@@ -534,6 +540,9 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		// cancelled context.
 		return &storage.EntryHealth{EntryName: h.EntryName, Status: storage.HealthUnknown}, entryDecode{skipped: true}
 	}
+	// Before any heal of this entry: the file that trips the brake stops
+	// its own entry's heal too.
+	sweepBrakeFrom(ctx).observe(results)
 	if r.autoRepairStillOn(ctx, autoRepair) {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -643,6 +652,10 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	if !skipDecode && !opts.ForceDecodeVerification && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
 		skipDecode = true
 	}
+	probe := r.probeFile
+	if r.probeFileFn != nil {
+		probe = r.probeFileFn
+	}
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
@@ -652,7 +665,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, c, name, opts, skipDecode)
+			results[i] = probe(gctx, c, name, opts, skipDecode)
 			return nil
 		})
 	}
@@ -844,6 +857,10 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive
 			res.decodeCoverage = coverage
+			// Read straight from the cause: get() reports an unset cause as
+			// inconclusive too, and with decoding skipped the reason below is
+			// not filled in.
+			res.readFailed = ok && !conclusive && cause.reason == unverifiedInconclusive
 			if ok && !conclusive && !skipDecode {
 				res.unverifiedReason = cause.get()
 				res.unverifiedCause, res.unverifiedDetail = cause.decodeCause, cause.detail
@@ -1623,9 +1640,10 @@ type autoRepairFollowsConfigKey struct{}
 // Auto-repair mid-sweep left an hours-long sweep deleting and re-searching
 // until it finished. When the value came from the settings it is re-read
 // here; a per-run override ("Run now" with auto-repair on) is honoured as
-// given. The post-restore hold turns it off whatever the source.
+// given. The post-restore hold turns it off whatever the source, and so does
+// a tripped sweep brake (see sweepBrake).
 func (r *Repair) autoRepairStillOn(ctx context.Context, autoRepair bool) bool {
-	if !autoRepair || r.manager.PostRestoreHold() {
+	if !autoRepair || r.manager.PostRestoreHold() || sweepBrakeFrom(ctx).holding() {
 		return false
 	}
 	if ctx != nil {
@@ -3264,6 +3282,7 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix,
 // but scoped to a specific media-id resolved through one or more Arrs.
 func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix, forceDecode bool) {
 	ctx = r.attachFFProbeChecker(ctx, r.logger)
+	ctx = r.withSweepBrake(ctx, run)
 	candidates := make(map[string]*candidate)
 	var lastErr error
 	for _, a := range arrs {

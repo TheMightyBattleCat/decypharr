@@ -261,6 +261,13 @@ func (r *Repair) forgetCachedPads(entry *storage.Entry, nzbID, name string, pads
 func (r *Repair) regrabStickyFailed(ctx context.Context, c *candidate, entry *storage.Entry, name string, res fileResult) fileResult {
 	res.healthy = false
 	res.reason = "sticky_failed_sample_broken"
+	if sweepBrakeFrom(ctx).holding() {
+		// The sweep's brake has tripped: no re-grab from here either. The
+		// file is left unknown, and the next sweep samples it again.
+		r.logger.Debug().Str("entry", entry.Name).Str("file", name).
+			Msg("Repair: sticky-failed regrab skipped; sweep healing is stopped")
+		return res
+	}
 	acted, guardReason, err := r.repairPlaybackFileNow(ctx, c.name, name, true, false)
 	switch {
 	case err != nil:
