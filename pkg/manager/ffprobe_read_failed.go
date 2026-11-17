@@ -18,6 +18,7 @@ var ffprobeReadFailedMarkers = []string{
 	"Connection refused",
 	"Connection timed out",
 	"HTTP error",
+	"Server returned 4", // our own WebDAV: a 404 or 401 says nothing about the file
 	"Server returned 5",
 	"Broken pipe",
 }

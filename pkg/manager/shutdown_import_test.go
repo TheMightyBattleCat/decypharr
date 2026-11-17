@@ -46,7 +46,7 @@ func TestCompleteEntryDuringShutdownDoesNotReportTheImport(t *testing.T) {
 	}
 
 	cancel() // Stop cancels the manager's context first
-	if err := m.downloader.completeEntry(entry); !errors.Is(err, context.Canceled) {
+	if err := m.downloader.completeEntry(entry, ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("completeEntry during shutdown = %v, want context.Canceled", err)
 	}
 	saved, err := m.queue.GetTorrent(entry.InfoHash)
