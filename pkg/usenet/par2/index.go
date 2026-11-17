@@ -270,6 +270,9 @@ func (idx *Index) parseFileDesc(body []byte) error {
 	copy(fd.FileMD5[:], body[16:32])
 	copy(fd.MD5_16k[:], body[32:48])
 	fd.Length = int64(binary.LittleEndian.Uint64(body[48:56]))
+	if fd.Length < 0 {
+		return fmt.Errorf("par2: FileDesc packet declares a negative file length (%d)", fd.Length)
+	}
 
 	name := body[fixed:]
 	if i := bytes.IndexByte(name, 0); i >= 0 {
@@ -328,11 +331,17 @@ func (idx *Index) finalize() error {
 		if !ok {
 			return fmt.Errorf("par2: Main packet references file %x with no FileDesc packet", id)
 		}
+		// Check the file's own count before adding it, so a single huge file
+		// cannot overflow the running total.
+		n := ceilDiv(fd.Length, idx.SliceSize)
+		if n < 0 || n > maxInputSlices {
+			return fmt.Errorf("par2: file %x needs %d slices, exceeding the %d spec limit", id, n, maxInputSlices)
+		}
 		idx.fileBase[i] = total
-		total += ceilDiv(fd.Length, idx.SliceSize)
+		total += n
 	}
 	idx.numSlices = total
-	if total > maxInputSlices {
+	if total < 0 || total > maxInputSlices {
 		return fmt.Errorf("par2: recovery set has %d input slices, exceeding the %d spec limit", total, maxInputSlices)
 	}
 	return nil
@@ -463,7 +472,7 @@ func ceilDiv(a, b int64) int64 {
 	if a <= 0 {
 		return 0
 	}
-	return (a + b - 1) / b
+	return (a-1)/b + 1 // not (a+b-1)/b, which overflows for a near MaxInt64
 }
 
 // fileIDLess orders two FileIDs as PAR2 v2.0 defines "sorted" for the Main
