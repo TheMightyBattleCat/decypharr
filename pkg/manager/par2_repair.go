@@ -2832,6 +2832,23 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	}
 	statMissing, statSwept, statExcluded := statPostedFileDamage(statCtx2, p.logger, u.StatSegments, matches, nzb.Par2Source, statControls, entryName, progress)
 	statCancel2()
+	// A file whose first articles were all 430 is still on estimated
+	// boundaries, and none of its dead segments could be placed. Measure
+	// it from a later article, skipping those the sweep just found missing,
+	// and redo its byte ranges.
+	sweptMissing := make(map[string]struct{}, len(statMissing))
+	for _, mid := range statMissing {
+		sweptMissing[mid] = struct{}{}
+	}
+	for _, m := range matches {
+		f := fetchers[m.FileID]
+		if f == nil || !f.resolveGeometryPastDeadHead(sweptMissing) {
+			continue
+		}
+		for i, seg := range nzb.Par2Source[m.PostedIndex].Segments {
+			msgIDRange[seg.MessageID] = postedRange{fileID: m.FileID, start: f.base[i], end: f.base[i] + f.segSizes[i]}
+		}
+	}
 	reducedTrust := len(statExcluded) > 0
 	statBudget := min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize))
 	statMissing, statLeftForSolve := settleStatMisses(ctx, p.logger, entryName, fetchers, msgIDSeg, statMissing, statExcluded,
@@ -5504,8 +5521,57 @@ func (f *postedFileFetcher) resolveGeometry() {
 }
 
 // geometryProbeArticles bounds how many leading articles resolveGeometry
-// tries before keeping the estimates.
+// tries before keeping the estimates, and how many later ones
+// resolveGeometryPastDeadHead tries after them.
 const geometryProbeArticles = 3
+
+// resolveGeometryPastDeadHead measures the geometry of a file whose leading
+// probes were all 430 from a later non-final article: each carries its own
+// =ypart offset, which measureArticle checks. Articles the STAT sweep found
+// missing (sweptMissing) are skipped, so the ones tried are those it saw
+// present - or, if the sweep did not get to them, the next in order. Reports
+// whether the geometry is now exact. A probe that fails other than with a
+// 430 replaces geometryErr, so the unplaced segments back off rather than
+// end terminal, as in resolveGeometry.
+//
+// Same concurrency rule as resolveGeometry: call it before the fetcher is
+// shared.
+func (f *postedFileFetcher) resolveGeometryPastDeadHead(sweptMissing map[string]struct{}) bool {
+	if f.exact || f.fetch == nil || f.geometryErr == nil || !nntp.IsArticleNotFoundError(f.geometryErr) {
+		return false
+	}
+	tried := 0
+	var retryableErr error
+	lastErr := f.geometryErr
+	for idx := geometryProbeArticles; idx < len(f.segs)-1 && tried < geometryProbeArticles; idx++ {
+		if _, missing := sweptMissing[f.segs[idx].MessageID]; missing {
+			continue
+		}
+		tried++
+		seed, size, err := f.measureArticle(idx)
+		if err != nil {
+			lastErr = err
+			if !nntp.IsArticleNotFoundError(err) {
+				retryableErr = err
+			}
+			continue
+		}
+		f.applyUniformGeometry(seed, size)
+		f.geometryErr = nil
+		f.logger.Info().Int("article", idx).Msg("par2 geometry: leading articles are gone; measured the article size from a later one")
+		return true
+	}
+	if tried == 0 {
+		return false
+	}
+	if retryableErr != nil {
+		lastErr = retryableErr
+	}
+	f.geometryErr = lastErr
+	f.logger.Warn().Err(lastErr).Int("articles_tried", geometryProbeArticles+tried).
+		Msg("par2 geometry: could not measure the article size past the dead leading articles; keeping estimated segment sizes")
+	return false
+}
 
 // measureArticle fetches article idx and returns the uniform article size
 // and file size it implies. The single-entry segment cache keeps its bytes
