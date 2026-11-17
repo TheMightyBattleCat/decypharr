@@ -179,8 +179,8 @@ func (r *Repair) debridConfigured(name string) bool {
 func (r *Repair) buildDebridGoneRefs(ctx context.Context) (debridGoneRefs, error) {
 	repairArrs := r.eligibleArrs(nil)
 	var skipArrs []*arr.Arr
-	for _, a := range r.manager.arr.GetAll() {
-		if a != nil && a.Host != "" && a.Token != "" && a.SkipRepair {
+	for _, a := range r.referenceArrs() {
+		if a.SkipRepair {
 			skipArrs = append(skipArrs, a)
 		}
 	}

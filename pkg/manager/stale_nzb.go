@@ -132,7 +132,7 @@ func (r *Repair) PreviewStaleNZBs(ctx context.Context) (StaleNZBPreview, error) 
 	defer r.clearStaleNZBProgress()
 
 	phaseStart := time.Now()
-	initialArrs := len(r.eligibleArrs(nil))
+	initialArrs := len(r.referenceArrs())
 	r.setStaleNZBProgress("Fetching Arr references…", 0, int64(initialArrs), start)
 	refs, err := r.buildArrReferencedSet(ctx, func(done, total int, name string) {
 		r.setStaleNZBProgress(fmt.Sprintf("Fetching %s… (%d/%d)", name, done, total), int64(done), int64(total), start)
@@ -319,7 +319,7 @@ func (r *Repair) CleanupStaleNZBs(ctx context.Context, entryIDs []string, orphan
 		Msg("StaleNZB: cleanup started")
 
 	phaseStart := time.Now()
-	initialArrs := len(r.eligibleArrs(nil))
+	initialArrs := len(r.referenceArrs())
 	r.setStaleNZBProgress("Fetching Arr references…", 0, int64(initialArrs), start)
 	refs, err := r.buildArrReferencedSet(ctx, func(done, total int, name string) {
 		r.setStaleNZBProgress(fmt.Sprintf("Fetching %s… (%d/%d)", name, done, total), int64(done), int64(total), start)
