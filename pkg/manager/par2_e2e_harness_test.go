@@ -88,6 +88,14 @@ type p2eSeg struct {
 
 func newP2eHarness(t *testing.T, srv *p2eServer, fx *p2eFixture, nzbID string) *p2eHarness {
 	t.Helper()
+	return newP2eHarnessNZB(t, srv, fx, fx.nzb(nzbID))
+}
+
+// newP2eHarnessNZB is newP2eHarness with the stored NZB record given, for a
+// test that changes the record fx.nzb builds (names, flags).
+func newP2eHarnessNZB(t *testing.T, srv *p2eServer, fx *p2eFixture, nzb *storage.NZB) *p2eHarness {
+	t.Helper()
+	nzbID := nzb.ID
 	srv.reset()
 	// Sets a fresh config path (the per-scenario data dir) and a fresh
 	// storage.Storage; builds Repair{handlers} + Par2Repair{queues, progress}.
@@ -106,7 +114,7 @@ func newP2eHarness(t *testing.T, srv *p2eServer, fx *p2eFixture, nzbID string) *
 	t.Cleanup(func() { _ = u.Close() })
 	p.manager.usenet = u
 
-	if err := u.AddNZBForTest(fx.nzb(nzbID)); err != nil {
+	if err := u.AddNZBForTest(nzb); err != nil {
 		t.Fatalf("AddNZBForTest: %v", err)
 	}
 	if err := p.manager.storage.AddOrUpdate(&storage.Entry{
