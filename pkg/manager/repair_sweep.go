@@ -943,6 +943,10 @@ func (r *Repair) logFileVerdict(entryName, file string, size int64, budget *Veri
 	switch {
 	case res.broken:
 		ev.Str(logger.FieldStatus, logger.StatusFail).Str("reason", res.reason).Msg("broken")
+	case skipDecode && res.readFailed:
+		// The metadata read failed with no dead article behind it: nothing
+		// was verified now, and "verified earlier" would say otherwise.
+		ev.Str(logger.FieldStatus, logger.StatusWarn).Str(logger.FieldNote, "read failed, not verified").Msg("inconclusive")
 	case skipDecode:
 		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "decode verified earlier").Msg("healthy")
 	case !res.decodeConclusive:
