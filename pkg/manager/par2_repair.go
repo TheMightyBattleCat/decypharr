@@ -131,6 +131,11 @@ const (
 	// config.Repair.Par2UrgentConcurrency is unset/non-positive.
 	par2DefaultUrgentConcurrency = 2
 
+	// par2ManualSlots is how many passes started by RunNow (the GUI's
+	// "repair now" and the repair sweeps) run at once. Further requests wait
+	// for a slot, still reported as queued.
+	par2ManualSlots = 2
+
 	// par2RecoveryStatTimeout bounds the recovery-volume STAT pre-census (see
 	// statRecoveryVolumes). Kept below par2JobIdleTimeout so a stalled STAT
 	// batch can't itself trip the idle watchdog before its own deadline fires
@@ -321,6 +326,13 @@ type Par2Repair struct {
 	// (see waitForLargeRepair). Nil means no gating (tests that build a
 	// Par2Repair directly).
 	largeRepair chan struct{}
+
+	// manualSlots bounds the passes RunNow runs at once (see
+	// par2ManualSlots); runNow allocates it on first use. manualWaiting
+	// holds, per nzbID, the channel that cancels a RunNow request still
+	// waiting for a slot. Both guarded by mu.
+	manualSlots   chan struct{}
+	manualWaiting map[string]chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -539,6 +551,15 @@ func (p *Par2Repair) CancelEntry(nzbID string) {
 		}
 	}
 	p.runningMu.Unlock()
+
+	// A RunNow request still waiting for a slot gives up, and releases its
+	// own claim.
+	p.mu.Lock()
+	if ch, waiting := p.manualWaiting[nzbID]; waiting {
+		delete(p.manualWaiting, nzbID)
+		close(ch)
+	}
+	p.mu.Unlock()
 
 	p.urgentMu.Lock()
 	item, queued := p.urgentSet[nzbID]
@@ -842,7 +863,9 @@ func (p *Par2Repair) enqueue(nzbID string) {
 // schedule that limits automatic, bandwidth-heavy background work has no
 // bearing on something the user explicitly asked to run right now. It still
 // goes through the same NNTP connection pool and bandwidth accounting as
-// every other fetch - there is no unthrottled fast path. Returns an error if
+// every other fetch - there is no unthrottled fast path. At most
+// par2ManualSlots such passes run at once; a request beyond that waits in
+// p.queued (IsQueued reports it) until a slot frees. Returns an error if
 // PAR2 repair is disabled outright, or if a pass for this nzbID is already
 // queued/deferred/running.
 func (p *Par2Repair) RunNow(nzbID string) error {
@@ -896,6 +919,18 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 		}
 	}
 
+	cancelled := make(chan struct{})
+	p.mu.Lock()
+	if p.manualSlots == nil {
+		p.manualSlots = make(chan struct{}, par2ManualSlots)
+	}
+	slots := p.manualSlots
+	if p.manualWaiting == nil {
+		p.manualWaiting = make(map[string]chan struct{})
+	}
+	p.manualWaiting[nzbID] = cancelled
+	p.mu.Unlock()
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -904,9 +939,51 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
 		}()
+		if !p.waitForManualSlot(nzbID, slots, cancelled) {
+			// Deleted or shutting down while it waited: no pass runs, so
+			// nothing else frees the claim taken above.
+			if p.repair != nil && p.repair.handlers != nil {
+				p.repair.handlers.ReleasePar2(nzbID)
+			}
+			return
+		}
+		defer func() { <-slots }()
 		p.runPass(nzbID, laneBatch, fromSweep)
 	}()
 	return nil
+}
+
+// waitForManualSlot takes one of the slots RunNow's passes share, waiting
+// for one to free. It returns false, holding no slot, if cancelled is closed
+// (CancelEntry: the entry is being deleted) or the worker stops first.
+func (p *Par2Repair) waitForManualSlot(nzbID string, slots, cancelled chan struct{}) bool {
+	defer func() {
+		p.mu.Lock()
+		if p.manualWaiting[nzbID] == cancelled {
+			delete(p.manualWaiting, nzbID)
+		}
+		p.mu.Unlock()
+	}()
+	var stop <-chan struct{}
+	if p.ctx != nil {
+		stop = p.ctx.Done()
+	}
+	select {
+	case slots <- struct{}{}:
+	case <-cancelled:
+		return false
+	case <-stop:
+		return false
+	}
+	// select picks at random when a slot and a cancel are both ready.
+	select {
+	case <-cancelled:
+	case <-stop:
+	default:
+		return true
+	}
+	<-slots
+	return false
 }
 
 // Availability reports whether nzbID's pending overlay damage looks
