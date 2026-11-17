@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/sirrobot01/appendstore"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -271,9 +272,8 @@ type ImportReport struct {
 	// written to the new store.
 	Read     map[string]int `json:"read"`
 	Imported map[string]int `json:"imported"`
-	// OrphanItems and OrphanRepairState were dropped because no entry has
-	// them: no file of the item belongs to an imported entry and the key is
-	// not an entry's folder under the running naming.
+	// OrphanItems and OrphanRepairState were dropped because their key is
+	// not the folder of any imported entry under any folder naming.
 	OrphanItems       int `json:"orphan_items"`
 	OrphanRepairState int `json:"orphan_repair_state"`
 	// EntriesWithoutItems counts entries whose folder has no item record;
@@ -288,9 +288,9 @@ type ImportReport struct {
 // the stream for a store, or (nil, nil) when the snapshot has none. Entries,
 // queue and repair state are re-put with their attributes rebuilt from the
 // value; keys starting "__" are put raw. Items and repair state whose entry
-// is missing are dropped; entries without items are counted. An item's entry
-// is found by its files' InfoHash, so the import does not depend on the
-// running folder_naming; repair state follows its item.
+// is missing are dropped; entries without items are counted. A key matches
+// an entry if it is the entry's folder under any folder naming, so the import
+// does not depend on the running folder_naming.
 func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
 	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
 		return nil, fmt.Errorf("import target %s is not empty", dir)
@@ -305,19 +305,12 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	// An item or health record is matched to its entry without the config:
 	// the database is imported before the snapshot's config is moved into
 	// place, so the running folder_naming may not be the one the keys were
-	// written under. folders (names under the running naming) still matches
-	// an item that has no files to go by; hashes is every InfoHash an entry
-	// refers to, its own and its files' (a season entry split out of a pack
-	// keeps the pack's InfoHash on its files).
+	// written under. folders holds every entry's folder under every naming.
+	// (Not the files' InfoHash: the seasons split out of one pack all carry
+	// the pack's, so it would keep a deleted season's item.)
 	folders := map[string]struct{}{}
-	hashes := map[string]struct{}{}
-	type importedEntry struct {
-		folder string
-		hashes []string
-	}
-	var imported []importedEntry
+	var imported [][]string
 	itemNames := map[string]struct{}{}
-	itemHashes := map[string]struct{}{}
 
 	each := func(name string, fn func(key string, value []byte) error) error {
 		rc, err := open(name)
@@ -356,13 +349,11 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 			}
 			entry := ProtoToEntry(&pb)
 			if name == "entries" {
-				ie := importedEntry{folder: entry.GetFolder()}
-				folders[ie.folder] = struct{}{}
-				for _, h := range entryHashes(entry) {
-					hashes[h] = struct{}{}
-					ie.hashes = append(ie.hashes, h)
+				names := entryFolders(entry)
+				for _, f := range names {
+					folders[f] = struct{}{}
 				}
-				imported = append(imported, ie)
+				imported = append(imported, names)
 			}
 			return put(name, key, value, entryPutOptions(entry))
 		})
@@ -372,32 +363,12 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	}
 
 	err = each("items", func(key string, value []byte) error {
-		if strings.HasPrefix(key, "__") {
-			return put("items", key, value, nil)
-		}
-		var pb EntryItemProto
-		if err := proto.Unmarshal(value, &pb); err != nil {
-			rep.Undecodable++
-			itemNames[key] = struct{}{}
-			return put("items", key, value, nil)
-		}
-		_, keep := folders[key]
-		var fileHashes []string
-		for _, f := range pb.GetFiles() {
-			if h := f.GetInfoHash(); h != "" {
-				fileHashes = append(fileHashes, h)
-				if _, ok := hashes[h]; ok {
-					keep = true
-				}
+		if !strings.HasPrefix(key, "__") {
+			if _, ok := folders[key]; !ok {
+				rep.OrphanItems++
+				return nil
 			}
-		}
-		if !keep {
-			rep.OrphanItems++
-			return nil
-		}
-		itemNames[key] = struct{}{}
-		for _, h := range fileHashes {
-			itemHashes[h] = struct{}{}
+			itemNames[key] = struct{}{}
 		}
 		return put("items", key, value, nil)
 	})
@@ -409,8 +380,7 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		if strings.HasPrefix(key, "__") {
 			return put("repair_state", key, value, nil)
 		}
-		_, kept := itemNames[key]
-		if _, ok := folders[key]; !ok && !kept {
+		if _, ok := folders[key]; !ok {
 			rep.OrphanRepairState++
 			return nil
 		}
@@ -439,13 +409,12 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		}
 	}
 
-	for _, ie := range imported {
-		_, ok := itemNames[ie.folder]
-		for _, h := range ie.hashes {
-			if ok {
+	for _, names := range imported {
+		ok := false
+		for _, f := range names {
+			if _, ok = itemNames[f]; ok {
 				break
 			}
-			_, ok = itemHashes[h]
 		}
 		if !ok {
 			rep.EntriesWithoutItems++
@@ -457,25 +426,32 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	return rep, nil
 }
 
-// entryHashes is every InfoHash entry refers to: its own and its files'.
-func entryHashes(entry *Entry) []string {
-	seen := map[string]struct{}{}
+// folderNamings is every folder_naming GetTorrentFolder knows; "" is the
+// default.
+var folderNamings = []config.WebDavFolderNaming{
+	"",
+	config.WebDavUseFileName,
+	config.WebDavUseOriginalName,
+	config.WebDavUseFileNameNoExt,
+	config.WebDavUseOriginalNameNoExt,
+	config.WebdavUseHash,
+}
+
+// entryFolders is entry's folder under every folder naming, without
+// duplicates or empty names.
+func entryFolders(entry *Entry) []string {
 	var out []string
-	add := func(h string) {
-		if h == "" {
-			return
+	seen := map[string]struct{}{}
+	for _, naming := range folderNamings {
+		f := GetTorrentFolder(naming, entry)
+		if f == "" || f == "." {
+			continue
 		}
-		if _, ok := seen[h]; ok {
-			return
+		if _, ok := seen[f]; ok {
+			continue
 		}
-		seen[h] = struct{}{}
-		out = append(out, h)
-	}
-	add(entry.InfoHash)
-	for _, f := range entry.Files {
-		if f != nil {
-			add(f.InfoHash)
-		}
+		seen[f] = struct{}{}
+		out = append(out, f)
 	}
 	return out
 }

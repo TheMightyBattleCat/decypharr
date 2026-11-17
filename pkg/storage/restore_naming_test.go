@@ -119,3 +119,61 @@ func TestImportUnderAnotherFolderNamingKeepsItemsAndHealth(t *testing.T) {
 		}
 	}
 }
+
+// Two seasons split out of one pack carry the pack's InfoHash on their
+// files. When one season's entry is missing from the snapshot (deleted while
+// the export ran), its item and health record are orphans even though the
+// other season shares the pack's InfoHash.
+func TestImportDropsMissingSeasonOfSharedPack(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	setFolderNaming(t, config.WebdavUseHash)
+
+	src, err := NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	for _, e := range []*Entry{
+		{InfoHash: "s01", Name: "Show S01", Category: "tv", Status: "downloaded", Protocol: config.ProtocolNZB,
+			Files: map[string]*File{"s01e01.mkv": {Name: "s01e01.mkv", InfoHash: "pack", Size: 1}}},
+		{InfoHash: "s02", Name: "Show S02", Category: "tv", Status: "downloaded", Protocol: config.ProtocolNZB,
+			Files: map[string]*File{"s02e01.mkv": {Name: "s02e01.mkv", InfoHash: "pack", Size: 1}}},
+	} {
+		if err := src.AddOrUpdate(e); err != nil {
+			t.Fatal(err)
+		}
+		if err := src.SaveEntryHealth(&EntryHealth{EntryName: e.GetFolder(), Status: HealthStatus("healthy")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The season's entry is gone; its item and health record are not.
+	if err := src.entries.Delete("s02"); err != nil {
+		t.Fatal(err)
+	}
+	streams := memStreams{}
+	if _, err := src.ExportStores(streams.open, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	setFolderNaming(t, "")
+	dir := t.TempDir()
+	rep, err := ImportStores(dir, streams.reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OrphanItems != 1 || rep.OrphanRepairState != 1 || rep.EntriesWithoutItems != 0 {
+		t.Errorf("import report = %+v, want the missing season's item and health dropped", rep)
+	}
+	setFolderNaming(t, config.WebdavUseHash)
+	again, err := NewStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	for _, name := range []string{"items", "repair_state"} {
+		if got, want := storeKeys(t, again, name), []string{"s01"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s keys = %v, want %v", name, got, want)
+		}
+	}
+}
