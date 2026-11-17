@@ -633,7 +633,8 @@ func (p *Par2Repair) pendingDeadSegments(nzbID string) (int, error) {
 // starting a pass that claimRun refused and dropped. If damage is still
 // recorded now - the pass did not cover what those requests were about, or
 // it failed - one more pass is requested through the normal gate, so a
-// backoff or a terminal verdict still holds it back. One follow-up per pass,
+// backoff, a terminal verdict or the repair mode (followUpAllowed) still
+// holds it back. One follow-up per pass,
 // and only when something asked: a pass nothing interrupted never re-queues
 // itself.
 func (p *Par2Repair) followUpMerged(nzbID, entryName string, merged int, proximity time.Duration) {
@@ -660,6 +661,10 @@ func (p *Par2Repair) followUpMerged(nzbID, entryName string, merged int, proximi
 	}
 	note := requests + " • " + logger.Count(left, "dead segment") + " still recorded"
 	ev := p.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Int("requests", merged).Int("dead_segments", left).Str(par2NoteField, note)
+	if !p.followUpAllowed(nzbID, left) {
+		ev.Msg("par2 repair: damage is still recorded after a pass that received more requests; not re-checking, the repair mode does not queue passes for it (run repair now to retry)")
+		return
+	}
 	switch p.enqueueUrgent(nzbID, proximity) {
 	case urgentQueued, urgentMerged:
 		ev.Msg("par2 repair: damage is still recorded after a pass that received more requests; checking again")
@@ -673,7 +678,7 @@ func (p *Par2Repair) followUpMerged(nzbID, entryName string, merged int, proximi
 // followUpDeferredSets queues the next pass for an entry whose pass repaired
 // one PAR2 recovery set and left dead segments another set protects. It runs
 // once the pass has released its handler claim, as followUpMerged does, and
-// goes through the same gate.
+// goes through the same gates, the repair mode included.
 func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int, proximity time.Duration) {
 	if p.ctx != nil && p.ctx.Err() != nil {
 		return
@@ -683,6 +688,10 @@ func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int,
 	}
 	ev := p.logger.Info().Str("entry", entryName).Str("nzb_id", nzbID).Int("dead_segments", deferred).
 		Str(par2NoteField, logger.Count(deferred, "dead segment")+" in another recovery set")
+	if !p.followUpAllowed(nzbID, deferred) {
+		ev.Msg("par2 repair: one recovery set repaired; the damage another set protects is left, the repair mode does not queue passes for it (run repair now again for the other set)")
+		return
+	}
 	switch p.enqueueUrgent(nzbID, proximity) {
 	case urgentQueued, urgentMerged:
 		ev.Msg("par2 repair: one recovery set repaired; queued the next pass for the damage another set protects")
@@ -691,6 +700,16 @@ func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int,
 	case urgentRefusedRegrab:
 		ev.Msg("par2 repair: one recovery set repaired; the damage another set protects is left, a re-grab now owns the entry")
 	}
+}
+
+// followUpAllowed applies AutoEnqueue's mode gate to a follow-up pass: a
+// follow-up is an automatic pass too, even after a manual "repair now". In
+// manual mode it is never queued, and under the threshold mode only when
+// deadSegments reaches Par2RepairMinSegments or the release is being
+// streamed (see autoEnqueueAllowed).
+func (p *Par2Repair) followUpAllowed(nzbID string, deadSegments int) bool {
+	cfg := config.Get().Repair
+	return autoEnqueueAllowed(cfg.Par2RepairMode, cfg.Par2RepairMinSegments, deadSegments, p.manager.Streaming(nzbID, ""))
 }
 
 // par2SetsDeferredError is runRepair's result when it repaired the PAR2
