@@ -30,6 +30,11 @@ var errReorderRefused = errors.New("not reordered in place")
 // the file and is recorded.
 var errReorderBusy = errors.New("the file is open")
 
+// errReorderPassActive is the other refusal that passes by itself: a PAR2
+// pass for the release is running or waiting to run. It works from the
+// layout it loaded, and writes its patches by place in the file.
+var errReorderPassActive = errors.New("a PAR2 pass for the release is running or queued")
+
 func refuseReorder(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", errReorderRefused, fmt.Sprintf(format, args...))
 }
@@ -184,9 +189,11 @@ func confirmOrderByContent(ctx context.Context, f *storage.NZBFile, vols []layou
 // reorderFileVolumes puts a stored RAR file's volumes in order in place and
 // returns how many moved. It reads the volumes' numbers afresh, and rewrites
 // the layout only when applyVolumeOrder and confirmOrderByContent both accept
-// it, the release has no overlay records (they name articles by position),
-// and nothing has the file open. The record as it was is kept beside the
-// meta store (usenet.ReorderFileSegments). Any other outcome wraps
+// it, the release has no overlay records (they name articles by position) and
+// no PAR2 pass running or queued, and nothing has the file open. The overlay
+// and PAR2 checks are made again under the storage lock at the write, since
+// either can change while the volumes are read. The record as it was is kept
+// beside the meta store (usenet.ReorderFileSegments). Any other outcome wraps
 // errReorderRefused or is a fetch or storage error; the file is untouched.
 func (r *Repair) reorderFileVolumes(ctx context.Context, entryName, infoHash, name string) (int, error) {
 	u := r.manager.usenet
@@ -201,8 +208,9 @@ func (r *Repair) reorderFileVolumes(ctx context.Context, entryName, infoHash, na
 	if f == nil || f.FileType != storage.NZBFileTypeRar || len(f.Segments) == 0 {
 		return 0, refuseReorder("not a stored RAR file")
 	}
-	if u.OverlayEntryExists(infoHash) {
-		return 0, refuseReorder("the release has repair overlay records, which name articles by their place in the file")
+	guard := r.reorderGuard(infoHash)
+	if err := guard(); err != nil {
+		return 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, volumeOrderTimeout)
 	defer cancel()
@@ -240,7 +248,7 @@ func (r *Repair) reorderFileVolumes(ctx context.Context, entryName, infoHash, na
 	}
 	backup, err := u.ReorderFileSegments(infoHash, name, volumeOrderKey(infoHash, f), func(cur *storage.NZBFile) string {
 		return volumeOrderKey(infoHash, cur)
-	}, segs)
+	}, guard, segs)
 	if err != nil {
 		return 0, err
 	}
@@ -265,6 +273,22 @@ func (r *Repair) reorderFileVolumes(ctx context.Context, entryName, infoHash, na
 		Str("source", vo.source).Str("backup", backup).
 		Msg("Repair: put the file's archive volumes back in order in place; no re-grab needed")
 	return moved, nil
+}
+
+// reorderGuard is what must still hold when a reorder of infoHash's file is
+// written: no overlay records (a refusal that is recorded) and no PAR2 pass
+// running or queued (one that passes by itself). reorderFileVolumes asks it
+// before reading the volumes and again under the storage lock at the write.
+func (r *Repair) reorderGuard(infoHash string) func() error {
+	return func() error {
+		if r.manager.usenet.OverlayEntryExists(infoHash) {
+			return refuseReorder("the release has repair overlay records, which name articles by their place in the file")
+		}
+		if p := r.manager.par2Repair; p.IsRunning(infoHash) || p.IsQueued(infoHash) {
+			return fmt.Errorf("%w: %w; the next sweep tries again", errReorderRefused, errReorderPassActive)
+		}
+		return nil
+	}
 }
 
 // verifyReordered loads the record reorderFileVolumes just wrote and reads its
@@ -370,7 +394,7 @@ func (r *Repair) autoReorderResults(ctx context.Context, c *candidate, results [
 		}
 		if _, err := r.reorderFileVolumes(ctx, c.name, res.infoHash, res.name); err != nil {
 			switch {
-			case errors.Is(err, errReorderBusy) || !errors.Is(err, errReorderRefused):
+			case errors.Is(err, errReorderBusy) || errors.Is(err, errReorderPassActive) || !errors.Is(err, errReorderRefused):
 				r.logger.Info().Err(err).Str("entry", c.name).Str("file", res.name).
 					Msg("Repair: could not put the file's volumes in order in place this time; it stays Unverified and the next sweep tries again")
 			default:

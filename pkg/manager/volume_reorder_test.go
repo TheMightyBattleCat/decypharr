@@ -8,7 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rs/zerolog"
+
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
 // reorderFile is voFile with offsets filled in, as a stored file has them.
@@ -192,5 +196,44 @@ func TestMergeVolumeOrderChecksDropsAReorderedFilesVerdict(t *testing.T) {
 		{name: "a.mkv", volumeReordered: true, volumeCheck: &storage.VolumeOrderCheck{FileName: "a.mkv", Layout: "new"}}})
 	if len(got) != 2 || got[0].Layout != "new" || got[0].Misordered {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// The reorder's guard, asked again under the storage lock at the write: an
+// overlay record is a refusal about the file (recorded), a PAR2 pass running
+// or queued is one that passes by itself (the next sweep tries again).
+func TestReorderGuard(t *testing.T) {
+	p, r := newTestPar2Repair(t)
+	store, err := overlay.NewStore(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("overlay.NewStore: %v", err)
+	}
+	u := usenet.NewWithOverlayForTest(store)
+	p.manager.usenet = u
+
+	if err := r.reorderGuard("free")(); err != nil {
+		t.Fatalf("nothing in the way, guard refused: %v", err)
+	}
+
+	p.mu.Lock()
+	p.queued["queued"] = struct{}{}
+	p.mu.Unlock()
+	p.runningMu.Lock()
+	p.running["running"] = &runningJob{}
+	p.runningMu.Unlock()
+	for _, id := range []string{"queued", "running"} {
+		err := r.reorderGuard(id)()
+		if !errors.Is(err, errReorderRefused) || !errors.Is(err, errReorderPassActive) {
+			t.Fatalf("%s pass: guard returned %v, want a refusal that passes by itself", id, err)
+		}
+	}
+
+	if err := u.RecordOverlayDead("recorded", "a.mkv", 3, "m3@x", 1000); err != nil {
+		t.Fatalf("RecordOverlayDead: %v", err)
+	}
+	err = r.reorderGuard("recorded")()
+	if !errors.Is(err, errReorderRefused) || errors.Is(err, errReorderPassActive) || errors.Is(err, errReorderBusy) ||
+		!strings.Contains(err.Error(), "overlay records") {
+		t.Fatalf("overlay record: guard returned %v, want the recorded refusal", err)
 	}
 }

@@ -688,11 +688,23 @@ func (u *Usenet) DropIdleReader(nzoID, filename string) bool {
 // was is first copied to the volume-order-backup folder beside the meta
 // store under its own time, and that path is returned: copying it back over
 // the record (RestoreNZBRecord) undoes the change.
-func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*storage.NZBFile) string, segs []storage.NZBSegment) (string, error) {
+//
+// guard, when not nil, is asked first under the same lock, before anything is
+// written: an error from it leaves the record and the backup folder alone and
+// is returned as it is. The caller's checks made before it read the volumes
+// over the network can have changed by now (an overlay record naming an
+// article by its place, a PAR2 pass that loaded the old layout).
+func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*storage.NZBFile) string, guard func() error, segs []storage.NZBSegment) (string, error) {
 	src := u.nzbStorage.MetaFilePath(nzoID)
 	dir := filepath.Join(filepath.Dir(u.nzbStorage.MetaDir()), "volume-order-backup")
 	backup := filepath.Join(dir, fmt.Sprintf("%s.%s", filepath.Base(src), time.Now().UTC().Format("20060102T150405.000")))
+	var refused error
 	err := u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
+		if guard != nil {
+			if refused = guard(); refused != nil {
+				return false, refused
+			}
+		}
 		f := nzb.GetFileByName(filename)
 		if f == nil {
 			return false, fmt.Errorf("file %q is not in the record", filename)
@@ -717,6 +729,9 @@ func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*
 		f.Segments = segs
 		return true, nil
 	})
+	if refused != nil {
+		return "", refused
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to store the reordered layout: %w", err)
 	}

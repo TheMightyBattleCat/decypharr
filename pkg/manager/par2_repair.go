@@ -3258,6 +3258,18 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			p.invalidateRepairedRanges(nzb, nzbID, entryName, deadRefsByFile(written))
 		}
 	}()
+	// The pass worked out every article's place from the record it loaded at
+	// the start. If the record has changed since (a volume reorder), a patch
+	// written by those places would land on another article. Nothing is
+	// written. The reorder refuses while a pass is running or queued, so
+	// this is a second line of defence.
+	fresh, err := u.GetNZB(nzbID)
+	if err != nil {
+		return par2Failf(par2Transient, "reload NZB record before writing patches: %w", err)
+	}
+	if err := par2RecordMoved(nzb, fresh, placeableRefs); err != nil {
+		return par2Failf(par2Transient, "the NZB record changed during the pass, no patch written: %w (transient: this pass's copy of the record is out of date)", err)
+	}
 	recorded, unwritable, err := p.writeRecordedPatches(nzbID, entryName, nzb, idx, repairedByIndex, placeableRefs)
 	written = append(written, recorded...)
 	tally.addPatchedRecorded(len(recorded))
@@ -3277,6 +3289,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	for _, dr := range discovered {
 		start, end, werr := readerPatchWindow(nzb, dr)
 		if werr != nil {
+			continue
+		}
+		if err := par2RecordMoved(nzb, fresh, []par2DeadRef{dr}); err != nil {
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+				Msg("par2 repair: the NZB record changed during the pass; not patching an article it found dead")
 			continue
 		}
 		data, err := extractPostedRange(idx, repairedByIndex, dr.rng.fileID, start, end)
@@ -3868,6 +3885,27 @@ func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange, s
 		return nil, false
 	}
 	return out, true
+}
+
+// par2RecordMoved reports the first of refs whose reader slot in fresh, the
+// NZB record as it is now, is not where it was in old, the record the pass
+// worked from. A ref with no slot in old is left to the writer, which skips
+// it as before.
+func par2RecordMoved(old, fresh *storage.NZB, refs []par2DeadRef) error {
+	for _, dr := range refs {
+		start, end, err := readerPatchWindow(old, dr)
+		if err != nil {
+			continue
+		}
+		fs, fe, err := readerPatchWindow(fresh, dr)
+		if err != nil {
+			return err
+		}
+		if fs != start || fe != end {
+			return fmt.Errorf("%s segment %d now reads [%d,%d) of its article, not [%d,%d)", dr.file, dr.seg.Index, fs, fe, start, end)
+		}
+	}
+	return nil
 }
 
 // readerPatchWindow returns the byte range of dr's posted article that the
