@@ -374,10 +374,10 @@ func TestPar2EarlyStoppedPassStaysSuspect(t *testing.T) {
 		t.Fatalf("RepairWith: %v, want an early stop", repairErr)
 	}
 	newly := 3
-	if stop, _ := par2RoundShouldStop(newly, 0, k, available); !stop {
+	if stop, _ := par2RoundShouldStop(newly, 0, false, k, available); !stop {
 		t.Fatal("round 0 went round again although the enlarged damage cannot fit the recovery budget")
 	}
-	if stop, _ := par2RoundShouldStop(1, 0, 1, 10); stop {
+	if stop, _ := par2RoundShouldStop(1, 0, false, 1, 10); stop {
 		t.Fatal("stopped although the enlarged damage fits")
 	}
 

@@ -3055,11 +3055,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// such slices (par2.ErrSliceUnavailable) and reports every one found in
 	// the pass, so a round adds all of them at once - the STAT sweep above
 	// under-reports (a provider can answer STAT 223 for an article whose
-	// BODY is gone everywhere), so this is where most of them surface. Bounded by maxIntactRepairRounds; a release with damage
+	// BODY is gone everywhere), so this is where most of them surface. Bounded by maxIntactRepairRounds full reads plus
+	// maxTransportCutRounds reads cut short by a transport error (see par2FailedRounds); a release with damage
 	// beyond what the overlay had recorded aborts with a clear terminal
 	// reason well before that, rather than spinning.
 	var repaired []par2.RepairedSlice
 	var damagedPos map[int64]struct{}
+	var failedRounds par2FailedRounds
 	for round := 0; ; round++ {
 		tally.setRounds(round + 1)
 		k := len(damaged)
@@ -3254,7 +3256,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// the short-read case, and one that made a geometry bug on intact data
 		// indistinguishable from genuine provider damage.
 		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
-		if stopErr := par2RoundStopError(len(newlyDamaged), round, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize)),
+		kindRound, cut := failedRounds.end(repairErr)
+		if stopErr := par2RoundStopError(len(newlyDamaged), kindRound, cut, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize)),
 			confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr); stopErr != nil {
 			return stopErr
 		}
@@ -3267,6 +3270,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			Int("checksum_bad", len(checksumBad)).
 			Str("providers", nntp.DescribeOutcomes(nntp.FailoverOutcomes(repairErr))).
 			Int("round", round+1).
+			Bool("cut_short", cut).
 			Bool("stat_sweep_ran", statSwept).
 			Str(par2NoteField, fmt.Sprintf("%d more damaged after full read %d", len(newlyDamaged), round+1)).
 			Msg("par2 repair: intact slice(s) unreadable; expanding damaged set and retrying")
@@ -3516,23 +3520,29 @@ func (p *Par2Repair) writeRecordedPatches(nzbID, entryName string, nzb *storage.
 
 // par2RoundShouldStop decides whether runRepair's round loop ends with the
 // cause-labelled error instead of folding newly unreadable slices in and
-// trying again: nothing new was found, the round cap is reached, or the
-// enlarged damaged set cannot fit the recovery budget (retained recovery
-// slices, capped by par2.MaxRepairSlicesFor the set's slice size). The last case is the
-// one an early-stopped pass always hits. Without it the loop went round
-// again and the next round's opening capacity gate returned "more damage
-// than recorded" - terminal - so a short-read or checksum-bad pass, which
-// classifyPar2Failure treats as suspect, went terminal on its first attempt.
+// trying again: nothing new was found, the enlarged damaged set cannot fit
+// the recovery budget (retained recovery slices, capped by
+// par2.MaxRepairSlicesFor the set's slice size), or the round cap for this
+// kind of round is reached. The budget case is the one an early-stopped pass
+// always hits. Without it the loop went round again and the next round's
+// opening capacity gate returned "more damage than recorded" - terminal - so
+// a short-read or checksum-bad pass, which classifyPar2Failure treats as
+// suspect, went terminal on its first attempt.
 //
-// The reason says which of the three fired. Only par2RoundStopCap can stop
-// with the enlarged set still inside the budget.
-func par2RoundShouldStop(newlyDamaged, round, k, budget int) (bool, par2RoundStop) {
+// round is the 0-based index of this round among failed rounds of its own
+// kind (see par2FailedRounds): a read that ran to the end counts toward
+// maxIntactRepairRounds, one cut short by a transport error toward
+// maxTransportCutRounds. The reason says which stop fired. Only the two caps
+// can stop with the enlarged set still inside the budget.
+func par2RoundShouldStop(newlyDamaged, round int, cut bool, k, budget int) (bool, par2RoundStop) {
 	switch {
 	case newlyDamaged == 0:
 		return true, par2RoundStopNothingNew
 	case k+newlyDamaged > budget:
 		return true, par2RoundStopOverBudget
-	case round >= maxIntactRepairRounds-1:
+	case cut && round >= maxTransportCutRounds-1:
+		return true, par2RoundStopCutCap
+	case !cut && round >= maxIntactRepairRounds-1:
 		return true, par2RoundStopCap
 	}
 	return false, par2RoundContinue
@@ -3546,28 +3556,73 @@ const (
 	par2RoundStopNothingNew
 	par2RoundStopOverBudget
 	par2RoundStopCap
+	par2RoundStopCutCap
 )
+
+// maxTransportCutRounds bounds the failed rounds whose read was cut short by
+// a transport error (see par2RoundCutShort). They do not count toward
+// maxIntactRepairRounds: such a round stops at the first slice that times
+// out, so the few dead slices it found say nothing about how many more the
+// rest of the read would find. Bounded on their own so a dead connection
+// cannot loop for ever.
+const maxTransportCutRounds = 3
+
+// par2FailedRounds counts runRepair's failed rounds by how their read ended.
+type par2FailedRounds struct {
+	full, cut int
+}
+
+// end records a failed round and returns its 0-based index among rounds of
+// the same kind, and whether it was cut short by a transport error.
+func (r *par2FailedRounds) end(repairErr error) (round int, cut bool) {
+	if par2RoundCutShort(repairErr) {
+		r.cut++
+		return r.cut - 1, true
+	}
+	r.full++
+	return r.full - 1, false
+}
+
+// par2RoundCutShort reports whether par2.RepairWith stopped on an intact
+// slice read that failed without a verdict on the slice: not unavailable (a
+// 430, a short decode or a corrupt copy, which RepairWith streams past), not
+// a checksum abort, and not one of runRepair's own classed errors (a missing
+// fetcher, a recovered panic). In practice that is a provider timeout or a
+// dropped connection. Cancelled contexts never get here: the round loop
+// returns them first.
+func par2RoundCutShort(repairErr error) bool {
+	if repairErr == nil || errors.Is(repairErr, par2.ErrSliceUnavailable) || errors.Is(repairErr, par2.ErrChecksumMismatch) {
+		return false
+	}
+	var classed par2Classed
+	return !errors.As(repairErr, &classed)
+}
 
 // par2RoundStopError returns nil when the round loop should fold the newly
 // damaged slices in and go round again, and otherwise the error the pass
-// ends with. A stop at the round cap with the enlarged damaged set still
-// inside the budget is transient: with providers timing out, each round can
-// be cut short before it has read everything, so it finds a few more dead
-// slices each time. That says nothing about whether the damage fits, and one
-// more read (after the backoff) can repair it. The cause text is kept for the
-// log, but repairErr is not wrapped, so a 430 inside it cannot make
+// ends with. round and cut are as par2FailedRounds.end returns them. A stop
+// at either round cap with the enlarged damaged set still inside the budget
+// is transient: with providers timing out, each round can be cut short
+// before it has read everything, so it finds a few more dead slices each
+// time. That says nothing about whether the damage fits, and one more read
+// (after the backoff) can repair it. The cause text is kept for the log, but
+// repairErr is not wrapped, so a 430 inside it cannot make
 // classifyPar2Failure treat the stop as terminal before it sees the tag.
-func par2RoundStopError(newlyDamaged, round, k, budget, confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
-	stop, why := par2RoundShouldStop(newlyDamaged, round, k, budget)
+func par2RoundStopError(newlyDamaged, round int, cut bool, k, budget, confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
+	stop, why := par2RoundShouldStop(newlyDamaged, round, cut, k, budget)
 	if !stop {
 		return nil
 	}
 	capErr := par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad, repairErr)
-	if why != par2RoundStopCap {
-		return capErr
+	switch why {
+	case par2RoundStopCap:
+		return par2Failf(par2Transient, "%v (transient: stopped after %d reads with the damage still inside the recovery budget, %d of %d slices)",
+			capErr, round+1, k+newlyDamaged, budget)
+	case par2RoundStopCutCap:
+		return par2Failf(par2Transient, "%v (transient: stopped after %d reads cut short by a transport error, with the damage still inside the recovery budget, %d of %d slices)",
+			capErr, round+1, k+newlyDamaged, budget)
 	}
-	return par2Failf(par2Transient, "%v (transient: stopped after %d reads with the damage still inside the recovery budget, %d of %d slices)",
-		capErr, round+1, k+newlyDamaged, budget)
+	return capErr
 }
 
 // par2RoundCapError names why intact slices were unreadable when the round
