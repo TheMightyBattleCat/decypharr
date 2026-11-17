@@ -188,3 +188,30 @@ func TestClassifyPar2FailureStructuralNoFetcherStaysTerminal(t *testing.T) {
 		t.Errorf("classifyPar2Failure(structural no-fetcher).terminal = false, want true")
 	}
 }
+
+// An overlay that cannot be read arms the transient backoff, so the next
+// automatic trigger inside the window starts no pass.
+func TestPar2OverlayUnreadableArmsBackoff(t *testing.T) {
+	p, _ := newTestPar2Repair(t)
+	const id = "nzb-overlay-unreadable"
+
+	if !p.par2ShouldAutoEnqueue(id) {
+		t.Fatal("fresh entry should be enqueueable")
+	}
+	// A path in the message that looks terminal must not flip the verdict.
+	p.recordOverlayUnreadable(id, errors.New("open /x/no PAR2 data available/overlay: permission denied"))
+
+	st, err := p.manager.storage.GetPar2RepairState(id)
+	if err != nil || st == nil {
+		t.Fatalf("no repair state recorded: %v", err)
+	}
+	if st.Terminal {
+		t.Fatalf("overlay read error recorded terminal: %q", st.TerminalReason)
+	}
+	if !st.NextRetryAt.After(time.Now()) {
+		t.Fatalf("no backoff window: NextRetryAt=%v", st.NextRetryAt)
+	}
+	if p.par2ShouldAutoEnqueue(id) {
+		t.Fatal("second trigger inside the backoff must not start a pass")
+	}
+}

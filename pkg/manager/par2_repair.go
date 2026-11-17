@@ -1643,6 +1643,15 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	p.runPass(nzbID, lane, false)
 }
 
+// recordOverlayUnreadable arms the transient backoff for a pass that could
+// not read the overlay's pending damage. Without it the exit left no state,
+// so every trigger (sweep, playback, manual enqueue) started a pass that
+// failed the same way at once. The class is set here, not read from the
+// error text, so a path in the message cannot flip it terminal.
+func (p *Par2Repair) recordOverlayUnreadable(nzbID string, err error) {
+	p.recordPar2Outcome(nzbID, par2Fail(par2Transient, fmt.Errorf("read overlay state: %w", err)), 0)
+}
+
 // runPass is runJob. fromSweep marks a pass the repair sweep started: when it
 // repairs one PAR2 set and leaves another's damage, it still counts as a
 // success but queues no follow-up. The sweep re-grabs the files the pass
@@ -1809,6 +1818,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		// PAR2 attempt report success and drop the file from its broken
 		// list with nothing repaired.
 		p.logger.Warn().Err(err).Str("entry", entryName).Msg("par2 repair: could not read the overlay's pending damage")
+		p.recordOverlayUnreadable(nzbID, err)
 		progress.SetPhase(Par2PhaseFailed)
 		progress.SetLastError("read overlay state: " + err.Error())
 		return
