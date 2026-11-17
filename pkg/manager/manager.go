@@ -919,6 +919,11 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	// on to the re-grabbed replacement's (different) nzbID. Best-effort: a
 	// failure here must never block deleting the entry record itself, since
 	// from the user's perspective the entry is already gone either way.
+	if torr.IsNZB() && m.par2Repair != nil {
+		// A PAR2 pass for the entry would read the whole release, fail at
+		// the patch write and record and notify that failure.
+		m.par2Repair.CancelEntry(infohash)
+	}
 	if torr.IsNZB() && m.usenet != nil {
 		if err := m.usenet.Delete(infohash); err != nil {
 			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete usenet/overlay state for entry")
@@ -930,6 +935,13 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
+	}
+	// Its PAR2 backoff/terminal row: only a successful pass deleted one, so
+	// every deleted entry with a failed pass left its row behind.
+	if torr.IsNZB() {
+		if err := m.storage.DeletePar2RepairState(infohash); err != nil {
+			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete PAR2 repair state for entry")
+		}
 	}
 	m.strm.RemoveEntryAsync(torr)
 

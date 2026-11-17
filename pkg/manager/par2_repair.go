@@ -255,6 +255,9 @@ type runningJob struct {
 	lane      repairLane
 	cancel    context.CancelFunc
 	preempted atomic.Bool
+	// deleted is set by CancelEntry: the entry was deleted under the pass,
+	// which then records nothing and notifies nobody.
+	deleted atomic.Bool
 	// done is closed once the job has deregistered, so a job for the same
 	// nzbID can wait out a preempted one instead of running alongside it.
 	done chan struct{}
@@ -515,6 +518,40 @@ func (p *Par2Repair) releaseRunNamed(nzbID string, job *runningJob) (merged int,
 		name = nzbID
 	}
 	return merged, proximity, name
+}
+
+// CancelEntry stops PAR2 work for an entry that is being deleted: a running
+// pass is cancelled and marked deleted, so it ends without recording an
+// outcome, an attempt or a notification, and an URGENT request still waiting
+// on the heap is dropped with its handler claim. It does not wait for the
+// pass to unwind: the terminal re-grab calls the delete from inside its own
+// pass.
+func (p *Par2Repair) CancelEntry(nzbID string) {
+	if p == nil || nzbID == "" {
+		return
+	}
+	p.runningMu.Lock()
+	job, running := p.running[nzbID]
+	if running {
+		job.deleted.Store(true)
+		if job.cancel != nil {
+			job.cancel()
+		}
+	}
+	p.runningMu.Unlock()
+
+	p.urgentMu.Lock()
+	item, queued := p.urgentSet[nzbID]
+	if queued {
+		heap.Remove(&p.urgentHeap, item.index)
+		delete(p.urgentSet, nzbID)
+	}
+	p.urgentMu.Unlock()
+	// A running pass releases its own claim as it ends; a queued request's
+	// claim has no pass to release it.
+	if queued && !running && p.repair != nil && p.repair.handlers != nil {
+		p.repair.handlers.ReleasePar2(nzbID)
+	}
 }
 
 // mergeIntoRunningUrgent records an URGENT request against the URGENT job
@@ -1565,6 +1602,10 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	// take.
 	defer func() {
 		merged, proximity, name := p.releaseRunNamed(nzbID, job)
+		if job.deleted.Load() {
+			// The entry is gone: nothing is left to follow up.
+			return
+		}
 		if setsDeferred > 0 && fromSweep {
 			p.logger.Info().Str("entry", name).Str("nzb_id", nzbID).Int("dead_segments", setsDeferred).
 				Str(par2NoteField, logger.Count(setsDeferred, "dead segment")+" in another recovery set").
@@ -1710,7 +1751,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	var deadSlicesDiscovered int // distinct dead slices the repair engine found across all rounds, beyond what the overlay already recorded
 	tally := &par2PassTally{recorded: deadSegments}
 	err = p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress, tally)
-	if deferredDead := par2DeferredSetsSuccess(err, tally); deferredDead > 0 && !job.preempted.Load() && (p.ctx == nil || p.ctx.Err() == nil) {
+	if deferredDead := par2DeferredSetsSuccess(err, tally); deferredDead > 0 && !job.preempted.Load() && !job.deleted.Load() && (p.ctx == nil || p.ctx.Err() == nil) {
 		// The chosen set is repaired; the damage another set protects waits
 		// for the next pass, queued as this one ends. Recording this as a
 		// failure armed a backoff, kept the repaired files failed and queued
@@ -1719,6 +1760,15 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		err = nil
 	}
 	if err != nil {
+		if job.deleted.Load() {
+			// The entry was deleted under the pass (CancelEntry). Nothing
+			// failed that a backoff, an attempt row or a notification would
+			// be about; the claim is released by the default branch above.
+			progress.SetPhase(Par2PhaseFailed)
+			progress.SetLastError("entry deleted")
+			p.logger.Debug().Str("entry", entryName).Msg("par2 repair stopped: entry deleted")
+			return
+		}
 		if job.preempted.Load() {
 			preempted = true
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
