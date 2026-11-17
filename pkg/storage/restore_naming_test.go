@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"google.golang.org/protobuf/proto"
 )
 
 func setFolderNaming(t *testing.T, naming config.WebDavFolderNaming) {
@@ -175,5 +176,68 @@ func TestImportDropsMissingSeasonOfSharedPack(t *testing.T) {
 		if got, want := storeKeys(t, again, name), []string{"s01"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("%s keys = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// An entry with no protocol is in the current metadata format once it has
+// been saved. Opening the store again, here under another folder naming as
+// after a restore, must not re-save it: a re-save files it in the name index
+// a second time, under the running naming.
+func TestOpenDoesNotReindexEntryWithoutProtocol(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	setFolderNaming(t, config.WebdavUseHash)
+
+	dir := t.TempDir()
+	s, err := NewStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddOrUpdate(&Entry{InfoHash: "aaa", Name: "One", Category: "movies", Status: "downloaded",
+		Files: map[string]*File{"one.mkv": {Name: "one.mkv", InfoHash: "aaa", Size: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	setFolderNaming(t, "")
+	again, err := NewStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	for _, name := range []string{"items", "repair_state"} {
+		if got, want := storeKeys(t, again, name), []string{"aaa"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s keys after reopening = %v, want %v", name, got, want)
+		}
+	}
+	if n, err := again.MigrateMetadata(); err != nil || n != 0 {
+		t.Errorf("MigrateMetadata = %d, %v; want 0 (already in the current format)", n, err)
+	}
+}
+
+// An entry stored in the old format (no metadata attributes) is still
+// migrated, once.
+func TestMigrateMetadataStillMigratesOldFormatEntry(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	s, err := NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	data, err := proto.Marshal(EntryToProto(&Entry{InfoHash: "old", Name: "Old", Status: "downloaded"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.entries.Put("old", data, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.MigrateMetadata(); err != nil || n != 1 {
+		t.Fatalf("first MigrateMetadata = %d, %v; want 1", n, err)
+	}
+	if n, err := s.MigrateMetadata(); err != nil || n != 0 {
+		t.Errorf("second MigrateMetadata = %d, %v; want 0", n, err)
 	}
 }
