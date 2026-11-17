@@ -2,6 +2,7 @@ package par2
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -99,27 +100,28 @@ type Source struct {
 // set per episode) is parsed as the set of the first Main packet found, in
 // source order; packets of the other sets are counted in OtherSetPackets and
 // ignored. Use ParseIndexSet to choose the set.
-func ParseIndex(sources []Source) (*Index, error) {
-	return parseIndex(sources, nil)
+func ParseIndex(ctx context.Context, sources []Source) (*Index, error) {
+	return parseIndex(ctx, sources, nil)
 }
 
 // ParseIndexSet is ParseIndex restricted to one recovery set: packets of any
 // other set are ignored rather than failing the parse. A release that carries
 // several PAR2 sets (a season pack posted as one PAR2 set per episode) has
 // them all in its source list. A zero setID behaves exactly like ParseIndex.
-func ParseIndexSet(sources []Source, setID [16]byte) (*Index, error) {
+func ParseIndexSet(ctx context.Context, sources []Source, setID [16]byte) (*Index, error) {
 	if setID == ([16]byte{}) {
-		return parseIndex(sources, nil)
+		return parseIndex(ctx, sources, nil)
 	}
-	return parseIndex(sources, &setID)
+	return parseIndex(ctx, sources, &setID)
 }
 
 // SourceSetIDs returns the recovery set of each source's first valid packet
-// (zero when the source has none), in source order.
-func SourceSetIDs(sources []Source) [][16]byte {
+// (zero when the source has none), in source order. A cancelled ctx leaves
+// the remaining sources zero; callers check ctx.Err() before trusting them.
+func SourceSetIDs(ctx context.Context, sources []Source) [][16]byte {
 	out := make([][16]byte, len(sources))
 	for i, src := range sources {
-		_ = walkPackets(src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+		_ = walkPackets(ctx, src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
 			out[i] = h.RecoverySetID
 			return errStopWalk
 		})
@@ -134,11 +136,11 @@ var errStopWalk = fmt.Errorf("par2: stop walk")
 // and in a mixed list the first packet of all can belong to a set whose Main
 // packet was never fetched; the Main packet names a set the index can be
 // built from.
-func firstMainSetID(sources []Source) ([16]byte, bool) {
+func firstMainSetID(ctx context.Context, sources []Source) ([16]byte, bool) {
 	for _, src := range sources {
 		var id [16]byte
 		found := false
-		_ = walkPackets(src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+		_ = walkPackets(ctx, src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
 			if h.Type != typeMain {
 				return nil
 			}
@@ -152,7 +154,7 @@ func firstMainSetID(sources []Source) ([16]byte, bool) {
 	return [16]byte{}, false
 }
 
-func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
+func parseIndex(ctx context.Context, sources []Source, want *[16]byte) (*Index, error) {
 	idx := &Index{
 		Files:  make(map[[16]byte]*FileDesc),
 		Slices: make(map[[16]byte][]SliceChecksum),
@@ -160,7 +162,7 @@ func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 	if want == nil {
 		// With no Main packet anywhere, the parse below fails with "no Main
 		// packet found" (or "no PAR2 packets") as before.
-		if id, ok := firstMainSetID(sources); ok {
+		if id, ok := firstMainSetID(ctx, sources); ok {
 			want = &id
 		}
 	}
@@ -175,7 +177,7 @@ func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 				Type:   packetTypeName(h.Type),
 			})
 		}
-		err := walkPackets(src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
+		err := walkPackets(ctx, src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
 			if want != nil && h.RecoverySetID != *want {
 				idx.OtherSetPackets++ // another recovery set in the same release
 				return nil

@@ -623,7 +623,7 @@ func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: vol}})
+	full, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "i", Data: index}, {Name: "v", Data: vol}})
 	if err != nil || len(full.Recovery) != 2 {
 		t.Fatalf("fixture: %d recovery slices, err %v; want 2", len(full.Recovery), err)
 	}
@@ -649,7 +649,7 @@ func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchWholePar2File with one dead article: %v", err)
 	}
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: data}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "i", Data: index}, {Name: "v", Data: data}})
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}

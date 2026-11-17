@@ -417,7 +417,7 @@ func buildTestIndex(t *testing.T, sliceSize uint64, fileALen, fileBLen uint64) (
 	fdAPkt := buildTestPar2Packet(t, setID, testFileDescType, fdBody(fileA, fileALen, "a.rar"))
 	fdBPkt := buildTestPar2Packet(t, setID, testFileDescType, fdBody(fileB, fileBLen, "b.rar"))
 
-	idx, err := par2.ParseIndex([]par2.Source{
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{
 		{Name: "test.par2", Data: append(append(mainPkt, fdAPkt...), fdBPkt...)},
 	})
 	if err != nil {

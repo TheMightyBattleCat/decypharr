@@ -1114,11 +1114,11 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 		return false, "", fmt.Errorf("failed to fetch any par2 index file")
 	}
 	// Several recovery sets (a season pack): parse the one protecting this file.
-	verifySet, err := par2VerifySet(sources, nzb.Par2Source, *posted, file)
+	verifySet, err := par2VerifySet(ctx, sources, nzb.Par2Source, *posted, file)
 	if err != nil {
 		return false, "", err
 	}
-	idx, err := par2.ParseIndexSet(sources, verifySet)
+	idx, err := par2.ParseIndexSet(ctx, sources, verifySet)
 	if err != nil {
 		return false, "", fmt.Errorf("parse par2 index: %w", err)
 	}
@@ -1195,20 +1195,25 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 // ID now parses the first set it meets, and a same-length file of another
 // episode there would match by length alone and report the whole-file MD5
 // as a mismatch.
-func par2VerifySet(sources []par2.Source, postedFiles []storage.PostedFileRef, posted storage.PostedFileRef, file string) ([16]byte, error) {
+func par2VerifySet(ctx context.Context, sources []par2.Source, postedFiles []storage.PostedFileRef, posted storage.PostedFileRef, file string) ([16]byte, error) {
 	var set [16]byte
 	if len(posted.Segments) > 0 {
-		set = choosePar2Set(sources, nil, postedFiles,
+		set = choosePar2Set(ctx, sources, nil, postedFiles,
 			map[string][]overlay.DeadSegment{file: {{MessageID: posted.Segments[0].MessageID}}}).setID
 	}
 	if set != ([16]byte{}) {
 		return set, nil
 	}
 	seen := make(map[[16]byte]bool)
-	for _, id := range par2.SourceSetIDs(sources) {
+	for _, id := range par2.SourceSetIDs(ctx, sources) {
 		if id != ([16]byte{}) {
 			seen[id] = true
 		}
+	}
+	// A cancelled walk leaves sources unread: not a reason to call the file
+	// untied to any set.
+	if err := ctx.Err(); err != nil {
+		return set, err
 	}
 	if len(seen) > 1 {
 		return set, fmt.Errorf("parse par2 index: the release carries %d PAR2 recovery sets and none could be tied to this file", len(seen))
@@ -2308,7 +2313,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		return nil
 	}
-	if err := applySetChoice(choosePar2Set(sources, vols, nzb.Par2Source, pending)); err != nil {
+	if err := applySetChoice(choosePar2Set(ctx, sources, vols, nzb.Par2Source, pending)); err != nil {
 		return err
 	}
 
@@ -2322,8 +2327,14 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// only be worse: skip the entire recovery-volume fetch (many minutes of
 	// 430s for a large release) and declare terminal now. The authoritative
 	// exact gate in the solve loop below is unchanged.
-	earlyIdx, earlyErr := par2.ParseIndexSet(sources, par2Set)
+	earlyIdx, earlyErr := par2.ParseIndexSet(ctx, sources, par2Set)
 	if earlyErr != nil {
+		// A parse cut short by the job's cancel or timeout proves nothing
+		// about the release: leave before the gates below read the missing
+		// index as "no recovery slices".
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		earlyIdx = nil
 	}
 	// An index file can hold recovery slices too (an obfuscated posting's
@@ -2383,7 +2394,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// fetched file's set is visible.
 	rechosen := false
 	if par2Set == ([16]byte{}) {
-		if c, next, ok := par2SetAfterVolumes(sources, vols, nextVolIdx, nzb.Par2Source, pending); ok {
+		if c, next, ok := par2SetAfterVolumes(ctx, sources, vols, nextVolIdx, nzb.Par2Source, pending); ok {
 			if err := applySetChoice(c); err != nil {
 				return err
 			}
@@ -2392,7 +2403,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
-	idx, err := par2.ParseIndexSet(sources, par2Set)
+	idx, err := par2.ParseIndexSet(ctx, sources, par2Set)
 	if err != nil {
 		return par2IndexFetchTransient(fmt.Errorf("parse PAR2 index: %w", err), indexFetchErr)
 	}
@@ -4413,7 +4424,7 @@ func topUpParsedRecovery(
 		if added == 0 {
 			break
 		}
-		idx, err = par2.ParseIndexSet(sources, idx.SetID)
+		idx, err = par2.ParseIndexSet(ctx, sources, idx.SetID)
 		if err != nil {
 			return idx, nextVolIdx, sources, fmt.Errorf("parse PAR2 index: %w", err)
 		}

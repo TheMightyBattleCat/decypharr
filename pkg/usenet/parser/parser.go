@@ -1131,7 +1131,7 @@ func (p *NZBParser) tryPar2NameRecovery(ctx context.Context, singleFileRarGroups
 			Msg("PAR2 name recovery: failed to fetch PAR2 file")
 		return nil
 	}
-	idx, err := par2.ParseIndex([]par2.Source{{Name: par2IndexFile.Filename, Data: data}})
+	idx, err := par2.ParseIndex(ctx, []par2.Source{{Name: par2IndexFile.Filename, Data: data}})
 	if err != nil || len(idx.Files) == 0 {
 		p.logger.Debug().Err(err).
 			Msg("PAR2 name recovery: failed to parse PAR2 index or no FileDesc entries")

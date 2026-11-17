@@ -35,7 +35,7 @@ func TestTopUpParsedRecoveryRefetchesMisservedVolume(t *testing.T) {
 	vol3 := par2FixtureBytes(t, "fixture.vol3+2.par2")
 
 	// Start from the index alone: zero recovery slices in hand.
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "fixture.par2", Data: indexOnly}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "fixture.par2", Data: indexOnly}})
 	if err != nil {
 		t.Fatalf("seed ParseIndex: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestTopUpParsedRecoveryStopsWhenExhausted(t *testing.T) {
 	vol0 := par2FixtureBytes(t, "fixture.vol0+1.par2")
 	vol1 := par2FixtureBytes(t, "fixture.vol1+2.par2")
 
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "fixture.par2", Data: indexOnly}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "fixture.par2", Data: indexOnly}})
 	if err != nil {
 		t.Fatalf("seed ParseIndex: %v", err)
 	}

@@ -31,11 +31,11 @@ func TestPar2SetChosenFromVolumesWhenAnIndexIsMissing(t *testing.T) {
 
 	// Episode 2's index failed: the first choice, on index files alone, has
 	// one set and leaves everything as it is.
-	first := choosePar2Set([]par2.Source{ep1Index}, vols, posted, pending)
+	first := choosePar2Set(context.Background(), []par2.Source{ep1Index}, vols, posted, pending)
 	if first.setID != ([16]byte{}) || first.unattributed != 0 {
 		t.Fatalf("first choice on one index: set %x unattributed %d, want no choice", first.setID, first.unattributed)
 	}
-	if _, _, ok := par2SetAfterVolumes([]par2.Source{ep1Index}, vols, 0, posted, pending); ok {
+	if _, _, ok := par2SetAfterVolumes(context.Background(), []par2.Source{ep1Index}, vols, 0, posted, pending); ok {
 		t.Fatal("one set visible: par2SetAfterVolumes should change nothing")
 	}
 
@@ -43,7 +43,7 @@ func TestPar2SetChosenFromVolumesWhenAnIndexIsMissing(t *testing.T) {
 	// episode 2's volume carries its set's Main and FileDesc packets.
 	ep2Vol, _ := otherSetIndex("Show.S01E02.vol00+01.par2", "e02.rar")
 	fetched := []par2.Source{ep1Index, ep2Vol}
-	c, next, ok := par2SetAfterVolumes(fetched, vols, 2, posted, pending)
+	c, next, ok := par2SetAfterVolumes(context.Background(), fetched, vols, 2, posted, pending)
 	if !ok || c.setID != set2 {
 		t.Fatalf("after the volumes: ok=%v set %x, want episode 2's set %x", ok, c.setID, set2)
 	}
@@ -56,7 +56,7 @@ func TestPar2SetChosenFromVolumesWhenAnIndexIsMissing(t *testing.T) {
 	if len(c.pending["e02.rar"]) != 1 || c.deferred != 0 {
 		t.Fatalf("pending = %v deferred=%d, want the e02.rar segment kept", c.pending, c.deferred)
 	}
-	idx, err := par2.ParseIndexSet(c.sources, c.setID)
+	idx, err := par2.ParseIndexSet(context.Background(), c.sources, c.setID)
 	if err != nil {
 		t.Fatalf("parse PAR2 index on the chosen set: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestPar2SetChosenFromVolumesWhenAnIndexIsMissing(t *testing.T) {
 	// dropped, and later fetches resume after episode 1's one tried volume
 	// (vols[1] was episode 2's and is gone from the narrowed list).
 	pending1 := map[string][]overlay.DeadSegment{"a": {{MessageID: posted[0].Segments[0].MessageID}}}
-	c, next, ok = par2SetAfterVolumes(fetched, vols, 2, posted, pending1)
+	c, next, ok = par2SetAfterVolumes(context.Background(), fetched, vols, 2, posted, pending1)
 	if !ok || c.setID != set1 {
 		t.Fatalf("damage in episode 1: ok=%v set %x, want %x", ok, c.setID, set1)
 	}
@@ -84,7 +84,7 @@ func TestPar2MixedSourcesParseAsTheFirstMainPacketsSet(t *testing.T) {
 	sources, set1, _, _, _ := multisetFixture(t)
 	ep1Index := sources[1]
 	ep2Vol, _ := otherSetIndex("Show.S01E02.vol00+01.par2", "e02.rar")
-	idx, err := par2.ParseIndexSet([]par2.Source{ep1Index, ep2Vol}, [16]byte{})
+	idx, err := par2.ParseIndexSet(context.Background(), []par2.Source{ep1Index, ep2Vol}, [16]byte{})
 	if err != nil {
 		t.Fatalf("parse PAR2 index over a mixed list: %v", err)
 	}
@@ -182,17 +182,17 @@ func TestPar2VerifySetRefusesAnUntiedMix(t *testing.T) {
 	sources, set1, set2, _, posted := multisetFixture(t)
 	e02 := posted[len(posted)-1]
 
-	if got, err := par2VerifySet(sources, posted, e02, "e02.rar"); err != nil || got != set2 {
+	if got, err := par2VerifySet(context.Background(), sources, posted, e02, "e02.rar"); err != nil || got != set2 {
 		t.Fatalf("tied to episode 2: set %x err %v, want %x", got, err, set2)
 	}
-	if got, err := par2VerifySet(sources, posted, posted[0], posted[0].Name); err != nil || got != set1 {
+	if got, err := par2VerifySet(context.Background(), sources, posted, posted[0], posted[0].Name); err != nil || got != set1 {
 		t.Fatalf("tied to episode 1: set %x err %v, want %x", got, err, set1)
 	}
-	if got, err := par2VerifySet(sources[1:], posted, posted[0], posted[0].Name); err != nil || got != ([16]byte{}) {
+	if got, err := par2VerifySet(context.Background(), sources[1:], posted, posted[0], posted[0].Name); err != nil || got != ([16]byte{}) {
 		t.Fatalf("one set: set %x err %v, want zero and no error", got, err)
 	}
 	stray := storage.PostedFileRef{Name: "e09.rar", Size: 1, Segments: []storage.Par2SegmentRef{{MessageID: "<e09-1>"}}}
-	if _, err := par2VerifySet(sources, append(posted, stray), stray, stray.Name); err == nil || !strings.Contains(err.Error(), "2 PAR2 recovery sets") {
+	if _, err := par2VerifySet(context.Background(), sources, append(posted, stray), stray, stray.Name); err == nil || !strings.Contains(err.Error(), "2 PAR2 recovery sets") {
 		t.Fatalf("untied file over two sets: err %v, want the several-sets error", err)
 	}
 }

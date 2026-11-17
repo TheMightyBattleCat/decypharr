@@ -55,7 +55,7 @@ func TestLivePar2Geometry(t *testing.T) {
 		}
 		sources = append(sources, par2.Source{Name: f.Name, Data: data})
 	}
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatal(err)
 	}

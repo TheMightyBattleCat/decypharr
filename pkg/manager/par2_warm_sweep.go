@@ -157,8 +157,8 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	if len(sources) == 0 {
 		return false
 	}
-	setChoice := choosePar2Set(sources, allVols, nzb.Par2Source, pending)
-	idx, err := par2.ParseIndexSet(sources, setChoice.setID)
+	setChoice := choosePar2Set(ctx, sources, allVols, nzb.Par2Source, pending)
+	idx, err := par2.ParseIndexSet(ctx, sources, setChoice.setID)
 	if err != nil {
 		return false
 	}

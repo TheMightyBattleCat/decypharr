@@ -54,7 +54,7 @@ func buildSingleFileIndexWithIFSC(t *testing.T, sliceSize int, fileID [16]byte, 
 	ifscPkt := buildTestPar2Packet(t, setID, testIFSCType, ifscBody)
 
 	data := append(append(append([]byte{}, mainPkt...), fdPkt...), ifscPkt...)
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "test.par2", Data: data}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "test.par2", Data: data}})
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}

@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"context"
 	"crypto/md5"
 	"errors"
 	"fmt"
@@ -46,7 +47,7 @@ func loadFixtureFile(t *testing.T, name string) []byte {
 }
 
 func TestParseIndexAgainstFixtures(t *testing.T) {
-	idx, err := ParseIndex(loadFixtureSources(t))
+	idx, err := ParseIndex(context.Background(), loadFixtureSources(t))
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}
@@ -79,14 +80,14 @@ func TestParseIndexAgainstFixtures(t *testing.T) {
 // index from the duplicate Main/FileDesc/IFSC packets in the other sources.
 func TestParseIndexSkipsBadPacketButStillBuilds(t *testing.T) {
 	sources := loadFixtureSources(t)
-	clean, err := ParseIndex(sources)
+	clean, err := ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("baseline ParseIndex: %v", err)
 	}
 
 	// Locate the first packet of the first source and flip a body byte.
 	var badOffset int64 = -1
-	_ = walkPackets(sources[0].Data, nil, func(h packetHeader, packet []byte, offset int64) error {
+	_ = walkPackets(context.Background(), sources[0].Data, nil, func(h packetHeader, packet []byte, offset int64) error {
 		if badOffset < 0 {
 			badOffset = offset
 		}
@@ -99,7 +100,7 @@ func TestParseIndexSkipsBadPacketButStillBuilds(t *testing.T) {
 	mutated[badOffset+int64(packetHeaderSize)+4] ^= 0xFF // a body byte, past the header
 	sources[0].Data = mutated
 
-	idx, err := ParseIndex(sources)
+	idx, err := ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex with one bad packet: %v", err)
 	}
@@ -158,7 +159,7 @@ type goldenFixture struct {
 func loadGoldenFixture(t *testing.T) *goldenFixture {
 	t.Helper()
 	sources := loadFixtureSources(t)
-	idx, err := ParseIndex(sources)
+	idx, err := ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}

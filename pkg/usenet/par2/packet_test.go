@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/binary"
 	"testing"
@@ -44,7 +45,7 @@ func TestWalkPacketsSurvivesOverflowingLength(t *testing.T) {
 	data := append(append(append([]byte{}, good...), bogus...), good...)
 
 	seen := 0
-	err := walkPackets(data, func(packetHeader, int64) {}, func(packetHeader, []byte, int64) error {
+	err := walkPackets(context.Background(), data, func(packetHeader, int64) {}, func(packetHeader, []byte, int64) error {
 		seen++
 		return nil
 	})
@@ -70,7 +71,7 @@ func TestWalkPacketsVerifiesMD5(t *testing.T) {
 	pkt := buildPacket(t, setID, typeMain, body)
 
 	var seen int
-	err := walkPackets(pkt, nil, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(context.Background(), pkt, nil, func(h packetHeader, packet []byte, offset int64) error {
 		seen++
 		if h.Type != typeMain {
 			t.Errorf("packet type = %q, want Main", packetTypeName(h.Type))
@@ -91,7 +92,7 @@ func TestWalkPacketsVerifiesMD5(t *testing.T) {
 	// nil onChecksumError callback walkPackets fails strict.
 	corrupt := append([]byte(nil), pkt...)
 	corrupt[70] ^= 0xFF
-	err = walkPackets(corrupt, nil, func(h packetHeader, packet []byte, offset int64) error {
+	err = walkPackets(context.Background(), corrupt, nil, func(h packetHeader, packet []byte, offset int64) error {
 		return nil
 	})
 	if err == nil {
@@ -110,7 +111,7 @@ func TestWalkPacketsSkipsBadPacketWithRecorder(t *testing.T) {
 
 	var skippedOffsets []int64
 	var visited []string
-	err := walkPackets(data, func(h packetHeader, offset int64) {
+	err := walkPackets(context.Background(), data, func(h packetHeader, offset int64) {
 		skippedOffsets = append(skippedOffsets, offset)
 	}, func(h packetHeader, packet []byte, offset int64) error {
 		visited = append(visited, packetTypeName(h.Type))
@@ -136,7 +137,7 @@ func TestWalkPacketsMultiplePackets(t *testing.T) {
 	data := append(append([]byte{}, p1...), p2...)
 
 	var types []string
-	err := walkPackets(data, nil, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(context.Background(), data, nil, func(h packetHeader, packet []byte, offset int64) error {
 		types = append(types, packetTypeName(h.Type))
 		return nil
 	})
@@ -154,7 +155,7 @@ func TestWalkPacketsStopsOnTrailingGarbage(t *testing.T) {
 	data := append(append([]byte{}, p1...), []byte{1, 2, 3}...) // not a valid packet header
 
 	var seen int
-	err := walkPackets(data, nil, func(h packetHeader, packet []byte, offset int64) error {
+	err := walkPackets(context.Background(), data, nil, func(h packetHeader, packet []byte, offset int64) error {
 		seen++
 		return nil
 	})

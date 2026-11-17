@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 )
@@ -33,7 +34,7 @@ func TestParseIndexSetPicksOneSetOfSeveral(t *testing.T) {
 	ep2, set2 := secondSetIndex(t, 0xE2, "e02.rar")
 	sources := append([]Source{ep2}, episode1...)
 
-	mixed, err := ParseIndex(sources)
+	mixed, err := ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex over two sets: %v, want the first Main packet's set", err)
 	}
@@ -42,7 +43,7 @@ func TestParseIndexSetPicksOneSetOfSeveral(t *testing.T) {
 			mixed.SetID, len(mixed.Files), mixed.OtherSetPackets, len(mixed.SkippedPackets), set2)
 	}
 
-	ids := SourceSetIDs(sources)
+	ids := SourceSetIDs(context.Background(), sources)
 	if ids[0] != set2 {
 		t.Fatalf("SourceSetIDs[0] = %x, want %x", ids[0], set2)
 	}
@@ -51,28 +52,28 @@ func TestParseIndexSetPicksOneSetOfSeveral(t *testing.T) {
 		t.Fatalf("fixture set id %x", set1)
 	}
 
-	want, err := ParseIndex(episode1)
+	want, err := ParseIndex(context.Background(), episode1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ParseIndexSet(sources, set1)
+	got, err := ParseIndexSet(context.Background(), sources, set1)
 	if err != nil {
-		t.Fatalf("ParseIndexSet(episode 1): %v", err)
+		t.Fatalf("ParseIndexSet(context.Background(), episode 1): %v", err)
 	}
 	if got.SetID != set1 || got.NumSlices() != want.NumSlices() || len(got.Recovery) != len(want.Recovery) || len(got.Files) != len(want.Files) {
 		t.Fatalf("episode 1 index: slices=%d/%d recovery=%d/%d files=%d/%d", got.NumSlices(), want.NumSlices(), len(got.Recovery), len(want.Recovery), len(got.Files), len(want.Files))
 	}
 
-	got2, err := ParseIndexSet(sources, set2)
+	got2, err := ParseIndexSet(context.Background(), sources, set2)
 	if err != nil {
-		t.Fatalf("ParseIndexSet(episode 2): %v", err)
+		t.Fatalf("ParseIndexSet(context.Background(), episode 2): %v", err)
 	}
 	if got2.SetID != set2 || len(got2.Files) != 1 {
 		t.Fatalf("episode 2 index: set=%x files=%d", got2.SetID, len(got2.Files))
 	}
 
 	// A zero set id is plain ParseIndex.
-	if got0, err := ParseIndexSet(sources, [16]byte{}); err != nil || got0.SetID != set2 {
+	if got0, err := ParseIndexSet(context.Background(), sources, [16]byte{}); err != nil || got0.SetID != set2 {
 		t.Fatalf("ParseIndexSet with a zero set id: %v, want ParseIndex's choice %x", err, set2)
 	}
 }
@@ -88,11 +89,11 @@ func TestParseIndexAdoptsTheFirstMainPacketsSet(t *testing.T) {
 	strayRecovery := Source{Name: "Show.S01E02.vol00+01.par2", Data: buildPacket(t, set2, typeRecvSlic, make([]byte, 4+4096))}
 	sources := append([]Source{strayRecovery}, episode1...)
 
-	want, err := ParseIndex(episode1)
+	want, err := ParseIndex(context.Background(), episode1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ParseIndex(sources)
+	got, err := ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex with another set's recovery packet first: %v", err)
 	}

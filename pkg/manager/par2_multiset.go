@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"strings"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -40,7 +41,7 @@ type par2SetChoice struct {
 // repairs one set, defers the other's damage, and the next pass (where the
 // repaired episode no longer has pending damage) repairs the other. A single
 // set leaves everything unchanged.
-func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) par2SetChoice {
+func choosePar2Set(ctx context.Context, sources []par2.Source, vols []par2Volume, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) par2SetChoice {
 	unchanged := par2SetChoice{sources: sources, vols: vols, pending: pending}
 
 	type setInfo struct {
@@ -48,7 +49,7 @@ func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.Po
 		names []string // index source names, for matching volume names
 	}
 	sets := make(map[[16]byte]*setInfo)
-	sourceSet := par2.SourceSetIDs(sources)
+	sourceSet := par2.SourceSetIDs(ctx, sources)
 	for i, src := range sources {
 		id := sourceSet[i]
 		if id == ([16]byte{}) {
@@ -56,7 +57,7 @@ func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.Po
 		}
 		si, ok := sets[id]
 		if !ok {
-			idx, err := par2.ParseIndexSet([]par2.Source{src}, id)
+			idx, err := par2.ParseIndexSet(ctx, []par2.Source{src}, id)
 			if err != nil {
 				continue
 			}
@@ -181,9 +182,9 @@ func choosePar2Set(sources []par2.Source, vols []par2Volume, posted []storage.Po
 // vols[:nextVolIdx] are the volumes already fetched (or tried). The chosen
 // set's volumes keep their order, so its fetched ones stay a prefix; next is
 // their count, the index later fetches resume from in the narrowed list.
-func par2SetAfterVolumes(sources []par2.Source, vols []par2Volume, nextVolIdx int, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) (c par2SetChoice, next int, ok bool) {
+func par2SetAfterVolumes(ctx context.Context, sources []par2.Source, vols []par2Volume, nextVolIdx int, posted []storage.PostedFileRef, pending map[string][]overlay.DeadSegment) (c par2SetChoice, next int, ok bool) {
 	seen := make(map[[16]byte]bool)
-	for _, id := range par2.SourceSetIDs(sources) {
+	for _, id := range par2.SourceSetIDs(ctx, sources) {
 		if id != ([16]byte{}) {
 			seen[id] = true
 		}
@@ -191,7 +192,7 @@ func par2SetAfterVolumes(sources []par2.Source, vols []par2Volume, nextVolIdx in
 	if len(seen) < 2 {
 		return par2SetChoice{}, nextVolIdx, false
 	}
-	c = choosePar2Set(sources, vols, posted, pending)
+	c = choosePar2Set(ctx, sources, vols, posted, pending)
 	if c.setID == ([16]byte{}) {
 		return c, nextVolIdx, true
 	}

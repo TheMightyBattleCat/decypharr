@@ -35,7 +35,7 @@ func TestTopUpCancelledIsTransient(t *testing.T) {
 	indexOnly := par2FixtureBytes(t, "fixture.par2")
 	vol0 := par2FixtureBytes(t, "fixture.vol0+1.par2")
 	vol1 := par2FixtureBytes(t, "fixture.vol1+2.par2")
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "fixture.par2", Data: indexOnly}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "fixture.par2", Data: indexOnly}})
 	if err != nil {
 		t.Fatalf("seed ParseIndex: %v", err)
 	}

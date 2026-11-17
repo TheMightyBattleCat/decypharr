@@ -45,7 +45,7 @@ func TestRepairProgressEndToEndAgainstRealFixture(t *testing.T) {
 		t.Fatalf("no .par2 fixtures found in %s", fixtureDir)
 	}
 
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestRepairContextCancellationSurfacesAsTransient(t *testing.T) {
 		}
 		sources = append(sources, par2.Source{Name: e.Name(), Data: data})
 	}
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}
