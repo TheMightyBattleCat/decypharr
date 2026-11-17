@@ -16,27 +16,63 @@ import (
 // after a 12 GB pass. Each is mapped to the reader file and segment that
 // serves it (by Message-ID) so it can be recorded and patched like a pending
 // dead segment. Articles the reader does not serve are skipped.
+//
+// One article can be served through more than one reader slot: it holds the
+// end of one archive member and the start of the next, or it belongs to two
+// file records. A ref is returned for every such slot, and for every slot of
+// a known (recorded) article other than the known ones, so the slices the
+// solve rebuilds are patched into each slot at once. Otherwise the other slot
+// was found dead only when read, and needed a second full pass.
 func discoveredDeadRefs(nzb *storage.NZB, matches []par2.Match, fetchers map[[16]byte]*postedFileFetcher, msgIDRange map[string]postedRange, known []par2DeadRef) []par2DeadRef {
 	type readerSeg struct {
 		file  string
 		index int
 		bytes int64
 	}
-	served := make(map[string]readerSeg)
+	type slotKey struct {
+		file  string
+		index int
+	}
+	served := make(map[string][]readerSeg)
 	for _, f := range nzb.Files {
 		if f.IsDeleted {
 			continue
 		}
 		for i, s := range f.Segments {
-			served[s.MessageID] = readerSeg{file: f.Name, index: i, bytes: s.Bytes}
+			served[s.MessageID] = append(served[s.MessageID], readerSeg{file: f.Name, index: i, bytes: s.Bytes})
 		}
 	}
-	seen := make(map[string]bool, len(known))
+	seen := make(map[slotKey]bool, len(known))
 	for _, dr := range known {
-		seen[dr.seg.MessageID] = true
+		seen[slotKey{dr.file, dr.seg.Index}] = true
 	}
 
 	var out []par2DeadRef
+	addSlots := func(id string) {
+		rng, mapped := msgIDRange[id]
+		if !mapped {
+			return
+		}
+		for _, rs := range served[id] {
+			k := slotKey{rs.file, rs.index}
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, par2DeadRef{
+				file: rs.file,
+				seg:  overlay.DeadSegment{Index: rs.index, MessageID: id, Bytes: rs.bytes},
+				rng:  rng,
+			})
+		}
+	}
+
+	// Other slots of the recorded articles first: those articles start in
+	// the damaged set, so the pass never fetches them and they never reach
+	// badArticles.
+	for _, dr := range known {
+		addSlots(dr.seg.MessageID)
+	}
 	for _, m := range matches {
 		f := fetchers[m.FileID]
 		if f == nil || m.PostedIndex < 0 || m.PostedIndex >= len(nzb.Par2Source) {
@@ -53,18 +89,7 @@ func discoveredDeadRefs(nzb *storage.NZB, matches []par2.Match, fetchers map[[16
 			if i < 0 || i >= len(segs) {
 				continue
 			}
-			id := segs[i].MessageID
-			rs, ok := served[id]
-			rng, mapped := msgIDRange[id]
-			if !ok || !mapped || seen[id] {
-				continue
-			}
-			seen[id] = true
-			out = append(out, par2DeadRef{
-				file: rs.file,
-				seg:  overlay.DeadSegment{Index: rs.index, MessageID: id, Bytes: rs.bytes},
-				rng:  rng,
-			})
+			addSlots(segs[i].MessageID)
 		}
 	}
 	return out
