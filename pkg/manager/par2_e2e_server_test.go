@@ -53,6 +53,7 @@ type p2eServer struct {
 	refuse      atomic.Bool
 	quotaAfter  atomic.Int64 // BODY count after which every BODY gets quotaCode; 0 = off
 	quotaCode   string
+	quotaAll    atomic.Bool  // every STAT and BODY gets quotaCode (a provider past its quota)
 	slowNS      atomic.Int64 // delay before each reply
 	connsServed atomic.Int64
 
@@ -116,6 +117,7 @@ func (s *p2eServer) reset() {
 	s.mu.Unlock()
 	s.refuse.Store(false)
 	s.quotaAfter.Store(0)
+	s.quotaAll.Store(false)
 	s.slowNS.Store(0)
 	s.resetCounters()
 }
@@ -233,6 +235,10 @@ func (s *p2eServer) p2eServeConn(c net.Conn) {
 		case "STAT":
 			s.cmdStat.Add(1)
 			id := strings.Trim(arg, "<>")
+			if s.quotaAll.Load() {
+				s.write(w, s.quotaCode+"\r\n")
+				break
+			}
 			a, b, _ := s.lookup(id)
 			switch {
 			case a == nil || b == p2eNotFound:
@@ -251,7 +257,7 @@ func (s *p2eServer) p2eServeConn(c net.Conn) {
 			id := strings.Trim(arg, "<>")
 			v, _ := s.bodyByID.LoadOrStore(id, new(atomic.Int64))
 			v.(*atomic.Int64).Add(1)
-			if q := s.quotaAfter.Load(); q > 0 && s.cmdBody.Load() > q {
+			if q := s.quotaAfter.Load(); s.quotaAll.Load() || (q > 0 && s.cmdBody.Load() > q) {
 				s.bodyQuota.Add(1)
 				s.write(w, s.quotaCode+"\r\n")
 				break
