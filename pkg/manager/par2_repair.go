@@ -3554,6 +3554,21 @@ func readerPatchWindow(nzb *storage.NZB, dr par2DeadRef) (start, end int64, err 
 // patch on a plain cache hit (PatchBytes is only reached on a live
 // article-fetch failure). See invalidateRepaired for the order.
 func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName string, pending map[string][]overlay.DeadSegment) {
+	p.invalidateCachedRanges(nzb, nzbID, entryName, pending)
+
+	// Every pass that writes patches comes through here (the job, and the
+	// sweep's warm and cold passes), so this is where a pre-cached episode's
+	// readiness row learns its repair landed.
+	if p.manager.precache != nil {
+		p.manager.precache.OnPar2Repaired(nzbID)
+	}
+}
+
+// invalidateCachedRanges runs invalidateRepaired against the live usenet
+// reader and the DFS mount for pending's segments. It is also used when the
+// sweep clears a sticky-failed file whose articles came back: the pads it
+// served are cached as zeros, and the clear deletes the only record of them.
+func (p *Par2Repair) invalidateCachedRanges(nzb *storage.NZB, nzbID, entryName string, pending map[string][]overlay.DeadSegment) {
 	refresh := func(file string, segIdx []int) {
 		if p.manager.usenet != nil {
 			p.manager.usenet.RefreshRepairedSegments(nzbID, file, segIdx)
@@ -3565,13 +3580,6 @@ func (p *Par2Repair) invalidateRepairedRanges(nzb *storage.NZB, nzbID, entryName
 		forget = func(file string, off, length int64) { fw.ForgetCachedRange(folder, file, off, length) }
 	}
 	invalidateRepaired(nzb, pending, refresh, forget, func(d time.Duration, f func()) { time.AfterFunc(d, f) })
-
-	// Every pass that writes patches comes through here (the job, and the
-	// sweep's warm and cold passes), so this is where a pre-cached episode's
-	// readiness row learns its repair landed.
-	if p.manager.precache != nil {
-		p.manager.precache.OnPar2Repaired(nzbID)
-	}
 }
 
 // repairedRangeReforgetDelay is how long after a repair invalidateRepaired

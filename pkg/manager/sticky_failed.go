@@ -180,6 +180,16 @@ func (r *Repair) reconcileStickyFailed(ctx context.Context, c *candidate, entry 
 // recordedDeadIndices returns the overlay's recorded-dead (non-patched)
 // segment indices for nzbID/name.
 func (r *Repair) recordedDeadIndices(nzbID, name string) []int {
+	var indices []int
+	for _, d := range r.unpatchedDeadSegments(nzbID, name) {
+		indices = append(indices, d.Index)
+	}
+	return indices
+}
+
+// unpatchedDeadSegments returns the overlay's dead and padded (non-patched)
+// segment records for nzbID/name: the ones OverlayClearFileDamage deletes.
+func (r *Repair) unpatchedDeadSegments(nzbID, name string) []overlay.DeadSegment {
 	if r.manager.usenet == nil {
 		return nil
 	}
@@ -191,13 +201,13 @@ func (r *Repair) recordedDeadIndices(nzbID, name string) []int {
 	if fe == nil {
 		return nil
 	}
-	var indices []int
+	var segs []overlay.DeadSegment
 	for _, d := range fe.DeadSegments {
 		if d.Status != overlay.StatusPatched {
-			indices = append(indices, d.Index)
+			segs = append(segs, d)
 		}
 	}
-	return indices
+	return segs
 }
 
 // clearStickyFailed un-fails a file the damage sampler proved genuinely
@@ -205,7 +215,15 @@ func (r *Repair) recordedDeadIndices(nzbID, name string) []int {
 // PAR2-patched segments — real recovered bytes — are preserved while the
 // verdict and dead/padded records are removed. It also un-poisons the
 // failedFiles cache so the next read re-verifies from scratch.
+//
+// A padded segment's zeros are in the DFS cache with no marker, and the
+// clear deletes the only record of where they are. So the records are read
+// first, and once the file is un-failed their cached ranges are forgotten
+// and a live reader is told to fetch them again (forgetCachedPads). That
+// runs after the clear, so a read in between re-fetches the articles that
+// came back rather than padding again from the old records.
 func (r *Repair) clearStickyFailed(entry *storage.Entry, name, nzbID string) {
+	pads := r.unpatchedDeadSegments(nzbID, name)
 	patchesPreserved, err := r.manager.usenet.OverlayClearFileDamage(nzbID, name)
 	if err != nil {
 		r.logger.Warn().Err(err).Str("entry", entry.Name).Str("file", name).
@@ -213,11 +231,28 @@ func (r *Repair) clearStickyFailed(entry *storage.Entry, name, nzbID string) {
 		return
 	}
 	r.manager.usenet.ClearFailedFile(nzbID, name)
+	r.forgetCachedPads(entry, nzbID, name, pads)
 	evt := r.logger.Info().Str("entry", entry.Name).Str("file", name)
 	if patchesPreserved {
 		evt.Bool("patches_preserved", true)
 	}
 	evt.Msg("Repair: sticky-failed verdict cleared by damage sample; file genuinely recovered")
+}
+
+// forgetCachedPads drops the cached copies of a cleared file's padded
+// segments, as a PAR2 pass does for the segments it patches (encrypted
+// files get the same CBC widening, via buildDeadOutputRanges).
+func (r *Repair) forgetCachedPads(entry *storage.Entry, nzbID, name string, pads []overlay.DeadSegment) {
+	if len(pads) == 0 || r.manager.par2Repair == nil {
+		return
+	}
+	nzb, err := r.manager.usenet.GetNZB(nzbID)
+	if err != nil || nzb == nil {
+		r.logger.Warn().Err(err).Str("entry", entry.Name).Str("file", name).Int("padded", len(pads)).
+			Msg("Repair: cannot read the NZB record, cached pads of the cleared file not forgotten")
+		return
+	}
+	r.manager.par2Repair.invalidateCachedRanges(nzb, nzbID, entry.Name, map[string][]overlay.DeadSegment{name: pads})
 }
 
 // regrabStickyFailed routes a sticky-Failed file the sampler confirmed still
