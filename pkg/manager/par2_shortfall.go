@@ -21,7 +21,7 @@ func par2RecoveryShortfall(damaged, got, transportFails int) error {
 // giving up on the release.
 func par2FetchShortfall(msg string, transportFails int) error {
 	if transportFails > 0 {
-		return fmt.Errorf("%s (transient: %d PAR2 article fetch(es) failed without a 430)", msg, transportFails)
+		return par2Failf(par2Transient, "%s (transient: %d PAR2 article fetch(es) failed without a 430)", msg, transportFails)
 	}
-	return errors.New(msg)
+	return par2Fail(par2Terminal, errors.New(msg))
 }

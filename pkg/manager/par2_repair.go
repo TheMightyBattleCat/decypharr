@@ -637,10 +637,14 @@ func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int,
 
 // par2SetsDeferredError is runRepair's result when it repaired the PAR2
 // recovery set it chose and left dead segments another set protects for the
-// next pass. Its text is classified transient (see classifyPar2Failure).
+// next pass. It is classed transient (see classifyPar2Failure).
 type par2SetsDeferredError struct {
 	dead int
 }
+
+// par2Class: the set this pass chose was repaired; the rest waits for the
+// next pass.
+func (e *par2SetsDeferredError) par2Class() par2Class { return par2Transient }
 
 func (e *par2SetsDeferredError) Error() string {
 	return fmt.Sprintf("%d dead segment(s) in another PAR2 recovery set left for the next pass (transient: several recovery sets)", e.dead)
@@ -954,7 +958,8 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 // repair. It names only the limit that was actually exceeded: too few recovery
 // slices retained in the posting, the per-repair limit (the slice cap, or the
 // repair memory limit for large slices), or both. The "more damage than
-// recorded" prefix is what classifyPar2Failure matches.
+// recorded" prefix is what the untyped fallback in classifyPar2Failure
+// matches; the error itself is classed terminal.
 func errMoreDamageThanRecorded(damaged int, available uint32, sliceSize int64) error {
 	limit := par2.MaxRepairSlicesFor(sliceSize)
 	limitText := fmt.Sprintf("the %d-slice repair cap", limit)
@@ -966,11 +971,11 @@ func errMoreDamageThanRecorded(damaged int, available uint32, sliceSize int64) e
 	overLimit := damaged > limit
 	switch {
 	case overRetained && overLimit:
-		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained (also over %s)", damaged, available, limitText)
+		return par2Failf(par2Terminal, "more damage than recorded; %d damaged slices, only %d recovery slices retained (also over %s)", damaged, available, limitText)
 	case overLimit:
-		return fmt.Errorf("more damage than recorded; %d damaged slices is over %s (%d recovery slices retained)", damaged, limitText, available)
+		return par2Failf(par2Terminal, "more damage than recorded; %d damaged slices is over %s (%d recovery slices retained)", damaged, limitText, available)
 	default:
-		return fmt.Errorf("more damage than recorded; %d damaged slices, only %d recovery slices retained", damaged, available)
+		return par2Failf(par2Terminal, "more damage than recorded; %d damaged slices, only %d recovery slices retained", damaged, available)
 	}
 }
 
@@ -1585,7 +1590,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	// goroutines runRepair starts itself are not caught here.
 	defer func() {
 		if r := recover(); r != nil {
-			err := fmt.Errorf("par2 repair panicked: %v (transient: internal error)", r)
+			err := par2Failf(par2Transient, "par2 repair panicked: %v (transient: internal error)", r)
 			p.logger.Error().Str("entry", nzbID).Str("lane", lane.String()).Interface("panic", r).
 				Bytes("stack", debug.Stack()).Msg("par2 repair: pass panicked; recovered")
 			progress.SetPhase(Par2PhaseFailed)
@@ -2292,35 +2297,35 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 
 	nzb, err := u.GetNZB(nzbID)
 	if err != nil {
-		return fmt.Errorf("load NZB record: %w", err)
+		return par2Failf(par2Transient, "load NZB record: %w", err)
 	}
 	if usenet.Par2FilesMayBeAmongPosted(nzb) {
 		moved, err := u.RefilePar2Refs(ctx, nzbID)
 		if err != nil {
-			return fmt.Errorf("looking for PAR2 files among the posted files did not complete: %w (transient: it can be retried)", err)
+			return par2Failf(par2Transient, "looking for PAR2 files among the posted files did not complete: %w (transient: it can be retried)", err)
 		}
 		if moved > 0 {
 			p.logger.Info().Str("entry", nzbID).Int("par2_files", moved).
 				Msg("Found the release's PAR2 files among its posted files by their yEnc names")
 			if nzb, err = u.GetNZB(nzbID); err != nil {
-				return fmt.Errorf("reload NZB record after refiling PAR2 files: %w", err)
+				return par2Failf(par2Transient, "reload NZB record after refiling PAR2 files: %w", err)
 			}
 		}
 	}
 	if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
 		if err := u.BackfillPar2Refs(ctx, nzbID); err != nil {
 			if errors.Is(err, usenet.ErrBackfillImpossible) {
-				return fmt.Errorf("no PAR2 data and backfill failed: %w", err)
+				return par2Failf(par2Terminal, "no PAR2 data and backfill failed: %w", err)
 			}
 			// A read/re-parse/save failure: a later attempt can succeed.
-			return fmt.Errorf("PAR2 refs backfill did not complete: %w (transient: backfill can be retried)", err)
+			return par2Failf(par2Transient, "PAR2 refs backfill did not complete: %w (transient: backfill can be retried)", err)
 		}
 		nzb, err = u.GetNZB(nzbID)
 		if err != nil {
-			return fmt.Errorf("reload NZB record after backfill: %w", err)
+			return par2Failf(par2Transient, "reload NZB record after backfill: %w", err)
 		}
 		if len(nzb.Par2Files) == 0 || len(nzb.Par2Source) == 0 {
-			return fmt.Errorf("no PAR2 data available")
+			return par2Failf(par2Terminal, "no PAR2 data available")
 		}
 	}
 
@@ -2406,7 +2411,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		p.logger.Info().Str("entry", entryName).Int("volumes", len(vols)).Int("deferred_dead_segments", c.deferred).
 			Msg("par2: release carries several recovery sets; repairing the one protecting the damaged files")
 		if len(pending) == 0 {
-			return fmt.Errorf("every dead segment is in another PAR2 set (transient: chosen set has none)")
+			return par2Failf(par2Transient, "every dead segment is in another PAR2 set (transient: chosen set has none)")
 		}
 		return nil
 	}
@@ -2477,7 +2482,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	var nextVolIdx int
 	nextVolIdx, fetchedSlices, sources, _, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, needed, fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
 	if err != nil {
-		return fmt.Errorf("fetch recovery volumes: %w", err)
+		return par2Failf(par2Transient, "fetch recovery volumes: %w", err)
 	}
 	progress.SetRecoveryVolsFetched(nextVolIdx)
 	progress.SetRecoverySlices(int(fetchedSlices), int(needed))
@@ -2502,7 +2507,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 
 	idx, err := par2.ParseIndexSet(ctx, sources, par2Set)
 	if err != nil {
-		return par2IndexFetchTransient(fmt.Errorf("parse PAR2 index: %w", err), indexFetchErr)
+		return par2IndexFetchTransient(par2IndexParseErr(err), indexFetchErr)
 	}
 	// applySetChoice counted only the chosen set's named volumes. As at the
 	// early gate, recovery slices already in hand (from files with no volume
@@ -2563,7 +2568,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	} else {
 		matches, skipped, err = par2.MatchFiles(idx, posted)
 		if err != nil {
-			return fmt.Errorf("match posted files: %w", err)
+			return par2Failf(par2Terminal, "match posted files: %w", err)
 		}
 		if ref := par2MatchToCache(nzb.Par2Source, matches, skipped); ref != nil {
 			// A cache is only here unused because par2MatchFromCache refused
@@ -2581,9 +2586,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		if len(skipped) > 0 {
 			// Matching skipped files because their bytes failed to fetch:
 			// a retry can match them.
-			return fmt.Errorf("no posted file matched the PAR2 recovery set (transient: %d posted file(s) failed to fetch/hash during matching)", len(skipped))
+			return par2Failf(par2Transient, "no posted file matched the PAR2 recovery set (transient: %d posted file(s) failed to fetch/hash during matching)", len(skipped))
 		}
-		return par2IndexFetchTransient(errors.New("no posted file matched the PAR2 recovery set"), indexFetchErr)
+		return par2IndexFetchTransient(par2Failf(par2Terminal, "no posted file matched the PAR2 recovery set"), indexFetchErr)
 	}
 
 	// Posted files MatchFiles couldn't attempt this pass because breaking
@@ -2693,13 +2698,11 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			rng, ok := msgIDRange[seg.MessageID]
 			if !ok {
 				pn, isPosted := msgIDToPosted[seg.MessageID]
-				if _, transient := transientUnmatch[pn]; isPosted && transient {
-					return fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file (transient: posted file %q failed to fetch/hash during matching)", seg.MessageID, file, pn)
-				}
-				return par2IndexFetchTransient(fmt.Errorf("dead segment %s (file %q) is not part of any matched posted file", seg.MessageID, file), indexFetchErr)
+				_, skipped := transientUnmatch[pn]
+				return par2UnmatchedDeadSegmentErr(seg.MessageID, file, pn, isPosted && skipped, indexFetchErr)
 			}
 			if _, err := idx.DamagedSlices(rng.fileID, rng.start, rng.end); err != nil {
-				return fmt.Errorf("map dead segment %s to slices: %w", seg.MessageID, err)
+				return par2Failf(par2Terminal, "map dead segment %s to slices: %w", seg.MessageID, err)
 			}
 			deadRefs = append(deadRefs, par2DeadRef{file: file, seg: seg, rng: rng})
 		}
@@ -2762,7 +2765,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	for _, dr := range deadRefs {
 		slices, err := idx.DamagedSlices(dr.rng.fileID, dr.rng.start, dr.rng.end)
 		if err != nil {
-			return fmt.Errorf("map dead segment %s to slices: %w", dr.seg.MessageID, err)
+			return par2Failf(par2Terminal, "map dead segment %s to slices: %w", dr.seg.MessageID, err)
 		}
 		for _, s := range slices {
 			damagedSet[s] = struct{}{}
@@ -2796,7 +2799,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// Found with a provider left out and over the recovery budget, so
 		// not seeded (see foldStatSlices). They are recorded: the next pass
 		// takes them as recorded damage.
-		return fmt.Errorf("%d article(s) the STAT sweep found missing were recorded but not repaired (transient: found with %s left out, and over the recovery budget of %d slices)",
+		return par2Failf(par2Transient, "%d article(s) the STAT sweep found missing were recorded but not repaired (transient: found with %s left out, and over the recovery budget of %d slices)",
 			len(statMissing), strings.Join(statExcluded, ", "), statBudget)
 	}
 	if extra := len(damagedSet) - overlayDamaged; extra > 0 {
@@ -2827,7 +2830,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// gate.
 	uncov, cerr := uncoveredIntactFiles(idx, damagedSet, fetchers)
 	if cerr != nil {
-		return fmt.Errorf("pre-solve coverage check: %w", cerr)
+		return par2Failf(par2Transient, "pre-solve coverage check: %w", cerr)
 	}
 	// Fold each uncovered file's slices into the damaged set so the solver
 	// rebuilds them from parity - whether the miss is transient (its match
@@ -2871,7 +2874,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		tally.setRounds(round + 1)
 		k := len(damaged)
 		if k == 0 {
-			return fmt.Errorf("no damaged slices resolved (nothing to repair)")
+			return par2Failf(par2Transient, "no damaged slices resolved (nothing to repair)")
 		}
 		if k > par2.MaxRepairSlicesFor(idx.SliceSize) || uint32(k) > available {
 			return errMoreDamageThanRecorded(k, available, idx.SliceSize)
@@ -2907,7 +2910,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		picked, perr := par2.PickRecovery(damaged, exps, k)
 		if perr != nil {
 			if nextVolIdx < len(vols) {
-				return fmt.Errorf("%w (transient: more recovery volumes can be fetched)", perr)
+				return par2Failf(par2Transient, "%w (transient: more recovery volumes can be fetched)", perr)
 			}
 			return perr
 		}
@@ -2919,7 +2922,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		for i, ref := range chosenRefs {
 			src := sources[ref.Source].Data
 			if ref.Offset+ref.Length > int64(len(src)) {
-				return fmt.Errorf("recovery slice %d out of range in %s", i, sources[ref.Source].Name)
+				return par2Failf(par2Terminal, "recovery slice %d out of range in %s", i, sources[ref.Source].Name)
 			}
 			recovery[i] = par2.RecoverySlice{
 				Exponent: ref.Exponent,
@@ -2973,7 +2976,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				if r := recover(); r != nil {
 					p.logger.Error().Str("entry", entryName).Int64("slice", i).Interface("panic", r).
 						Bytes("stack", debug.Stack()).Msg("par2 repair: reading an intact slice panicked; recovered")
-					data, err = nil, fmt.Errorf("reading PAR2 slice %d panicked: %v (transient: internal error)", i, r)
+					data, err = nil, par2Failf(par2Transient, "reading PAR2 slice %d panicked: %v (transient: internal error)", i, r)
 				}
 			}()
 			data, err = jobSource.ReadSlice(i)
@@ -3151,7 +3154,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 // rebuilt, or the overlay refuses the length (overlay.ErrPatchGeometry) -
 // is skipped, and the rest are still written: the solve has already rebuilt
 // their bytes. Those refusals come out the same on every pass, so
-// unwritable reports them with text par2TerminalSubstrings lists. Any other
+// unwritable is classed terminal. Any other
 // write error (the entry was deleted, an I/O failure) is returned as err at
 // once.
 func (p *Par2Repair) writeRecordedPatches(nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, repairedByIndex map[int64][]byte, refs []par2DeadRef) (written []par2DeadRef, unwritable, err error) {
@@ -3189,7 +3192,7 @@ func (p *Par2Repair) writeRecordedPatches(nzbID, entryName string, nzb *storage.
 				skip(dr, perr)
 				continue
 			}
-			return written, nil, perr
+			return written, nil, par2Fail(par2Transient, perr)
 		}
 		// A prior playback read may have permanently cached this file as
 		// failed (see Usenet.shouldPoisonFailedFile) before this repair
@@ -3201,7 +3204,7 @@ func (p *Par2Repair) writeRecordedPatches(nzbID, entryName string, nzb *storage.
 		written = append(written, dr)
 	}
 	if skipped > 0 {
-		unwritable = fmt.Errorf("%d dead segment(s) cannot be patched: reader slot and article disagree (first: %w)", skipped, first)
+		unwritable = par2Failf(par2Terminal, "%d dead segment(s) cannot be patched: reader slot and article disagree (first: %w)", skipped, first)
 	}
 	return written, unwritable, nil
 }
@@ -3258,14 +3261,26 @@ func par2RoundStopError(newlyDamaged, round, k, budget, confirmedMissing, corrup
 	if why != par2RoundStopCap {
 		return capErr
 	}
-	return fmt.Errorf("%v (transient: stopped after %d reads with the damage still inside the recovery budget, %d of %d slices)",
+	return par2Failf(par2Transient, "%v (transient: stopped after %d reads with the damage still inside the recovery budget, %d of %d slices)",
 		capErr, round+1, k+newlyDamaged, budget)
 }
 
 // par2RoundCapError names why intact slices were unreadable when the round
-// loop stops. The cause text is load-bearing: classifyPar2Failure keeps a
-// confirmed-dead cause terminal and a short read or bad checksum suspect.
+// loop stops, and classes the stop by those causes: a confirmed-dead or
+// every-provider-corrupt slice makes it terminal, a short read or bad
+// checksum alone suspect. A repairErr classed transient (the stream stopped
+// on a retryable error, such as a posted file that failed to match this
+// pass) keeps the stop transient. With no cause counted the stop has no
+// class of its own, and repairErr decides.
 func par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
+	class := par2Suspect
+	if confirmedMissing > 0 || corrupt > 0 {
+		class = par2Terminal
+	}
+	var classed par2Classed
+	if errors.As(repairErr, &classed) && classed.par2Class() == par2Transient {
+		class = par2Transient
+	}
 	type cause struct {
 		n    int
 		text string
@@ -3285,7 +3300,7 @@ func par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad int, re
 	case 0:
 		return fmt.Errorf("repair: %w", repairErr)
 	case 1:
-		return fmt.Errorf("repair: %d intact slice(s) %s: %w", causes[0].n, causes[0].text, repairErr)
+		return par2Failf(class, "repair: %d intact slice(s) %s: %w", causes[0].n, causes[0].text, repairErr)
 	}
 	total := 0
 	parts := make([]string, len(causes))
@@ -3293,7 +3308,7 @@ func par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad int, re
 		total += c.n
 		parts[i] = fmt.Sprintf("%d %s", c.n, c.text)
 	}
-	return fmt.Errorf("repair: %d intact slice(s) unreadable - %s: %w", total, strings.Join(parts, ", "), repairErr)
+	return par2Failf(class, "repair: %d intact slice(s) unreadable - %s: %w", total, strings.Join(parts, ", "), repairErr)
 }
 
 // deadRefsByFile groups refs back into the file -> dead segments shape
@@ -3347,7 +3362,7 @@ func splitPlaceableDeadRefs(fetchers map[[16]byte]*postedFileFetcher, deadRefs [
 	if cause == nil {
 		cause = errors.New("no article could be measured")
 	}
-	return placeable, fmt.Errorf("%d dead segment(s) left unpatched: article boundaries of %q were not measured, so a patch cannot be placed: %w", skipped, file, cause)
+	return placeable, par2Failf(par2Transient, "%d dead segment(s) left unpatched: article boundaries of %q were not measured, so a patch cannot be placed: %w", skipped, file, cause)
 }
 
 // recordSweepMisses records in the overlay each article the STAT sweep
@@ -3469,7 +3484,7 @@ func (p *Par2Repair) healBeforeRecoveryGate(ctx context.Context, nzbID, entryNam
 		// substrings this attempt has just disproved for part of the damage.
 		p.logger.Info().Str("entry", entryName).Int("healed", healed).Int("dead", total).AnErr("gate", gateErr).
 			Msg("par2 repair: healed part of the damage without recovery data; retrying on the rest")
-		return fmt.Errorf("healed %d of %d dead segments without parity; re-evaluating the remaining damage", healed, total)
+		return par2Failf(par2Transient, "healed %d of %d dead segments without parity; re-evaluating the remaining damage", healed, total)
 	default:
 		return gateErr
 	}
@@ -4521,7 +4536,7 @@ func topUpParsedRecovery(
 			ctx, logger, fetch, vols, nextVolIdx,
 			uint32(want), uint32(len(idx.Recovery)), sources, entryName, maxConc)
 		if err != nil {
-			return idx, nextVolIdx, sources, fmt.Errorf("fetch recovery volumes: %w", err)
+			return idx, nextVolIdx, sources, par2Failf(par2Transient, "fetch recovery volumes: %w", err)
 		}
 		if progress != nil {
 			progress.SetRecoveryVolsFetched(nextVolIdx)
@@ -4531,7 +4546,7 @@ func topUpParsedRecovery(
 		}
 		idx, err = par2.ParseIndexSet(ctx, sources, idx.SetID)
 		if err != nil {
-			return idx, nextVolIdx, sources, fmt.Errorf("parse PAR2 index: %w", err)
+			return idx, nextVolIdx, sources, par2IndexParseErr(err)
 		}
 		logSkippedPar2Packets(logger, entryName, idx)
 		if progress != nil {
@@ -4755,13 +4770,39 @@ func fetchPar2IndexFiles(ctx context.Context, logger zerolog.Logger, fetch artic
 // par2IndexFetchTransient tags err, a failure that depends on which recovery
 // set the pass works on, transient when an index file failed to fetch
 // without a 430: with that file missing the pass may have picked the wrong
-// set, or seen too few sets to pick one. err is formatted with %v so the
-// classifier sees the tag rather than a wrapped error it checks first.
+// set, or seen too few sets to pick one. err is formatted with %v so neither
+// its class nor a 430 inside it outranks the transient class.
 func par2IndexFetchTransient(err, indexErr error) error {
 	if err == nil || indexErr == nil {
 		return err
 	}
-	return fmt.Errorf("%v (transient: PAR2 %v)", err, indexErr)
+	return par2Failf(par2Transient, "%v (transient: PAR2 %v)", err, indexErr)
+}
+
+// par2IndexParseErr is a failed PAR2 index parse, terminal: the index or
+// the posted file mapping is structurally wrong. A parse that failed on a
+// packet MD5 mismatch (see par2.walkPackets) is transient instead: far more
+// likely a mis-served or mis-decoded article during the volume fetch, which a
+// bare retry fetches again. A cancelled parse stays transient through the
+// context check in classifyPar2Failure.
+func par2IndexParseErr(err error) error {
+	class := par2Terminal
+	if strings.Contains(err.Error(), "packet MD5 mismatch") {
+		class = par2Transient
+	}
+	return par2Failf(class, "parse PAR2 index: %w", err)
+}
+
+// par2UnmatchedDeadSegmentErr is the failure for dead segment messageID of
+// file when it lies in no matched posted file. It is terminal, unless its
+// posted file was skipped by matching this pass for a fetch/hash failure
+// (postedSkipped) or an index file failed to fetch (indexFetchErr): a retry
+// can match it then.
+func par2UnmatchedDeadSegmentErr(messageID, file, posted string, postedSkipped bool, indexFetchErr error) error {
+	if postedSkipped {
+		return par2Failf(par2Transient, "dead segment %s (file %q) is not part of any matched posted file (transient: posted file %q failed to fetch/hash during matching)", messageID, file, posted)
+	}
+	return par2IndexFetchTransient(par2Failf(par2Terminal, "dead segment %s (file %q) is not part of any matched posted file", messageID, file), indexFetchErr)
 }
 
 // fetchWholePar2File downloads and concatenates every segment of a retained
@@ -5383,10 +5424,9 @@ func logSkippedPar2Packets(logger zerolog.Logger, entryName string, idx *par2.In
 // missingFetcherErr formats the error par2 repair returns when an intact
 // slice maps to a FileID that has no posted-file fetcher. classifyMiss (see
 // the closure of that name in runRepair) decides whether the miss is
-// structural/terminal or transient/retryable; the "(transient: ...)" tag
-// and the "no posted-file fetcher for file" prefix are both load-bearing
-// for classifyPar2Failure downstream, so keep this the single place that
-// builds the string.
+// structural/terminal or transient/retryable, and the error is classed to
+// match; the "(transient: ...)" tag and the "no posted-file fetcher for
+// file" prefix stay in the text for the log.
 func missingFetcherErr(fileID [16]byte, classifyMiss func(fileID [16]byte) (reason string, terminal bool)) error {
 	reason, terminal := "", true
 	if classifyMiss != nil {
@@ -5394,11 +5434,11 @@ func missingFetcherErr(fileID [16]byte, classifyMiss func(fileID [16]byte) (reas
 	}
 	if terminal {
 		if reason != "" {
-			return fmt.Errorf("no posted-file fetcher for file %x (%s)", fileID, reason)
+			return par2Failf(par2Terminal, "no posted-file fetcher for file %x (%s)", fileID, reason)
 		}
-		return fmt.Errorf("no posted-file fetcher for file %x", fileID)
+		return par2Failf(par2Terminal, "no posted-file fetcher for file %x", fileID)
 	}
-	return fmt.Errorf("no posted-file fetcher for file %x (transient: %s)", fileID, reason)
+	return par2Failf(par2Transient, "no posted-file fetcher for file %x (transient: %s)", fileID, reason)
 }
 
 // uncoveredIntactFiles scans every slice par2.Repair's streaming pass would

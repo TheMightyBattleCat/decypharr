@@ -92,16 +92,60 @@ type par2FailureClass struct {
 	suspect bool
 }
 
+// par2Class is the retry class runRepair gives a failure it builds itself
+// (see par2Failure): transient backs off and retries, suspect backs off and
+// turns terminal after par2SuspectAttemptLimit, terminal stops automatic
+// retries.
+type par2Class uint8
+
+const (
+	par2Transient par2Class = iota + 1
+	par2Suspect
+	par2Terminal
+)
+
+// par2Classed is a failure that carries its own class. classifyPar2Failure
+// takes the outermost one in the chain over anything its text says: the text
+// carries names taken from the release (file names, PAR2 volume names), and a
+// name containing "(transient:" or "recovery slice" must not flip a verdict.
+type par2Classed interface {
+	error
+	par2Class() par2Class
+}
+
+// par2Failure is a runRepair failure with its class decided where it is
+// built. The text is cause's, unchanged, and is for the log and the
+// persisted reason only.
+type par2Failure struct {
+	class par2Class
+	cause error
+}
+
+func (f *par2Failure) Error() string        { return f.cause.Error() }
+func (f *par2Failure) Unwrap() error        { return f.cause }
+func (f *par2Failure) par2Class() par2Class { return f.class }
+
+// par2Fail gives err class; nil stays nil.
+func par2Fail(class par2Class, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &par2Failure{class: class, cause: err}
+}
+
+// par2Failf is fmt.Errorf with class.
+func par2Failf(class par2Class, format string, args ...any) error {
+	return &par2Failure{class: class, cause: fmt.Errorf(format, args...)}
+}
+
 // par2TerminalSubstrings are runRepair failure messages that can never
 // resolve themselves on a bare retry: no PAR2 data was ever retained for
 // this release, every retained PAR2 file failed to fetch (recovery data
 // confirmed gone, not merely slow), or the PAR2 index/posted-file mapping
-// is structurally inconsistent with what's on disk. This is deliberately a
-// substring match against runRepair's existing error messages rather than a
-// parallel set of typed sentinel errors threaded through every return in
-// that function - runRepair has no other error-classification consumer
-// today, and inventing one across a dozen call sites for a single new
-// caller isn't worth the churn. Anything NOT matched here defaults to
+// is structurally inconsistent with what's on disk. runRepair's own exits
+// carry their class (see par2Failure); this list is the fallback for an
+// untyped error, and the phrases stay in those exits' text for the log.
+// Anything NOT matched here defaults to
 // transient (backed off, not given up on) - a false "transient" costs an
 // extra backed-off retry; a false "terminal" would silently stop ever
 // trying again, which is the worse mistake to risk.
@@ -181,6 +225,24 @@ func classifyPar2Failure(err error) par2FailureClass {
 		return par2FailureClass{terminal: true, reason: "source article(s) confirmed missing across every provider"}
 	}
 	msg := err.Error()
+	// A failure that carries its class: the class decides, not the text.
+	// After the typed checks above, which a classed wrapper does not hide
+	// (a 430 under a transient-tagged error stays terminal, a cancelled
+	// parse under a terminal one stays transient).
+	var classed par2Classed
+	if errors.As(err, &classed) {
+		switch classed.par2Class() {
+		case par2Terminal:
+			return par2FailureClass{terminal: true, reason: msg}
+		case par2Suspect:
+			return par2FailureClass{suspect: true, reason: msg}
+		default:
+			return par2FailureClass{}
+		}
+	}
+	// Untyped errors (from other packages, or not yet converted) fall back to
+	// the text.
+	//
 	// An error runRepair explicitly tagged "(transient: ...)" is a
 	// structurally-terminal-looking failure (no posted-file fetcher, dead
 	// segment not in any matched file) whose actual cause this pass was a
