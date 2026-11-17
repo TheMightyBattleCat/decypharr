@@ -1402,6 +1402,64 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 	r.healBrokenEntry(ctx, run, statsMu, name, h, bulkOverride)
 }
 
+// applySweepPar2Result drops from h the broken files the sweep's PAR2 pass
+// repaired and records the repair. fixed holds the InfoHashes whose pass
+// completed, but a pass covers a whole release: only a file broken for missing
+// segments with nothing left pending in the overlay (pendingAfter, read now)
+// was repaired by it. A file broken for any other reason, or one whose pending
+// damage can't be read, stays broken and goes on to heal. credited is true
+// when it counted the entry as repaired in run; resolved is true when nothing
+// broken is left, after saving the entry healthy.
+func (r *Repair) applySweepPar2Result(run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, fixed map[string]struct{}, pendingAfter func(nzbID string) (map[string][]overlay.DeadSegment, error)) (credited, resolved bool) {
+	pendingByHash := make(map[string]map[string][]overlay.DeadSegment)
+	repaired := func(bf storage.BrokenFile) bool {
+		if _, ok := fixed[bf.InfoHash]; !ok || bf.Reason != "usenet_segment_missing" || pendingAfter == nil {
+			return false
+		}
+		pending, read := pendingByHash[bf.InfoHash]
+		if !read {
+			p, err := pendingAfter(bf.InfoHash)
+			if err != nil {
+				p = nil
+			} else if p == nil {
+				p = map[string][]overlay.DeadSegment{}
+			}
+			pending = p
+			pendingByHash[bf.InfoHash] = pending
+		}
+		return pending != nil && len(pending[bf.FileName]) == 0
+	}
+	remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
+	for _, bf := range h.BrokenFiles {
+		if !repaired(bf) {
+			remaining = append(remaining, bf)
+		}
+	}
+	filesFixed := len(h.BrokenFiles) - len(remaining)
+	if filesFixed == 0 {
+		return false, false
+	}
+	h.BrokenFiles = remaining
+	h.BrokenCount = len(remaining)
+
+	statsMu.Lock()
+	run.Stats.Repaired++
+	r.saveRun(run)
+	statsMu.Unlock()
+	r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
+		Msg("Repair: resolved via warm PAR2 sweep (cache-only, no re-grab needed)")
+
+	if len(remaining) == 0 {
+		h.Status = storage.HealthHealthy
+		h.FailureReason = ""
+		h.LastRepairAt = time.Now()
+		h.LastOKAt = time.Now()
+		r.saveHealth(h)
+		return true, true
+	}
+	return true, false
+}
+
 // healBrokenEntry runs the Arr delete + blocklist + re-search for one broken
 // entry, then deletes the entry when it's fully broken and every file was
 // handled. It does not verify the outcome: SearchMissing/MarkHistoryFailed only
@@ -1450,30 +1508,13 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		}
 	}
 	if len(fixed) > 0 {
-		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
-		for _, bf := range h.BrokenFiles {
-			if _, ok := fixed[bf.InfoHash]; !ok {
-				remaining = append(remaining, bf)
-			}
+		var pendingAfter func(string) (map[string][]overlay.DeadSegment, error)
+		if r.manager.usenet != nil {
+			pendingAfter = r.manager.usenet.OverlayPendingRepair
 		}
-		filesFixed := len(h.BrokenFiles) - len(remaining)
-		h.BrokenFiles = remaining
-		h.BrokenCount = len(remaining)
-
-		statsMu.Lock()
-		run.Stats.Repaired++
-		parRepaired = true
-		r.saveRun(run)
-		statsMu.Unlock()
-		r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
-			Msg("Repair: resolved via warm PAR2 sweep (cache-only, no re-grab needed)")
-
-		if len(remaining) == 0 {
-			h.Status = storage.HealthHealthy
-			h.FailureReason = ""
-			h.LastRepairAt = time.Now()
-			h.LastOKAt = time.Now()
-			r.saveHealth(h)
+		var resolved bool
+		parRepaired, resolved = r.applySweepPar2Result(run, statsMu, name, h, fixed, pendingAfter)
+		if resolved {
 			return
 		}
 	}
