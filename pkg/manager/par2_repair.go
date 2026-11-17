@@ -805,6 +805,13 @@ func (p *Par2Repair) enqueue(nzbID string) {
 // PAR2 repair is disabled outright, or if a pass for this nzbID is already
 // queued/deferred/running.
 func (p *Par2Repair) RunNow(nzbID string) error {
+	return p.runNow(nzbID, false)
+}
+
+// runNow is RunNow. fromSweep marks a pass the repair sweep started (see
+// runNowAndWait): that pass queues no follow-up for damage it leaves to
+// another PAR2 set, since the sweep re-grabs what the pass did not repair.
+func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 	if p == nil || nzbID == "" {
 		return fmt.Errorf("nzbID is required")
 	}
@@ -850,7 +857,7 @@ func (p *Par2Repair) RunNow(nzbID string) error {
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
 		}()
-		p.runJob(nzbID, laneBatch)
+		p.runPass(nzbID, laneBatch, fromSweep)
 	}()
 	return nil
 }
@@ -1508,6 +1515,15 @@ func par2ErrWithJobCtx(err error, jobCtx context.Context) error {
 // autoActionRegrab, so a terminal PAR2 failure surfaces in the overlay GUI
 // for a MANUAL "Delete & re-search" instead (see handleOverlayResearch).
 func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
+	p.runPass(nzbID, lane, false)
+}
+
+// runPass is runJob. fromSweep marks a pass the repair sweep started: when it
+// repairs one PAR2 set and leaves another's damage, it still counts as a
+// success but queues no follow-up. The sweep re-grabs the files the pass
+// left damaged, and a queued pass would repair the same files alongside
+// that re-grab.
+func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	base := p.ctx
 	if base == nil {
 		base = context.Background()
@@ -1537,13 +1553,19 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 	}
 	// setsDeferred is set when the pass repaired one PAR2 set and left
 	// another set's damage: the follow-up for it is queued below, and covers
-	// merged requests too.
+	// merged requests too. A sweep pass queues none (see runPass).
 	setsDeferred := 0
 	// Registered first among the job's own defers, so it runs last: after
 	// the handler claim below is released, which a follow-up pass needs to
 	// take.
 	defer func() {
 		merged, proximity, name := p.releaseRunNamed(nzbID, job)
+		if setsDeferred > 0 && fromSweep {
+			p.logger.Info().Str("entry", name).Str("nzb_id", nzbID).Int("dead_segments", setsDeferred).
+				Str(par2NoteField, logger.Count(setsDeferred, "dead segment")+" in another recovery set").
+				Msg("par2 repair: one recovery set repaired; the sweep handles the damage another set protects")
+			return
+		}
 		if setsDeferred > 0 {
 			p.followUpDeferredSets(nzbID, name, setsDeferred, proximity)
 			return

@@ -1,9 +1,11 @@
 package manager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
@@ -97,6 +99,54 @@ func TestPar2MultisetPartialRepairCountsAsSuccessAndQueuesTheRest(t *testing.T) 
 	}
 	if o.Mismatch != 0 || o.Patched != 2 {
 		t.Errorf("overlay after the follow-up: %s, want 2 patches matching the original bytes", o.Overlay)
+	}
+}
+
+// The same release repaired by the sweep's PAR2 pass (runNowAndWait, as
+// coldSweepRepair calls it): the pass completes, so the sweep drops the
+// repaired file, but it queues no follow-up for the other set. The sweep
+// re-grabs that file itself; a queued pass would only race the re-grab.
+func TestPar2MultisetSweepPassQueuesNoFollowUp(t *testing.T) {
+	servers, fx := newP2eEnvSets(t, 1,
+		p2eSet{base: p2eRelease + ".part1", files: []int{0}},
+		p2eSet{base: p2eRelease + ".part23", files: []int{1, 2}},
+	)
+	h := newP2eHarness(t, servers[0], fx, "p2e-multiset-sweep")
+	f1, f2 := fx.posted[0], fx.posted[1]
+	h.recordDead(p2eSeg{f1, 1}, p2eSeg{f2, 1})
+	servers[0].set(f1.ids[1], p2eNotFound)
+	servers[0].set(f2.ids[1], p2eNotFound)
+	h.warmup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	completed := h.p.runNowAndWait(ctx, h.nzbID)
+	// runNowAndWait returns on the completed phase, before the job's
+	// deferred release and follow-up have run: wait for the job to end.
+	h.p.wg.Wait()
+
+	if !completed {
+		t.Fatalf("runNowAndWait = false, want true (one set repaired)")
+	}
+	pend, err := h.u.OverlayPendingRepair(h.nzbID)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	left := 0
+	for _, segs := range pend {
+		left += len(segs)
+	}
+	if left != 1 {
+		t.Fatalf("pending after the pass = %+v, want the other set's one dead segment", pend)
+	}
+	if h.p.IsQueued(h.nzbID) {
+		t.Errorf("a follow-up pass is queued after a sweep pass, want none (the sweep re-grabs the rest)")
+	}
+	if kind, _, exists := h.repair.handlers.State(h.nzbID); exists {
+		t.Errorf("handler claim %v left after the sweep pass, want released", kind)
+	}
+	if st, err := h.p.manager.storage.GetPar2RepairState(h.nzbID); err == nil && st != nil {
+		t.Errorf("repair state %+v left after the pass, want none", st)
 	}
 }
 
