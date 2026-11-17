@@ -263,21 +263,15 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	// real length exactly like ReadRange itself clamps (see its doc
 	// comment) - a single miss anywhere fails the whole gate.
 	stage = "intact data not fully cached"
-	for s := int64(0); s < idx.NumSlices(); s++ {
-		if _, damaged := damagedSet[s]; damaged {
-			continue
-		}
-		fileID, local, lerr := idx.SliceLocation(s)
-		if lerr != nil {
-			return false
-		}
+	if !warmIntactSlicesCached(ctx, idx, damagedSet, func(fileID [16]byte, off, n int64) error {
 		f, ok := fetchers[fileID]
 		if !ok {
-			return false
+			return errWarmSweepNoFetch
 		}
-		if _, rerr := f.ReadRange(local*idx.SliceSize, idx.SliceSize); rerr != nil {
-			return false
-		}
+		_, rerr := f.ReadRange(off, n)
+		return rerr
+	}) {
+		return false
 	}
 
 	// Every intact slice this pass needs is already on disk, and recovery
@@ -303,6 +297,31 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 		p.repair.handlers.Set(nzbID, handlerRegrab)
 	}
 	return completed
+}
+
+// warmIntactSlicesCached reports whether every slice of idx outside
+// damagedSet reads from the local cache through read. It stops and reports
+// false as soon as ctx ends: on a large release this loop reads every
+// intact byte from disk, and a cancelled sweep must not wait for that.
+// ctx is the sweep's own context, not the preflight's fetch timeout, so a
+// long cache read is not cut short by a deadline meant for network fetches.
+func warmIntactSlicesCached(ctx context.Context, idx *par2.Index, damagedSet map[int64]struct{}, read func(fileID [16]byte, off, n int64) error) bool {
+	for s := int64(0); s < idx.NumSlices(); s++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		if _, damaged := damagedSet[s]; damaged {
+			continue
+		}
+		fileID, local, err := idx.SliceLocation(s)
+		if err != nil {
+			return false
+		}
+		if read(fileID, local*idx.SliceSize, idx.SliceSize) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // aliveRecoverySlices STATs every article of vols and returns the recovery
