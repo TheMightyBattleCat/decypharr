@@ -1844,6 +1844,16 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	var deadSlicesDiscovered int // distinct dead slices the repair engine found across all rounds, beyond what the overlay already recorded
 	tally := &par2PassTally{recorded: deadSegments}
 	err = p.runRepair(timeoutCtx, nzbID, entryName, pending, &readBytes, &cacheBytes, &slicesRepaired, &deadSlicesDiscovered, progress, tally)
+	if !job.deleted.Load() && (p.ctx == nil || p.ctx.Err() == nil) {
+		// However the pass ended, a file it left with every recorded segment
+		// patched is repaired. Only a successful pass cleared the verdict, so
+		// a file healed by a pass that then ended terminal or transient kept
+		// Failed: its next dead article failed the read instead of padding,
+		// and a failed read could poison it in the permanent-failure cache.
+		// Done before the terminal re-grab
+		// below, which may delete the entry (UnfailRepaired then skips it).
+		p.unfailRepaired(nzbID, entryName)
+	}
 	if deferredDead := par2DeferredSetsSuccess(err, tally); deferredDead > 0 && !job.preempted.Load() && !job.deleted.Load() && (p.ctx == nil || p.ctx.Err() == nil) {
 		// The chosen set is repaired; the damage another set protects waits
 		// for the next pass, queued as this one ends. Recording this as a
@@ -1960,7 +1970,6 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		SegmentsPatched: tally.patched(),
 	})
 	p.recordPar2Outcome(nzbID, nil, 0)
-	p.unfailRepaired(nzbID, entryName)
 	p.notifyCompleted(entryName, tally.patched(), time.Since(start))
 }
 
@@ -2057,7 +2066,8 @@ func (t *par2PassTally) logFields(e *zerolog.Event) {
 }
 
 // unfailRepaired clears the Failed verdict of nzbID's files the pass left
-// with every recorded segment patched (see Usenet.OverlayUnfailRepaired).
+// with every recorded segment patched (see Usenet.OverlayUnfailRepaired),
+// whether or not the pass succeeded.
 // Left Failed, the next escalation for such a file found nothing pending,
 // so par2Usable said no and the playback policy re-grabbed it.
 func (p *Par2Repair) unfailRepaired(nzbID, entryName string) {

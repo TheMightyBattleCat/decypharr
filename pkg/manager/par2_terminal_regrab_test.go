@@ -10,6 +10,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
 // An urgent pass over a two-file release: part 1's only recorded dead
@@ -93,5 +94,48 @@ func TestPar2TerminalRegrabWithNothingPendingRegrabsNothing(t *testing.T) {
 		if ln["message"] == "par2 repair: terminal verdict on urgent lane; initiating immediate regrab" {
 			t.Fatalf("re-grab initiated for %v with nothing pending, want none", ln["file"])
 		}
+	}
+}
+
+// A pass that ends terminal still clears the failed verdict of a file it
+// left with every recorded segment patched. Part 1's only dead article is
+// healed from the second provider; part 2 is beyond the recovery set. Part 1
+// kept verdict failed when only a successful pass cleared it, so a later dead
+// article in it failed the read instead of padding, and the GUI listed it
+// among the failed files. Part 2 still has dead segments and stays failed.
+func TestPar2TerminalPassUnfailsTheFileItHealed(t *testing.T) {
+	servers, fx := newP2eEnv(t, 2)
+	h := newP2eHarness(t, servers[0], fx, "p2e-terminal-unfail")
+	f1, f2 := fx.posted[0], fx.posted[1]
+
+	h.recordDead(p2eSeg{f1, 1}, p2eSeg{f2, 1})
+	servers[1].set(f1.ids[1], p2eNotFound) // recorded dead: gone on one provider, alive on the other
+	for _, srv := range servers {
+		for _, id := range f2.ids[1:4] { // three articles: more slices than the recovery set holds
+			srv.set(id, p2eNotFound)
+		}
+	}
+	if v1, v2 := h.u.OverlayVerdict(h.nzbID, f1.name), h.u.OverlayVerdict(h.nzbID, f2.name); v1 != overlay.VerdictFailed || v2 != overlay.VerdictFailed {
+		t.Fatalf("before the pass: verdicts %s=%q %s=%q, want both failed", f1.name, v1, f2.name, v2)
+	}
+
+	o := h.run(nil)
+	h.report(o)
+
+	if o.LogMsg != "par2 repair unavailable" || o.Class != "terminal" {
+		t.Fatalf("pass ended %q class=%q err=%q, want unavailable and terminal", o.LogMsg, o.Class, o.Err)
+	}
+	pend, err := h.u.OverlayPendingRepair(h.nzbID)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pend[f1.name]) != 0 || len(pend[f2.name]) == 0 {
+		t.Fatalf("pending after the pass = %+v, want %s healed and %s still damaged", pend, f1.name, f2.name)
+	}
+	if v := h.u.OverlayVerdict(h.nzbID, f1.name); v != overlay.VerdictClean {
+		t.Errorf("%s verdict after the pass = %q, want %q (every recorded segment is patched)", f1.name, v, overlay.VerdictClean)
+	}
+	if v := h.u.OverlayVerdict(h.nzbID, f2.name); v != overlay.VerdictFailed {
+		t.Errorf("%s verdict after the pass = %q, want %q (dead segments remain)", f2.name, v, overlay.VerdictFailed)
 	}
 }
