@@ -3163,6 +3163,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// workers' fetches run on it too (trackedFetch's fctx), so the cancel
 		// aborts the ones still in flight.
 		roundCtx, roundCancel := context.WithCancel(ctx)
+		// One fetch per article for the whole round, shared by every slice
+		// that overlaps it; a failed article is not asked again this round.
+		roundArticles := attachPar2RoundArticles(idx, fetchers, u.ProcessingMaxConnections())
 		sliceSource := newConcurrentSliceSource(roundCtx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
 		var repairErr error
 		// Stop the pass once the unreadable intact slices outnumber the
@@ -3181,6 +3184,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// connection budget with the next round's workers.
 		roundCancel()
 		sliceSource.Wait()
+		roundArticles.detach()
 		if repairErr == nil {
 			break
 		}
@@ -5314,6 +5318,14 @@ type postedFileFetcher struct {
 	cacheMu   sync.Mutex
 	cacheIdx  int
 	cacheData []byte
+
+	// round, while a repair round runs, shares this fetcher's articles with
+	// the round's other askers: one fetch per article per round, errors
+	// kept for the round (see par2RoundArticles). nil outside a round.
+	// roundBase is this file's byte position in the round's read order,
+	// set by attachPar2RoundArticles before the round's workers start.
+	round     atomic.Pointer[par2RoundArticles]
+	roundBase int64
 }
 
 // trueLen, when greater than the posted file's own declared Size, overrides
@@ -5705,7 +5717,15 @@ func (f *postedFileFetcher) segmentData(ctx context.Context, idx int) ([]byte, e
 		return data, nil
 	}
 	f.cacheMu.Unlock()
+	if r := f.round.Load(); r != nil {
+		return r.segmentData(ctx, f, idx)
+	}
+	return f.fetchSegment(ctx, idx)
+}
 
+// fetchSegment fetches article idx from Usenet and keeps it as the
+// fetcher's last-fetched article.
+func (f *postedFileFetcher) fetchSegment(ctx context.Context, idx int) ([]byte, error) {
 	// Per-segment timeout, independent of how many OTHER segments are being
 	// fetched concurrently right now: a single dead/stuck connection fails
 	// this one fetch in par2ArticleFetchTimeout, not the whole job's
