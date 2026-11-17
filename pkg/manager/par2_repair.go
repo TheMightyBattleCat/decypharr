@@ -1893,6 +1893,11 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		}
 		if job.preempted.Load() {
 			preempted = true
+			// Queued, not left in the running phase it was cut out of: the
+			// urgent pass replaces this record when it starts, but if it never
+			// does (PAR2 switched off meanwhile) the record would read as a
+			// pass stuck mid-phase for ever.
+			progress.SetPhase(Par2PhaseQueued)
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
 			return
 		}
