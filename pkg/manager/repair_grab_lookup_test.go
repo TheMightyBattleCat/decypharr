@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
@@ -15,12 +16,14 @@ import (
 // repairArrFiles blocklists the grab that produced the broken file (matched by
 // its download ID), not the newest grab of the movie: that can be an upgrade
 // still downloading, or a grab already rejected at import. The newest grab is
-// used only when the Arr has no record for the file's download ID.
+// used only when the Arr has no record for the file's download ID. A season
+// split out of a multi-season NZB is looked up by the pack's NZB ID.
 func TestRepairArrFilesBlocklistsTheBrokenFilesOwnGrab(t *testing.T) {
 	cases := []struct {
 		name       string
 		infoHash   string
 		byDownload map[string][]arr.HistoryRecord
+		season     bool // store a season entry split out of "nzb-pack" under infoHash
 		wantFailed []string
 	}{
 		{
@@ -32,8 +35,26 @@ func TestRepairArrFilesBlocklistsTheBrokenFilesOwnGrab(t *testing.T) {
 			wantFailed: []string{"POST /api/v3/history/failed/5"},
 		},
 		{
+			// convertToMultiSeason: the season entry has a generated ID the
+			// Arr never saw; its files keep the pack's NZB ID, which is the
+			// one the grab was recorded under.
+			name:     "split season: the pack's grab is failed, not the newest",
+			infoHash: generateSeasonHash("nzb-pack", 1),
+			byDownload: map[string][]arr.HistoryRecord{
+				"nzb-pack": {{ID: 5, DownloadID: "nzb-pack", MovieID: 1}},
+			},
+			season:     true,
+			wantFailed: []string{"POST /api/v3/history/failed/5"},
+		},
+		{
+			name:       "split season, no record for the pack: falls back to the newest grab",
+			infoHash:   generateSeasonHash("nzb-pack", 1),
+			season:     true,
+			wantFailed: []string{"POST /api/v3/history/failed/9"},
+		},
+		{
 			name:       "no record for the download ID: falls back to the newest grab",
-			infoHash:   "split-generated",
+			infoHash:   "unknown-download",
 			wantFailed: []string{"POST /api/v3/history/failed/9"},
 		},
 		{
@@ -49,6 +70,14 @@ func TestRepairArrFilesBlocklistsTheBrokenFilesOwnGrab(t *testing.T) {
 			defer srv.Close()
 			a := arr.New("radarr", srv.URL, "token", false, nil, "", "")
 			repair := newTestRepairForClaims(t)
+			if c.season {
+				season := &storage.Entry{InfoHash: c.infoHash, Name: "Show.S01", Protocol: config.ProtocolNZB, Files: map[string]*storage.File{
+					"dead.mkv": {Name: "dead.mkv", InfoHash: "nzb-pack", Size: 1},
+				}}
+				if err := repair.manager.storage.AddOrUpdate(season); err != nil {
+					t.Fatalf("AddOrUpdate: %v", err)
+				}
+			}
 			var mu sync.Mutex
 			files := []arr.ContentFile{{Id: 1, FileId: 101, Name: "dead.mkv", IsBroken: true, InfoHash: c.infoHash}}
 			if _, cancelled := repair.repairArrFiles(context.Background(), &storage.RepairRun{}, &mu, a, files, nil); cancelled {

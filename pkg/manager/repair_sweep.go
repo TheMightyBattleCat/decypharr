@@ -1687,6 +1687,22 @@ func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
 	}
 }
 
+// arrDownloadID returns the download ID the Arr was given for the grab behind
+// infoHash. A season entry split out of a multi-season NZB
+// (convertToMultiSeason) is stored under a generated InfoHash the Arr never
+// saw; its grab is the pack's, recorded under the NZB's ID (entryNZBID). Any
+// other ID, or one with no stored entry, is returned unchanged.
+func (r *Repair) arrDownloadID(infoHash string) string {
+	if infoHash == "" || r.manager == nil || r.manager.storage == nil {
+		return infoHash
+	}
+	entry, err := r.manager.GetEntry(infoHash)
+	if err != nil || entry == nil {
+		return infoHash
+	}
+	return entryNZBID(entry)
+}
+
 // repairArrFiles deletes the broken files in one Arr, blocklists their grabs,
 // and re-searches anything without a grab record. Returns true when the delete
 // succeeded (so the caller may consider the files handled). Concurrency is
@@ -1708,8 +1724,10 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// The grab is looked up by the file's own download ID first, so the grab
 	// that produced the broken file is the one blocklisted. The newest grab of
 	// the episode or movie is only the fallback, for when the Arr has no record
-	// of that ID (a season split's generated ID, or trimmed history): it can be
-	// a different download, such as an upgrade still in flight.
+	// of that ID (trimmed history, a manual import): it can be a different
+	// download, such as an upgrade still in flight. A season split out of a
+	// multi-season NZB has a generated ID the Arr never saw, so it is mapped
+	// back to the pack's ID first (arrDownloadID).
 	//
 	// HistoryIDs are deduped per arr — a season-pack grab covers multiple broken
 	// files but only needs one history/failed POST.
@@ -1731,7 +1749,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			needSearch = append(needSearch, f)
 			continue
 		}
-		id := a.FindGrabHistoryIDForDownload(f.InfoHash, mediaID)
+		id := a.FindGrabHistoryIDForDownload(r.arrDownloadID(f.InfoHash), mediaID)
 		var herr error
 		if id == 0 {
 			id, _, herr = a.FindGrabHistoryID(mediaID)
