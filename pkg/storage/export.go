@@ -272,7 +272,8 @@ type ImportReport struct {
 	Read     map[string]int `json:"read"`
 	Imported map[string]int `json:"imported"`
 	// OrphanItems and OrphanRepairState were dropped because no entry has
-	// their folder.
+	// them: no file of the item belongs to an imported entry and the key is
+	// not an entry's folder under the running naming.
 	OrphanItems       int `json:"orphan_items"`
 	OrphanRepairState int `json:"orphan_repair_state"`
 	// EntriesWithoutItems counts entries whose folder has no item record;
@@ -287,7 +288,9 @@ type ImportReport struct {
 // the stream for a store, or (nil, nil) when the snapshot has none. Entries,
 // queue and repair state are re-put with their attributes rebuilt from the
 // value; keys starting "__" are put raw. Items and repair state whose entry
-// is missing are dropped; entries without items are counted.
+// is missing are dropped; entries without items are counted. An item's entry
+// is found by its files' InfoHash, so the import does not depend on the
+// running folder_naming; repair state follows its item.
 func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
 	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
 		return nil, fmt.Errorf("import target %s is not empty", dir)
@@ -299,8 +302,22 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	defer st.Close()
 
 	rep := &ImportReport{Read: map[string]int{}, Imported: map[string]int{}}
+	// An item or health record is matched to its entry without the config:
+	// the database is imported before the snapshot's config is moved into
+	// place, so the running folder_naming may not be the one the keys were
+	// written under. folders (names under the running naming) still matches
+	// an item that has no files to go by; hashes is every InfoHash an entry
+	// refers to, its own and its files' (a season entry split out of a pack
+	// keeps the pack's InfoHash on its files).
 	folders := map[string]struct{}{}
+	hashes := map[string]struct{}{}
+	type importedEntry struct {
+		folder string
+		hashes []string
+	}
+	var imported []importedEntry
 	itemNames := map[string]struct{}{}
+	itemHashes := map[string]struct{}{}
 
 	each := func(name string, fn func(key string, value []byte) error) error {
 		rc, err := open(name)
@@ -339,7 +356,13 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 			}
 			entry := ProtoToEntry(&pb)
 			if name == "entries" {
-				folders[entry.GetFolder()] = struct{}{}
+				ie := importedEntry{folder: entry.GetFolder()}
+				folders[ie.folder] = struct{}{}
+				for _, h := range entryHashes(entry) {
+					hashes[h] = struct{}{}
+					ie.hashes = append(ie.hashes, h)
+				}
+				imported = append(imported, ie)
 			}
 			return put(name, key, value, entryPutOptions(entry))
 		})
@@ -349,12 +372,32 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	}
 
 	err = each("items", func(key string, value []byte) error {
-		if !strings.HasPrefix(key, "__") {
-			if _, ok := folders[key]; !ok {
-				rep.OrphanItems++
-				return nil
-			}
+		if strings.HasPrefix(key, "__") {
+			return put("items", key, value, nil)
+		}
+		var pb EntryItemProto
+		if err := proto.Unmarshal(value, &pb); err != nil {
+			rep.Undecodable++
 			itemNames[key] = struct{}{}
+			return put("items", key, value, nil)
+		}
+		_, keep := folders[key]
+		var fileHashes []string
+		for _, f := range pb.GetFiles() {
+			if h := f.GetInfoHash(); h != "" {
+				fileHashes = append(fileHashes, h)
+				if _, ok := hashes[h]; ok {
+					keep = true
+				}
+			}
+		}
+		if !keep {
+			rep.OrphanItems++
+			return nil
+		}
+		itemNames[key] = struct{}{}
+		for _, h := range fileHashes {
+			itemHashes[h] = struct{}{}
 		}
 		return put("items", key, value, nil)
 	})
@@ -366,7 +409,8 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		if strings.HasPrefix(key, "__") {
 			return put("repair_state", key, value, nil)
 		}
-		if _, ok := folders[key]; !ok {
+		_, kept := itemNames[key]
+		if _, ok := folders[key]; !ok && !kept {
 			rep.OrphanRepairState++
 			return nil
 		}
@@ -395,8 +439,15 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		}
 	}
 
-	for f := range folders {
-		if _, ok := itemNames[f]; !ok {
+	for _, ie := range imported {
+		_, ok := itemNames[ie.folder]
+		for _, h := range ie.hashes {
+			if ok {
+				break
+			}
+			_, ok = itemHashes[h]
+		}
+		if !ok {
 			rep.EntriesWithoutItems++
 		}
 	}
@@ -404,6 +455,29 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		return nil, err
 	}
 	return rep, nil
+}
+
+// entryHashes is every InfoHash entry refers to: its own and its files'.
+func entryHashes(entry *Entry) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(h string) {
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	add(entry.InfoHash)
+	for _, f := range entry.Files {
+		if f != nil {
+			add(f.InfoHash)
+		}
+	}
+	return out
 }
 
 // Sync flushes every store to disk.
