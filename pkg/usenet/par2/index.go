@@ -61,7 +61,8 @@ type Index struct {
 	Recovery []RecoverySliceRef
 
 	// SkippedPackets lists packets walkPackets skipped during the parse
-	// because their packet MD5 did not verify. PAR2 duplicates the structural
+	// because their packet MD5 did not verify, plus RecvSlic packets whose
+	// data is not exactly one slice (dropped by finalize). PAR2 duplicates the structural
 	// packets (Main/FileDesc/IFSC) into every volume, so a skip here is
 	// frequently covered by a clean copy in another source; when it is not,
 	// the shortfall surfaces downstream - a missing FileDesc fails finalize,
@@ -344,6 +345,22 @@ func (idx *Index) finalize() error {
 	if total < 0 || total > maxInputSlices {
 		return fmt.Errorf("par2: recovery set has %d input slices, exceeding the %d spec limit", total, maxInputSlices)
 	}
+	// A recovery packet whose data is not exactly one slice is not a recovery
+	// slice: the solve refuses it, so it must never be counted or picked.
+	// Report it with the other skipped packets.
+	kept := idx.Recovery[:0]
+	for _, r := range idx.Recovery {
+		if r.Length != idx.SliceSize {
+			idx.SkippedPackets = append(idx.SkippedPackets, SkippedPacket{
+				Source: r.Source,
+				Offset: r.Offset - packetHeaderSize - 4,
+				Type:   "RecvSlic",
+			})
+			continue
+		}
+		kept = append(kept, r)
+	}
+	idx.Recovery = kept
 	return nil
 }
 
