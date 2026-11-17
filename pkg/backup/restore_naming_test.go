@@ -144,3 +144,61 @@ func TestRepoRestoreIndexesUnderRestoredConfigNaming(t *testing.T) {
 	}
 	assertIndexedUnderHash(t, data)
 }
+
+func hasNamingWarning(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, `folder_naming "infohash"`) {
+			return true
+		}
+	}
+	return false
+}
+
+// A database-only restore keeps the running naming. When the snapshot's
+// config used another one, the restore says so; when it used the same, it
+// says nothing.
+func TestDBOnlyRestoreWarnsWhenSnapshotNamingDiffers(t *testing.T) {
+	repo, _, id := namingSnapshot(t)
+
+	setNaming(t, "")
+	resp, err := backup.StageDBRestore(repo, id, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasNamingWarning(resp.Warnings) {
+		t.Errorf("warnings = %q, want one naming the snapshot's folder_naming", resp.Warnings)
+	}
+
+	setNaming(t, config.WebdavUseHash)
+	resp, err = backup.StageDBRestore(repo, id, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasNamingWarning(resp.Warnings) {
+		t.Errorf("warnings = %q, want none under the same naming", resp.Warnings)
+	}
+}
+
+// The same through a repository restore of the database alone; restoring the
+// config with it gives no warning.
+func TestRepoDBOnlyRestoreWarnsWhenSnapshotNamingDiffers(t *testing.T) {
+	repo, _, id := namingSnapshot(t)
+	setNaming(t, "")
+	for _, tc := range []struct {
+		only []backup.Component
+		warn bool
+	}{
+		{[]backup.Component{backup.ComponentDB}, true},
+		{[]backup.Component{backup.ComponentDB, backup.ComponentConfig}, false},
+	} {
+		rep, err := backup.RestoreToDataDir(context.Background(), repo, backup.RestoreOptions{
+			SnapshotID: id, DataDir: t.TempDir(), Only: tc.only,
+		})
+		if err != nil {
+			t.Fatal(tc.only, err)
+		}
+		if got := hasNamingWarning(rep.Warnings); got != tc.warn {
+			t.Errorf("%v: warnings = %q, want naming warning %v", tc.only, rep.Warnings, tc.warn)
+		}
+	}
+}

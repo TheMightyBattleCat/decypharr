@@ -74,9 +74,20 @@ func writeJSONFile(path string, v any) error {
 // mainPath, checks that it opens and that the record counts match the
 // snapshot, and records a pending swap. Nothing live is touched: the swap
 // happens at the next start (ApplyPendingRestore). The database is indexed
-// under the running folder naming, since the config is not restored with it.
+// under the running folder naming, since the config is not restored with it;
+// the response warns when the snapshot's config used another one.
 func StageDBRestore(repo Repo, snapshotID, mainPath string) (RestoreDBResponse, error) {
-	return stageSnapshotDB(repo, snapshotID, mainPath, config.Get().FolderNaming)
+	running := config.Get().FolderNaming
+	resp, err := stageSnapshotDB(repo, snapshotID, mainPath, running)
+	if err != nil {
+		return resp, err
+	}
+	if snap, err := repo.ReadSnapshot(context.Background(), snapshotID); err == nil {
+		if w := namingMismatchWarning(snap, repo, running); w != "" {
+			resp.Warnings = append(resp.Warnings, w)
+		}
+	}
+	return resp, nil
 }
 
 // stageSnapshotDB is StageDBRestore for a database that will run under
@@ -289,4 +300,47 @@ func configFileFolderNaming(p string) (config.WebDavFolderNaming, bool) {
 	}
 	defer f.Close()
 	return configFolderNaming(f)
+}
+
+// snapshotFolderNaming is the folder naming of the config.json saved in snap;
+// ok is false when it has none that can be read.
+func snapshotFolderNaming(snap *Snapshot, bs BlobStore) (config.WebDavFolderNaming, bool) {
+	sha := snap.Components[ComponentConfig].Files["config.json"]
+	if sha == "" {
+		return "", false
+	}
+	rc, err := bs.OpenBlob(context.Background(), sha)
+	if err != nil {
+		return "", false
+	}
+	defer rc.Close()
+	return configFolderNaming(rc)
+}
+
+// namingMismatchWarning is the warning for restoring snap's database without
+// its config while the install runs under running: empty when the snapshot's
+// config used the same folder naming, or has none to compare. Items and
+// health records keep the snapshot's folder names, which direct paths (and
+// the Arr links made with them) resolve by; the __all__ listing uses the
+// running naming, so its folders would not open.
+func namingMismatchWarning(snap *Snapshot, bs BlobStore, running config.WebDavFolderNaming) string {
+	theirs, ok := snapshotFolderNaming(snap, bs)
+	if !ok || sameFolderNaming(theirs, running) {
+		return ""
+	}
+	return fmt.Sprintf("the snapshot's config uses folder_naming %q but this install uses %q: folders listed in __all__ will not open until folder_naming is set to %q (or the snapshot's config is restored too)",
+		namingLabel(theirs), namingLabel(running), namingLabel(theirs))
+}
+
+// sameFolderNaming reports whether a and b name folders alike: the default
+// ("") is the entry's file name.
+func sameFolderNaming(a, b config.WebDavFolderNaming) bool {
+	return namingLabel(a) == namingLabel(b)
+}
+
+func namingLabel(n config.WebDavFolderNaming) string {
+	if n == "" {
+		return string(config.WebDavUseFileName)
+	}
+	return string(n)
 }

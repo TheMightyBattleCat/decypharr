@@ -153,18 +153,18 @@ func RestoreToDataDir(ctx context.Context, repo Repo, opts RestoreOptions) (Rest
 			// with it, which is written only after the database is staged.
 			naming := config.Get().FolderNaming
 			if wanted(opts.Only, ComponentConfig) {
-				if sha := snap.Components[ComponentConfig].Files["config.json"]; sha != "" {
-					if rc, err := repo.OpenBlob(ctx, sha); err == nil {
-						if n, ok := configFolderNaming(rc); ok {
-							naming = n
-						}
-						_ = rc.Close()
-					}
+				if n, ok := snapshotFolderNaming(snap, repo); ok {
+					naming = n
 				}
 			}
 			resp, err := stageSnapshotDB(repo, snap.ID, opts.DataDir, naming)
 			if err != nil {
 				return rep, err
+			}
+			if !wanted(opts.Only, ComponentConfig) {
+				if w := namingMismatchWarning(snap, repo, naming); w != "" {
+					resp.Warnings = append(resp.Warnings, w)
+				}
 			}
 			rep.DB = &resp
 			rep.Warnings = append(rep.Warnings, resp.Warnings...)
