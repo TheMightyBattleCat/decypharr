@@ -309,6 +309,7 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 
 					file := p.parseRAR5FileHeader(encHeader.Data, encHeader.ExtraSize, volumeIndex, volumeName, offsetInVol, encDataSize, password)
 					if file != nil {
+						file.SplitBefore = encHeader.Flags&RAR5HeaderFlagSplitBefore != 0
 						// Note: file.IsEncrypted is now set correctly from extra area parsing
 						// Headers being encrypted does NOT mean data is encrypted
 						result.Files = append(result.Files, file)
@@ -355,6 +356,7 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 			// because each stream only contains one volume
 			file := p.parseRAR5FileHeader(header.Data, header.ExtraSize, volumeIndex, volumeName, offsetInVol, dataSize, password)
 			if file != nil {
+				file.SplitBefore = header.Flags&RAR5HeaderFlagSplitBefore != 0
 				result.Files = append(result.Files, file)
 			}
 		}

@@ -38,6 +38,9 @@ const (
 	RAR5HeaderFlagDataArea      = 0x0002
 	RAR5HeaderFlagSkipIfUnknown = 0x0004
 	RAR5HeaderFlagDataSector    = 0x0008
+	// RAR5HeaderFlagSplitBefore marks a file header whose data continues the
+	// file from the previous volume (the same bit as RAR5HeaderFlagDataSector).
+	RAR5HeaderFlagSplitBefore = 0x0008
 
 	RAR5MainFlagVolume       = 0x0001 // Archive is part of multi-volume set
 	RAR5MainFlagVolumeNumber = 0x0002 // Volume number field is present
@@ -70,6 +73,7 @@ const (
 	RAR4HeaderFlagLongBlock = 0x8000
 	RAR4FileFlagDirectory   = 0x00E0
 	RAR4FileFlagSolid       = 0x0010
+	RAR4FileFlagSplitBefore = 0x0001 // file data continues from the previous volume
 	RAR4FileFlagEncrypted   = 0x0004 // File data is encrypted
 	RAR4FileFlagHighSize    = 0x0100 // 64-bit file size (high 4 bytes follow after low 4 bytes)
 	RAR4ArchiveFlagPassword = 0x0080 // Archive headers are encrypted
@@ -124,6 +128,9 @@ type RARFileEntry struct {
 	VolumeParts      []*types.RARVolumePart // Parts across volumes
 	CRC32            uint32
 	VolumeIndex      int // Which volume this file starts in
+	// SplitBefore: this header's data continues the file from the previous
+	// volume. A header without it starts a copy of the file.
+	SplitBefore bool
 }
 
 // RARParser handles parsing RAR archives from usenet segments
@@ -933,6 +940,7 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 		if header.Type == RAR5HeaderTypeFile {
 			file := p.parseRAR5FileHeader(header.Data, header.ExtraSize, volumeIndex, volumeName, dataOffset, dataSize, password)
 			if file != nil {
+				file.SplitBefore = header.Flags&RAR5HeaderFlagSplitBefore != 0
 				files = append(files, file)
 			}
 		}
@@ -1443,6 +1451,7 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 		IsStored:         isStored,
 		IsDirectory:      isDirectory,
 		RAR4Encrypted:    header.Flags&RAR4FileFlagEncrypted != 0,
+		SplitBefore:      header.Flags&RAR4FileFlagSplitBefore != 0,
 		CRC32:            crc32,
 		VolumeIndex:      volumeIndex,
 		VolumeParts: []*types.RARVolumePart{{
@@ -1715,16 +1724,41 @@ func sliceSegmentsForRangeSimple(
 // aggregateFileParts combines file parts across volumes for multi-volume RAR archives
 // When a file spans multiple RAR volumes, each volume contains a file header for the continuation
 // This function merges these into a single RARFileEntry with all volume parts
+//
+// rawFiles must be in volume (posting) order. A name that starts more than
+// once (two archives merged by the obfuscated merge, each holding the same
+// file) is not joined into one file: its copies are told apart by the
+// split-before flag and only one is kept (see pickDuplicateCopy).
 func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry {
 	if len(rawFiles) == 0 {
 		return nil
 	}
 
+	starts := make(map[string]int)
+	for _, file := range rawFiles {
+		if file != nil && !file.SplitBefore {
+			starts[file.Name]++
+		}
+	}
+
 	// Map of filename -> aggregated file entry
 	fileMap := make(map[string]*RARFileEntry)
+	// copies holds, for a name that starts more than once, one chain per start.
+	copies := make(map[string][][]*RARFileEntry)
 
 	for _, file := range rawFiles {
 		if file == nil {
+			continue
+		}
+
+		if starts[file.Name] > 1 {
+			chains := copies[file.Name]
+			if !file.SplitBefore {
+				copies[file.Name] = append(chains, []*RARFileEntry{file})
+			} else if len(chains) > 0 {
+				chains[len(chains)-1] = append(chains[len(chains)-1], file)
+			}
+			// A continuation before any start belongs to no copy we can name.
 			continue
 		}
 
@@ -1733,15 +1767,23 @@ func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry
 			// First occurrence of this file
 			fileMap[file.Name] = file
 		} else {
-			// File continuation from another volume - merge the parts
-			if len(file.VolumeParts) > 0 {
-				// Append volume parts (PartNumber already set correctly during parsing)
-				existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
-				existing.RAR4Encrypted = existing.RAR4Encrypted || file.RAR4Encrypted
-				// Update total packed size
-				existing.PackedSize += file.PackedSize
-			}
+			mergeFilePart(existing, file)
 		}
+	}
+
+	for name, chains := range copies {
+		kept, dropped := pickDuplicateCopy(chains)
+		head := kept[0]
+		for _, part := range kept[1:] {
+			mergeFilePart(head, part)
+		}
+		fileMap[name] = head
+		p.logger.Warn().
+			Str("file", name).
+			Int("copies", len(chains)).
+			Int("volumes_kept", len(kept)).
+			Int("volumes_dropped", dropped).
+			Msg("RAR file appears in more than one archive of this set; serving one copy, not the copies joined")
 	}
 
 	// Convert map back to slice
@@ -1756,4 +1798,42 @@ func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry
 	})
 
 	return result
+}
+
+// mergeFilePart appends a continuation header's parts to the file's entry.
+func mergeFilePart(existing, file *RARFileEntry) {
+	// File continuation from another volume - merge the parts
+	if len(file.VolumeParts) > 0 {
+		// Append volume parts (PartNumber already set correctly during parsing)
+		existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
+		existing.RAR4Encrypted = existing.RAR4Encrypted || file.RAR4Encrypted
+		// Update total packed size
+		existing.PackedSize += file.PackedSize
+	}
+}
+
+// pickDuplicateCopy chooses which copy of a file listed in several archives
+// to serve: the first whose parts hold exactly the size its header gives,
+// else the first. It returns that copy's headers and how many headers the
+// other copies had.
+func pickDuplicateCopy(chains [][]*RARFileEntry) (kept []*RARFileEntry, dropped int) {
+	pick := 0
+	for i, chain := range chains {
+		var sum int64
+		for _, f := range chain {
+			for _, vp := range f.VolumeParts {
+				sum += vp.UnpackedSize
+			}
+		}
+		if sum == chain[0].UncompressedSize {
+			pick = i
+			break
+		}
+	}
+	for i, chain := range chains {
+		if i != pick {
+			dropped += len(chain)
+		}
+	}
+	return chains[pick], dropped
 }
