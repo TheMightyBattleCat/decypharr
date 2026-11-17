@@ -1633,6 +1633,15 @@ func (p *Par2Repair) runJob(nzbID string, lane repairLane) {
 			p.logger.Debug().Str("entry", entryName).Msg("par2 repair preempted by urgent lane")
 			return
 		}
+		if p.ctx != nil && p.ctx.Err() != nil {
+			// Shutdown (Stop cancelled the root context), not a failure of the
+			// pass: recording it would add an attempt and a backoff and send a
+			// "repair failed" notification for every deploy. The overlay still
+			// holds the damage, so the next start picks the entry up again.
+			progress.SetPhase(Par2PhaseQueued)
+			p.logger.Debug().Str("entry", entryName).Msg("par2 repair interrupted by shutdown")
+			return
+		}
 		err = par2ErrWithJobCtx(err, timeoutCtx)
 		canary := errors.Is(err, par2.ErrChecksumMismatch)
 		class := p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
