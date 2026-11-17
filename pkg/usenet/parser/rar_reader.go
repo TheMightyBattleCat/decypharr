@@ -737,6 +737,13 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 			}
 		}
 
+		// Any other long block (e.g. the 0x7A comment sub-block) carries data
+		// after its header; the size is the first four bytes of the body.
+		if header.Type != RAR4HeaderTypeFile && header.Type != RAR4HeaderTypeEnd &&
+			header.Flags&RAR4HeaderFlagLongBlock != 0 && len(header.Data) >= 4 {
+			dataSkipSize = int64(binary.LittleEndian.Uint32(header.Data[:4]))
+		}
+
 		// Skip the file data section (PackedSize) to get to the next header
 		// CRITICAL FIX: Do NOT manually skip AddSize.
 		// AddSize (if present) is part of the header structure we just read, NOT part of the file data body.
