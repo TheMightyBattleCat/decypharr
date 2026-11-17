@@ -761,6 +761,12 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 				if err == io.EOF {
 					break
 				}
+				// The skip ends inside the volume's last article. If that
+				// article cannot be fetched, the file headers already read
+				// are still good: keep them rather than dropping the volume.
+				if len(files) > 0 {
+					break
+				}
 				return nil, 0, false, fmt.Errorf("failed to skip RAR4 data section: %w", err)
 			}
 		}
