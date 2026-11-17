@@ -2573,8 +2573,36 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		return nil
 	}
-	if err := applySetChoice(choosePar2Set(ctx, sources, vols, nzb.Par2Source, pending)); err != nil {
+	// A damaged file no fetched index names may be in a set posted with no
+	// index file, or whose index failed: fetch a volume of each set not seen
+	// yet until one names it. Before the choice, so the choice is made over
+	// every set and does not narrow the volumes to a set seen so far.
+	// nextVolIdx counts the volumes tried, which stay vols[:nextVolIdx].
+	var nextVolIdx int
+	searchUnseenSet := func() error {
+		before := transportFails.Load()
+		var unseen bool
+		var err error
+		vols, nextVolIdx, sources, unseen, err = fetchVolumesForUnseenSet(ctx, p.logger, fetch, vols, nextVolIdx, sources,
+			nzb.Par2Source, pending, entryName, u.ProcessingMaxConnections(), progress)
+		if err != nil {
+			return err
+		}
+		// A volume that failed without a 430 may be of the set looked for:
+		// the set-dependent failures below are not final.
+		if unseen && indexFetchErr == nil && transportFails.Load() > before {
+			indexFetchErr = errors.New("recovery volume failed to fetch without a 430 while looking for the set protecting the damaged files")
+		}
+		return nil
+	}
+	if err := searchUnseenSet(); err != nil {
 		return err
+	}
+	if c, next, ok := par2SetAfterVolumes(ctx, sources, vols, nextVolIdx, nzb.Par2Source, pending); ok {
+		if err := applySetChoice(c); err != nil {
+			return err
+		}
+		nextVolIdx = next
 	}
 
 	// Early arithmetic-impossibility gate. The Main/FileDesc/IFSC packets are
@@ -2639,7 +2667,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// parsed reality), since a fetched-but-mis-served volume inflates this
 	// count without contributing any usable slice - see topUpParsedRecovery.
 	var fetchedSlices uint32
-	var nextVolIdx int
 	nextVolIdx, fetchedSlices, sources, _, err = fetchMoreVolumes(ctx, p.logger, fetch, vols, nextVolIdx, needed, fetchedSlices, sources, entryName, u.ProcessingMaxConnections())
 	if err != nil {
 		return par2Failf(par2Transient, "fetch recovery volumes: %w", err)
@@ -2656,6 +2683,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// fetched file's set is visible.
 	rechosen := false
 	if par2Set == ([16]byte{}) {
+		if err := searchUnseenSet(); err != nil {
+			return err
+		}
 		if c, next, ok := par2SetAfterVolumes(ctx, sources, vols, nextVolIdx, nzb.Par2Source, pending); ok {
 			if err := applySetChoice(c); err != nil {
 				return err
