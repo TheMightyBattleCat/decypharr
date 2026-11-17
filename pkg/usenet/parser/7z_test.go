@@ -381,3 +381,37 @@ func TestBuildSegmentsForRARFile_ClipsPackedSizeToVolumePhysicalSize(t *testing.
 		}
 	})
 }
+
+// A plain (not encrypted) 7z entry that is compressed holds LZMA data at its
+// offset, not the file. A compressed media file must fail the import, as a
+// compressed RAR does; a compressed .nfo is skipped without sinking a stored
+// media file beside it.
+func TestSevenZipPlainFiles_CompressedEntries(t *testing.T) {
+	segs := []storage.NZBSegment{{Number: 1, Bytes: 1000, StartOffset: 0, EndOffset: 999}}
+	groups := map[string]struct{}{"alt.binaries.test": {}}
+
+	t.Run("compressed media fails the import", func(t *testing.T) {
+		entries := []sevenzip.FileInfo{{Name: "movie.mkv", Size: 500, Offset: 0, Compressed: true}}
+		files, err := sevenZipPlainFiles(entries, map[int]int{0: 1}, "", segs, groups)
+		if err == nil {
+			t.Fatalf("compressed media imported as %d file(s)", len(files))
+		}
+		if !strings.Contains(err.Error(), "compressed inside a 7z; cannot stream") {
+			t.Fatalf("error = %q, want the compressed-inside-a-7z message", err)
+		}
+	})
+
+	t.Run("compressed nfo is skipped beside stored media", func(t *testing.T) {
+		entries := []sevenzip.FileInfo{
+			{Name: "movie.mkv", Size: 500, Offset: 0},
+			{Name: "movie.nfo", Size: 50, Offset: 500, Compressed: true},
+		}
+		files, err := sevenZipPlainFiles(entries, map[int]int{0: 2}, "", segs, groups)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(files) != 1 || files[0].Name != "movie.mkv" || !files[0].IsStored {
+			t.Fatalf("files = %+v, want only the stored movie.mkv", files)
+		}
+	})
+}
