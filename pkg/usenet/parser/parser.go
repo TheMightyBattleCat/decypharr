@@ -113,6 +113,17 @@ type FileGroup struct {
 	Files          []nzbparser.NzbFile
 	metadata       *fileAnalysisResult
 	Groups         map[string]struct{}
+	// key is the group's key in the map groupProcessedFiles builds, when it
+	// differs from BaseName (see mediaGroupKey).
+	key string
+}
+
+// mapKey is the key the group is stored under in a groups map.
+func (f *FileGroup) mapKey() string {
+	if f.key != "" {
+		return f.key
+	}
+	return f.BaseName
 }
 
 func (f *FileGroup) getMetadata() *fileAnalysisResult {
@@ -990,7 +1001,7 @@ func (p *NZBParser) mergeObfuscatedRarGroups(ctx context.Context, groups map[str
 	result := make(map[string]*FileGroup)
 	result[mergedGroup.BaseName] = mergedGroup
 	for _, group := range otherGroups {
-		result[group.BaseName] = group
+		result[group.mapKey()] = group
 	}
 
 	p.logger.Info().
@@ -1222,12 +1233,10 @@ type recoveredFile struct {
 // recovery at its second volume.
 func regroupRecoveredVolumes(recovered []recoveredFile, otherGroups []*FileGroup, baseName func(string) string) (map[string]*FileGroup, string) {
 	result := make(map[string]*FileGroup, len(otherGroups)+1)
-	for _, group := range otherGroups {
-		result[group.BaseName] = group
-	}
 	existing := make(map[string]bool, len(otherGroups))
-	for key := range result {
-		existing[key] = true
+	for _, group := range otherGroups {
+		result[group.mapKey()] = group
+		existing[group.BaseName] = true
 	}
 
 	for _, rf := range recovered {
@@ -1361,17 +1370,26 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 		} else {
 			groupKey = item.file.Basefilename
 		}
+		mapKey := groupKey
+		if item.fileType == storage.NZBFileTypeMedia {
+			name := item.actualFilename
+			if name == "" {
+				name = item.file.Filename
+			}
+			mapKey = mediaGroupKey(groupKey, name)
+		}
 
-		group, exists := groups[groupKey]
+		group, exists := groups[mapKey]
 		if !exists {
 			group = &FileGroup{
 				ActualFilename: item.actualFilename,
 				BaseName:       groupKey,
+				key:            mapKey,
 				Type:           item.fileType,
 				Files:          []nzbparser.NzbFile{},
 				Groups:         make(map[string]struct{}),
 			}
-			groups[groupKey] = group
+			groups[mapKey] = group
 		} else if group.Type == storage.NZBFileTypeUnknown && item.fileType != storage.NZBFileTypeUnknown {
 			group.Type = item.fileType
 		}
@@ -1393,6 +1411,31 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 	}
 
 	return groups
+}
+
+// mediaGroupKey keeps a media file whose name ends in its own extension
+// apart from others of the same base name: "x.mkv" and an external "x.flac"
+// are two files, and grouped under "x" alone the second would be appended to
+// the first. A numbered part ("x.mkv.001") keeps the base key, so the parts
+// of a split file still join.
+func mediaGroupKey(baseKey, name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == "" || isDigits(ext[1:]) {
+		return baseKey
+	}
+	return baseKey + "\x00" + ext
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *NZBParser) getBaseFilename(filename string) string {
