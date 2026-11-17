@@ -292,6 +292,14 @@ type ImportReport struct {
 // an entry if it is the entry's folder under any folder naming, so the import
 // does not depend on the running folder_naming.
 func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
+	return ImportStoresNamed(dir, config.Get().FolderNaming, open)
+}
+
+// ImportStoresNamed is ImportStores for a database that will run under
+// naming: the folder name each entry is indexed under is computed with it.
+// A restore that also restores the snapshot's config passes that config's
+// naming, because the config is moved into place after the import.
+func ImportStoresNamed(dir string, naming config.WebDavFolderNaming, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
 	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
 		return nil, fmt.Errorf("import target %s is not empty", dir)
 	}
@@ -355,7 +363,9 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 				}
 				imported = append(imported, names)
 			}
-			return put(name, key, value, entryPutOptions(entry))
+			opts := entryPutOptions(entry)
+			opts.Attributes[attributeName] = GetTorrentFolder(naming, entry)
+			return put(name, key, value, opts)
 		})
 		if err != nil {
 			return nil, err

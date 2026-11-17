@@ -17,6 +17,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -46,6 +47,10 @@ type ArchiveRestoreOptions struct {
 	// number; zero means the defaults.
 	MaxBytes   int64
 	MaxEntries int
+
+	// folderNaming, when set, is the folder naming of a config restored by
+	// another archive of the same restore (RestoreFromArchiveFiles).
+	folderNaming *config.WebDavFolderNaming
 }
 
 // RestoreFromArchiveFile restores the .tar.zst at path; see RestoreFromArchive.
@@ -125,7 +130,24 @@ func RestoreFromArchive(ctx context.Context, r io.Reader, opts ArchiveRestoreOpt
 		if id == "" {
 			id = "archive"
 		}
-		resp, err := stageDB(id, BuildInfo{Commit: info.Commit, DBFormat: info.DBFormat}, info.Records, opts.DataDir,
+		// The database is indexed under the naming the install will run
+		// under: the restored config's when one comes with it (it is moved
+		// into place only after the database is staged), else the running
+		// one.
+		naming := config.Get().FolderNaming
+		if opts.folderNaming != nil {
+			naming = *opts.folderNaming
+		} else if wanted(opts.Only, ComponentConfig) {
+			for _, n := range byComp[ComponentConfig] {
+				if n != "config.json" {
+					continue
+				}
+				if cn, ok := configFileFolderNaming(filepath.Join(scratch, n)); ok {
+					naming = cn
+				}
+			}
+		}
+		resp, err := stageDB(id, BuildInfo{Commit: info.Commit, DBFormat: info.DBFormat}, info.Records, opts.DataDir, naming,
 			func(store string) (io.ReadCloser, error) {
 				f, err := os.Open(filepath.Join(scratch, "db", store))
 				if errors.Is(err, os.ErrNotExist) {
@@ -366,6 +388,32 @@ func peekArchive(p string, maxEntries int) (archiveHead, error) {
 	return head, nil
 }
 
+// archiveConfigFolderNaming is the folder naming set by the config.json in
+// the .tar.zst at p; ok is false when it holds none that can be read.
+func archiveConfigFolderNaming(p string, maxEntries int) (config.WebDavFolderNaming, bool) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	zr, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxZstdWindow))
+	if err != nil {
+		return "", false
+	}
+	defer zr.Close()
+	tr := tar.NewReader(zr)
+	for i := 0; i < maxEntries; i++ {
+		h, err := tr.Next()
+		if err != nil {
+			return "", false
+		}
+		if h.Name == "config.json" && h.Typeflag == tar.TypeReg {
+			return configFolderNaming(tr)
+		}
+	}
+	return "", false
+}
+
 // RestoreFromArchiveFiles restores several downloaded archives (say the
 // database one and the config one) as a single operation. Every archive is
 // looked at first and the whole set is refused, before anything is written,
@@ -414,6 +462,13 @@ func RestoreFromArchiveFiles(ctx context.Context, paths []string, opts ArchiveRe
 			}
 		}
 		dbFirst = append(dbFirst, p)
+	}
+	if wanted(opts.Only, ComponentConfig) {
+		for _, p := range rest {
+			if n, ok := archiveConfigFolderNaming(p, maxEntries); ok {
+				opts.folderNaming = &n
+			}
+		}
 	}
 	for _, p := range append(dbFirst, rest...) {
 		one, err := RestoreFromArchiveFile(ctx, p, opts)

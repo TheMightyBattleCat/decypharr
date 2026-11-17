@@ -149,7 +149,20 @@ func RestoreToDataDir(ctx context.Context, repo Repo, opts RestoreOptions) (Rest
 		if _, ok := snap.Components[ComponentDB]; !ok {
 			rep.Skipped[ComponentDB] = "not in the snapshot"
 		} else {
-			resp, err := StageDBRestore(repo, snap.ID, opts.DataDir)
+			// Index the database under the naming of the config restored
+			// with it, which is written only after the database is staged.
+			naming := config.Get().FolderNaming
+			if wanted(opts.Only, ComponentConfig) {
+				if sha := snap.Components[ComponentConfig].Files["config.json"]; sha != "" {
+					if rc, err := repo.OpenBlob(ctx, sha); err == nil {
+						if n, ok := configFolderNaming(rc); ok {
+							naming = n
+						}
+						_ = rc.Close()
+					}
+				}
+			}
+			resp, err := stageSnapshotDB(repo, snap.ID, opts.DataDir, naming)
 			if err != nil {
 				return rep, err
 			}
