@@ -951,7 +951,7 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	// same-name entry still claims it or a file in it is open; the sidecar's
 	// InfoHash keeps a replacement from reading the old bytes either way.
 	if torr.IsNZB() && m.repair != nil {
-		if freed, ok := m.repair.RemoveEntryCacheDir(torr.GetFolder(), infohash); ok {
+		if freed, ok := m.repair.RemoveEntryCache(torr); ok {
 			m.logger.Debug().Str("entry", torr.Name).Str("infohash", infohash).Int64("bytes_freed", freed).
 				Msg("Removed DFS cache dir for deleted entry")
 		}

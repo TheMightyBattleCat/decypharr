@@ -267,13 +267,15 @@ func (d *Downloader) completeEntry(entry *storage.Entry, servedFolder string) er
 // paddingImportGate (padded/zero-filled segments):
 // the symlink tree (or downloaded file) at entry.DownloadPath(), the DFS
 // cache dir backing it (if one was warmed), and the overlay manifest dir for
-// this infohash. RemoveEntryCacheDir carries its own safety checks (DFS mode
-// + a configured cache dir, resolved path contained within it, and no other
-// live entry still sharing the folder name), so it's always safe to call
-// here even when there's nothing to remove. OverlayDeleteEntry is an
-// os.RemoveAll under a per-nzbID lock and no-ops cleanly when no overlay dir
-// exists; the reap "still the live owner?" guard is deliberately skipped
-// because the entry is confirmed broken and being discarded here.
+// this infohash. A season split frees only its own files from the parent's
+// cache folder (RemoveEntryCache). RemoveEntryCacheDir carries its own
+// safety checks (DFS mode + a configured cache dir, resolved path contained
+// within it, and no other live entry still sharing the folder name), so
+// it's always safe to call here even when there's nothing to remove.
+// OverlayDeleteEntry is an os.RemoveAll under a per-nzbID lock and no-ops
+// cleanly when no overlay dir exists; the reap "still the live owner?"
+// guard is deliberately skipped because the entry is confirmed broken and
+// being discarded here.
 func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	symlinkPath := entry.DownloadPath()
 	if err := os.RemoveAll(symlinkPath); err != nil {
@@ -285,7 +287,7 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	}
 
 	nzbID := entryNZBID(entry)
-	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
+	if freed, ok := d.manager.Repair().RemoveEntryCache(entry); ok {
 		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
 			Msg("Import: removed DFS cache dir for rejected import")
 	}
