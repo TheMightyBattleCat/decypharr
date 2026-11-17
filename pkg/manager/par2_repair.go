@@ -1871,7 +1871,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		class := p.recordPar2Outcome(nzbID, err, deadSlicesDiscovered)
 		p.logger.Info().Err(err).Str("entry", entryName).Str("lane", lane.String()).Bool("crc_canary", canary).Bool("terminal", class.terminal).
 			Str("class", class.name()).
-			Int64("cache_bytes", cacheBytes).Int64("usenet_bytes", readBytes).
+			Int64("cache_bytes", atomic.LoadInt64(&cacheBytes)).Int64("usenet_bytes", atomic.LoadInt64(&readBytes)).
 			Func(tally.logFields).
 			Dur(par2TookField, time.Since(start)).
 			Msg("par2 repair unavailable")
@@ -1884,7 +1884,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 			StartedAt:  start,
 			Duration:   time.Since(start),
 			Outcome:    storage.Par2RepairOutcomeFailed,
-			ReadBytes:  readBytes,
+			ReadBytes:  atomic.LoadInt64(&readBytes),
 			FailReason: err.Error(),
 			CRCCanary:  canary,
 		})
@@ -1933,8 +1933,8 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		Int("slices_rebuilt", slicesRepaired).
 		Dur(par2TookField, time.Since(start)).
 		Dur("duration", time.Since(start)).
-		Int64("cache_bytes", cacheBytes).
-		Int64("usenet_bytes", readBytes).
+		Int64("cache_bytes", atomic.LoadInt64(&cacheBytes)).
+		Int64("usenet_bytes", atomic.LoadInt64(&readBytes)).
 		Int("deferred_dead_segments", setsDeferred).
 		Msg("par2 repair completed")
 	progress.SetPhase(Par2PhaseCompleted)
@@ -1945,7 +1945,7 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 		StartedAt:       start,
 		Duration:        time.Since(start),
 		Outcome:         storage.Par2RepairOutcomeCompleted,
-		ReadBytes:       readBytes,
+		ReadBytes:       atomic.LoadInt64(&readBytes),
 		SlicesRepaired:  slicesRepaired,
 		SegmentsPatched: tally.patched(),
 	})
@@ -3118,7 +3118,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		var intactRead int64
 		intactTotal := int64(len(intactOrder))
-		trackedFetch := func(i int64) (data []byte, err error) {
+		trackedFetch := func(fctx context.Context, i int64) (data []byte, err error) {
 			// The slice source calls this on its own worker goroutines,
 			// outside runJob's recover, and ReadSlice does the offset
 			// arithmetic over release data that has panicked before on
@@ -3132,7 +3132,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 					data, err = nil, par2Failf(par2Transient, "reading PAR2 slice %d panicked: %v (transient: internal error)", i, r)
 				}
 			}()
-			data, err = jobSource.ReadSlice(i)
+			data, err = jobSource.ReadSlice(fctx, i)
 			progress.AddIntactRead(1)
 			if atomic.AddInt64(&intactRead, 1) == intactTotal {
 				progress.SetPhase(Par2PhaseSolving)
@@ -3142,7 +3142,9 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// Each round's source gets its own context, cancelled as soon as the
 		// pass returns. An early-stopped or failed pass otherwise left its
 		// workers holding fetched slices (up to 3x the connection count x
-		// SliceSize) and their connections until the whole job ended.
+		// SliceSize) and their connections until the whole job ended. The
+		// workers' fetches run on it too (trackedFetch's fctx), so the cancel
+		// aborts the ones still in flight.
 		roundCtx, roundCancel := context.WithCancel(ctx)
 		sliceSource := newConcurrentSliceSource(roundCtx, intactOrder, u.ProcessingMaxConnections(), trackedFetch)
 		var repairErr error
@@ -3156,7 +3158,12 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			MaxUnavailable:     max(0, spare),
 			OnChecksumMismatch: func(i int64) { checksumBad = append(checksumBad, i) },
 		})
+		// Wait for the round's workers before using its result: a worker
+		// still inside a fetch adds to readBytes while runJob reads it, can
+		// record a dead slice NotFoundIndices below misses, and shares the
+		// connection budget with the next round's workers.
 		roundCancel()
+		sliceSource.Wait()
 		if repairErr == nil {
 			break
 		}
@@ -3847,7 +3854,7 @@ func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange, s
 		if err != nil || fileID != rng.fileID {
 			return nil, false
 		}
-		data, _, err := f.readRange(local*idx.SliceSize, idx.SliceSize, false)
+		data, _, err := f.readRange(f.ctx, local*idx.SliceSize, idx.SliceSize, false)
 		if err != nil {
 			return nil, false
 		}
@@ -4702,7 +4709,7 @@ func confirmStatMisses(
 			if ctx.Err() != nil {
 				return
 			}
-			_, err := f.segmentData(pos.index)
+			_, err := f.segmentData(f.ctx, pos.index)
 			switch {
 			case err == nil:
 				verdicts[i] = verdictAlive
@@ -5583,7 +5590,10 @@ func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
 	return lo, nil
 }
 
-func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
+// segmentData fetches article idx. ctx bounds the fetch: f.ctx (the job's)
+// for one-off reads, a repair round's context for the streaming workers so
+// a cancelled round aborts its in-flight fetches.
+func (f *postedFileFetcher) segmentData(ctx context.Context, idx int) ([]byte, error) {
 	f.cacheMu.Lock()
 	if f.cacheIdx == idx {
 		data := f.cacheData
@@ -5595,9 +5605,9 @@ func (f *postedFileFetcher) segmentData(idx int) ([]byte, error) {
 	// Per-segment timeout, independent of how many OTHER segments are being
 	// fetched concurrently right now: a single dead/stuck connection fails
 	// this one fetch in par2ArticleFetchTimeout, not the whole job's
-	// deadline. f.ctx (the job's own context, via par2JobTimeout) remains
-	// the backstop if it's already closer than that.
-	fetchCtx, cancel := context.WithTimeout(f.ctx, par2ArticleFetchTimeout)
+	// deadline. ctx (the job's own context via par2JobTimeout, or a round's
+	// child of it) remains the backstop if it's already closer than that.
+	fetchCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
 	data, err := f.fetch(fetchCtx, f.segs[idx].MessageID, f.identityCheck(idx))
 	cancel()
 	if err != nil {
@@ -5624,7 +5634,7 @@ var ErrSegmentShort = errors.New("segment data shorter than its recorded size")
 // are served from the local DFS cache where possible (see readCached),
 // otherwise fetched from Usenet.
 func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
-	out, _, err := f.readRange(start, length, true)
+	out, _, err := f.readRange(f.ctx, start, length, true)
 	return out, err
 }
 
@@ -5632,8 +5642,9 @@ func (f *postedFileFetcher) ReadRange(start, length int64) ([]byte, error) {
 // IFSC-verified cache path needs (see jobSliceSource.ReadSlice):
 // allowCache=false forces every byte to come from a fresh Usenet fetch, and
 // usedCache reports whether any returned byte was served from the DFS cache
-// (so the caller knows whether an IFSC re-check is worth doing).
-func (f *postedFileFetcher) readRange(start, length int64, allowCache bool) (out []byte, usedCache bool, err error) {
+// (so the caller knows whether an IFSC re-check is worth doing). ctx bounds
+// the Usenet fetches (see segmentData).
+func (f *postedFileFetcher) readRange(ctx context.Context, start, length int64, allowCache bool) (out []byte, usedCache bool, err error) {
 	out = make([]byte, length)
 	pos := start
 	written := int64(0)
@@ -5671,7 +5682,7 @@ func (f *postedFileFetcher) readRange(start, length int64, allowCache bool) (out
 			}
 		}
 
-		data, err := f.segmentData(segIdx)
+		data, err := f.segmentData(ctx, segIdx)
 		if err != nil {
 			if nntp.IsArticleNotFoundError(err) || nntp.IsCorruptArticleError(err) {
 				// Gone, or corrupt on every provider: the solve rebuilds its
@@ -5784,7 +5795,9 @@ type jobSliceSource struct {
 	logger zerolog.Logger
 }
 
-func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
+// ReadSlice reads intact slice globalIdx; ctx bounds its Usenet fetches (a
+// repair round's context, so a cancelled round aborts them).
+func (s *jobSliceSource) ReadSlice(ctx context.Context, globalIdx int64) ([]byte, error) {
 	fileID, local, err := s.idx.SliceLocation(globalIdx)
 	if err != nil {
 		return nil, err
@@ -5794,7 +5807,7 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 		return nil, missingFetcherErr(fileID, s.classifyMiss)
 	}
 	start := local * s.idx.SliceSize
-	data, usedCache, err := f.readRange(start, s.idx.SliceSize, true)
+	data, usedCache, err := f.readRange(ctx, start, s.idx.SliceSize, true)
 	if err != nil {
 		return nil, err
 	}
@@ -5818,7 +5831,7 @@ func (s *jobSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 	if verr == nil && !verified {
 		s.logger.Warn().Int64("slice", globalIdx).Str("file", fmt.Sprintf("%x", fileID)).
 			Msg("par2 repair: cached intact slice failed IFSC verification (stale zero-fill) - refetching from NNTP")
-		fresh, _, ferr := f.readRange(start, s.idx.SliceSize, false)
+		fresh, _, ferr := f.readRange(ctx, start, s.idx.SliceSize, false)
 		if ferr != nil {
 			return nil, ferr
 		}

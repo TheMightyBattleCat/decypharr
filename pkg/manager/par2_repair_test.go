@@ -577,7 +577,7 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 	}
 
 	// Global slice 0 belongs to fileA.
-	data, err := src.ReadSlice(0)
+	data, err := src.ReadSlice(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("ReadSlice(0): %v", err)
 	}
@@ -586,12 +586,40 @@ func TestJobSliceSourceReadSlice(t *testing.T) {
 	}
 
 	// Global slice 3 is fileB's first slice (fileA occupies 0,1,2).
-	data, err = src.ReadSlice(3)
+	data, err = src.ReadSlice(context.Background(), 3)
 	if err != nil {
 		t.Fatalf("ReadSlice(3): %v", err)
 	}
 	if data[0] != 0x0B {
 		t.Errorf("ReadSlice(3)[0] = %#x, want 0x0B (fileB)", data[0])
+	}
+}
+
+// ReadSlice fetches on the context it is given (a repair round's), not only
+// the fetcher's own job context: a cancelled round aborts its in-flight
+// fetches instead of waiting each one out.
+func TestJobSliceSourceReadSliceFetchesOnTheGivenContext(t *testing.T) {
+	idx, fileA, _ := buildTestIndex(t, 100, 250, 150)
+	fileARef := storage.PostedFileRef{Name: "a.rar", Size: 250, Segments: []storage.Par2SegmentRef{{MessageID: "<a1>", Bytes: 250}}}
+	fetch := func(ctx context.Context, _ string) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return repeatByte(0x0A, 250), nil
+	}
+	src := &jobSliceSource{
+		idx: idx,
+		fetchers: map[[16]byte]*postedFileFetcher{
+			fileA: newPostedFileFetcher(context.Background(), uncheckedPosted(fetch), fileARef, nil, 0, zerolog.Nop()),
+		},
+	}
+	round, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := src.ReadSlice(round, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadSlice on a cancelled round = %v, want context.Canceled", err)
+	}
+	if _, err := src.ReadSlice(context.Background(), 0); err != nil {
+		t.Fatalf("ReadSlice on a live context: %v", err)
 	}
 }
 

@@ -19,7 +19,7 @@ func TestConcurrentSliceSourceReturnsResultsForCorrectIndex(t *testing.T) {
 	fetchOne := func(idx int64) ([]byte, error) {
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 3, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 3, ignoreFetchCtx(fetchOne))
 
 	for _, idx := range order {
 		data, err := src.ReadSlice(idx)
@@ -44,7 +44,7 @@ func TestConcurrentSliceSourceHandlesOutOfOrderCompletion(t *testing.T) {
 		}
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 5, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 5, ignoreFetchCtx(fetchOne))
 
 	// Give the fast workers a head start so their results are sitting in
 	// resultCh/pending before we ever call ReadSlice at all.
@@ -70,7 +70,7 @@ func TestConcurrentSliceSourcePropagatesTheRightError(t *testing.T) {
 		}
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 3, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 3, ignoreFetchCtx(fetchOne))
 
 	if _, err := src.ReadSlice(0); err != nil {
 		t.Fatalf("ReadSlice(0): unexpected error: %v", err)
@@ -103,7 +103,7 @@ func TestConcurrentSliceSourceBoundsConcurrency(t *testing.T) {
 		inFlight.Add(-1)
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, maxConcurrency, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, maxConcurrency, ignoreFetchCtx(fetchOne))
 
 	for _, idx := range order {
 		if _, err := src.ReadSlice(idx); err != nil {
@@ -128,7 +128,7 @@ func TestConcurrentSliceSourceTracksNotFoundIndices(t *testing.T) {
 		}
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 4, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 4, ignoreFetchCtx(fetchOne))
 
 	for _, idx := range order {
 		_, _ = src.ReadSlice(idx) // drain everything so all workers have reported in
@@ -155,7 +155,7 @@ func TestConcurrentSliceSourceTracksShortSegmentAsNotFound(t *testing.T) {
 		}
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 3, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 3, ignoreFetchCtx(fetchOne))
 	for _, idx := range order {
 		_, _ = src.ReadSlice(idx)
 	}
@@ -188,7 +188,7 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 		}
 		return []byte{byte(idx)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 4, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 4, ignoreFetchCtx(fetchOne))
 	for _, idx := range order {
 		_, _ = src.ReadSlice(idx)
 	}
@@ -209,7 +209,7 @@ func TestConcurrentSliceSourceSplitsDeadCauses(t *testing.T) {
 	}
 	// Each unreadable slice is marked so par2.Repair finishes the pass.
 	for _, idx := range []int64{1, 2} {
-		if _, err := newConcurrentSliceSource(context.Background(), []int64{idx}, 1, fetchOne).ReadSlice(idx); !errors.Is(err, par2.ErrSliceUnavailable) {
+		if _, err := newConcurrentSliceSource(context.Background(), []int64{idx}, 1, ignoreFetchCtx(fetchOne)).ReadSlice(idx); !errors.Is(err, par2.ErrSliceUnavailable) {
 			t.Errorf("slice %d: %v, want ErrSliceUnavailable", idx, err)
 		}
 	}
@@ -304,7 +304,7 @@ func TestConcurrentSliceSourceDoesNotTrackOtherErrorsAsNotFound(t *testing.T) {
 		}
 		return []byte{0}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, 2, fetchOne)
+	src := newConcurrentSliceSource(context.Background(), order, 2, ignoreFetchCtx(fetchOne))
 	for _, idx := range order {
 		_, _ = src.ReadSlice(idx)
 	}
@@ -314,8 +314,8 @@ func TestConcurrentSliceSourceDoesNotTrackOtherErrorsAsNotFound(t *testing.T) {
 }
 
 // Cancelling a source whose consumer has stopped reading (an early-stopped
-// pass) stops the fetches. fetchOne takes no context, so without the checks
-// in run() the unblocked workers read the rest of the release.
+// pass) stops the fetches. This fetchOne ignores its context, so without the
+// checks in run() the unblocked workers read the rest of the release.
 func TestConcurrentSliceSourceStopsFetchingWhenCancelled(t *testing.T) {
 	const n = 2000
 	order := make([]int64, n)
@@ -324,7 +324,7 @@ func TestConcurrentSliceSourceStopsFetchingWhenCancelled(t *testing.T) {
 	}
 	var calls atomic.Int64
 	ctx, cancel := context.WithCancel(context.Background())
-	src := newConcurrentSliceSource(ctx, order, 4, func(i int64) ([]byte, error) {
+	src := newConcurrentSliceSource(ctx, order, 4, func(_ context.Context, i int64) ([]byte, error) {
 		calls.Add(1)
 		time.Sleep(time.Millisecond)
 		return []byte{byte(i)}, nil
@@ -372,7 +372,7 @@ func TestConcurrentSliceSourceBoundsReadAheadBehindSlowSlice(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	src := newConcurrentSliceSource(ctx, order, concurrency, fetch)
+	src := newConcurrentSliceSource(ctx, order, concurrency, ignoreFetchCtx(fetch))
 
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -420,7 +420,7 @@ func TestConcurrentSliceSourceFailingSlicesDoNotStallTheWindow(t *testing.T) {
 		}
 		return []byte{byte(i)}, nil
 	}
-	src := newConcurrentSliceSource(context.Background(), order, concurrency, fetch)
+	src := newConcurrentSliceSource(context.Background(), order, concurrency, ignoreFetchCtx(fetch))
 
 	done := make(chan error, 1)
 	go func() {
@@ -458,7 +458,7 @@ func TestConcurrentSliceSourceCancelReleasesAFullWindow(t *testing.T) {
 		order[i] = int64(i)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	src := newConcurrentSliceSource(ctx, order, 2, func(i int64) ([]byte, error) {
+	src := newConcurrentSliceSource(ctx, order, 2, func(_ context.Context, i int64) ([]byte, error) {
 		return []byte{byte(i)}, nil
 	})
 	for i := int64(0); i < 3; i++ {
@@ -498,5 +498,79 @@ func TestConcurrentSliceSourceCancelReleasesAFullWindow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ReadSlice after cancel did not return")
+	}
+}
+
+// ignoreFetchCtx adapts a fetch that takes no context to
+// newConcurrentSliceSource's fetchOne.
+func ignoreFetchCtx(fetch func(int64) ([]byte, error)) func(context.Context, int64) ([]byte, error) {
+	return func(_ context.Context, i int64) ([]byte, error) { return fetch(i) }
+}
+
+// Wait returns only once every worker has left fetchOne. A fetch that does
+// not honour the cancel keeps Wait blocked until it is released; before Wait
+// existed, runRepair moved on while such a worker still ran.
+func TestConcurrentSliceSourceWaitOutlastsABlockedFetch(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 4)
+	var inFetch atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	src := newConcurrentSliceSource(ctx, []int64{0, 1, 2, 3}, 2, func(_ context.Context, i int64) ([]byte, error) {
+		inFetch.Add(1)
+		defer inFetch.Add(-1)
+		started <- struct{}{}
+		<-release
+		return []byte{byte(i)}, nil
+	})
+	<-started
+	cancel()
+
+	waited := make(chan struct{})
+	go func() {
+		src.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatalf("Wait returned with %d fetch(es) still blocked", inFetch.Load())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after the blocked fetch was released")
+	}
+	if n := inFetch.Load(); n != 0 {
+		t.Fatalf("Wait returned with %d fetch(es) still running", n)
+	}
+}
+
+// fetchOne runs on a context the source's cancel reaches, so a round that is
+// cancelled aborts the fetches it still has in flight instead of waiting for
+// each to finish or time out.
+func TestConcurrentSliceSourceCancelReachesInFlightFetch(t *testing.T) {
+	started := make(chan struct{}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	src := newConcurrentSliceSource(ctx, []int64{0, 1, 2, 3}, 2, func(fctx context.Context, i int64) ([]byte, error) {
+		started <- struct{}{}
+		select {
+		case <-fctx.Done():
+			return nil, fctx.Err()
+		case <-time.After(10 * time.Second):
+			return []byte{byte(i)}, nil
+		}
+	})
+	<-started
+	cancel()
+	waited := make(chan struct{})
+	go func() {
+		src.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelling the source did not abort the in-flight fetch")
 	}
 }

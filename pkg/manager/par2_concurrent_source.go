@@ -90,6 +90,11 @@ type concurrentSliceSource struct {
 	// mid-flight, best-effort). See NotFoundIndices.
 	notFoundMu sync.Mutex
 	notFound   map[int64]deadCause
+
+	// done is closed when run() has returned: every worker has ended, so
+	// nothing writes a counter or notFound any more. nil in hand-built test
+	// structs. See Wait.
+	done chan struct{}
 }
 
 // newConcurrentSliceSource launches maxConcurrency worker goroutines that
@@ -98,8 +103,10 @@ type concurrentSliceSource struct {
 // par2.Repair.ReadSlice will be called with, in the exact sequence it will
 // call them (ascending, skipping already-damaged indices) - see runRepair,
 // which derives this from the same idx.NumSlices()/damaged set par2.Repair
-// itself uses internally, so the two can never disagree.
-func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(globalIdx int64) ([]byte, error)) *concurrentSliceSource {
+// itself uses internally, so the two can never disagree. fetchOne gets the
+// pool's context, a child of ctx: a fetch made with it is aborted when ctx is
+// cancelled, so Wait after a cancel does not wait out a slow article.
+func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(ctx context.Context, globalIdx int64) ([]byte, error)) *concurrentSliceSource {
 	if maxConcurrency < 1 {
 		maxConcurrency = 1
 	}
@@ -110,18 +117,34 @@ func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency
 		pending:  make(map[int64]sliceFetchResult),
 		slots:    make(chan struct{}, window),
 		notFound: make(map[int64]deadCause),
+		done:     make(chan struct{}),
 	}
 	go s.run(ctx, order, maxConcurrency, fetchOne)
 	return s
 }
 
-func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(int64) ([]byte, error)) {
+// Wait blocks until run() and every worker it started have returned. Call it
+// after cancelling the source's context: runRepair does so at the end of
+// each round, so no worker of that round still fetches, adds to the pass's
+// byte counters, or records a dead slice once the round's result is used.
+// Returns at once on a hand-built struct with no done channel.
+func (s *concurrentSliceSource) Wait() {
+	if s.done != nil {
+		<-s.done
+	}
+}
+
+func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(context.Context, int64) ([]byte, error)) {
+	if s.done != nil {
+		defer close(s.done)
+	}
 	p := pool.New().WithContext(ctx).WithMaxGoroutines(maxConcurrency)
 dispatch:
 	for _, idx := range order {
 		// A cancelled source (the round is over - see runRepair) must stop
-		// fetching: fetchOne does not take the context, so without these
-		// checks every remaining slice of the release would still be read.
+		// fetching: without these checks every remaining slice of the
+		// release would still be started, each failing on the cancelled
+		// context.
 		if ctx.Err() != nil {
 			break
 		}
@@ -140,7 +163,7 @@ dispatch:
 			if ctx.Err() != nil {
 				return nil
 			}
-			data, err := fetchOne(idx)
+			data, err := fetchOne(ctx, idx)
 			if err != nil {
 				// This slice's backing data is unreadable at this position:
 				// a hard 430 confirmed across every provider
@@ -197,9 +220,7 @@ dispatch:
 // with a confirmed article-not-found (across every provider) so far. Safe
 // to call at any time, including while workers are still running (the
 // returned set just may not be complete yet) - runRepair's retry loop
-// calls it only after par2.Repair has already returned, by which point
-// every worker that was going to report anything has either finished or
-// been abandoned by the pool's context cancellation.
+// calls it only after cancelling the round and Wait, so the set is final.
 func (s *concurrentSliceSource) NotFoundIndices() []int64 {
 	s.notFoundMu.Lock()
 	defer s.notFoundMu.Unlock()

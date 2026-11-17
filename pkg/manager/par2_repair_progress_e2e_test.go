@@ -166,7 +166,7 @@ func TestRepairProgressEndToEndAgainstRealFixture(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	sliceSource := newConcurrentSliceSource(ctx, intactOrder, maxConcurrency, trackedFetch)
+	sliceSource := newConcurrentSliceSource(ctx, intactOrder, maxConcurrency, ignoreFetchCtx(trackedFetch))
 
 	start := time.Now()
 	repaired, err := par2.Repair(idx, damaged, recovery, sliceSource)
@@ -359,7 +359,7 @@ func TestRepairContextCancellationSurfacesAsTransient(t *testing.T) {
 	}
 	defer cancel()
 
-	sliceSource := newConcurrentSliceSource(ctx, intactOrder, 2, fetchOne)
+	sliceSource := newConcurrentSliceSource(ctx, intactOrder, 2, ignoreFetchCtx(fetchOne))
 	_, repairErr := par2.Repair(idx, damaged, recovery, sliceSource)
 	if repairErr == nil {
 		t.Skip("repair completed before the cancel could take effect - timing-dependent, not a failure of the fix")
