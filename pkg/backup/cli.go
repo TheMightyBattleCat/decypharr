@@ -316,6 +316,9 @@ const cliUsage = `usage:
   decypharr backup restore --repo <dir> --snapshot <id|latest> --config <data dir>
                            [--only db,config,state,nzb,overlay,hearsay,links] [--links-plan|--links-apply]
                            (--links-plan and --links-apply alone restore only the links)
+  decypharr backup restore --check --repo <dir> [--snapshot <id|latest>]
+                           (dry run: restores the database into a scratch folder under the
+                           system temp folder, compares it with the snapshot, then deletes it)
   decypharr backup restore --file <path.tar.zst> --config <data dir> [--only db,config,state,hearsay]
                            (a downloaded archive instead of --repo; no links, nzb or overlay)
 `
@@ -344,8 +347,32 @@ func RunCLI(ctx context.Context, args []string, env CLIEnv) int {
 	linksPlan := fs.Bool("links-plan", false, "write a link plan file (default for links)")
 	linksApply := fs.Bool("links-apply", false, "create the links")
 	file := fs.String("file", "", "downloaded .tar.zst to restore (instead of --repo)")
+	check := fs.Bool("check", false, "restore the database into a scratch folder and compare it with the snapshot")
 	if err := fs.Parse(rest); err != nil {
 		return 2
+	}
+	if verb == "restore" && *check {
+		// "--check <snapshot>": parsing stops at the snapshot id, so the
+		// flags after it are parsed on their own.
+		if fs.NArg() > 0 {
+			pos := fs.Arg(0)
+			if err := fs.Parse(fs.Args()[1:]); err != nil {
+				return 2
+			}
+			if fs.NArg() > 0 {
+				fmt.Fprintf(env.Err, "backup: unexpected argument %q\n", fs.Arg(0))
+				return 2
+			}
+			if *snapshot != "" {
+				fmt.Fprintln(env.Err, "backup: give the snapshot once, with --snapshot or after --check")
+				return 2
+			}
+			*snapshot = pos
+		}
+		if *dataDir != "" || *only != "" || *file != "" || *linksPlan || *linksApply {
+			fmt.Fprintln(env.Err, "backup: --check takes only --repo and --snapshot; it never touches a data folder")
+			return 2
+		}
 	}
 	if verb == "restore" && *file != "" {
 		if *repoDir != "" {
@@ -411,6 +438,9 @@ func RunCLI(ctx context.Context, args []string, env CLIEnv) int {
 		return 0
 
 	case "restore":
+		if *check {
+			return cliRestoreCheck(ctx, env, repo, *snapshot)
+		}
 		if *dataDir == "" {
 			fmt.Fprintln(env.Err, "backup: --config <data dir> is required")
 			return 2
@@ -483,6 +513,39 @@ func printRestoreReport(env CLIEnv, rep RestoreReport) {
 	if rep.DB != nil {
 		fmt.Fprintln(env.Out, "the database is swapped in and the post-restore hold is on; release it from the Backups page after checking the install")
 	}
+}
+
+// cliRestoreCheck is "restore --check": a dry run of the database restore in
+// a scratch folder under the system temp folder, removed on every return.
+func cliRestoreCheck(ctx context.Context, env CLIEnv, repo Repo, snapshot string) int {
+	fail := func(err error) int {
+		fmt.Fprintln(env.Err, "backup:", err)
+		return 1
+	}
+	scratch, err := os.MkdirTemp("", "decypharr-restore-check-")
+	if err != nil {
+		return fail(err)
+	}
+	defer os.RemoveAll(scratch)
+	// Storage opens the logger, which loads the config: keep that default
+	// config and its logs in the scratch folder, away from the cwd and from
+	// any live data folder.
+	prev := config.GetMainPath()
+	config.SetConfigPath(filepath.Join(scratch, "config"))
+	defer config.SetConfigPath(prev)
+	id, err := ResolveSnapshotID(ctx, repo, snapshot)
+	if err != nil {
+		return fail(err)
+	}
+	rep, err := CheckRestore(ctx, repo, id, scratch)
+	if err != nil {
+		return fail(err)
+	}
+	printRestoreCheck(env.Out, rep)
+	if !rep.OK() {
+		return 1
+	}
+	return 0
 }
 
 // cliRestoreFile restores a downloaded .tar.zst into dataDir. It takes the
