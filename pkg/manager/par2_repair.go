@@ -298,6 +298,10 @@ type Par2Repair struct {
 	// repair window was closed (see readyToRun) - loop's local pending slice
 	// mirrors this set so IsQueued can see them too.
 	deferred map[string]struct{}
+	// dropped holds nzbIDs CancelEntry took out of the batch queue while
+	// their request still sat in the channel: loop skips the next one it
+	// dequeues for each (see takeQueued).
+	dropped map[string]struct{}
 
 	// progress holds live, per-nzbID job progress (phase, slice/byte
 	// counts) - see par2_progress.go. Updated frequently throughout
@@ -332,7 +336,9 @@ type Par2Repair struct {
 	// manualSlots bounds the passes RunNow runs at once (see
 	// par2ManualSlots); runNow allocates it on first use. manualWaiting
 	// holds, per nzbID, the channel that cancels a RunNow request still
-	// waiting for a slot. Both guarded by mu.
+	// waiting for a slot. It stays until the request's goroutine ends, so
+	// CancelEntry can tell a RunNow entry in queued from a batch request.
+	// Both guarded by mu.
 	manualSlots   chan struct{}
 	manualWaiting map[string]chan struct{}
 
@@ -362,6 +368,7 @@ func NewPar2Repair(m *Manager, repair *Repair) *Par2Repair {
 		logger:     logger.New("par2-repair"),
 		queued:     make(map[string]struct{}),
 		deferred:   make(map[string]struct{}),
+		dropped:    make(map[string]struct{}),
 		queue:      make(chan string, par2QueueDepth),
 		progress:   newPar2ProgressTracker(),
 		urgentSet:  make(map[string]*urgentJob),
@@ -555,11 +562,25 @@ func (p *Par2Repair) CancelEntry(nzbID string) {
 	p.runningMu.Unlock()
 
 	// A RunNow request still waiting for a slot gives up, and releases its
-	// own claim.
+	// own claim. A batch request still in the channel or deferred by a
+	// closed repair window is dropped: loop would otherwise run a pass for
+	// the deleted entry once it reached it.
+	batchDropped := false
 	p.mu.Lock()
 	if ch, waiting := p.manualWaiting[nzbID]; waiting {
 		delete(p.manualWaiting, nzbID)
 		close(ch)
+	} else if _, q := p.queued[nzbID]; q {
+		delete(p.queued, nzbID)
+		if p.dropped == nil {
+			p.dropped = make(map[string]struct{})
+		}
+		p.dropped[nzbID] = struct{}{}
+		batchDropped = true
+	}
+	if _, d := p.deferred[nzbID]; d {
+		delete(p.deferred, nzbID)
+		batchDropped = true
 	}
 	p.mu.Unlock()
 
@@ -572,7 +593,7 @@ func (p *Par2Repair) CancelEntry(nzbID string) {
 	p.urgentMu.Unlock()
 	// A running pass releases its own claim as it ends; a queued request's
 	// claim has no pass to release it.
-	if queued && !running && p.repair != nil && p.repair.handlers != nil {
+	if (queued || batchDropped) && !running && p.repair != nil && p.repair.handlers != nil {
 		p.repair.handlers.ReleasePar2(nzbID)
 	}
 }
@@ -958,6 +979,9 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 		defer func() {
 			p.mu.Lock()
 			delete(p.queued, nzbID)
+			if p.manualWaiting[nzbID] == cancelled {
+				delete(p.manualWaiting, nzbID)
+			}
 			p.mu.Unlock()
 		}()
 		if !p.waitForManualSlot(nzbID, slots, cancelled) {
@@ -978,13 +1002,6 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 // for one to free. It returns false, holding no slot, if cancelled is closed
 // (CancelEntry: the entry is being deleted) or the worker stops first.
 func (p *Par2Repair) waitForManualSlot(nzbID string, slots, cancelled chan struct{}) bool {
-	defer func() {
-		p.mu.Lock()
-		if p.manualWaiting[nzbID] == cancelled {
-			delete(p.manualWaiting, nzbID)
-		}
-		p.mu.Unlock()
-	}()
 	var stop <-chan struct{}
 	if p.ctx != nil {
 		stop = p.ctx.Done()
@@ -1589,9 +1606,9 @@ func (p *Par2Repair) loop() {
 		case <-p.ctx.Done():
 			return
 		case nzbID := <-p.queue:
-			p.mu.Lock()
-			delete(p.queued, nzbID)
-			p.mu.Unlock()
+			if !p.takeQueued(nzbID) {
+				continue
+			}
 			if p.handledByUrgent(nzbID) {
 				continue
 			}
@@ -1607,13 +1624,8 @@ func (p *Par2Repair) loop() {
 			if len(pending) == 0 || !p.readyToRun() {
 				continue
 			}
-			todo := pending
+			todo := p.takeDeferred(pending)
 			pending = nil
-			p.mu.Lock()
-			for _, id := range todo {
-				delete(p.deferred, id)
-			}
-			p.mu.Unlock()
 			for _, id := range todo {
 				if p.ctx.Err() != nil {
 					return
@@ -1625,6 +1637,38 @@ func (p *Par2Repair) loop() {
 			}
 		}
 	}
+}
+
+// takeQueued is loop's bookkeeping for a request it has just taken off the
+// channel. It reports false for one CancelEntry dropped, which is skipped. A
+// request queued again after the drop has its own place in the channel and
+// runs.
+func (p *Par2Repair) takeQueued(nzbID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, d := p.dropped[nzbID]; d {
+		delete(p.dropped, nzbID)
+		return false
+	}
+	delete(p.queued, nzbID)
+	return true
+}
+
+// takeDeferred returns the deferred requests still to run, in order, and
+// clears them from the deferred set. One CancelEntry removed from the set,
+// or a duplicate of one already taken, is left out.
+func (p *Par2Repair) takeDeferred(pending []string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	todo := pending[:0:0]
+	for _, id := range pending {
+		if _, d := p.deferred[id]; !d {
+			continue
+		}
+		delete(p.deferred, id)
+		todo = append(todo, id)
+	}
+	return todo
 }
 
 // readyToRun gates the BATCH lane only: enabled, and within the repair
@@ -1794,25 +1838,15 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	if entryErr != nil || entry == nil {
 		// A ghost overlay record - the backing entry is already gone
 		// (deleted, superseded, re-grabbed under a different nzbID). There
-		// is nothing to repair on behalf of; mark it terminal so the
-		// automatic path stops re-enqueuing it (Commit A/B's cleanup hooks
-		// should reap the overlay record itself shortly, but a race is not a
-		// reason to keep hammering it in the meantime).
-		terminalErr := fmt.Errorf("entry no longer exists")
-		p.logger.Info().Str("entry", nzbID).Msg("par2 repair: entry no longer exists; marking unrepairable")
+		// is nothing to repair on behalf of, so the pass ends as a deleted
+		// one does: no state row, no attempt row, no notification, no
+		// follow-up, and the claim released. Recording it left a transient
+		// backoff row (the error carried no class) and an attempt for an
+		// entry that no longer exists, and nothing removed the row.
+		job.deleted.Store(true)
+		p.logger.Info().Str("entry", nzbID).Msg("par2 repair: entry no longer exists; nothing to repair")
 		progress.SetPhase(Par2PhaseFailed)
-		progress.SetLastError(terminalErr.Error())
-		p.recordAttempt(&storage.Par2RepairAttempt{
-			ID:         uuid.NewString(),
-			EntryName:  nzbID,
-			NzbID:      nzbID,
-			StartedAt:  start,
-			Duration:   time.Since(start),
-			Outcome:    storage.Par2RepairOutcomeUnavailable,
-			FailReason: terminalErr.Error(),
-		})
-		p.recordPar2Outcome(nzbID, terminalErr, 0)
-		terminal = true
+		progress.SetLastError("entry no longer exists")
 		return
 	}
 	entryName := entry.Name
