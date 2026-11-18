@@ -2490,17 +2490,24 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// fetchPosted wraps every article fetch this pass makes so runJob can
 	// report a real (not estimated) read_bytes total in the persisted attempt
 	// log - used in place of u.FetchArticle everywhere below. A posted file's
-	// articles pass an identity check (see postedArticleMismatch); PAR2 files
-	// go through fetch, which has none, and records which provider served
-	// each article in prov (see refetchMisservedPar2Articles).
+	// articles pass an identity check (see postedArticleMismatch), and the
+	// provider that served each is recorded in postedServed (see
+	// postedFailover); PAR2 files go through fetch, which has none, and
+	// records which provider served each article in prov (see
+	// refetchMisservedPar2Articles).
+	postedServed := newPar2Provenance()
 	fetchPosted := func(fctx context.Context, messageID string, check usenet.ArticleCheck) ([]byte, error) {
-		data, err := u.FetchArticleChecked(fctx, messageID, check)
-		if err == nil && readBytes != nil {
+		data, host, err := u.FetchArticleCheckedServedBy(fctx, messageID, check)
+		if err != nil {
+			return nil, err
+		}
+		postedServed.record(messageID, host, len(data))
+		if readBytes != nil {
 			n := int64(len(data))
 			atomic.AddInt64(readBytes, n)
 			progress.AddUsenetBytes(n)
 		}
-		return data, err
+		return data, nil
 	}
 	// transportFails counts PAR2 article fetches that failed without a 430
 	// (a timeout, a reset): each can drop a whole recovery volume for this
@@ -2938,10 +2945,23 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
+	// An intact article whose body one provider served short or wrong after
+	// decode is asked of the others (see postedFailover).
+	failover := newPostedFailover(postedServed, func(fctx context.Context, messageID, exceptHost string, check usenet.ArticleCheck) ([]byte, string, error) {
+		data, host, err := u.FetchArticleCheckedExcept(fctx, messageID, exceptHost, check)
+		if err == nil && readBytes != nil {
+			n := int64(len(data))
+			atomic.AddInt64(readBytes, n)
+			progress.AddUsenetBytes(n)
+		}
+		return data, host, err
+	})
 	fetchers := make(map[[16]byte]*postedFileFetcher, len(matches))
 	for _, m := range matches {
 		file := nzb.Par2Source[m.PostedIndex]
-		fetchers[m.FileID] = newPostedFileFetcher(ctx, fetchPosted, file, cacheSource, idx.Files[m.FileID].Length, p.logger.With().Str("entry", entryName).Str("file", file.Name).Logger())
+		f := newPostedFileFetcher(ctx, fetchPosted, file, cacheSource, idx.Files[m.FileID].Length, p.logger.With().Str("entry", entryName).Str("file", file.Name).Logger())
+		f.failover = failover
+		fetchers[m.FileID] = f
 	}
 	// Measure the real article boundaries of every file whose refs are only
 	// estimates, before anything below maps a byte range to slices: dead
@@ -5697,6 +5717,11 @@ type postedFileFetcher struct {
 	// set by attachPar2RoundArticles before the round's workers start.
 	round     atomic.Pointer[par2RoundArticles]
 	roundBase int64
+
+	// failover, when set (a repair pass's fetchers), asks another provider
+	// for an article whose body one provider served bad after decode: short,
+	// or failing a slice's IFSC. nil elsewhere (MD5-16k, heal, warm sweep).
+	failover *postedFailover
 }
 
 // trueLen, when greater than the posted file's own declared Size, overrides
@@ -6081,6 +6106,9 @@ func (f *postedFileFetcher) segmentFor(offset int64) (int, error) {
 // for one-off reads, a repair round's context for the streaming workers so
 // a cancelled round aborts its in-flight fetches.
 func (f *postedFileFetcher) segmentData(ctx context.Context, idx int) ([]byte, error) {
+	if data, ok := f.failover.replaced(f, idx); ok {
+		return data, nil
+	}
 	f.cacheMu.Lock()
 	if f.cacheIdx == idx {
 		data := f.cacheData
@@ -6187,6 +6215,13 @@ func (f *postedFileFetcher) readRange(ctx context.Context, start, length int64, 
 			return nil, usedCache, fmt.Errorf("fetch segment %d: %w", segIdx, err)
 		}
 		avail := int64(len(data)) - withinSeg
+		if avail <= 0 {
+			// Another provider may hold the whole article.
+			if better, ok := f.failover.replace(ctx, f, segIdx, "short body"); ok {
+				data = better
+				avail = int64(len(data)) - withinSeg
+			}
+		}
 		if avail <= 0 {
 			// The fetched article decoded to fewer bytes than the offset this
 			// slice needs from it - a truncated backing post. The slice's data
@@ -6509,7 +6544,7 @@ func (s *jobSliceSource) ReadSlice(ctx context.Context, globalIdx int64) ([]byte
 		return nil, err
 	}
 	if !usedCache {
-		return data, nil
+		return s.otherCopyIfBad(ctx, f, globalIdx, start, data), nil
 	}
 
 	// This slice was served (at least partly) from the local DFS cache. A
@@ -6532,6 +6567,7 @@ func (s *jobSliceSource) ReadSlice(ctx context.Context, globalIdx int64) ([]byte
 		if ferr != nil {
 			return nil, ferr
 		}
+		fresh = s.otherCopyIfBad(ctx, f, globalIdx, start, fresh)
 		// Verify the REFETCHED bytes too. A stale zero-fill in the cache is
 		// only one of two explanations for the mismatch above; the other is
 		// that our posted-file byte->slice offset mapping is drifted for this
@@ -6549,6 +6585,178 @@ func (s *jobSliceSource) ReadSlice(ctx context.Context, globalIdx int64) ([]byte
 		return fresh, nil
 	}
 	return data, nil
+}
+
+// otherCopyIfBad returns data, slice globalIdx just read from Usenet, or
+// the slice read again after another provider served the articles under it,
+// when data fails its IFSC and the other copy passes. One provider can hold
+// a body that passes the identity check and decodes cleanly but is not the
+// posted bytes (a twin file's same part); par2.RepairWith would only count
+// the slice unavailable, and the next round asks the same provider first
+// again. Only with exact article boundaries: estimated ones put every
+// slice off its IFSC, and asking for each would cost an article per slice.
+func (s *jobSliceSource) otherCopyIfBad(ctx context.Context, f *postedFileFetcher, globalIdx, start int64, data []byte) []byte {
+	if f.failover == nil || !f.exact {
+		return data
+	}
+	if ok, err := s.idx.VerifySliceChecksum(globalIdx, data); err != nil || ok {
+		return data
+	}
+	// The slice's IFSC does not say which of its articles is bad. Another
+	// slice's failover may already have replaced it; else the articles are
+	// asked for one at a time, until the slice passes.
+	reread := func() ([]byte, bool) {
+		again, _, err := f.readRange(ctx, start, s.idx.SliceSize, false)
+		if err != nil {
+			return nil, false
+		}
+		ok, verr := s.idx.VerifySliceChecksum(globalIdx, again)
+		return again, verr == nil && ok
+	}
+	end := min(start+s.idx.SliceSize, f.length)
+	var toAsk []int
+	replacedAny := false
+	for pos := start; pos < end; {
+		segIdx, err := f.segmentFor(pos)
+		if err != nil {
+			break
+		}
+		if _, ok := f.failover.replaced(f, segIdx); ok {
+			replacedAny = true
+		} else {
+			toAsk = append(toAsk, segIdx)
+		}
+		next := f.base[segIdx] + f.segSizes[segIdx]
+		if next <= pos {
+			break
+		}
+		pos = next
+	}
+	if replacedAny {
+		if again, ok := reread(); ok {
+			return again
+		}
+	}
+	for _, segIdx := range toAsk {
+		if _, ok := f.failover.replace(ctx, f, segIdx, "slice failed its IFSC"); !ok {
+			continue
+		}
+		if again, ok := reread(); ok {
+			return again
+		}
+	}
+	return data
+}
+
+// postedFailoverMax caps how many posted-file articles one pass asks
+// another provider for. Exact boundaries keep the count to the articles
+// that are really bad; the cap bounds a provider that mis-serves a whole
+// file.
+const postedFailoverMax = 16
+
+// postedFailover asks another provider, once per article slot per pass, for
+// a posted-file article whose body the first provider served bad after
+// decode (short, or failing a slice's IFSC), and holds the other copy for
+// the rest of the pass, every round, in place of the first. Shared by the
+// pass's fetchers; safe for concurrent use.
+type postedFailover struct {
+	served  *par2Provenance // the provider that served each posted article
+	refetch func(ctx context.Context, messageID, exceptHost string, check usenet.ArticleCheck) ([]byte, string, error)
+
+	mu      sync.Mutex
+	entries map[par2RoundArticleKey]*postedFailoverEntry
+}
+
+type postedFailoverEntry struct {
+	done chan struct{} // closed once data is set
+	data []byte        // the other provider's copy, nil when there is none
+}
+
+func newPostedFailover(served *par2Provenance, refetch func(ctx context.Context, messageID, exceptHost string, check usenet.ArticleCheck) ([]byte, string, error)) *postedFailover {
+	return &postedFailover{served: served, refetch: refetch, entries: make(map[par2RoundArticleKey]*postedFailoverEntry)}
+}
+
+// replaced returns the other provider's copy of article idx of f, when one
+// has been fetched. Nil-safe.
+func (fo *postedFailover) replaced(f *postedFileFetcher, idx int) ([]byte, bool) {
+	if fo == nil {
+		return nil, false
+	}
+	fo.mu.Lock()
+	e := fo.entries[par2RoundArticleKey{f: f, idx: idx}]
+	fo.mu.Unlock()
+	if e == nil {
+		return nil, false
+	}
+	select {
+	case <-e.done:
+		return e.data, e.data != nil
+	default:
+		return nil, false
+	}
+}
+
+// replace returns another provider's copy of article idx of f: one already
+// fetched, a fetch in flight (waited for), or a new fetch from every
+// provider but the one that served the bad body. A copy must pass the
+// identity check and decode to the article's full size. false when there
+// is none: the article was asked already, the cap is reached, no other
+// provider holds it, or the serving provider is not known (a cache read).
+// Nil-safe.
+func (fo *postedFailover) replace(ctx context.Context, f *postedFileFetcher, idx int, why string) ([]byte, bool) {
+	if fo == nil || !f.exact {
+		return nil, false
+	}
+	key := par2RoundArticleKey{f: f, idx: idx}
+	fo.mu.Lock()
+	if e, ok := fo.entries[key]; ok {
+		fo.mu.Unlock()
+		select {
+		case <-e.done:
+			return e.data, e.data != nil
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+	if len(fo.entries) >= postedFailoverMax {
+		fo.mu.Unlock()
+		return nil, false
+	}
+	e := &postedFailoverEntry{done: make(chan struct{})}
+	fo.entries[key] = e
+	fo.mu.Unlock()
+
+	messageID := f.segs[idx].MessageID
+	first, known := fo.served.get(messageID)
+	var data []byte
+	var host string
+	var err error
+	if known {
+		fctx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
+		data, host, err = fo.refetch(fctx, messageID, first.host, f.identityCheck(idx))
+		cancel()
+	}
+	fo.mu.Lock()
+	switch {
+	case !known:
+	case err != nil:
+		f.logger.Debug().Err(err).Int("segment", idx).Str("first_provider", first.host).Str("reason", why).
+			Msg("par2 repair: no other news server served a good copy of an intact article")
+		if ctx.Err() != nil {
+			// Cut off by the round, not answered: a later asker may try.
+			delete(fo.entries, key)
+		}
+	case int64(len(data)) < f.segSizes[idx]:
+		f.logger.Debug().Int("segment", idx).Str("provider", host).Int("bytes", len(data)).Int64("want", f.segSizes[idx]).
+			Msg("par2 repair: another news server's copy of an intact article is short too")
+	default:
+		e.data = data
+		f.logger.Info().Int("segment", idx).Str("first_provider", first.host).Str("provider", host).Str("reason", why).
+			Msg("par2 repair: asked another news server for an intact article; its copy is used for the rest of the pass")
+	}
+	fo.mu.Unlock()
+	close(e.done)
+	return e.data, e.data != nil
 }
 
 // extractPostedRange cuts [start, end) of posted file fileID out of the

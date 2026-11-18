@@ -340,10 +340,10 @@ func p2eRoundtrip(t *testing.T, h *p2eHarness) {
 // and the pass completes. A recovery article whose body fails only its PAR2
 // packet MD5 is asked of the second provider once (row 70), and the pass
 // completes; when the second provider serves the same bad body the shortfall
-// is transient, not terminal. A body that passes the identity check and
-// fails only after decode (IFSC checksum, short decode) does not fail over
-// today: the pass ends without asking the second provider for that article.
-// Those cases assert today's outcome; a fail-over fix flips them.
+// is transient, not terminal. An intact article whose body passes the
+// identity check and fails only after decode (a twin file's same part fails
+// its slice's IFSC; a CRC-valid short body) is asked of the second provider
+// once too, and the pass completes.
 func TestP2EPar2TwoProvidersDisagree(t *testing.T) {
 	servers, fx := newP2eEnv(t, 2)
 	primary, backup := servers[0], servers[1]
@@ -362,9 +362,9 @@ func TestP2EPar2TwoProvidersDisagree(t *testing.T) {
 	}{
 		{"intact_notfound_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eNotFound) }, p2eCompleted(2), true, 0},
 		{"intact_wrongbody_other_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f2.ids[4]) }, p2eCompleted(2), true, 0},
-		// No fail-over after decode: the IFSC and short-decode gap (row 51 Notes).
-		{"intact_wrongbody_twin_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f1.ids[2]) }, p2eFailed("suspect"), false, 0},
-		{"intact_short_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eTruncateShort) }, p2eFailed("suspect"), false, 0},
+		// Bad only after decode: asked of the other provider once.
+		{"intact_wrongbody_twin_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f1.ids[2]) }, p2eCompleted(2), true, 1},
+		{"intact_short_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eTruncateShort) }, p2eCompleted(2), true, 1},
 		// A mis-served recovery article is asked of the other provider once
 		// (row 70).
 		{"recovery_wrongbody_on_primary", vol0.ids[0], func(id string) { primary.setWrong(id, vol6.ids[0]) }, p2eCompleted(2), true, 1},

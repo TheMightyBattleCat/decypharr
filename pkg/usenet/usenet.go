@@ -1438,14 +1438,7 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 		if err != nil {
 			return err
 		}
-		if check != nil {
-			if reason := check(meta); reason != "" {
-				u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
-					Msg("Provider returned a different upload's article; trying the next provider")
-				return nntp.NewForeignArticleError(reason)
-			}
-		}
-		return nil
+		return u.refuseForeign(messageID, meta, check)
 	})
 	if err != nil {
 		return nil, err
@@ -1455,12 +1448,26 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 	return out, nil
 }
 
+// refuseForeign applies check to an article's yEnc headers: nil to accept
+// it, or the error that makes failover ask the next provider.
+func (u *Usenet) refuseForeign(messageID string, meta *nntp.YencMetadata, check ArticleCheck) error {
+	if check == nil {
+		return nil
+	}
+	if reason := check(meta); reason != "" {
+		u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
+			Msg("Provider returned a different upload's article; trying the next provider")
+		return nntp.NewForeignArticleError(reason)
+	}
+	return nil
+}
+
 // FetchArticleServedBy is FetchArticle that also returns the host of the
 // provider that served the body, so a caller that finds the body bad only
 // later (a PAR2 packet whose MD5 fails) can ask the others with
 // FetchArticleExcept.
 func (u *Usenet) FetchArticleServedBy(ctx context.Context, messageID string) ([]byte, string, error) {
-	return u.fetchArticleExcept(ctx, messageID, nil)
+	return u.fetchArticleExcept(ctx, messageID, nil, nil)
 }
 
 // FetchArticleExcept fetches one article from every provider but exceptHost
@@ -1468,15 +1475,31 @@ func (u *Usenet) FetchArticleServedBy(ctx context.Context, messageID string) ([]
 // served it. Nothing is counted against exceptHost. With no other provider
 // it fails without asking anyone.
 func (u *Usenet) FetchArticleExcept(ctx context.Context, messageID, exceptHost string) ([]byte, string, error) {
-	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost})
+	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost}, nil)
 }
 
-func (u *Usenet) fetchArticleExcept(ctx context.Context, messageID string, except []string) ([]byte, string, error) {
+// FetchArticleCheckedServedBy is FetchArticleChecked that also returns the
+// host of the provider that served the body, for a caller that may find the
+// body bad only after decode and ask the others (FetchArticleCheckedExcept).
+func (u *Usenet) FetchArticleCheckedServedBy(ctx context.Context, messageID string, check ArticleCheck) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, nil, check)
+}
+
+// FetchArticleCheckedExcept is FetchArticleExcept with FetchArticleChecked's
+// identity check applied to every other provider's copy.
+func (u *Usenet) FetchArticleCheckedExcept(ctx context.Context, messageID, exceptHost string, check ArticleCheck) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost}, check)
+}
+
+func (u *Usenet) fetchArticleExcept(ctx context.Context, messageID string, except []string, check ArticleCheck) ([]byte, string, error) {
 	var buf bytes.Buffer
 	host, err := u.nntp.ExecuteWithFailoverExcept(ctx, except, func(conn *nntp.Connection) error {
 		buf.Reset()
-		_, _, err := conn.StreamBodyMeta(messageID, &buf)
-		return err
+		_, meta, err := conn.StreamBodyMeta(messageID, &buf)
+		if err != nil {
+			return err
+		}
+		return u.refuseForeign(messageID, meta, check)
 	})
 	if err != nil {
 		return nil, "", err
