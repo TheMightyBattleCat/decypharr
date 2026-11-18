@@ -111,3 +111,23 @@ func TestStartupSettingsRequireRestart(t *testing.T) {
 		})
 	}
 }
+
+// A folder_naming change needs a restart: entries keep the folder name they
+// were saved under until each is re-saved, so it must not hot-apply.
+func TestFolderNamingRequiresRestart(t *testing.T) {
+	before := &Config{FolderNaming: WebDavUseOriginalNameNoExt}
+	after := *before
+	after.FolderNaming = WebdavUseHash
+	if !before.RequiresRestart(&after) {
+		t.Fatal("folder_naming change did not require a restart")
+	}
+
+	// Other hot fields still apply live.
+	hot := *before
+	hot.AppURL = "https://changed.test"
+	hot.MinFileSize = "10MB"
+	hot.SkipPreCache = true
+	if before.RequiresRestart(&hot) {
+		t.Fatal("hot-field change required a restart")
+	}
+}
