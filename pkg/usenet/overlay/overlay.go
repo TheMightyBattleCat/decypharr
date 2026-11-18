@@ -759,6 +759,123 @@ func (s *Store) RecordDead(nzbID, file string, segIndex int, msgID string, bytes
 	return s.saveManifestLocked(nzbID, m)
 }
 
+// DeadMove asks MoveDeadSegments to move the not-yet-patched record at From,
+// whose article is MessageID, to index To, where the NZB record now holds
+// that article. Bytes is the reader's slot length at To (0 keeps the
+// recorded one).
+type DeadMove struct {
+	From, To  int
+	MessageID string
+	Bytes     int64
+	// Dropped is set on a returned move whose To already held a record of
+	// the same article: the record at From was a stale duplicate and is gone.
+	Dropped bool
+}
+
+// MoveDeadSegments re-indexes file's dead records whose articles the NZB
+// record now holds at another index (a volume reorder permuted the file's
+// segments after the damage was recorded). All moves are applied under one
+// lock, so two dead records swapping places both move. A move is skipped
+// when the record at From is missing, names another article or is patched,
+// or when its To would be shared with another record. A To that already
+// holds a record of the same article drops the one at From instead. Returns
+// the moves applied (dropped ones flagged).
+func (s *Store) MoveDeadSegments(nzbID, file string, moves []DeadMove) ([]DeadMove, error) {
+	if s.isRejected(nzbID) {
+		return nil, nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return nil, nil
+	}
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return nil, err
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return nil, nil
+	}
+	at := make(map[int]int, len(fe.DeadSegments)) // index → position in fe.DeadSegments
+	for i, d := range fe.DeadSegments {
+		at[d.Index] = i
+	}
+	valid := make(map[int]DeadMove, len(moves)) // keyed by From
+	for _, mv := range moves {
+		i, ok := at[mv.From]
+		if !ok || mv.From == mv.To || mv.To < 0 {
+			continue
+		}
+		if d := fe.DeadSegments[i]; d.MessageID != mv.MessageID || d.Status == StatusPatched {
+			continue
+		}
+		valid[mv.From] = mv
+	}
+	drop := make(map[int]DeadMove) // keyed by From
+	for from, mv := range valid {
+		if j, ok := at[mv.To]; ok && fe.DeadSegments[j].MessageID == mv.MessageID {
+			if _, moving := valid[mv.To]; !moving {
+				mv.Dropped = true
+				drop[from] = mv
+			}
+		}
+	}
+	for from := range drop {
+		delete(valid, from)
+	}
+	// Refuse moves whose target another record would also occupy; each
+	// refusal can free or block another target, so repeat until stable.
+	for changed := true; changed; {
+		changed = false
+		taken := make(map[int]int, len(fe.DeadSegments))
+		for _, d := range fe.DeadSegments {
+			if _, gone := drop[d.Index]; gone {
+				continue
+			}
+			idx := d.Index
+			if mv, ok := valid[d.Index]; ok {
+				idx = mv.To
+			}
+			taken[idx]++
+		}
+		for from, mv := range valid {
+			if taken[mv.To] > 1 {
+				delete(valid, from)
+				changed = true
+			}
+		}
+	}
+	if len(valid) == 0 && len(drop) == 0 {
+		return nil, nil
+	}
+
+	var applied []DeadMove
+	kept := fe.DeadSegments[:0]
+	for _, d := range fe.DeadSegments {
+		if mv, gone := drop[d.Index]; gone {
+			applied = append(applied, mv)
+			continue
+		}
+		if mv, ok := valid[d.Index]; ok {
+			d.Index = mv.To
+			if mv.Bytes > 0 {
+				d.Bytes = mv.Bytes
+			}
+			applied = append(applied, mv)
+		}
+		kept = append(kept, d)
+	}
+	fe.DeadSegments = kept
+	sortDeadSegments(fe)
+	recomputeVerdictLocked(fe)
+	if err := s.saveManifestLocked(nzbID, m); err != nil {
+		return nil, err
+	}
+	return applied, nil
+}
+
 // PatchBytes returns the recovered bytes for a patched segment, if PAR2
 // repair has already written one. The bytes are stored fully post-processed
 // (final logical file bytes) - callers serve them as-is, with no further

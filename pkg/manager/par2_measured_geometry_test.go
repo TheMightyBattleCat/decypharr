@@ -453,7 +453,7 @@ func (w wrongSlices) ReadSlice(int64) ([]byte, error) { return make([]byte, w.si
 // segment whose article is back is patched with its verified bytes; one the
 // STAT sweep saw missing, and one whose fetch fails, are left for parity.
 func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -481,6 +481,7 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 		})
 	}
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	storeNZBRecord(t, m, nzb)
 	forgot := &forgetRecorder{}
 	m.mountManager = forgot
 	var refs []par2DeadRef
@@ -526,7 +527,7 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 // with no parity and no network matching. It used to return terminal before
 // the heal ever ran.
 func TestHealWithoutRecoveryHealsIntactDeadSegments(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -546,6 +547,7 @@ func TestHealWithoutRecoveryHealsIntactDeadSegments(t *testing.T) {
 	}
 	readerFile.Segments[4].Bytes = 40
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}, Par2Source: []storage.PostedFileRef{ref}}
+	storeNZBRecord(t, m, nzb)
 	pending := map[string][]overlay.DeadSegment{}
 	for _, i := range []int{1, 2, 3} {
 		seg := ref.Segments[i]
@@ -715,7 +717,7 @@ func TestPar2JobTimeoutScalesWithReleaseSize(t *testing.T) {
 // whole article. WritePatch used to refuse the whole-article patch, and a
 // repaired first article of a volume could never be stored.
 func TestHealPatchesTheReaderSlotInsideAnArticle(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -746,6 +748,7 @@ func TestHealPatchesTheReaderSlotInsideAnArticle(t *testing.T) {
 	}
 	const nzbID = "nzb-slot"
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	storeNZBRecord(t, m, nzb)
 	var refs []par2DeadRef
 	for _, i := range []int{0, 1} {
 		seg := readerFile.Segments[i]

@@ -1087,6 +1087,15 @@ func (u *Usenet) OverlayWritePatch(nzoID, filename string, segIndex int, data []
 	return u.overlay.WritePatch(nzoID, filename, segIndex, data)
 }
 
+// OverlayMoveDeadSegments re-indexes filename's dead records whose articles
+// the NZB record now holds elsewhere - see overlay.Store.MoveDeadSegments.
+func (u *Usenet) OverlayMoveDeadSegments(nzoID, filename string, moves []overlay.DeadMove) ([]overlay.DeadMove, error) {
+	if u.overlay == nil {
+		return nil, fmt.Errorf("overlay store unavailable")
+	}
+	return u.overlay.MoveDeadSegments(nzoID, filename, moves)
+}
+
 // OverlayListNZBIDs returns every nzbID with recorded overlay state. Empty
 // (nil error) if the overlay store is unavailable.
 func (u *Usenet) OverlayListNZBIDs() ([]string, error) {

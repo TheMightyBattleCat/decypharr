@@ -2565,6 +2565,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
+	// Before anything reads pending by index: the cache source below steers
+	// around the dead slots, and every patch is written by index.
+	pending = p.moveRelocatedDeadRecords(nzbID, entryName, nzb, pending)
+
 	// Source intact slices from the local DFS cache where already present,
 	// instead of always re-fetching them over NNTP: cacheSource is tried
 	// first for every posted-file byte range the streaming pass needs (see
@@ -3892,6 +3896,11 @@ func (p *Par2Repair) recordSweepMisses(nzbID, entryName string, refs []par2DeadR
 	return recorded
 }
 
+// par2HealFlushBytes bounds the verified bytes healFetchableDeadSegments
+// holds before writing them: the heal can run on damage beyond the recovery
+// budget (healBeforeRecoveryGate), so holding all of it could be gigabytes.
+const par2HealFlushBytes = 64 << 20
+
 // healFetchableDeadSegments patches every dead segment whose article can be
 // fetched and proven intact, and returns the ones still needing parity.
 //
@@ -3904,14 +3913,62 @@ func (p *Par2Repair) recordSweepMisses(nzbID, entryName string, refs []par2DeadR
 // any reason, stays for the solve exactly as before. Seen live 2026-09-22:
 // all nine "dead" segments of Deep in Orbit S02E01 were intact on three
 // providers, and the solve read 313 MB to fail on them.
+//
+// The verified bytes are written in batches, each against the NZB record
+// reloaded just before it: a segment whose reader slot moved since the pass
+// loaded nzb (a volume reorder) is not written, and the solve's own check
+// then ends the pass transient, as it does for its patches.
 func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entryName string, nzb *storage.NZB, idx *par2.Index, fetchers map[[16]byte]*postedFileFetcher, deadRefs []par2DeadRef, statMissing map[string]struct{}) ([]par2DeadRef, error) {
 	u := p.manager.usenet
 	remaining := deadRefs[:0:0]
 	var healedRefs []par2DeadRef
 	healed := 0
+	type verifiedPatch struct {
+		dr   par2DeadRef
+		data []byte
+	}
+	var batch []verifiedPatch
+	var batchBytes int
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		fresh, ferr := u.GetNZB(nzbID)
+		for _, vp := range batch {
+			dr := vp.dr
+			if ferr != nil {
+				p.logger.Warn().Err(ferr).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+					Msg("par2 repair: could not reload the NZB record before patching a dead segment fetched intact; leaving it to the solve")
+				remaining = append(remaining, dr)
+				continue
+			}
+			if err := par2RecordMoved(nzb, fresh, []par2DeadRef{dr}); err != nil {
+				p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+					Msg("par2 repair: the NZB record changed during the pass; not patching a dead segment fetched intact")
+				remaining = append(remaining, dr)
+				continue
+			}
+			if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, vp.data); err != nil {
+				// e.g. a volume's first article, whose reader slot is shorter
+				// than the posted article. Leave it to the solve, which meets
+				// the same refusal at the end as it always has, rather than
+				// abort a pass that can still repair the other segments.
+				p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
+					Msg("par2 repair: verified bytes for a dead segment could not be patched; leaving it to the solve")
+				remaining = append(remaining, dr)
+				continue
+			}
+			u.ClearFailedFile(nzbID, dr.file)
+			healedRefs = append(healedRefs, dr)
+			healed++
+		}
+		batch, batchBytes = nil, 0
+	}
+	var ctxErr error
 	for _, dr := range deadRefs {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			ctxErr = ctx.Err()
+			break
 		}
 		f := fetchers[dr.rng.fileID]
 		if _, missing := statMissing[dr.seg.MessageID]; missing || f == nil || !f.exact {
@@ -3930,20 +3987,14 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 			remaining = append(remaining, dr)
 			continue
 		}
-		if err := u.OverlayWritePatch(nzbID, dr.file, dr.seg.Index, data); err != nil {
-			// e.g. a volume's first article, whose reader slot is shorter
-			// than the posted article. Leave it to the solve, which meets
-			// the same refusal at the end as it always has, rather than
-			// abort a pass that can still repair the other segments.
-			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", dr.file).Int("segment", dr.seg.Index).
-				Msg("par2 repair: verified bytes for a dead segment could not be patched; leaving it to the solve")
-			remaining = append(remaining, dr)
-			continue
+		batch = append(batch, verifiedPatch{dr: dr, data: data})
+		if batchBytes += len(data); batchBytes >= par2HealFlushBytes {
+			flush()
 		}
-		u.ClearFailedFile(nzbID, dr.file)
-		healedRefs = append(healedRefs, dr)
-		healed++
 	}
+	// Bytes already verified are written even when ctx ended: the writes
+	// are local, and the next pass would fetch them again.
+	flush()
 	// Invalidated here, not by the caller on success: the solve that follows
 	// can still fail, and the healed segments' stale zero-fill in the DFS
 	// cache and warm readers would then outlive their patches.
@@ -3953,6 +4004,9 @@ func (p *Par2Repair) healFetchableDeadSegments(ctx context.Context, nzbID, entry
 	if healed > 0 {
 		p.logger.Info().Str("entry", entryName).Int("healed", healed).Int("remaining", len(remaining)).
 			Msg("par2 repair: dead segment(s) fetched intact and verified against PAR2 checksums; patched without parity")
+	}
+	if ctxErr != nil {
+		return nil, ctxErr
 	}
 	return remaining, nil
 }
@@ -4124,6 +4178,87 @@ func readVerifiedRange(idx *par2.Index, f *postedFileFetcher, rng postedRange, s
 		return nil, false
 	}
 	return out, true
+}
+
+// moveRelocatedDeadRecords moves each pending dead record whose article nzb
+// now holds at another index of the same file (a volume reorder after the
+// damage was recorded) to that index, in the overlay and in the returned
+// copy of pending. Left at its old index, the record named a slot holding
+// another article, so readerPatchWindow refused it and the pass ended in
+// writeRecordedPatches' terminal skip - in the urgent lane, a re-grab. A
+// record whose article is nowhere in the file, or in it more than once, is
+// left as it was. A failed move is logged and leaves pending unchanged.
+func (p *Par2Repair) moveRelocatedDeadRecords(nzbID, entryName string, nzb *storage.NZB, pending map[string][]overlay.DeadSegment) map[string][]overlay.DeadSegment {
+	var out map[string][]overlay.DeadSegment
+	for name, segs := range pending {
+		file := nzb.GetFileByName(name)
+		if file == nil {
+			continue
+		}
+		var where map[string]int // message ID → index; -1 when it appears twice
+		var moves []overlay.DeadMove
+		for _, d := range segs {
+			if d.Index >= 0 && d.Index < len(file.Segments) && file.Segments[d.Index].MessageID == d.MessageID {
+				continue
+			}
+			if where == nil {
+				where = make(map[string]int, len(file.Segments))
+				for i, s := range file.Segments {
+					if _, dup := where[s.MessageID]; dup {
+						where[s.MessageID] = -1
+					} else {
+						where[s.MessageID] = i
+					}
+				}
+			}
+			if to, ok := where[d.MessageID]; ok && to >= 0 {
+				moves = append(moves, overlay.DeadMove{From: d.Index, To: to, MessageID: d.MessageID, Bytes: file.Segments[to].Bytes})
+			}
+		}
+		if len(moves) == 0 {
+			continue
+		}
+		applied, err := p.manager.usenet.OverlayMoveDeadSegments(nzbID, name, moves)
+		if err != nil {
+			p.logger.Warn().Err(err).Str("entry", entryName).Str("file", name).
+				Msg("par2 repair: could not move dead records to where the NZB record now holds their articles")
+			continue
+		}
+		if len(applied) == 0 {
+			continue
+		}
+		byFrom := make(map[int]overlay.DeadMove, len(applied))
+		for _, mv := range applied {
+			byFrom[mv.From] = mv
+		}
+		moved := make([]overlay.DeadSegment, 0, len(segs))
+		for _, d := range segs {
+			if mv, ok := byFrom[d.Index]; ok && mv.MessageID == d.MessageID {
+				if mv.Dropped {
+					continue
+				}
+				d.Index = mv.To
+				if mv.Bytes > 0 {
+					d.Bytes = mv.Bytes
+				}
+			}
+			moved = append(moved, d)
+		}
+		sort.Slice(moved, func(i, j int) bool { return moved[i].Index < moved[j].Index })
+		if out == nil {
+			out = make(map[string][]overlay.DeadSegment, len(pending))
+			for n, s := range pending {
+				out[n] = s
+			}
+		}
+		out[name] = moved
+		p.logger.Info().Str("entry", entryName).Str("file", name).Int("records", len(applied)).
+			Msg("par2 repair: dead records moved to where the NZB record now holds their articles")
+	}
+	if out == nil {
+		return pending
+	}
+	return out
 }
 
 // par2RecordMoved reports the first of refs whose reader slot in fresh, the
