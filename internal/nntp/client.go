@@ -36,6 +36,10 @@ type ProviderPool struct {
 	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
 	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
 	timing      providerTiming // per-article phase durations (fetch_timing.go)
+	// foreignBodies counts BODY replies a caller refused as another upload's
+	// article (NewForeignArticleError). Observability only: the refusal is a
+	// 430 like any other, and nothing routes by this count.
+	foreignBodies atomic.Int64
 
 	// Dial cooldown: consecutive createConnection failures open a backoff
 	// window in which checkouts go to another provider instead of paying a
@@ -46,6 +50,24 @@ type ProviderPool struct {
 	// Ported from upstream 5b55a7d5.
 	dialFailStreak    atomic.Int32
 	dialCooldownUntil atomic.Int64 // nanotimeNow deadline; 0 = no cooldown
+}
+
+// errForeignArticle marks a BODY reply the caller refused because its yEnc
+// headers name another article than the one requested (see
+// NewForeignArticleError).
+var errForeignArticle = errors.New("foreign article")
+
+// NewForeignArticleError is the error a caller of ExecuteWithFailover returns
+// for a decoded body whose yEnc headers show it is not the requested article
+// (a different upload under a reused Message-ID). It is a 430 from that
+// provider, so failover and exclusions treat it exactly as one; failover also
+// counts it against the provider (the body_foreign stat).
+func NewForeignArticleError(reason string) *Error {
+	return &Error{
+		Type:    ErrorTypeArticleNotFound,
+		Message: "article belongs to a different upload: " + reason,
+		Err:     errForeignArticle,
+	}
 }
 
 // maxDialCooldown caps the exponential dial backoff, short enough that a
@@ -514,6 +536,11 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				}
 
 				errProvider = currentProvider
+				if errors.Is(execErr, errForeignArticle) {
+					if pp := c.pools[currentProvider.Host]; pp != nil {
+						pp.foreignBodies.Add(1)
+					}
+				}
 				noteOutcome(currentProvider, execErr)
 				note(currentProvider, execErr)
 				var nntpErr *Error
@@ -1381,6 +1408,10 @@ func (c *Client) Stats() map[string]any {
 			// primaries (body_routing.go). 0 until measured.
 			"body_mib_s":    float64(pp.body.bytesPerSec.Load()) / (1 << 20),
 			"body_deferred": c.bodyRoutingOn() && pp.body.slow.Load(),
+			// BODY replies refused as another upload's article (yEnc part
+			// number or size not the one asked for); each was failed over
+			// as a 430. Normally 0.
+			"body_foreign": pp.foreignBodies.Load(),
 			// Per-STAT latency BatchStat routing judges by (stat_routing.go),
 			// 0 until measured, and how many pipelined STAT windows were
 			// discarded because their replies did not line up.

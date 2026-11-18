@@ -500,10 +500,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 					Int("segment", segIdx).
 					Str("reason", reason).
 					Msg("Provider returned a different upload's article; trying the next provider")
-				return &nntp.Error{
-					Type:    nntp.ErrorTypeArticleNotFound,
-					Message: "article belongs to a different upload: " + reason,
-				}
+				return nntp.NewForeignArticleError(reason)
 			}
 
 			// Commit (updates cache state to StateOnDisk). A body no longer

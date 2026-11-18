@@ -1427,10 +1427,7 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 			if reason := check(meta); reason != "" {
 				u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
 					Msg("Provider returned a different upload's article; trying the next provider")
-				return &nntp.Error{
-					Type:    nntp.ErrorTypeArticleNotFound,
-					Message: "article belongs to a different upload: " + reason,
-				}
+				return nntp.NewForeignArticleError(reason)
 			}
 		}
 		return nil
