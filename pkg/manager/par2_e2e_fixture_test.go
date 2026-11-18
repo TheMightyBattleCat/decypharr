@@ -88,11 +88,14 @@ func p2eMsgID(name string, part int) string {
 	return fmt.Sprintf("p2e-%s-%03d@p2e.test", tag, part)
 }
 
-func (f *p2eFile) cut(all map[string]*p2eArticle) {
-	n := (len(f.data) + p2eArticleSize - 1) / p2eArticleSize
+func (f *p2eFile) cut(all map[string]*p2eArticle) { f.cutSized(all, p2eArticleSize) }
+
+// cutSized is cut with articles of size bytes.
+func (f *p2eFile) cutSized(all map[string]*p2eArticle, size int) {
+	n := (len(f.data) + size - 1) / size
 	for i := 0; i < n; i++ {
-		off := i * p2eArticleSize
-		end := min(off+p2eArticleSize, len(f.data))
+		off := i * size
+		end := min(off+size, len(f.data))
 		p := f.data[off:end]
 		id := p2eMsgID(f.name, i+1)
 		half := p[:len(p)/2]

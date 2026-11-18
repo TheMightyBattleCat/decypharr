@@ -509,6 +509,17 @@ func newP2eEnvSets(t *testing.T, n int, sets ...p2eSet) ([]*p2eServer, *p2eFixtu
 		}
 		par2Bin = bin
 	}
+	p2eStartClock(t)
+	fx, err := buildP2eFixture(t.TempDir(), par2Bin, sets...)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	return p2eServeFixture(t, n, fx), fx
+}
+
+// p2eStartClock starts the cached clock the nntp deadlines read.
+func p2eStartClock(t *testing.T) {
+	t.Helper()
 	// Production starts the cached clock at boot; nntp deadlines are built
 	// from utils.Now(), which is frozen at package init without this. The
 	// first refresh comes one tick after Start: wait for it, or in a full
@@ -521,11 +532,12 @@ func newP2eEnvSets(t *testing.T, n int, sets ...p2eSet) ([]*p2eServer, *p2eFixtu
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
 
-	fx, err := buildP2eFixture(t.TempDir(), par2Bin, sets...)
-	if err != nil {
-		t.Fatalf("fixture: %v", err)
-	}
+// p2eServeFixture starts n fake servers holding every article of fx and the
+// warm-up article, and configures one provider per server (see newP2eEnv).
+func p2eServeFixture(t *testing.T, n int, fx *p2eFixture) []*p2eServer {
+	t.Helper()
 	warm := []byte("p2e warm-up payload")
 	warmArticle := &p2eArticle{id: p2eWarmupID, data: warm, body: p2eYenc("warmup.bin", int64(len(warm)), 1, 1, 0, warm)}
 
@@ -562,5 +574,5 @@ func newP2eEnvSets(t *testing.T, n int, sets ...p2eSet) ([]*p2eServer, *p2eFixtu
 		DiskBufferPath:           t.TempDir(),
 	}
 	t.Cleanup(func() { cfg.Usenet = oldUsenet })
-	return servers, fx
+	return servers
 }
