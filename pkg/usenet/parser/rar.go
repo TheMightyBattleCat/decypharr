@@ -989,6 +989,17 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 	return files, volumeNumber, hasVolumeNumber, nil
 }
 
+// rar5DataAreaSize converts a RAR5 header's data-size vint. A value above
+// MaxInt64 would turn negative: the walks would then skip nothing and read
+// the data as the next header, or move their offset backwards. No volume is
+// that large, so it is a header error and the walk stops there.
+func rar5DataAreaSize(v uint64) (int64, error) {
+	if v > math.MaxInt64 {
+		return 0, fmt.Errorf("invalid RAR5 data size: %d (too large)", v)
+	}
+	return int64(v), nil
+}
+
 // rar5HeaderData represents a RAR 5.0 header
 type rar5HeaderData struct {
 	ExtraSize uint64
@@ -1047,7 +1058,9 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		dataAreaSize = int64(dataSize)
+		if dataAreaSize, err = rar5DataAreaSize(dataSize); err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	// Calculate remaining header data size based on actual bytes consumed

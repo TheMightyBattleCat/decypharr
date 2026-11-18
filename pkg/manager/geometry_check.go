@@ -203,20 +203,46 @@ func (r *Repair) checkImportGeometry(ctx context.Context, infoHash, name string,
 	if f == nil || len(f.Segments) == 0 {
 		return geometryVerdict{}
 	}
-	var head []byte
+	var prefix []byte
 	// An encrypted file's first article is ciphertext: no header to read.
 	if first := f.Segments[0]; readHead && !f.IsEncrypted && first.StartOffset == 0 && isMatroskaName(name) && spliceBoundaries(f.Segments) == 0 {
 		want := first.SegmentDataStart + min(first.Bytes, matroskaHeadBytes)
-		prefix, err := u.FetchArticlePrefix(ctx, first.MessageID, int(want))
-		if err == nil && int64(len(prefix)) == want {
-			if startsMidArchive(f, prefix) {
-				return geometryVerdict{reason: reasonMissingVolume, missingStart: true}
-			}
-			head = prefix[first.SegmentDataStart:]
+		p, err := u.FetchArticlePrefix(ctx, first.MessageID, int(want))
+		if err == nil && int64(len(p)) == want {
+			prefix = p
 		}
+	}
+	return r.postedGeometry(infoHash, name, f, prefix)
+}
+
+// postedGeometry classifies f from its stored meta and, when prefix is set,
+// from its first article (from the article's first byte). Both header walks
+// read bytes off the posting, so a hostile or corrupt post that makes one
+// panic is caught here: the probe runs in an errgroup goroutine with no
+// recover above it, where a panic would end the process. A panic means the
+// file could not be checked: it is logged with the release and returns the
+// empty verdict, leaving the file to the normal checks, never a verdict.
+func (r *Repair) postedGeometry(infoHash, name string, f *storage.NZBFile, prefix []byte) (v geometryVerdict) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.logger.Warn().Interface("panic", p).Str("infohash", infoHash).Str("file", name).
+				Msg("Repair: geometry check panicked reading the posted headers; could not check, leaving the file to the normal checks")
+			v = geometryVerdict{}
+		}
+	}()
+	var head []byte
+	if prefix != nil {
+		if startsMidArchive(f, prefix) {
+			return geometryVerdict{reason: reasonMissingVolume, missingStart: true}
+		}
+		head = prefix[f.Segments[0].SegmentDataStart:]
 	}
 	return classifyGeometry(f, head)
 }
+
+// readFileHeaderStart is parser.ReadFileHeaderStart; a test swaps it to
+// prove postedGeometry's recover.
+var readFileHeaderStart = parser.ReadFileHeaderStart
 
 // startsMidArchive reports whether a stored RAR file's first slice is data
 // its archive continues from an earlier volume: the file header whose data
@@ -233,7 +259,7 @@ func startsMidArchive(f *storage.NZBFile, prefix []byte) bool {
 	if first.SegmentDataStart <= 0 {
 		return false
 	}
-	hs, ok := parser.ReadFileHeaderStart(prefix)
+	hs, ok := readFileHeaderStart(prefix)
 	// DataAt == SegmentDataStart is what makes this safe, not SplitBefore:
 	// the walk returns a volume's first file header, which is often another
 	// file's (Emberly's volume 1 starts with its cover .jpg; a season-set

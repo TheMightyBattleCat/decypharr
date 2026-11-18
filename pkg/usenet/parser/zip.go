@@ -509,6 +509,16 @@ func (p *ZIPParser) calculateZIPDataOffset(ctx context.Context, volumes []*types
 	// Data starts at: LocalHeaderOffset + 30 + filename_length + extra_field_length
 
 	headerOffset := file.LocalHeaderOffset
+	if len(volumes) == 0 {
+		return 0, fmt.Errorf("no volumes")
+	}
+	// The header is read from the first volume only. An offset that leaves
+	// no room for its 30 bytes there (a corrupt or hostile central
+	// directory) cannot be read: refuse it before the NNTP lookup. A size of
+	// 0 is unknown and left to the read.
+	if size := volumes[0].Size; headerOffset < 0 || (size > 0 && headerOffset > size-30) {
+		return 0, fmt.Errorf("local header offset %d is beyond the volume (%d bytes)", headerOffset, size)
+	}
 
 	// Create a temporary FS to read the local header
 	usenetFS, err := fs.NewFS(ctx, p.manager, p.maxConcurrent, 0, volumes, p.logger) // 0 prefetch for parsing

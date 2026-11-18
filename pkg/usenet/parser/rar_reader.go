@@ -484,7 +484,9 @@ func (p *RARParser) readAndDecryptRAR5Header(stream *rarReader, key, iv []byte) 
 			return nil, 0, 0, err
 		}
 		bytesConsumed += n
-		dataAreaSize = int64(dataSize)
+		if dataAreaSize, err = rar5DataAreaSize(dataSize); err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	// Read remaining header data
@@ -601,7 +603,9 @@ func (p *RARParser) readRAR5HeaderFromStream(stream *rarReader) (*rar5HeaderData
 			return nil, 0, 0, err
 		}
 		bytesConsumed = int(reader.Size()) - reader.Len()
-		dataAreaSize = int64(dataSize)
+		if dataAreaSize, err = rar5DataAreaSize(dataSize); err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	// Remaining bytes are the header data
