@@ -9,9 +9,17 @@ import (
 // It is terminal - the recovery data is gone - unless PAR2 article fetches
 // failed this pass without a 430 (timeouts, resets): each can drop a whole
 // recovery volume, which is never retried within the pass, so the shortfall
-// then says nothing about the data and the pass backs off instead.
-func par2RecoveryShortfall(damaged, got, transportFails int) error {
-	return par2FetchShortfall(fmt.Sprintf("%d damaged slices but only %d recovery slices fetched/available", damaged, got), transportFails)
+// then says nothing about the data and the pass backs off instead. The same
+// holds when the index the count came from skipped packets whose MD5 failed
+// (skippedPackets): a provider served a wrong or broken body for a PAR2
+// article that no other provider replaced this pass, and a later pass may
+// be served the right one.
+func par2RecoveryShortfall(damaged, got, transportFails, skippedPackets int) error {
+	msg := fmt.Sprintf("%d damaged slices but only %d recovery slices fetched/available", damaged, got)
+	if transportFails == 0 && skippedPackets > 0 {
+		return par2Failf(par2Transient, "%s (transient: %d PAR2 packet(s) failed their checksum, a mis-served article?)", msg, skippedPackets)
+	}
+	return par2FetchShortfall(msg, transportFails)
 }
 
 // par2FetchShortfall is msg as a failure that is terminal only when every

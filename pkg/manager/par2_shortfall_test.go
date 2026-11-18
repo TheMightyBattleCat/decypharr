@@ -16,8 +16,8 @@ func TestPar2TransientShortfallsStayTransient(t *testing.T) {
 		err      error
 		terminal bool
 	}{
-		{"shortfall, recovery gone", par2RecoveryShortfall(2, 0, 0), true},
-		{"shortfall after a timed-out article", par2RecoveryShortfall(2, 0, 1), false},
+		{"shortfall, recovery gone", par2RecoveryShortfall(2, 0, 0, 0), true},
+		{"shortfall after a timed-out article", par2RecoveryShortfall(2, 0, 1, 0), false},
 		{"no recovery volumes, none failed", par2FetchShortfall("no PAR2 recovery volumes retained", 0), true},
 		{"no recovery volumes after timeouts", par2FetchShortfall("no PAR2 recovery volumes retained", 3), false},
 		{"no PAR2 file fetched, none failed", par2FetchShortfall("failed to fetch any PAR2 file", 0), true},

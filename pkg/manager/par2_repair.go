@@ -31,9 +31,11 @@
 package manager
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -2455,7 +2457,8 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// report a real (not estimated) read_bytes total in the persisted attempt
 	// log - used in place of u.FetchArticle everywhere below. A posted file's
 	// articles pass an identity check (see postedArticleMismatch); PAR2 files
-	// go through fetch, which has none.
+	// go through fetch, which has none, and records which provider served
+	// each article in prov (see refetchMisservedPar2Articles).
 	fetchPosted := func(fctx context.Context, messageID string, check usenet.ArticleCheck) ([]byte, error) {
 		data, err := u.FetchArticleChecked(fctx, messageID, check)
 		if err == nil && readBytes != nil {
@@ -2470,11 +2473,28 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// pass, so a recovery shortfall that follows one says nothing about
 	// whether the recovery data exists - see recoveryShortfall.
 	var transportFails atomic.Int32
+	prov := newPar2Provenance()
 	fetch := countPar2TransportFails(ctx, func(fctx context.Context, messageID string) ([]byte, error) {
-		return fetchPosted(fctx, messageID, nil)
+		data, host, err := u.FetchArticleServedBy(fctx, messageID)
+		if err != nil {
+			return nil, err
+		}
+		prov.record(messageID, host, len(data))
+		if readBytes != nil {
+			n := int64(len(data))
+			atomic.AddInt64(readBytes, n)
+			progress.AddUsenetBytes(n)
+		}
+		return data, nil
 	}, &transportFails)
-	recoveryShortfall := func(damaged, got int) error {
-		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()))
+	// recoveryShortfall is the "not enough recovery slices" failure for idx,
+	// the index the count came from: its skipped packets make it transient.
+	recoveryShortfall := func(damaged, got int, idx *par2.Index) error {
+		skipped := 0
+		if idx != nil {
+			skipped = len(idx.SkippedPackets)
+		}
+		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()), skipped)
 	}
 
 	nzb, err := u.GetNZB(nzbID)
@@ -2527,6 +2547,42 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	cacheSource := p.newCacheSource(nzbID, entryName, cacheReader, nzb, pending, cacheBytes, progress)
 
 	vols, indexFiles := censusPar2Volumes(nzb.Par2Files)
+
+	// parse parses the fetched PAR2 files, and when packets failed their MD5
+	// asks another provider for the articles behind them and parses again
+	// (see refetchMisservedPar2Articles). Each article is asked once a pass.
+	par2Refs := make(map[string]storage.Par2FileRef, len(nzb.Par2Files))
+	for _, f := range nzb.Par2Files {
+		par2Refs[f.Name] = f
+	}
+	refetch := func(fctx context.Context, messageID, exceptHost string) ([]byte, string, error) {
+		data, host, err := u.FetchArticleExcept(fctx, messageID, exceptHost)
+		if err == nil && readBytes != nil {
+			n := int64(len(data))
+			atomic.AddInt64(readBytes, n)
+			progress.AddUsenetBytes(n)
+		}
+		return data, host, err
+	}
+	parse := func(ctx context.Context, srcs []par2.Source, set [16]byte) (*par2.Index, []par2.Source, error) {
+		idx, err := par2.ParseIndexSet(ctx, srcs, set)
+		if err != nil || len(idx.SkippedPackets) == 0 {
+			return idx, srcs, err
+		}
+		logSkippedPar2Packets(p.logger, entryName, idx)
+		next, n := refetchMisservedPar2Articles(ctx, p.logger, idx, srcs, par2Refs, prov, refetch, entryName)
+		if n == 0 {
+			return idx, srcs, nil
+		}
+		reparsed, err := par2.ParseIndexSet(ctx, next, set)
+		if err != nil {
+			return nil, next, err
+		}
+		p.logger.Info().Str("entry", entryName).Int("articles", n).Int("recovery_before", len(idx.Recovery)).
+			Int("recovery_after", len(reparsed.Recovery)).Int("skipped_after", len(reparsed.SkippedPackets)).
+			Msg("par2: re-parsed the PAR2 files after another provider served the articles behind bad-checksum packets")
+		return reparsed, next, nil
+	}
 
 	// Replace the filename-derived paper count with what the provider will
 	// actually serve right now: STAT the smallest recovery volumes and drop
@@ -2719,7 +2775,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 	}
 
-	idx, err := par2.ParseIndexSet(ctx, sources, par2Set)
+	idx, sources, err := parse(ctx, sources, par2Set)
 	if err != nil {
 		return par2IndexFetchTransient(par2IndexParseErr(err), indexFetchErr)
 	}
@@ -2729,7 +2785,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if rechosen && uint32(len(idx.Recovery)) > available {
 		available = uint32(len(idx.Recovery))
 	}
-	logSkippedPar2Packets(p.logger, entryName, idx)
 
 	// No usable recovery slices - either every volume 430'd (fetchMoreVolumes'
 	// consecutive-not-found abort) or every fetched volume was unparseable
@@ -2756,7 +2811,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
 			Msg("par2: no recovery slices fetched, skipping file matching")
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource, tally,
-			recoveryShortfall(deadCount, 0))
+			recoveryShortfall(deadCount, 0, idx))
 	}
 
 	// The repair stream checks every intact slice against its IFSC checksum,
@@ -2764,7 +2819,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// later pass fails the same way on the same volumes. Every PAR2 file of
 	// the set carries the packet: fetch further volumes until each file has
 	// its checksums or none are left.
-	idx, nextVolIdx, sources, err = topUpSliceChecksums(ctx, p.logger, fetch, vols, nextVolIdx, idx, sources, entryName, u.ProcessingMaxConnections(), progress)
+	idx, nextVolIdx, sources, err = topUpSliceChecksums(ctx, p.logger, fetch, parse, vols, nextVolIdx, idx, sources, entryName, u.ProcessingMaxConnections(), progress)
 	if err != nil {
 		return err
 	}
@@ -3136,13 +3191,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// that fetched but was mis-served yields nothing once ParseIndex skips
 		// its bad-MD5 packets. See topUpParsedRecovery.
 		idx, nextVolIdx, sources, err = topUpParsedRecovery(
-			ctx, p.logger, fetch, vols, nextVolIdx, k, idx, sources,
+			ctx, p.logger, fetch, parse, vols, nextVolIdx, k, idx, sources,
 			entryName, u.ProcessingMaxConnections(), progress)
 		if err != nil {
 			return err
 		}
 		if k > len(idx.Recovery) {
-			return recoveryShortfall(k, len(idx.Recovery))
+			return recoveryShortfall(k, len(idx.Recovery), idx)
 		}
 
 		// Choose k recovery slices whose solve matrix is invertible for
@@ -4961,11 +5016,14 @@ type volumeFetchResult struct {
 // is exhausted, or fetchMoreVolumes' own consecutive-not-found abort tripped.
 // nextVolIdx advances by at least one whenever a source is added, so the loop
 // is bounded by len(vols). A still-short recovery set on return is not an
-// error here; the caller turns it into the terminal verdict.
+// error here; the caller turns it into the verdict. parse re-parses (nil:
+// plainPar2Parse); runRepair's also asks another provider for the articles
+// behind bad-checksum packets.
 func topUpParsedRecovery(
 	ctx context.Context,
 	logger zerolog.Logger,
 	fetch articleFetchFunc,
+	parse par2ParseFunc,
 	vols []par2Volume,
 	nextVolIdx int,
 	want int,
@@ -4975,6 +5033,9 @@ func topUpParsedRecovery(
 	maxConc int,
 	progress *par2JobProgressState,
 ) (*par2.Index, int, []par2.Source, error) {
+	if parse == nil {
+		parse = plainPar2Parse
+	}
 	for want > len(idx.Recovery) {
 		var added int
 		var err error
@@ -4990,11 +5051,11 @@ func topUpParsedRecovery(
 		if added == 0 {
 			break
 		}
-		idx, err = par2.ParseIndexSet(ctx, sources, idx.SetID)
+		next, parsed, err := parse(ctx, sources, idx.SetID)
 		if err != nil {
-			return idx, nextVolIdx, sources, par2IndexParseErr(err)
+			return idx, nextVolIdx, parsed, par2IndexParseErr(err)
 		}
-		logSkippedPar2Packets(logger, entryName, idx)
+		idx, sources = next, parsed
 		if progress != nil {
 			progress.SetRecoverySlices(len(idx.Recovery), want)
 		}
@@ -5009,11 +5070,13 @@ func topUpParsedRecovery(
 // A batch that adds nothing (its volumes 430'd or failed) does not stop the
 // search: nextVolIdx advances past every volume tried, so the loop is bounded
 // by len(vols). Files still missing checksums on return are not an error
-// here; the caller turns that into the verdict.
+// here; the caller turns that into the verdict. parse is as for
+// topUpParsedRecovery.
 func topUpSliceChecksums(
 	ctx context.Context,
 	logger zerolog.Logger,
 	fetch articleFetchFunc,
+	parse par2ParseFunc,
 	vols []par2Volume,
 	nextVolIdx int,
 	idx *par2.Index,
@@ -5022,6 +5085,9 @@ func topUpSliceChecksums(
 	maxConc int,
 	progress *par2JobProgressState,
 ) (*par2.Index, int, []par2.Source, error) {
+	if parse == nil {
+		parse = plainPar2Parse
+	}
 	for len(idx.MissingChecksums()) > 0 && nextVolIdx < len(vols) {
 		logger.Info().Str("entry", entryName).Int("files", len(idx.MissingChecksums())).
 			Msg("par2: fetched PAR2 files hold no slice checksums for some files, fetching another volume")
@@ -5039,12 +5105,11 @@ func topUpSliceChecksums(
 		if added == 0 {
 			continue
 		}
-		next, err := par2.ParseIndexSet(ctx, sources, idx.SetID)
+		next, parsed, err := parse(ctx, sources, idx.SetID)
 		if err != nil {
-			return idx, nextVolIdx, sources, par2IndexParseErr(err)
+			return idx, nextVolIdx, parsed, par2IndexParseErr(err)
 		}
-		idx = next
-		logSkippedPar2Packets(logger, entryName, idx)
+		idx, sources = next, parsed
 	}
 	return idx, nextVolIdx, sources, nil
 }
@@ -5960,6 +6025,208 @@ func (f *postedFileFetcher) readRange(ctx context.Context, start, length int64, 
 		pos += n
 	}
 	return out, usedCache, nil
+}
+
+// par2Provenance records, for every PAR2 article fetched in one pass, the
+// provider that served it and its decoded length. fetchPar2FileConcurrent
+// concatenates a file's bodies and leaves out the 430'd ones, so the lengths
+// are what maps a byte offset in a fetched PAR2 file back to the article it
+// came from. Safe for concurrent use: the volume fetches record from many
+// goroutines.
+type par2Provenance struct {
+	mu      sync.Mutex
+	served  map[string]par2ServedArticle // by message ID
+	retried map[string]struct{}          // asked of another provider this pass
+}
+
+type par2ServedArticle struct {
+	host string
+	n    int
+}
+
+func newPar2Provenance() *par2Provenance {
+	return &par2Provenance{served: make(map[string]par2ServedArticle), retried: make(map[string]struct{})}
+}
+
+func (pv *par2Provenance) record(messageID, host string, n int) {
+	pv.mu.Lock()
+	pv.served[messageID] = par2ServedArticle{host: host, n: n}
+	pv.mu.Unlock()
+}
+
+func (pv *par2Provenance) get(messageID string) (par2ServedArticle, bool) {
+	pv.mu.Lock()
+	defer pv.mu.Unlock()
+	a, ok := pv.served[messageID]
+	return a, ok
+}
+
+// claimRetry reports whether messageID has not been asked of another
+// provider yet this pass, and marks it asked.
+func (pv *par2Provenance) claimRetry(messageID string) bool {
+	pv.mu.Lock()
+	defer pv.mu.Unlock()
+	if _, done := pv.retried[messageID]; done {
+		return false
+	}
+	pv.retried[messageID] = struct{}{}
+	return true
+}
+
+// par2RefetchFunc fetches one article from every provider but exceptHost,
+// returning the body and the host that served it (usenet.FetchArticleExcept).
+type par2RefetchFunc func(ctx context.Context, messageID, exceptHost string) ([]byte, string, error)
+
+// par2ParseFunc parses sources into the index of set, and returns the
+// sources it parsed, which can differ from the ones handed in (see
+// refetchMisservedPar2Articles).
+type par2ParseFunc func(ctx context.Context, sources []par2.Source, set [16]byte) (*par2.Index, []par2.Source, error)
+
+// plainPar2Parse is a par2ParseFunc that only parses.
+func plainPar2Parse(ctx context.Context, sources []par2.Source, set [16]byte) (*par2.Index, []par2.Source, error) {
+	idx, err := par2.ParseIndexSet(ctx, sources, set)
+	return idx, sources, err
+}
+
+// par2ArticleSpan is one article's bytes within a fetched PAR2 file.
+type par2ArticleSpan struct {
+	id         string
+	host       string
+	start, end int
+}
+
+// par2SourceSpans maps src back to the articles of ref it was concatenated
+// from, using the lengths pv recorded. ok is false when the recorded lengths
+// do not add up to the source's length: an article left out or fetched in a
+// way pv did not see, so no offset can be tied to an article.
+func par2SourceSpans(src par2.Source, ref storage.Par2FileRef, pv *par2Provenance) ([]par2ArticleSpan, bool) {
+	spans := make([]par2ArticleSpan, 0, len(ref.Segments))
+	off := 0
+	for _, seg := range ref.Segments {
+		a, ok := pv.get(seg.MessageID)
+		if !ok {
+			continue // 430'd: left out of the concatenation
+		}
+		spans = append(spans, par2ArticleSpan{id: seg.MessageID, host: a.host, start: off, end: off + a.n})
+		off += a.n
+	}
+	return spans, off == len(src.Data)
+}
+
+// par2SkippedPacketRange is the byte range in data of the packet starting at
+// offset, by the length its header declares (bytes 8-16, little-endian),
+// clamped to data. A header too short or too broken to read gives the header
+// alone.
+func par2SkippedPacketRange(data []byte, offset int64) (int, int) {
+	const headerSize = 64
+	start := int(offset)
+	if offset < 0 || start >= len(data) {
+		return 0, 0
+	}
+	end := len(data)
+	if start+headerSize < end {
+		end = start + headerSize
+	}
+	if start+16 <= len(data) {
+		n := binary.LittleEndian.Uint64(data[start+8 : start+16])
+		if n >= headerSize && n <= uint64(len(data)-start) {
+			end = start + int(n)
+		} else if n > uint64(len(data)-start) {
+			end = len(data)
+		}
+	}
+	return start, end
+}
+
+// refetchMisservedPar2Articles asks another provider, once per article per
+// pass, for every PAR2 article overlapping a packet idx skipped for a bad
+// MD5: a provider can serve another article's body (or a broken copy) that
+// passes yEnc decoding and fails only the packet checksum, which cost the
+// packet's whole volume. Excluding the provider that served the bad copy
+// (and its backbone) asks only the others; nothing is counted against it,
+// so the body_foreign stat keeps counting only identity-check refusals.
+// Returns sources with every source that got a different body rebuilt (the
+// slice handed in is not modified) and how many articles changed; the
+// caller re-parses when that is non-zero. With no other provider, or an
+// unmapped source, nothing changes and the shortfall that follows is
+// transient (see par2RecoveryShortfall).
+func refetchMisservedPar2Articles(ctx context.Context, logger zerolog.Logger, idx *par2.Index, sources []par2.Source,
+	files map[string]storage.Par2FileRef, pv *par2Provenance, refetch par2RefetchFunc, entryName string) ([]par2.Source, int) {
+	if idx == nil || len(idx.SkippedPackets) == 0 || pv == nil || refetch == nil {
+		return sources, 0
+	}
+	bySource := make(map[int][]par2.SkippedPacket)
+	for _, sp := range idx.SkippedPackets {
+		if sp.Source >= 0 && sp.Source < len(sources) {
+			bySource[sp.Source] = append(bySource[sp.Source], sp)
+		}
+	}
+	srcIdxs := make([]int, 0, len(bySource))
+	for si := range bySource {
+		srcIdxs = append(srcIdxs, si)
+	}
+	sort.Ints(srcIdxs)
+
+	out := sources
+	changed := 0
+	for _, si := range srcIdxs {
+		src := sources[si]
+		ref, ok := files[src.Name]
+		if !ok {
+			continue
+		}
+		spans, ok := par2SourceSpans(src, ref, pv)
+		if !ok {
+			logger.Debug().Str("entry", entryName).Str("file", src.Name).
+				Msg("par2: fetched PAR2 file does not map back to its articles; not asking another provider for the bad packet's articles")
+			continue
+		}
+		replaced := make(map[int][]byte)
+		for _, sp := range bySource[si] {
+			start, end := par2SkippedPacketRange(src.Data, sp.Offset)
+			for i, sn := range spans {
+				if sn.end <= start || sn.start >= end || !pv.claimRetry(sn.id) {
+					continue
+				}
+				if ctx.Err() != nil {
+					return out, changed
+				}
+				aCtx, cancel := context.WithTimeout(ctx, par2ArticleFetchTimeout)
+				data, host, err := refetch(aCtx, sn.id, sn.host)
+				cancel()
+				if err != nil {
+					logger.Debug().Err(err).Str("entry", entryName).Str("file", src.Name).Str("message_id", sn.id).Str("served_by", sn.host).
+						Msg("par2: no other provider served the article behind a bad-checksum PAR2 packet")
+					continue
+				}
+				if bytes.Equal(data, src.Data[sn.start:sn.end]) {
+					continue // the same copy elsewhere too
+				}
+				pv.record(sn.id, host, len(data))
+				replaced[i] = data
+				logger.Info().Str("entry", entryName).Str("file", src.Name).Str("message_id", sn.id).
+					Str("served_by", sn.host).Str("refetched_from", host).
+					Msg("par2: another provider served a different body for the article behind a bad-checksum PAR2 packet")
+			}
+		}
+		if len(replaced) == 0 {
+			continue
+		}
+		data := make([]byte, 0, len(src.Data))
+		for i, sn := range spans {
+			if b, ok := replaced[i]; ok {
+				data = append(data, b...)
+				continue
+			}
+			data = append(data, src.Data[sn.start:sn.end]...)
+		}
+		if changed == 0 {
+			out = append([]par2.Source(nil), sources...)
+		}
+		out[si] = par2.Source{Name: src.Name, Data: data}
+		changed += len(replaced)
+	}
+	return out, changed
 }
 
 // logSkippedPar2Packets warns when par2.ParseIndex had to skip packets whose

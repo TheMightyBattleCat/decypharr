@@ -1446,6 +1446,37 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 	return out, nil
 }
 
+// FetchArticleServedBy is FetchArticle that also returns the host of the
+// provider that served the body, so a caller that finds the body bad only
+// later (a PAR2 packet whose MD5 fails) can ask the others with
+// FetchArticleExcept.
+func (u *Usenet) FetchArticleServedBy(ctx context.Context, messageID string) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, nil)
+}
+
+// FetchArticleExcept fetches one article from every provider but exceptHost
+// (and the providers on its backbone), returning the body and the host that
+// served it. Nothing is counted against exceptHost. With no other provider
+// it fails without asking anyone.
+func (u *Usenet) FetchArticleExcept(ctx context.Context, messageID, exceptHost string) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost})
+}
+
+func (u *Usenet) fetchArticleExcept(ctx context.Context, messageID string, except []string) ([]byte, string, error) {
+	var buf bytes.Buffer
+	host, err := u.nntp.ExecuteWithFailoverExcept(ctx, except, func(conn *nntp.Connection) error {
+		buf.Reset()
+		_, _, err := conn.StreamBodyMeta(messageID, &buf)
+		return err
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, host, nil
+}
+
 // FetchArticlePrefix returns the first n decoded bytes of one NNTP article,
 // held in memory only: no segment cache, no DFS cache, no prefetch. The rest
 // of the body is drained and discarded (the connection stays reusable), so

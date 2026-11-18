@@ -195,7 +195,10 @@ func TestP2EPar2EndToEnd(t *testing.T) {
 			deadNotFound(h)
 			h.srv.setWrong(f2.ids[2], f1.ids[2])
 		}},
-		{name: "S10c_recovery_wrongbody_other_volume", want: p2eFailed("terminal"), dead: s0, setup: func(h *p2eHarness) {
+		// One provider: no other copy to ask, and the bad packet makes the
+		// shortfall transient (row 70). S10d's body holds no PAR2 packet, so
+		// nothing is skipped and its shortfall stays terminal.
+		{name: "S10c_recovery_wrongbody_other_volume", want: p2eFailed("transient"), dead: s0, setup: func(h *p2eHarness) {
 			deadNotFound(h)
 			h.srv.setWrong(vol("vol00+").ids[0], vol("vol06+").ids[0])
 		}},
@@ -311,10 +314,13 @@ func p2eRoundtrip(t *testing.T, h *p2eHarness) {
 // missing, wrong or short body for one article the pass needs, the second
 // serves the right one. A 430 and a body that fails the identity check
 // (K39: "belongs to a different upload") fail over to the second provider
-// and the pass completes. A body that passes the identity check and fails
-// only after decode (IFSC checksum, short decode, PAR2 packet MD5) does not
-// fail over today: the pass ends without asking the second provider for that
-// article. Those cases assert today's outcome; a fail-over fix flips them.
+// and the pass completes. A recovery article whose body fails only its PAR2
+// packet MD5 is asked of the second provider once (row 70), and the pass
+// completes; when the second provider serves the same bad body the shortfall
+// is transient, not terminal. A body that passes the identity check and
+// fails only after decode (IFSC checksum, short decode) does not fail over
+// today: the pass ends without asking the second provider for that article.
+// Those cases assert today's outcome; a fail-over fix flips them.
 func TestP2EPar2TwoProvidersDisagree(t *testing.T) {
 	servers, fx := newP2eEnv(t, 2)
 	primary, backup := servers[0], servers[1]
@@ -328,14 +334,23 @@ func TestP2EPar2TwoProvidersDisagree(t *testing.T) {
 		want  p2eWant
 		// backupBody: whether the second provider must be asked for bad.
 		backupBody bool
+		// backupBodies, when non-zero, is exactly how many times.
+		backupBodies int64
 	}{
-		{"intact_notfound_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eNotFound) }, p2eCompleted(2), true},
-		{"intact_wrongbody_other_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f2.ids[4]) }, p2eCompleted(2), true},
+		{"intact_notfound_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eNotFound) }, p2eCompleted(2), true, 0},
+		{"intact_wrongbody_other_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f2.ids[4]) }, p2eCompleted(2), true, 0},
 		// No fail-over after decode: the IFSC and short-decode gap (row 51 Notes).
-		{"intact_wrongbody_twin_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f1.ids[2]) }, p2eFailed("suspect"), false},
-		{"intact_short_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eTruncateShort) }, p2eFailed("suspect"), false},
-		// No fail-over for a mis-served recovery article (row 70).
-		{"recovery_wrongbody_on_primary", vol0.ids[0], func(id string) { primary.setWrong(id, vol6.ids[0]) }, p2eFailed("terminal"), false},
+		{"intact_wrongbody_twin_part_on_primary", f2.ids[2], func(id string) { primary.setWrong(id, f1.ids[2]) }, p2eFailed("suspect"), false, 0},
+		{"intact_short_on_primary", f2.ids[2], func(id string) { primary.set(id, p2eTruncateShort) }, p2eFailed("suspect"), false, 0},
+		// A mis-served recovery article is asked of the other provider once
+		// (row 70).
+		{"recovery_wrongbody_on_primary", vol0.ids[0], func(id string) { primary.setWrong(id, vol6.ids[0]) }, p2eCompleted(2), true, 1},
+		// Both serve the same wrong body: asked once, then a transient
+		// shortfall, not a terminal one.
+		{"recovery_wrongbody_on_both", vol0.ids[0], func(id string) {
+			primary.setWrong(id, vol6.ids[0])
+			backup.setWrong(id, vol6.ids[0])
+		}, p2eFailed("transient"), true, 1},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,6 +372,9 @@ func TestP2EPar2TwoProvidersDisagree(t *testing.T) {
 			}
 			if got := backup.bodyCount(tc.bad) > 0; got != tc.backupBody {
 				t.Errorf("second provider asked for the mis-served article = %v, want %v", got, tc.backupBody)
+			}
+			if tc.backupBodies > 0 && backup.bodyCount(tc.bad) != tc.backupBodies {
+				t.Errorf("second provider asked for the mis-served article %d times, want exactly %d", backup.bodyCount(tc.bad), tc.backupBodies)
 			}
 			tc.want.check(t, h, o)
 		})

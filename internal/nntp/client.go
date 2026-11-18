@@ -438,8 +438,39 @@ func isIdleExpired(lastUsed time.Time, now time.Time) bool {
 // queue PAR2 repair on a not-found, and an article one slow provider still
 // holds is not missing.
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
-	var lastErr error
+	_, err := c.executeWithFailover(ctx, providerExclusions{}, fn)
+	return err
+}
+
+// ExecuteWithFailoverExcept is ExecuteWithFailover with the providers named
+// by exceptHosts left out from the start, each the way a 430 leaves it out
+// (with its whole backbone when it has one: a provider on the same backbone
+// serves the same copy). On success it also returns the host of the
+// provider whose connection fn succeeded on. For asking the other providers
+// for an article one provider served a body for that turned out bad only
+// later (a PAR2 packet MD5): nothing is counted against the excluded
+// providers. With no other provider eligible it fails without running fn.
+func (c *Client) ExecuteWithFailoverExcept(ctx context.Context, exceptHosts []string, fn func(conn *Connection) error) (string, error) {
 	var exclusions providerExclusions
+	for _, h := range exceptHosts {
+		found := false
+		for _, p := range c.providers {
+			if p.Host == h {
+				excludeForArticleNotFound(&exclusions, p)
+				found = true
+			}
+		}
+		if !found {
+			exclusions.excludeHost(h)
+		}
+	}
+	return c.executeWithFailover(ctx, exclusions, fn)
+}
+
+// executeWithFailover is ExecuteWithFailover starting from exclusions, and
+// returning the host of the provider fn succeeded on.
+func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExclusions, fn func(conn *Connection) error) (string, error) {
+	var lastErr error
 	// outcomes records what each provider actually answered, so a caller
 	// that turns this into a verdict - the reader pads a segment and queues
 	// a PAR2 repair on a not-found - can say which providers said what. On
@@ -481,7 +512,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 
 	for providerAttempts := 0; providerAttempts < len(c.providers); providerAttempts++ {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 
 		checkoutStart := nanotimeNow()
@@ -521,7 +552,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		pendingErr := c.safeExecute(currentConn, fn)
 		if pendingErr == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
-			return nil
+			return currentProvider.Host, nil
 		}
 		err = retry.Do(
 			func() error {
@@ -626,7 +657,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// Success
 		if err == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
-			return nil
+			return currentProvider.Host, nil
 		}
 
 		// Handle failure
@@ -648,7 +679,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				exclusions.excludeHost(failedProvider.Host)
 			case ErrorTypeYencDecode:
 				if !IsCorruptArticleError(err) {
-					return err
+					return "", err
 				}
 				// Providers on one backbone serve the same damaged copy
 				// (Tower of Coins part087 article 86: 767,964 of 768,000
@@ -658,13 +689,13 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				excludeForArticleNotFound(&exclusions, failedProvider)
 			default:
 				// Non-retriable error, return immediately
-				return err
+				return "", err
 			}
 		} else if customerror.IsPanicError(err) {
 			exclusions.excludeHost(failedProvider.Host)
 		} else {
 			// Unknown error type - return immediately
-			return err
+			return "", err
 		}
 	}
 
@@ -676,17 +707,17 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			}
 			c.logger.Debug().Str("provider", p.Host).Err(terr).
 				Msg("Article not found on the providers that answered; one only timed out, so not treating it as missing")
-			return withOutcomes(terr, outcomes)
+			return "", withOutcomes(terr, outcomes)
 		}
 		if IsCorruptArticleError(lastErr) {
-			return withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
+			return "", withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
 		}
-		return withOutcomes(notFound, outcomes)
+		return "", withOutcomes(notFound, outcomes)
 	}
 	if lastErr != nil {
-		return withOutcomes(lastErr, outcomes)
+		return "", withOutcomes(lastErr, outcomes)
 	}
-	return errors.New("all providers failed")
+	return "", errors.New("all providers failed")
 }
 
 // ProviderOutcome is what one provider answered for one article.

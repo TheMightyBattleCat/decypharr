@@ -76,7 +76,7 @@ func TestTopUpParsedRecoveryRefetchesMisservedVolume(t *testing.T) {
 	sources := []par2.Source{{Name: "fixture.par2", Data: indexOnly}}
 
 	gotIdx, nextVolIdx, _, err := topUpParsedRecovery(
-		context.Background(), parallelFetchNopLogger, fetch, vols, 0, want, idx, sources, "entry", 4, progress)
+		context.Background(), parallelFetchNopLogger, fetch, nil, vols, 0, want, idx, sources, "entry", 4, progress)
 	if err != nil {
 		t.Fatalf("topUpParsedRecovery: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestTopUpParsedRecoveryStopsWhenExhausted(t *testing.T) {
 
 	const want = 10 // more than the 3 slices these two volumes can ever supply
 	gotIdx, nextVolIdx, _, err := topUpParsedRecovery(
-		context.Background(), parallelFetchNopLogger, fetch, vols, 0, want, idx, nil, "entry", 4, nil)
+		context.Background(), parallelFetchNopLogger, fetch, nil, vols, 0, want, idx, nil, "entry", 4, nil)
 	if err != nil {
 		t.Fatalf("topUpParsedRecovery: %v", err)
 	}

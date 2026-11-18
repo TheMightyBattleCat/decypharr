@@ -47,7 +47,7 @@ func TestTopUpCancelledIsTransient(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, _, err = topUpParsedRecovery(ctx, parallelFetchNopLogger, fetch, vols, 0, 2, idx,
+	_, _, _, err = topUpParsedRecovery(ctx, parallelFetchNopLogger, fetch, nil, vols, 0, 2, idx,
 		[]par2.Source{{Name: "fixture.par2", Data: indexOnly}}, "entry", 4, nil)
 	if err == nil {
 		t.Fatal("cancelled top-up returned nil; runRepair would report a terminal shortfall")

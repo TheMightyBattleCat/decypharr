@@ -48,7 +48,7 @@ func TestPar2RecoveryArticleTimeoutCountsAsTransportFailure(t *testing.T) {
 		t.Fatalf("a timed-out PAR2 article was not counted as a transport failure (err %v)", err)
 	}
 
-	short := par2RecoveryShortfall(14, 11, int(fails.Load()))
+	short := par2RecoveryShortfall(14, 11, int(fails.Load()), 0)
 	if !strings.Contains(short.Error(), "(transient:") {
 		t.Fatalf("shortfall after a timeout is not tagged transient: %v", short)
 	}
@@ -71,7 +71,7 @@ func TestPar2CancelledJobFetchIsNotATransportFailure(t *testing.T) {
 	if n := fails.Load(); n != 0 {
 		t.Fatalf("a fetch ended by the job's cancellation was counted: %d", n)
 	}
-	if c := classifyPar2Failure(par2RecoveryShortfall(14, 11, int(fails.Load()))); !c.terminal {
+	if c := classifyPar2Failure(par2RecoveryShortfall(14, 11, int(fails.Load()), 0)); !c.terminal {
 		t.Fatalf("a shortfall with no transport failures classed %s, want terminal", c.name())
 	}
 }
