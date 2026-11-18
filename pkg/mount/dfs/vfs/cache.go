@@ -1200,6 +1200,11 @@ type CacheItem struct {
 	// forget takes it alone. Order: forgetMu, then metaMu, then the
 	// buffer's locks; nothing under those two takes forgetMu.
 	forgetMu sync.RWMutex
+	// forgetGen counts ForgetRange calls. Written under forgetMu's write
+	// lock, read under its read lock. A downloader captures it before it
+	// fetches, so bytes fetched before a forget but written after it are
+	// dropped rather than stored (see WriteAtNoOverwriteSince).
+	forgetGen uint64
 
 	metaDirty   atomic.Bool
 	metaFlushCh chan struct{}
@@ -1555,11 +1560,16 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 	if item.buf == nil {
 		return len(p), 0, errors.New("cache file closed")
 	}
-	writeRange := ranges.Range{Pos: off, Size: int64(len(p))}
-	n = len(p)
-
 	item.forgetMu.RLock()
 	defer item.forgetMu.RUnlock()
+	return item.writeAtNoOverwriteLocked(p, off)
+}
+
+// writeAtNoOverwriteLocked is the body of WriteAtNoOverwrite; the caller
+// holds forgetMu's read lock.
+func (item *CacheItem) writeAtNoOverwriteLocked(p []byte, off int64) (n, skipped int, err error) {
+	writeRange := ranges.Range{Pos: off, Size: int64(len(p))}
+	n = len(p)
 
 	item.metaMu.RLock()
 	frs := item.info.Rs.FindAll(writeRange)
@@ -1581,6 +1591,37 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 	item.metaMu.Unlock()
 	item.markMetadataDirty()
 	return n, skipped, nil
+}
+
+// errForgottenSinceFetch is returned by WriteAtNoOverwriteSince when a
+// ForgetRange ran after the caller captured its generation: the bytes were
+// fetched before the forget and may be the very bytes it meant to drop.
+var errForgottenSinceFetch = errors.New("cache range forgotten since fetch started")
+
+// forgetGeneration returns the current forget generation, for a writer to
+// capture before it starts fetching - see WriteAtNoOverwriteSince.
+func (item *CacheItem) forgetGeneration() uint64 {
+	item.forgetMu.RLock()
+	defer item.forgetMu.RUnlock()
+	return item.forgetGen
+}
+
+// WriteAtNoOverwriteSince is WriteAtNoOverwrite for bytes fetched after the
+// caller captured gen from forgetGeneration. If a ForgetRange has run since,
+// nothing is written and errForgottenSinceFetch is returned: those bytes may
+// predate whatever made the forget necessary (a PAR2 repair replacing padded
+// bytes), so the caller must fetch again. The check and the write share
+// forgetMu, so a forget either lands before the check or after the write.
+func (item *CacheItem) WriteAtNoOverwriteSince(p []byte, off int64, gen uint64) (n, skipped int, err error) {
+	if item.buf == nil {
+		return len(p), 0, errors.New("cache file closed")
+	}
+	item.forgetMu.RLock()
+	defer item.forgetMu.RUnlock()
+	if item.forgetGen != gen {
+		return 0, 0, errForgottenSinceFetch
+	}
+	return item.writeAtNoOverwriteLocked(p, off)
 }
 
 // onBufferEvict is invoked by the buffer pool after it punches a hole behind
@@ -1611,6 +1652,7 @@ func (item *CacheItem) ForgetRange(off, length int64) {
 	// between them or straddles them (see forgetMu).
 	item.forgetMu.Lock()
 	defer item.forgetMu.Unlock()
+	item.forgetGen++
 	item.metaMu.Lock()
 	item.info.Rs.Remove(ranges.Range{Pos: off, Size: length})
 	item.metaMu.Unlock()
