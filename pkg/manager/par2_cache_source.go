@@ -22,6 +22,18 @@ type dfsCacheRangeReader interface {
 	PeekCachedRange(entryName, filename string, p []byte, off int64) bool
 }
 
+// dfsCachePresenceChecker is satisfied by the same DFS mount MountManager as
+// dfsCacheRangeReader (same type-assertion seam). It answers what
+// PeekCachedRange would answer without reading the bytes, so a check that
+// only needs to know the data is there (the warm sweep preflight) costs no
+// disk read.
+type dfsCachePresenceChecker interface {
+	// PeekHasCachedRange reports whether PeekCachedRange would find
+	// [off, off+length) of filename's cache item under entryName fully
+	// cached.
+	PeekHasCachedRange(entryName, filename string, off, length int64) bool
+}
+
 // dfsCacheRangeForgetter is satisfied by the same DFS mount MountManager as
 // dfsCacheRangeReader (same type-assertion seam - a direct import would
 // cycle). A failed assertion (rclone mode, no mount) just means there is no
@@ -193,6 +205,11 @@ type cacheSlicedSource struct {
 	deadRanges  map[string][]outputByteRange
 	cacheBytes  *int64
 	progress    *par2JobProgressState // nil-safe; live cache_bytes for the progress API
+	// presence, when set, turns readCached into a probe: it checks the range
+	// is cached and returns ok with nil bytes, reading nothing from disk. For
+	// the warm sweep preflight only, which needs to know every intact slice
+	// is cached but not its bytes; the pass that follows reads them.
+	presence dfsCachePresenceChecker
 }
 
 // newCacheSource builds a pass's cacheSlicedSource, keyed by the entry's DFS
@@ -215,7 +232,9 @@ func (p *Par2Repair) newCacheSource(nzbID, entryName string, reader dfsCacheRang
 // current dead/padded set for that file (never trust cache bytes for the
 // unknowns being solved for - see buildDeadOutputRanges), and the DFS cache
 // actually has those output bytes present right now. ok=false for any
-// other reason at all - the caller must fetch from Usenet instead.
+// other reason at all - the caller must fetch from Usenet instead. With
+// presence set, a hit returns nil bytes: the range is cached, nothing was
+// read.
 func (s *cacheSlicedSource) readCached(messageID string, dataStart, n int64) ([]byte, bool) {
 	if s == nil || s.reader == nil || n <= 0 {
 		return nil, false
@@ -229,6 +248,12 @@ func (s *cacheSlicedSource) readCached(messageID string, dataStart, n int64) ([]
 		outEnd := outStart + n
 		if outputRangeOverlapsAny(s.deadRanges[m.fileName], outStart, outEnd) {
 			continue // overlaps a dead/padded range - that's zeros on disk, not real data
+		}
+		if s.presence != nil {
+			if !s.presence.PeekHasCachedRange(s.entryName, m.fileName, outStart, n) {
+				continue
+			}
+			return nil, true
 		}
 		buf := make([]byte, n)
 		if !s.reader.PeekCachedRange(s.entryName, m.fileName, buf, outStart) {

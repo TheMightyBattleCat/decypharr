@@ -208,6 +208,14 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	// real job progress - see cacheSlicedSource.readCached's nil handling of
 	// both fields.
 	cacheSource := p.newCacheSource(nzbID, entry.Name, cacheReader, nzb, pending, nil, nil)
+	// Check presence only: the pass reads every intact slice from the cache
+	// anyway, so reading them here too doubled the disk reads (a 50 GB
+	// release read twice). The check asks the same live cache item the
+	// pass's PeekCachedRange reads from. A mount without the check falls
+	// back to reading.
+	if probe, ok := cacheReader.(dfsCachePresenceChecker); ok {
+		cacheSource.presence = probe
+	}
 
 	// noFetch never actually fetches; ReadRange below only reaches it on a
 	// cache miss (see postedFileFetcher.ReadRange), at which point the

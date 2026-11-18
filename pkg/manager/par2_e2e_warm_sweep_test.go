@@ -22,6 +22,31 @@ type p2eWarmCache struct {
 	dead  map[string][][2]int64
 	cold  map[string][2]int64
 	peeks int
+	// probes counts PeekHasCachedRange calls (p2eWarmProbeCache only).
+	probes int
+}
+
+// p2eWarmProbeCache is p2eWarmCache with the presence check the real DFS
+// mount has, so the preflight checks ranges without reading them.
+type p2eWarmProbeCache struct{ *p2eWarmCache }
+
+func (c p2eWarmProbeCache) PeekHasCachedRange(_, file string, off, length int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.probes++
+	return c.cached(file, off, off+length)
+}
+
+// cached reports whether [off, end) of file is in the cache. Caller holds mu.
+func (c *p2eWarmCache) cached(file string, off, end int64) bool {
+	data, ok := c.files[file]
+	if !ok || off < 0 || end > int64(len(data)) {
+		return false
+	}
+	if r, ok := c.cold[file]; ok && off < r[1] && end > r[0] {
+		return false
+	}
+	return true
 }
 
 func (c *p2eWarmCache) Start(context.Context) error                    { return nil }
@@ -35,15 +60,11 @@ func (c *p2eWarmCache) PeekCachedRange(_, file string, p []byte, off int64) bool
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.peeks++
-	data, ok := c.files[file]
 	end := off + int64(len(p))
-	if !ok || off < 0 || end > int64(len(data)) {
+	if !c.cached(file, off, end) {
 		return false
 	}
-	if r, ok := c.cold[file]; ok && off < r[1] && end > r[0] {
-		return false
-	}
-	copy(p, data[off:end])
+	copy(p, c.files[file][off:end])
 	for _, r := range c.dead[file] {
 		for i := max(off, r[0]); i < min(end, r[1]); i++ {
 			p[i-off] = 0
@@ -66,8 +87,14 @@ func newP2eWarmCache(fx *p2eFixture, dead []p2eSeg) *p2eWarmCache {
 
 // warmHarness is a harness whose NZB marks the posted files stored (the
 // cache source maps only stored files), with recorded damage gone from the
-// server and the given cache mounted.
+// server and the given cache mounted, with the presence check.
 func warmHarness(t *testing.T, srv *p2eServer, fx *p2eFixture, nzbID string, cold func(c *p2eWarmCache)) (*p2eHarness, *p2eWarmCache) {
+	return warmHarnessMount(t, srv, fx, nzbID, cold, true)
+}
+
+// warmHarnessMount is warmHarness; probe=false mounts a cache without the
+// presence check, so the preflight reads the ranges as it did before.
+func warmHarnessMount(t *testing.T, srv *p2eServer, fx *p2eFixture, nzbID string, cold func(c *p2eWarmCache), probe bool) (*p2eHarness, *p2eWarmCache) {
 	t.Helper()
 	nzb := fx.nzb(nzbID)
 	for i := range nzb.Files {
@@ -83,7 +110,11 @@ func warmHarness(t *testing.T, srv *p2eServer, fx *p2eFixture, nzbID string, col
 	if cold != nil {
 		cold(c)
 	}
-	h.p.manager.mountManager = c
+	if probe {
+		h.p.manager.mountManager = p2eWarmProbeCache{c}
+	} else {
+		h.p.manager.mountManager = c
+	}
 	h.warmup()
 	h.srv.resetCounters()
 	return h, c
@@ -144,7 +175,7 @@ func TestP2EPar2WarmSweepRepairsFromTheCache(t *testing.T) {
 func TestP2EPar2WarmSweepDeclinesWhenNotFullyCached(t *testing.T) {
 	servers, fx := newP2eEnv(t, 1)
 	f3 := fx.posted[2]
-	h, _ := warmHarness(t, servers[0], fx, "p2e-warm-cold", func(c *p2eWarmCache) {
+	h, c := warmHarness(t, servers[0], fx, "p2e-warm-cold", func(c *p2eWarmCache) {
 		c.cold[f3.name] = [2]int64{0, 1}
 	})
 
@@ -166,6 +197,10 @@ func TestP2EPar2WarmSweepDeclinesWhenNotFullyCached(t *testing.T) {
 	if o.Patched != 0 {
 		t.Errorf("%d segment(s) patched, want none: %v", o.Patched, o.OverlayDiff)
 	}
+	// The preflight checked presence and read nothing.
+	if c.probes == 0 || c.peeks != 0 {
+		t.Errorf("presence checks = %d, cache reads = %d: want the preflight to check without reading", c.probes, c.peeks)
+	}
 	if !h.logged("par2 warm sweep pass declined; the sweep re-grabs") {
 		t.Errorf("no decline log line")
 	}
@@ -173,5 +208,46 @@ func TestP2EPar2WarmSweepDeclinesWhenNotFullyCached(t *testing.T) {
 		if ln["message"] == "par2 warm sweep pass declined; the sweep re-grabs" && ln["stage"] != "intact data not fully cached" {
 			t.Errorf("declined at stage %v, want \"intact data not fully cached\"", ln["stage"])
 		}
+	}
+}
+
+// The preflight checks the intact ranges without reading them, so the warm
+// repair reads each intact range from the cache once (in the pass), not
+// twice. The control mounts a cache without the presence check: there the
+// preflight reads every range too, which is the double read. Same result
+// either way: the pass completes and patches both segments.
+func TestP2EPar2WarmSweepReadsTheCacheOnce(t *testing.T) {
+	run := func(nzbID string, probe bool) *p2eWarmCache {
+		servers, fx := newP2eEnv(t, 1)
+		h, c := warmHarnessMount(t, servers[0], fx, nzbID, nil, probe)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		passed := h.p.attemptWarmSweepRepair(ctx, h.nzbID)
+		h.p.wg.Wait()
+		var o p2eOutcome
+		h.collectOverlay(&o)
+		if !passed || o.Patched != 2 || o.StillDead != 0 || o.Mismatch != 0 {
+			h.report(o)
+			t.Fatalf("probe=%v: passed=%v, overlay %s %v, want a completed pass with 2 patches equal to the posted bytes", probe, passed, o.Overlay, o.OverlayDiff)
+		}
+		if a, _ := h.p.manager.storage.LatestPar2RepairAttemptForNzb(h.nzbID); a == nil || a.Outcome != storage.Par2RepairOutcomeCompleted {
+			t.Fatalf("probe=%v: attempt %+v, want completed", probe, a)
+		}
+		return c
+	}
+
+	control := run("p2e-warm-reads-control", false)
+	fixed := run("p2e-warm-reads-once", true)
+
+	// The pass's own reads: what the control read minus the preflight's
+	// share, which is the same walk the probes now take.
+	if fixed.probes == 0 {
+		t.Fatalf("the preflight never used the presence check")
+	}
+	if fixed.peeks != fixed.probes {
+		t.Errorf("cache reads = %d, presence checks = %d: want one read per intact range checked (the preflight reads nothing)", fixed.peeks, fixed.probes)
+	}
+	if control.peeks != 2*fixed.peeks {
+		t.Errorf("cache reads without the presence check = %d, with it = %d: want the preflight's share (half) gone", control.peeks, fixed.peeks)
 	}
 }

@@ -286,6 +286,22 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return item.ReadCachedRange(p, off)
 }
 
+// PeekHasCachedRange reports whether PeekCachedRange would find
+// [off, off+length) of filename's cache item under entryName fully cached,
+// without reading the bytes. It looks only at the live in-memory item, as
+// PeekCachedRange does - unlike HasCachedRange, which also trusts the on-disk
+// sidecar of a closed item that PeekCachedRange cannot read from.
+func (m *Manager) PeekHasCachedRange(entryName, filename string, off, length int64) bool {
+	if m.cache == nil || length <= 0 {
+		return false
+	}
+	item, ok := m.cache.PeekItem(entryName, filename)
+	if !ok || item.buf == nil {
+		return false
+	}
+	return item.HasRange(ranges.Range{Pos: off, Size: length})
+}
+
 // HasCachedRange reports whether [off, off+length) of filename's cache item
 // under entryName is already cached, without reading or fetching anything:
 // the live in-memory item if one is open, else its on-disk metadata sidecar.
