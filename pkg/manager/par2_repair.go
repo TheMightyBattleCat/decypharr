@@ -4196,6 +4196,10 @@ func (p *Par2Repair) healWithoutRecovery(ctx context.Context, nzbID, entryName s
 				ref := nzb.Par2Source[pos.posted]
 				f = newPostedFileFetcher(ctx, fetch, ref, cacheSource, fd.Length, p.logger.With().Str("entry", entryName).Str("file", ref.Name).Logger())
 				f.resolveGeometry()
+				// Past a dead head, measure from a later article, skipping
+				// those STAT just found missing (as runRepair does after
+				// its sweep).
+				f.resolveGeometryPastDeadHead(missing)
 				fetchers[fileID] = f
 			}
 			refs = append(refs, par2DeadRef{

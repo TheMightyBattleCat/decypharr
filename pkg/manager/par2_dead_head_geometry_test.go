@@ -160,3 +160,72 @@ func TestResolveGeometryPastDeadHeadTimeoutBacksOff(t *testing.T) {
 		t.Fatalf("with every later article missing: exact %v, err %v (was %v), fetches %d -> %d", pf.exact, pf.geometryErr, headErr, before, len(f.calls))
 	}
 }
+
+// The heal that runs before a failing recovery gate builds its fetchers late,
+// with no STAT sweep of its own beyond the pending articles. It used to give
+// up on the geometry after three dead leading articles, so a reader-dead
+// article that is really intact further on could not be placed and was left
+// for parity there is not. Now it measures past the dead head, skipping the
+// articles its STAT check found missing, and heals that article.
+func TestHealWithoutRecoveryMeasuresGeometryPastDeadHead(t *testing.T) {
+	m := newTestManagerWithNZBRecords(t)
+	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
+
+	content, articles, ref := deadHeadFixture()
+	delete(articles, "<p4>") // also gone, and STAT says so
+	const sliceSize = 20
+	var slices [][]byte
+	for off := 0; off < len(content); off += sliceSize {
+		slices = append(slices, content[off:off+sliceSize])
+	}
+	idx := buildSingleFileIndexWithIFSC(t, sliceSize, [16]byte{0x0d}, ref.Name, slices)
+
+	const nzbID = "nzb-heal-dead-head"
+	readerFile := storage.NZBFile{Name: ref.Name}
+	for i, seg := range ref.Segments {
+		readerFile.Segments = append(readerFile.Segments, storage.NZBSegment{
+			Number: i + 1, MessageID: seg.MessageID, Bytes: 60,
+		})
+	}
+	readerFile.Segments[len(readerFile.Segments)-1].Bytes = 40
+	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}, Par2Source: []storage.PostedFileRef{ref}}
+	storeNZBRecord(t, m, nzb)
+
+	gone := map[string]bool{"<p1>": true, "<p2>": true, "<p3>": true, "<p4>": true}
+	pending := map[string][]overlay.DeadSegment{}
+	for _, i := range []int{0, 1, 2, 3, 5} {
+		seg := ref.Segments[i]
+		if err := m.usenet.RecordOverlayDead(nzbID, ref.Name, i, seg.MessageID, 60); err != nil {
+			t.Fatalf("record dead %d: %v", i, err)
+		}
+		pending[ref.Name] = append(pending[ref.Name], overlay.DeadSegment{Index: i, MessageID: seg.MessageID, Bytes: 60})
+	}
+	stat := func(_ context.Context, ids []string) ([]nntp.StatResult, error) {
+		out := make([]nntp.StatResult, len(ids))
+		for i, id := range ids {
+			out[i] = nntp.StatResult{MessageID: id, Available: !gone[id]}
+			if gone[id] {
+				out[i].Error = &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "no such article"}
+			}
+		}
+		return out, nil
+	}
+	f := &yencFetcher{articles: articles, calls: map[string]int{}}
+
+	healed, total := p.healWithoutRecovery(context.Background(), nzbID, "Some.Release", nzb, idx, pending, f.fetch, nil, stat)
+	if healed != 1 || total != 5 {
+		t.Fatalf("healed %d of %d, want 1 of 5: the intact article past the dead head", healed, total)
+	}
+	patch, ok := m.usenet.OverlayPatchBytes(nzbID, ref.Name, 5)
+	if !ok || !bytes.Equal(patch, content[300:360]) {
+		t.Fatalf("segment 5 patch = %d bytes (ok=%v), want its real bytes at the measured offset 300", len(patch), ok)
+	}
+	for _, i := range []int{0, 1, 2, 3} {
+		if _, ok := m.usenet.OverlayPatchBytes(nzbID, ref.Name, i); ok {
+			t.Fatalf("segment %d patched although its article is gone", i)
+		}
+	}
+	if f.calls["<p4>"] != 0 {
+		t.Fatalf("<p4> fetched %d times; STAT found it missing, so the geometry probe must skip it", f.calls["<p4>"])
+	}
+}
