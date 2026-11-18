@@ -1849,6 +1849,10 @@ func mergeFilePart(existing, file *RARFileEntry) {
 // to serve: the first whose parts hold exactly the size its header gives,
 // else the first. It returns that copy's headers and how many headers the
 // other copies had.
+//
+// An encrypted RAR5 stored file's parts hold its data AES-padded to a whole
+// block, so for one of those the complete size is the header size rounded
+// up to 16 bytes.
 func pickDuplicateCopy(chains [][]*RARFileEntry) (kept []*RARFileEntry, dropped int) {
 	pick := 0
 	for i, chain := range chains {
@@ -1858,7 +1862,11 @@ func pickDuplicateCopy(chains [][]*RARFileEntry) (kept []*RARFileEntry, dropped 
 				sum += vp.UnpackedSize
 			}
 		}
-		if sum == chain[0].UncompressedSize {
+		want := chain[0].UncompressedSize
+		if chain[0].IsEncrypted && chain[0].IsStored {
+			want = (want + crypto.BlockSize - 1) / crypto.BlockSize * crypto.BlockSize
+		}
+		if sum == want {
 			pick = i
 			break
 		}

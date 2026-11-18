@@ -132,3 +132,53 @@ func TestParseArchive_SameNameInTwoArchivesNotJoined(t *testing.T) {
 		}
 	}
 }
+
+// An encrypted RAR5 stored file's parts hold its data AES-padded to a
+// 16-byte block, so a complete copy sums to the header size rounded up to
+// 16, never to the header size itself. With part1 posted twice (a lone
+// part1, then a repost followed by part2 and part3), the complete chain
+// must be served, not the lone part1.
+//
+// Built from file entries rather than archive bytes: the testdata holds no
+// encrypted RAR5 volume set and no RAR tool is available to make one.
+func TestAggregateFileParts_EncryptedRAR5RepostKeepsCompleteChain(t *testing.T) {
+	const size = 10001 // not a multiple of 16: padded to 10016
+	part := func(vol int, splitBefore bool, n int64) *RARFileEntry {
+		return &RARFileEntry{
+			Name:             "movie.mkv",
+			UncompressedSize: size,
+			PackedSize:       n,
+			IsStored:         true,
+			IsEncrypted:      true,
+			SplitBefore:      splitBefore,
+			VolumeIndex:      vol,
+			VolumeParts: []*types.RARVolumePart{{
+				Name:         fmt.Sprintf("vol%d", vol),
+				PackedSize:   n,
+				UnpackedSize: n,
+				Stored:       true,
+				PartNumber:   vol,
+			}},
+		}
+	}
+	raw := []*RARFileEntry{
+		part(0, false, 4000), // lone part1
+		part(1, false, 4000), // reposted part1
+		part(2, true, 4000),
+		part(3, true, 2016),
+	}
+	p := &RARParser{logger: zerolog.Nop()}
+	files := p.aggregateFileParts(raw)
+	if len(files) != 1 {
+		t.Fatalf("files = %d, want one movie.mkv", len(files))
+	}
+	var parts []int
+	var sum int64
+	for _, vp := range files[0].VolumeParts {
+		parts = append(parts, vp.PartNumber)
+		sum += vp.UnpackedSize
+	}
+	if fmt.Sprint(parts) != "[1 2 3]" || sum != 10016 {
+		t.Fatalf("parts %v holding %d bytes, want the complete chain [1 2 3] holding 10016", parts, sum)
+	}
+}
