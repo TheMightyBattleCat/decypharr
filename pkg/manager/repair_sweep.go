@@ -553,6 +553,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	broken := r.brokenFiles(c, results)
 	final := rollupStatus(results)
+	unchecked := anyUsenetUnchecked(results)
 
 	h.Status = final
 	h.FileCount = len(names)
@@ -573,9 +574,13 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 	switch final {
 	case storage.HealthHealthy:
-		h.LastOKAt = h.LastCheckedAt
+		if !unchecked {
+			h.LastOKAt = h.LastCheckedAt
+		}
 		h.FailureReason = ""
-		if decodeRan {
+		// A file no news server answered for was never read: a decode stamp
+		// now would let the next sweep skip its decode windows.
+		if decodeRan && !unchecked {
 			h.DecodeVerifiedAt = h.LastCheckedAt
 			h.DecodeVerifiedFingerprint = currentFP
 			h.DecodeVerifiedCoverage = decodeCoverage
@@ -584,7 +589,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.LastFailedAt = h.LastCheckedAt
 		h.FailureReason = topReason(broken)
 	}
-	if final != storage.HealthHealthy || reordered {
+	// An outage proves nothing either way: an entry left Unknown by it keeps
+	// its decode stamp.
+	outageOnly := final == storage.HealthUnknown && unchecked
+	if (final != storage.HealthHealthy && !outageOnly) || reordered {
 		h.DecodeVerifiedAt = time.Time{}
 		h.DecodeVerifiedFingerprint = ""
 		h.DecodeVerifiedCoverage = ""
@@ -595,6 +603,12 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.NextCheckDueAt = h.LastCheckedAt
 		h.Dirty = true
 		h.DirtyReason = "volumes reordered in place"
+	} else if unchecked {
+		// No news server answered for at least one file: nothing was
+		// verified for it, so the next sweep checks it again.
+		h.NextCheckDueAt = h.LastCheckedAt
+		h.Dirty = true
+		h.DirtyReason = "no news server answered the availability check"
 	}
 
 	r.saveHealth(h)
@@ -988,8 +1002,29 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		_, res.confirmedDeadBytes = r.recordDeadSegments(ctx, entry, name)
 		return r.routeAutoRepair(entry, res)
 	}
+	if errors.Is(err, usenet.ErrAvailabilityUnchecked) {
+		// No news server answered: neither healthy nor broken. probeEntry
+		// keeps LastOKAt and marks the entry for the next sweep.
+		res.reason = reasonUsenetUnchecked
+		return res
+	}
 	res.reason = "usenet_probe_error"
 	return res
+}
+
+// reasonUsenetUnchecked is a file whose STAT sample no news server answered
+// (usenet.ErrAvailabilityUnchecked): an outage, not a verdict.
+const reasonUsenetUnchecked = "usenet_not_checked"
+
+// anyUsenetUnchecked reports whether an entry's probe left a file unchecked
+// because no news server answered.
+func anyUsenetUnchecked(results []fileResult) bool {
+	for _, res := range results {
+		if res.reason == reasonUsenetUnchecked {
+			return true
+		}
+	}
+	return false
 }
 
 // par2TerminalWithDamage reports whether nzbID's PAR2 repair state is terminal

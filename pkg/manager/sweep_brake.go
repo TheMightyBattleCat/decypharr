@@ -23,9 +23,11 @@ const sweepBrakeLimit = 5
 // blocklist and re-search for the rest of the sweep; probing goes on, so the
 // health records still show what was seen.
 //
-// "No eligible providers" reaches the sweep only this way: the STAT check
-// fails open on it (Usenet.checkAvailability), and the body fetch behind the
-// ffprobe read ends short.
+// A STAT check no news server answered at all (Usenet.checkAvailability's
+// ErrAvailabilityUnchecked, "No eligible providers" included) leaves the file
+// Unknown, unread and unhealed: neutral here, it neither counts nor resets.
+// What counts is an outage the STAT check got through and the body fetch
+// behind the ffprobe read did not.
 type sweepBrake struct {
 	mu      sync.Mutex
 	inARow  int

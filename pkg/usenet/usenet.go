@@ -1036,8 +1036,14 @@ func (u *Usenet) checkFileSkippingPatched(ctx context.Context, nzoID, filename s
 	return u.checkAvailability(ctx, filename, messageIDs)
 }
 
+// CheckFileAvailability is the post-parse import check for one file. It fails
+// open when no news server answered: ErrAvailabilityUnchecked becomes nil.
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
-	return u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
+	err := u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
+	if errors.Is(err, ErrAvailabilityUnchecked) {
+		return nil
+	}
+	return err
 }
 
 // RecordOverlayDead records a confirmed-dead segment against the overlay
@@ -1720,9 +1726,21 @@ func (u *Usenet) OverlayScreenFile(ctx context.Context, nzoID, filename string) 
 	return result, nil
 }
 
+// ErrAvailabilityUnchecked is checkAvailability's "could not ask": no news
+// server answered any sampled STAT (every one failed with an error, none was
+// found and none reported missing). The file is neither available nor
+// missing. The sweep records it Unknown and re-checks it next sweep; the
+// import checks fail open on it.
+var ErrAvailabilityUnchecked = errors.New("no news server answered the availability check")
+
 // checkAvailability batch-STATs the given sampled message ids. The NNTP client
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
+//
+// It returns nil when the sample is available (or some of it answered present
+// and the rest failed with errors), customerror.UsenetSegmentMissingError when
+// a sampled article is definitively missing, and ErrAvailabilityUnchecked when
+// nothing was answered at all.
 func (u *Usenet) checkAvailability(ctx context.Context, fileName string, messageIDs []string) error {
 	if len(messageIDs) == 0 {
 		return nil
@@ -1730,24 +1748,33 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 
 	result, err := u.nntp.BatchStat(ctx, messageIDs)
 	if err != nil {
-		// Connection/system error - log and continue (don't fail availability check)
+		// Connection/system error: nothing was checked.
 		u.logger.Warn().
 			Err(err).
 			Str("file", fileName).
-			Msg("Non-fatal error during availability check, ignoring")
-		return nil
+			Msg("Availability check could not ask any news server")
+		return fmt.Errorf("%w: %w", ErrAvailabilityUnchecked, err)
 	}
 
 	// Check if all sampled segments are available.
 	// Distinguish genuine article-not-found from connection errors:
 	//   TotalCount = FoundCount + notFoundCount + ErrorCount
 	// Only treat a file as unavailable when segments are definitively missing
-	// (notFoundCount > 0). Connection errors mean we couldn't check — treat
-	// those the same as the top-level error path above (non-fatal, skip check).
+	// (notFoundCount > 0). Connection errors mean we couldn't check: with
+	// some articles found the sample passes; with none found it is unchecked.
 	if !result.AllAvailable() {
 		notFoundCount := result.TotalCount - result.FoundCount - result.ErrorCount
 		if result.ErrorCount > 0 && notFoundCount == 0 {
 			// All failures were connection errors, not missing articles.
+			if result.FoundCount == 0 {
+				// Debug: during an outage every file a sweep probes ends here.
+				u.logger.Debug().
+					Str("file", fileName).
+					Int("sampled_segments", len(messageIDs)).
+					Int("error_count", result.ErrorCount).
+					Msg("Availability check got no answer from any news server")
+				return ErrAvailabilityUnchecked
+			}
 			return nil
 		}
 		// At least some segments are definitively missing.
