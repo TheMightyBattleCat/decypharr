@@ -138,6 +138,10 @@ type Store struct {
 	// was before notifications existed for this.
 	failedNotify atomic.Pointer[func(nzbID, file string)]
 
+	// damageClearedNotify is told which dead/padded records DeleteEntry,
+	// DeleteFile or ClearFileDamage removed - see SetDamageClearedNotifier.
+	damageClearedNotify atomic.Pointer[func(nzbID string, removed map[string][]DeadSegment)]
+
 	// policy holds the current padding caps. nil until SetPolicy is called,
 	// in which case Policy() falls back to DefaultPolicy() - the original,
 	// pre-configurable behavior.
@@ -317,6 +321,46 @@ func (s *Store) notifyViewerPad(nzbID, file string) {
 	if p := s.viewerPadNotify.Load(); p != nil && *p != nil {
 		(*p)(nzbID, file)
 	}
+}
+
+// SetDamageClearedNotifier installs the callback told, after DeleteEntry,
+// DeleteFile or ClearFileDamage, which non-patched (dead or padded) records
+// it removed, keyed by file. Those records were the only note of where a
+// viewer was served zero-fill, and the DFS cache may still hold it. Called
+// after the entry's lock is released, and only when something non-patched
+// was removed. fn may be nil to disable it.
+func (s *Store) SetDamageClearedNotifier(fn func(nzbID string, removed map[string][]DeadSegment)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.damageClearedNotify.Store(nil)
+		return
+	}
+	s.damageClearedNotify.Store(&fn)
+}
+
+func (s *Store) notifyDamageCleared(nzbID string, removed map[string][]DeadSegment) {
+	if s == nil || len(removed) == 0 {
+		return
+	}
+	if p := s.damageClearedNotify.Load(); p != nil && *p != nil {
+		(*p)(nzbID, removed)
+	}
+}
+
+// unpatchedOf returns fe's dead and padded (non-patched) records, or nil.
+func unpatchedOf(fe *FileEntry) []DeadSegment {
+	if fe == nil {
+		return nil
+	}
+	var out []DeadSegment
+	for _, d := range fe.DeadSegments {
+		if d.Status != StatusPatched {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // SetPolicy installs the padding caps Decide consults. Call it once at
@@ -1274,6 +1318,19 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
+	var removed map[string][]DeadSegment
+	if s.damageClearedNotify.Load() != nil {
+		if m, lerr := s.loadManifestLocked(nzbID); lerr == nil {
+			for name, fe := range m.Files {
+				if segs := unpatchedOf(fe); len(segs) > 0 {
+					if removed == nil {
+						removed = make(map[string][]DeadSegment)
+					}
+					removed[name] = segs
+				}
+			}
+		}
+	}
 	err = os.RemoveAll(dir)
 	mu.Unlock()
 	// The mutex stays in s.locks: goroutines may still hold or wait on it,
@@ -1283,6 +1340,7 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("overlay: delete entry: %w", err)
 	}
+	s.notifyDamageCleared(nzbID, removed)
 	return nil
 }
 
@@ -1295,6 +1353,17 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if s == nil {
 		return false, nil
 	}
+	var cleared []DeadSegment
+	patchesPreserved, err = s.clearFileDamage(nzbID, file, &cleared)
+	if err == nil && len(cleared) > 0 {
+		s.notifyDamageCleared(nzbID, map[string][]DeadSegment{file: cleared})
+	}
+	return patchesPreserved, err
+}
+
+// clearFileDamage is ClearFileDamage under the entry's lock; it sets
+// *cleared to the non-patched records it removed.
+func (s *Store) clearFileDamage(nzbID, file string, cleared *[]DeadSegment) (patchesPreserved bool, err error) {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1307,6 +1376,7 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if !ok {
 		return false, nil
 	}
+	*cleared = unpatchedOf(fe)
 
 	var patched []DeadSegment
 	for _, d := range fe.DeadSegments {
@@ -1399,6 +1469,17 @@ func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	if s == nil {
 		return false, nil
 	}
+	var cleared []DeadSegment
+	removed, err = s.deleteFile(nzbID, file, &cleared)
+	if removed && err == nil && len(cleared) > 0 {
+		s.notifyDamageCleared(nzbID, map[string][]DeadSegment{file: cleared})
+	}
+	return removed, err
+}
+
+// deleteFile is DeleteFile under the entry's lock; it sets *cleared to the
+// non-patched records it removed.
+func (s *Store) deleteFile(nzbID, file string, cleared *[]DeadSegment) (removed bool, err error) {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1411,6 +1492,7 @@ func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	if !ok {
 		return false, nil
 	}
+	*cleared = unpatchedOf(fe)
 	for _, d := range fe.DeadSegments {
 		if d.Status == StatusPatched {
 			if path, err := s.patchPath(nzbID, file, d.Index); err == nil {

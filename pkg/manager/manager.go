@@ -153,6 +153,10 @@ type Manager struct {
 	backup atomic.Pointer[backupHolder]
 	// backupSvc is the concrete service, for Start and Stop.
 	backupSvc *backup.BackupService
+
+	// padRangeCache holds each damaged file's pad byte ranges for
+	// OverlayPadRanges, so a DFS stream doesn't decode the NZB per chunk.
+	padRangeCache sync.Map // nzbID+"\x00"+file -> padRangeCacheEntry
 }
 
 // New creates a new Manager instance
@@ -344,6 +348,7 @@ func (m *Manager) init() {
 		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
 		m.usenet.SetOverlayFailedNotifier(m.notifyOverlayFileFailed)
 		m.usenet.SetOverlayViewerPadNotifier(m.onViewerPaddedFailedFile)
+		m.usenet.SetOverlayDamageClearedNotifier(m.onOverlayDamageCleared)
 	}
 
 	// Initialize the read-ahead precache service (see precache.go). Depends

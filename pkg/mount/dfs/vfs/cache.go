@@ -62,6 +62,11 @@ type Cache struct {
 	// because they cannot build a *manager.Manager.
 	identity func(entryName, filename string) (infoHash string, size int64, ok bool)
 
+	// padRanges returns the [start, end) byte ranges of entry's filename
+	// within [off, end) that the overlay records as dead or padded - see
+	// lookupPadRanges. nil means ask manager; tests set it.
+	padRanges func(entry *storage.Entry, filename string, off, end int64) [][2]int64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -1278,6 +1283,11 @@ func (item *CacheItem) flushMetadata(force bool) {
 		copy(rsCopy, info.Rs)
 		info.Rs = rsCopy
 	}
+	if len(info.Pads) > 0 {
+		padsCopy := make(ranges.Ranges, len(info.Pads))
+		copy(padsCopy, info.Pads)
+		info.Pads = padsCopy
+	}
 	item.metaMu.RUnlock()
 
 	data, err := json.Marshal(info)
@@ -1317,8 +1327,14 @@ type ItemInfo struct {
 	InfoHash string        `json:"info_hash,omitempty"`
 	Size     int64         `json:"size"`
 	Rs       ranges.Ranges `json:"ranges"` // Downloaded regions
-	ModTime  time.Time     `json:"mod_time"`
-	ATime    time.Time     `json:"atime"`
+	// Pads marks the parts of Rs a stream wrote while the overlay recorded
+	// them dead or padded: zero-fill, not the article. When those records
+	// are removed (reap, reclaim, a sticky-failed clear) the marks are what
+	// lets the cache forget exactly those bytes - see ForgetPads. Absent in
+	// sidecars written before it existed, which load with no marks.
+	Pads    ranges.Ranges `json:"pads,omitempty"`
+	ModTime time.Time     `json:"mod_time"`
+	ATime   time.Time     `json:"atime"`
 }
 
 // sidecarBelongsTo reports whether a persisted sidecar describes the grab
@@ -1562,12 +1578,13 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 	}
 	item.forgetMu.RLock()
 	defer item.forgetMu.RUnlock()
-	return item.writeAtNoOverwriteLocked(p, off)
+	return item.writeAtNoOverwriteLocked(p, off, nil)
 }
 
 // writeAtNoOverwriteLocked is the body of WriteAtNoOverwrite; the caller
-// holds forgetMu's read lock.
-func (item *CacheItem) writeAtNoOverwriteLocked(p []byte, off int64) (n, skipped int, err error) {
+// holds forgetMu's read lock. When wrote is non-nil, every piece actually
+// written (not skipped as already cached) is inserted into it.
+func (item *CacheItem) writeAtNoOverwriteLocked(p []byte, off int64, wrote *ranges.Ranges) (n, skipped int, err error) {
 	writeRange := ranges.Range{Pos: off, Size: int64(len(p))}
 	n = len(p)
 
@@ -1583,6 +1600,9 @@ func (item *CacheItem) writeAtNoOverwriteLocked(p []byte, off int64) (n, skipped
 		localOff := fr.R.Pos - off
 		if _, werr := item.buf.WriteAt(p[localOff:localOff+fr.R.Size], fr.R.Pos); werr != nil {
 			return n, skipped, werr
+		}
+		if wrote != nil {
+			wrote.Insert(fr.R)
 		}
 	}
 
@@ -1613,6 +1633,12 @@ func (item *CacheItem) forgetGeneration() uint64 {
 // bytes), so the caller must fetch again. The check and the write share
 // forgetMu, so a forget either lands before the check or after the write.
 func (item *CacheItem) WriteAtNoOverwriteSince(p []byte, off int64, gen uint64) (n, skipped int, err error) {
+	return item.writeAtNoOverwriteSince(p, off, gen, nil)
+}
+
+// writeAtNoOverwriteSince is WriteAtNoOverwriteSince that also inserts the
+// pieces it actually wrote into wrote (nil: don't collect).
+func (item *CacheItem) writeAtNoOverwriteSince(p []byte, off int64, gen uint64, wrote *ranges.Ranges) (n, skipped int, err error) {
 	if item.buf == nil {
 		return len(p), 0, errors.New("cache file closed")
 	}
@@ -1621,7 +1647,97 @@ func (item *CacheItem) WriteAtNoOverwriteSince(p []byte, off int64, gen uint64) 
 	if item.forgetGen != gen {
 		return 0, 0, errForgottenSinceFetch
 	}
-	return item.writeAtNoOverwriteLocked(p, off)
+	return item.writeAtNoOverwriteLocked(p, off, wrote)
+}
+
+// lookupPadRanges returns the byte ranges within [off, end) of the item's
+// file that the overlay records as dead or padded right now (see
+// Cache.padRanges), or nil.
+func (item *CacheItem) lookupPadRanges(off, end int64) [][2]int64 {
+	c := item.cache
+	if c == nil || item.entry == nil || end <= off {
+		return nil
+	}
+	if c.padRanges != nil {
+		return c.padRanges(item.entry, item.filename, off, end)
+	}
+	if c.manager == nil {
+		return nil
+	}
+	return c.manager.OverlayPadRanges(item.entry, item.filename, off, end)
+}
+
+// markPads records which of the bytes a stream just wrote (wrote) were
+// zero-fill: the parts the overlay records as dead or padded. A segment is
+// recorded dead before its pad is served, so asking after the stream
+// returns sees every pad it wrote. Only bytes still cached are marked: a
+// forget that ran since the write already dropped what it covered, and a
+// forget elsewhere in the file leaves this stream's other pads to mark.
+// Returns the bytes marked.
+func (item *CacheItem) markPads(wrote ranges.Ranges) int64 {
+	if len(wrote) == 0 {
+		return 0
+	}
+	first, last := wrote[0], wrote[len(wrote)-1]
+	pads := item.lookupPadRanges(first.Pos, last.End())
+	if len(pads) == 0 {
+		return 0
+	}
+	item.forgetMu.RLock()
+	defer item.forgetMu.RUnlock()
+	var marked int64
+	item.metaMu.Lock()
+	for _, pr := range pads {
+		for _, w := range wrote.Intersection(ranges.Range{Pos: pr[0], Size: pr[1] - pr[0]}) {
+			for _, r := range item.info.Rs.Intersection(w) {
+				if r.Size > 0 {
+					item.info.Pads.Insert(r)
+					marked += r.Size
+				}
+			}
+		}
+	}
+	item.metaMu.Unlock()
+	if marked > 0 {
+		item.markMetadataDirty()
+	}
+	return marked
+}
+
+// PadRanges returns a copy of the item's pad marks.
+func (item *CacheItem) PadRanges() ranges.Ranges {
+	item.metaMu.RLock()
+	defer item.metaMu.RUnlock()
+	out := make(ranges.Ranges, len(item.info.Pads))
+	copy(out, item.info.Pads)
+	return out
+}
+
+// ForgetPads forgets every range marked as zero-fill (see markPads), as
+// ForgetRange does, and drops the marks: a later read fetches those bytes
+// again. Returns the bytes forgotten.
+func (item *CacheItem) ForgetPads() int64 {
+	if item.buf == nil {
+		return 0
+	}
+	item.forgetMu.Lock()
+	defer item.forgetMu.Unlock()
+	item.metaMu.Lock()
+	pads := item.info.Pads
+	item.info.Pads = nil
+	for _, r := range pads {
+		item.info.Rs.Remove(r)
+	}
+	item.metaMu.Unlock()
+	if len(pads) == 0 {
+		return 0
+	}
+	item.forgetGen++
+	for _, r := range pads {
+		_ = item.buf.Discard(r.Pos, r.Size)
+	}
+	item.markMetadataDirty()
+	return pads.Size()
 }
 
 // onBufferEvict is invoked by the buffer pool after it punches a hole behind
@@ -1634,6 +1750,7 @@ func (item *CacheItem) WriteAtNoOverwriteSince(p []byte, off int64, gen uint64) 
 func (item *CacheItem) onBufferEvict(off, length int64) {
 	item.metaMu.Lock()
 	item.info.Rs.Remove(ranges.Range{Pos: off, Size: length})
+	item.info.Pads.Remove(ranges.Range{Pos: off, Size: length})
 	item.metaMu.Unlock()
 	item.markMetadataDirty()
 }
@@ -1655,6 +1772,7 @@ func (item *CacheItem) ForgetRange(off, length int64) {
 	item.forgetGen++
 	item.metaMu.Lock()
 	item.info.Rs.Remove(ranges.Range{Pos: off, Size: length})
+	item.info.Pads.Remove(ranges.Range{Pos: off, Size: length})
 	item.metaMu.Unlock()
 	_ = item.buf.Discard(off, length)
 	item.markMetadataDirty()
@@ -1676,24 +1794,48 @@ func (c *Cache) forgetDiskRange(entryName, filename string, off, length int64) {
 	if err := decodeJSONFile(metaPath, &info); err != nil {
 		return
 	}
-	before := info.Rs.Size()
+	before, padsBefore := info.Rs.Size(), info.Pads.Size()
 	info.Rs.Remove(ranges.Range{Pos: off, Size: length})
-	if info.Rs.Size() == before {
+	info.Pads.Remove(ranges.Range{Pos: off, Size: length})
+	if info.Rs.Size() == before && info.Pads.Size() == padsBefore {
 		return
 	}
+	c.rewriteSidecar(metaPath, entryName, filename, info)
+}
+
+// forgetDiskPads is ForgetPads for an item that is not open: it drops the
+// marked ranges and the marks from filename's sidecar under entryName.
+// Returns the bytes forgotten; 0 when there is no sidecar or no mark.
+func (c *Cache) forgetDiskPads(entryName, filename string) int64 {
+	metaPath := filepath.Join(c.config.CacheDir, entryName, filename+".json")
+	var info ItemInfo
+	if err := decodeJSONFile(metaPath, &info); err != nil || len(info.Pads) == 0 {
+		return 0
+	}
+	pads := info.Pads
+	info.Pads = nil
+	for _, r := range pads {
+		info.Rs.Remove(r)
+	}
+	c.rewriteSidecar(metaPath, entryName, filename, info)
+	return pads.Size()
+}
+
+// rewriteSidecar writes info to metaPath atomically (temp + rename),
+// matching flushMetadata, so a concurrent scanDiskCandidates never sees a
+// half-written sidecar.
+func (c *Cache) rewriteSidecar(metaPath, entryName, filename string, info ItemInfo) {
 	data, err := json.Marshal(info)
 	if err != nil {
 		return
 	}
-	// Atomic write (temp + rename), matching flushMetadata, so a concurrent
-	// scanDiskCandidates never sees a half-written sidecar.
 	tmpPath := metaPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rewrite cache metadata after par2 repair range-forget")
+		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rewrite cache metadata after a range-forget")
 		return
 	}
 	if err := os.Rename(tmpPath, metaPath); err != nil {
-		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rename cache metadata after par2 repair range-forget")
+		c.logger.Warn().Err(err).Str("entry", entryName).Str("file", filename).Msg("failed to rename cache metadata after a range-forget")
 		_ = os.Remove(tmpPath)
 	}
 }

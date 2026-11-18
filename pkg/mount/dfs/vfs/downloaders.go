@@ -1372,6 +1372,13 @@ func (dl *downloader) streamChunk(start, end int64) (int64, error) {
 		err = flushErr
 	}
 
+	// Mark what this stream wrote as zero-fill where the overlay records it
+	// dead or padded, before any early return: a stream that failed or was
+	// cut short may still have written a pad.
+	if len(writer.wrote) > 0 {
+		dl.dls.item.markPads(writer.wrote)
+	}
+
 	// A forget landed mid-stream and the rest of this fetch was dropped.
 	// Not a failure: dl.offset stopped at the first dropped byte, so the
 	// next pass of run() fetches from there again under a fresh generation.
@@ -1533,6 +1540,9 @@ type cacheWriter struct {
 	// is set once a write was dropped because a ForgetRange ran since.
 	gen       uint64
 	forgotten atomic.Bool
+	// wrote collects the pieces actually written (not skipped as already
+	// cached), for markPads.
+	wrote ranges.Ranges
 	// onProgress is called whenever bytes are consumed from the stream.
 	onProgress func(int)
 }
@@ -1541,7 +1551,7 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	n, skipped, err := w.item.WriteAtNoOverwriteSince(p, w.offset, w.gen)
+	n, skipped, err := w.item.writeAtNoOverwriteSince(p, w.offset, w.gen, &w.wrote)
 	if err != nil {
 		if errors.Is(err, errForgottenSinceFetch) {
 			w.forgotten.Store(true)

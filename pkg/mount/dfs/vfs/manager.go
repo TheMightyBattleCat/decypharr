@@ -353,6 +353,21 @@ func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int6
 	m.cache.forgetDiskRange(entryName, filename, off, length)
 }
 
+// ForgetPaddedRanges forgets every range of filename's cache item under
+// entryName that was marked as zero-fill when written (see
+// CacheItem.ForgetPads), and drops the marks: the live item if one is open,
+// otherwise its on-disk sidecar. Returns the bytes forgotten. No-op when
+// there is no VFS cache, no item, or no mark. Never creates a cache item.
+func (m *Manager) ForgetPaddedRanges(entryName, filename string) int64 {
+	if m.cache == nil {
+		return 0
+	}
+	if item, ok := m.cache.PeekItem(entryName, filename); ok {
+		return item.ForgetPads()
+	}
+	return m.cache.forgetDiskPads(entryName, filename)
+}
+
 // CacheCoverage returns filename's cache coverage under entryName: cached
 // bytes against the file's total declared size, plus the item's last write
 // time (modTime). Tries the live in-memory item first (Cache.PeekItem /

@@ -219,6 +219,16 @@ func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int6
 	m.vfs.ForgetCachedRange(entryName, filename, off, length)
 }
 
+// ForgetPaddedRanges forgets the ranges of filename's cache item under
+// entryName that were marked as zero-fill when written - see
+// vfs.Manager.ForgetPaddedRanges. No-op when there is no VFS mount.
+func (m *Manager) ForgetPaddedRanges(entryName, filename string) int64 {
+	if m.vfs == nil {
+		return 0
+	}
+	return m.vfs.ForgetPaddedRanges(entryName, filename)
+}
+
 // CacheCoverage returns filename's cache coverage under entryName - cached
 // bytes against the file's total declared size, plus its last write time -
 // see vfs.Manager.CacheCoverage. ok=false means there is nothing to report

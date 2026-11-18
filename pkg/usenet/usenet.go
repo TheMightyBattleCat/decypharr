@@ -1324,6 +1324,16 @@ func (u *Usenet) SetOverlayViewerPadNotifier(fn func(nzoID, file string)) {
 	u.overlay.SetViewerPadNotifier(fn)
 }
 
+// SetOverlayDamageClearedNotifier installs the callback told which
+// non-patched records an overlay delete or clear removed - see
+// overlay.Store.SetDamageClearedNotifier.
+func (u *Usenet) SetOverlayDamageClearedNotifier(fn func(nzoID string, removed map[string][]overlay.DeadSegment)) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetDamageClearedNotifier(fn)
+}
+
 // overlayPolicyFromConfig derives the overlay padding-cap Policy from repair
 // config - already clamped by config's load/save path (see
 // RepairConfig.PadMaxRunSegments and friends), so this is a plain field copy.
