@@ -113,11 +113,13 @@ func (f *p2eFile) cutSized(all map[string]*p2eArticle, size int) {
 
 // p2eSet is one PAR2 recovery set of a fixture: the set's base name, the
 // indexes into p2eFixture.posted of the files it protects, and its
-// redundancy in percent (0 means 20).
+// redundancy in percent (0 means 20). args, when set, replaces the
+// default slice-size, redundancy and file-count options of par2 create.
 type p2eSet struct {
 	base       string
 	files      []int
 	redundancy int
+	args       []string
 }
 
 // p2eTestdata holds the default set (p2eDefaultSet) as par2cmdline 1.2.0
@@ -167,7 +169,11 @@ func buildP2eFixture(dir, par2Bin string, sets ...p2eSet) (*p2eFixture, error) {
 		if redundancy == 0 {
 			redundancy = 20
 		}
-		args := []string{"create", "-q", "-s16384", fmt.Sprintf("-r%d", redundancy), "-n3", set.base + ".par2"}
+		opts := []string{"-s16384", fmt.Sprintf("-r%d", redundancy), "-n3"}
+		if len(set.args) > 0 {
+			opts = set.args
+		}
+		args := append(append([]string{"create", "-q"}, opts...), set.base+".par2")
 		for _, i := range set.files {
 			args = append(args, fx.posted[i].name)
 		}

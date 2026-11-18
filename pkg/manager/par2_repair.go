@@ -2817,6 +2817,10 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// gate counts them.
 	var searchHeld int
 	if earlyIdx != nil {
+		// The index gives the slice size: count an obfuscated posting's
+		// volumes by it, not by the census's size steps.
+		vols = recountSizedVolumes(vols, nzb.Par2Files, earlyIdx.SliceSize)
+		available = par2VolumeSlices(vols)
 		volNames := make(map[string]bool, len(vols))
 		for _, v := range vols {
 			volNames[v.ref.Name] = true
@@ -2877,7 +2881,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// the volumes just fetched may belong to another: an index that did not
 	// fetch, or a set posted with no index file. Choose again now that every
 	// fetched file's set is visible.
-	rechosen := false
 	if par2Set == ([16]byte{}) {
 		if err := searchUnseenSet(); err != nil {
 			return err
@@ -2887,7 +2890,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 				return err
 			}
 			nextVolIdx = next
-			rechosen = par2Set != ([16]byte{})
 		}
 	}
 
@@ -2895,11 +2897,21 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	if err != nil {
 		return par2IndexFetchTransient(par2IndexParseErr(err), indexFetchErr)
 	}
-	// applySetChoice counted only the chosen set's named volumes. As at the
-	// early gate, recovery slices already in hand (from files with no volume
-	// marker) are available too.
-	if rechosen && uint32(len(idx.Recovery)) > available {
-		available = uint32(len(idx.Recovery))
+	// With no early index, this is the first slice size seen: count an
+	// obfuscated posting's volumes by it (see recountSizedVolumes).
+	// available is still the volumes' count here: only the early index adds
+	// slices from index files.
+	if earlyIdx == nil {
+		vols = recountSizedVolumes(vols, nzb.Par2Files, idx.SliceSize)
+		available = par2VolumeSlices(vols)
+	}
+	// The slices parsed are a floor on what the posting holds. The volumes'
+	// counts are estimates - an obfuscated posting's from sizes, and after
+	// applySetChoice only the chosen set's volumes, not the recovery slices
+	// in hand from files with no volume marker - and a low one ended a
+	// repairable pass terminal at the round gate.
+	if n := uint32(len(idx.Recovery)); n > available {
+		available = n
 	}
 
 	// No usable recovery slices - either every volume 430'd (fetchMoreVolumes'
@@ -4543,6 +4555,10 @@ type par2Volume struct {
 	ref   storage.Par2FileRef
 	start uint32
 	count uint32
+	// sized: count was estimated from file sizes alone (an obfuscated
+	// posting, see censusUnnamedVolumes), so recountSizedVolumes may raise
+	// it once a parsed index gives the slice size.
+	sized bool
 }
 
 // censusPar2Volumes splits files into recovery volumes (name-parsed for
@@ -4603,10 +4619,55 @@ func censusUnnamedVolumes(indexFiles []storage.Par2FileRef) ([]par2Volume, []sto
 		if n > int64(^uint32(0)) {
 			n = int64(^uint32(0))
 		}
-		vols = append(vols, par2Volume{ref: f, count: uint32(n)})
+		vols = append(vols, par2Volume{ref: f, count: uint32(n), sized: true})
 	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].ref.Size < vols[j].ref.Size })
 	return vols, kept
+}
+
+// recountSizedVolumes re-estimates the slice count of every volume
+// censusUnnamedVolumes counted from sizes, now that a parsed index gives the
+// slice size: (size - index size) / (slice size + packet overhead). The
+// census counts in steps of the smallest size difference, so equal-size
+// volumes (par2cmdline -n/-u, most posters) are each one step and one slice
+// (a 4.6 MB volume of 16 KiB slices holds 280), and the early capacity gate
+// declined a repair the posting holds plenty of recovery for. Every volume
+// repeats the index's metadata at least once, so the new count is at least
+// the real one, as the census's is meant to be; a count is only ever
+// raised. vols is copied before a change. Named volumes are untouched.
+func recountSizedVolumes(vols []par2Volume, files []storage.Par2FileRef, sliceSize int64) []par2Volume {
+	if sliceSize <= 0 {
+		return vols
+	}
+	base, _ := unnamedRecoveryGeometry(files)
+	copied := false
+	for i, v := range vols {
+		if !v.sized || v.ref.Size <= base {
+			continue
+		}
+		n := (v.ref.Size - base) / (sliceSize + par2RecoveryPacketOverhead)
+		if n > int64(^uint32(0)) {
+			n = int64(^uint32(0))
+		}
+		if uint32(n) <= v.count {
+			continue
+		}
+		if !copied {
+			vols = append([]par2Volume(nil), vols...)
+			copied = true
+		}
+		vols[i].count = uint32(n)
+	}
+	return vols
+}
+
+// par2VolumeSlices is the slices vols are counted at, saturating.
+func par2VolumeSlices(vols []par2Volume) uint32 {
+	var n uint64
+	for _, v := range vols {
+		n += uint64(v.count)
+	}
+	return uint32(min(n, uint64(^uint32(0))))
 }
 
 // censusNamedPar2Volumes is censusPar2Volumes without the size-based split
