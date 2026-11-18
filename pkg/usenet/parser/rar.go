@@ -594,8 +594,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		}
 		entries = append(entries, volEntry{idx: r.index, num: num, hasNum: hasNum})
 	}
-	volumeOrder := p.resolveVolumeOrderFor(entries, len(results), version == RARVersion5)
-	orderKnown := orderEstablished(entries, len(results))
+	volumeOrder, orderKnown := p.resolveVolumeOrderKnown(entries, len(results), version == RARVersion5)
 
 	// Sort results by index to maintain NZB/upload order and collect files.
 	// (Internal coordinate systems — baseSegments, volumeOffsetMap — are built
@@ -695,6 +694,27 @@ type volEntry struct {
 // archive that currently assembles.
 func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []int {
 	return p.resolveVolumeOrderFor(entries, totalVolumes, true)
+}
+
+// resolveVolumeOrderKnown is resolveVolumeOrderFor plus whether the order is
+// established (verified at import). A RAR4 number inferred for a volume whose
+// tail could not be read is a guess: a set missing a volume from the NZB looks
+// the same as a set with one unread tail, so the inferred placement is kept
+// but the order is not reported established, and the sweep's volume-order
+// check reads the volumes. RAR5's unnumbered volume is the first by format,
+// so it does not count as a guess.
+func (p *RARParser) resolveVolumeOrderKnown(entries []volEntry, totalVolumes int, unnumberedIsFirst bool) ([]int, bool) {
+	inferred := false
+	if !unnumberedIsFirst {
+		for _, e := range entries {
+			if !e.hasNum {
+				inferred = true
+				break
+			}
+		}
+	}
+	order := p.resolveVolumeOrderFor(entries, totalVolumes, unnumberedIsFirst)
+	return order, !inferred && orderEstablished(entries, totalVolumes)
 }
 
 // resolveVolumeOrderFor is resolveVolumeOrder with the meaning of an
