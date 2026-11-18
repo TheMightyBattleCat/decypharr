@@ -862,13 +862,26 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 	// short-circuiting on a stale cause.
 	u.ClearFailedFile(entry.InfoHash, req.File)
 	if removed {
-		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
+		if freed, ok := removeReclaimedEntryCache(s.manager.Repair(), entry); ok {
 			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed file")
 		} else {
 			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("overlay reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
 		}
 	}
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
+}
+
+// entryCacheRemover frees an entry's DFS cache (manager.Repair).
+type entryCacheRemover interface {
+	RemoveEntryCache(entry *storage.Entry) (int64, bool)
+}
+
+// removeReclaimedEntryCache frees the cached copy of a reclaimed entry's
+// files. It goes through RemoveEntryCache, not RemoveEntryCacheDir, so a
+// season split (which has no cache folder of its own) evicts its files from
+// the parent's folder instead of freeing nothing.
+func removeReclaimedEntryCache(r entryCacheRemover, entry *storage.Entry) (int64, bool) {
+	return r.RemoveEntryCache(entry)
 }
 
 // reclaimOverlayByNzbID deletes an overlay record addressed directly by the
@@ -918,7 +931,7 @@ func (s *Server) reclaimOverlayByNzbID(w http.ResponseWriter, nzbID, file string
 	// comes from the nzbID's own entry. If GetEntry fails the entry is gone
 	// entirely and its cache dir was torn down with it; nothing to evict.
 	if entry, gerr := s.manager.GetEntry(nzbID); gerr == nil && entry != nil {
-		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
+		if freed, ok := removeReclaimedEntryCache(s.manager.Repair(), entry); ok {
 			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed superseded overlay record")
 		} else {
 			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Msg("superseded overlay record reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
