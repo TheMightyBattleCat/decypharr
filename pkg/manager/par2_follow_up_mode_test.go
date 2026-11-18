@@ -60,3 +60,40 @@ func TestFollowUpsObeyPar2RepairMode(t *testing.T) {
 		}
 	}
 }
+
+// With PAR2 repair switched off, a pass that was already running may still
+// finish and ask for a follow-up. Neither follow-up queues anything or leaves
+// a claim behind: switching repair off stops further automatic passes.
+func TestFollowUpsRefusedWhenPar2RepairOff(t *testing.T) {
+	followUps := map[string]func(p *Par2Repair){
+		"deferred sets": func(p *Par2Repair) {
+			p.followUpDeferredSets("x", "Some Release", 50, 0)
+		},
+		"merged requests": func(p *Par2Repair) {
+			p.pendingDamage = func(string) (int, error) { return 50, nil }
+			p.followUpMerged("x", "Some Release", 2, 0)
+		},
+	}
+	for name, run := range followUps {
+		t.Run(name, func(t *testing.T) {
+			p, repair := newTestPar2Repair(t)
+			cfg := config.Get()
+			prevMode, prevOn := cfg.Repair.Par2RepairMode, cfg.Repair.Par2Repair
+			t.Cleanup(func() {
+				cfg.Repair.Par2RepairMode, cfg.Repair.Par2Repair = prevMode, prevOn
+			})
+			off := false
+			cfg.Repair.Par2RepairMode = config.Par2RepairModeAutoAll
+			cfg.Repair.Par2Repair = &off
+
+			run(p)
+
+			if urgentWaiting(p, "x") {
+				t.Fatal("follow-up queued while PAR2 repair is off")
+			}
+			if _, _, claimed := repair.handlers.State("x"); claimed {
+				t.Fatal("handler claim held while PAR2 repair is off")
+			}
+		})
+	}
+}

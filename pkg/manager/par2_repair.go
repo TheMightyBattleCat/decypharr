@@ -733,9 +733,14 @@ func (p *Par2Repair) followUpDeferredSets(nzbID, entryName string, deferred int,
 // follow-up is an automatic pass too, even after a manual "repair now". In
 // manual mode it is never queued, and under the threshold mode only when
 // deadSegments reaches Par2RepairMinSegments or the release is being
-// streamed (see autoEnqueueAllowed).
+// streamed (see autoEnqueueAllowed). With PAR2 repair switched off nothing
+// is queued: a pass that was running when it was switched off must not
+// chain another.
 func (p *Par2Repair) followUpAllowed(nzbID string, deadSegments int) bool {
 	cfg := config.Get().Repair
+	if !cfg.Par2RepairEnabled() {
+		return false
+	}
 	return autoEnqueueAllowed(cfg.Par2RepairMode, cfg.Par2RepairMinSegments, deadSegments, p.manager.Streaming(nzbID, ""))
 }
 
