@@ -23,6 +23,10 @@ type repairHandlerState struct {
 	kind     repairHandlerKind
 	since    time.Time
 	terminal bool
+	// waiting marks a "repair now" claim whose pass is still waiting for a
+	// manual slot (PinPar2Waiting): the stale-claim reap skips it, since the
+	// wait has no bound of its own. Replacing the entry clears it.
+	waiting bool
 }
 
 // defaultRepairHandlerTTL bounds how long a claimed (non-terminal) handler
@@ -70,7 +74,7 @@ func newRepairHandlerRegistry(ttl time.Duration) *repairHandlerRegistry {
 // manual, explicit action) removes one. Caller must hold reg.mu.
 func (reg *repairHandlerRegistry) reapIfStaleLocked(nzbID string) {
 	e, ok := reg.entries[nzbID]
-	if !ok || e.terminal {
+	if !ok || e.terminal || e.waiting {
 		return
 	}
 	if reg.ttl <= 0 {
@@ -128,6 +132,21 @@ func (reg *repairHandlerRegistry) EnsurePar2Running(nzbID string) {
 		return
 	}
 	reg.entries[nzbID] = &repairHandlerState{kind: handlerPar2Running, since: reg.nowFn()}
+}
+
+// PinPar2Waiting keeps nzbID's live PAR2 claim from being reaped as stale
+// while its "repair now" pass waits for a manual slot. EnsurePar2Running
+// (once the slot is taken) replaces the entry and so ends the pin;
+// ReleasePar2 drops it. A no-op unless nzbID holds a non-terminal PAR2 claim.
+func (reg *repairHandlerRegistry) PinPar2Waiting(nzbID string) {
+	if nzbID == "" {
+		return
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if e, ok := reg.entries[nzbID]; ok && !e.terminal && isPar2Claim(e.kind) {
+		e.waiting = true
+	}
 }
 
 // ReleasePar2 clears nzbID's claim only if it is a PAR2 claim: a pass that
@@ -363,7 +382,7 @@ func (reg *repairHandlerRegistry) ReapStale() int {
 	now := reg.nowFn()
 	reaped := 0
 	for id, e := range reg.entries {
-		if e.terminal {
+		if e.terminal || e.waiting {
 			continue
 		}
 		if now.Sub(e.since) >= reg.ttl {

@@ -211,7 +211,7 @@ func (p *Par2Repair) runNowAndWait(ctx context.Context, nzbID string) bool {
 	}
 	prior, _ := p.Progress(nzbID)
 	priorStart := prior.StartedAt
-	if err := p.runNow(nzbID, true); err != nil {
+	if _, err := p.runNow(nzbID, true); err != nil {
 		if !p.IsRunning(nzbID) && !p.IsQueued(nzbID) {
 			return false
 		}

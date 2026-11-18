@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,5 +150,73 @@ func TestPar2CancelEntryDropsWaitingRunNow(t *testing.T) {
 	}
 	if _, _, exists := h.repair.handlers.State(third); exists {
 		t.Fatalf("deleted entry's waiting request kept its claim")
+	}
+}
+
+// A "repair now" request that waits for a slot longer than the running
+// claim's TTL still holds its claim: a re-grab can't take the entry from
+// under it while it waits, and the pass starts holding the claim.
+func TestPar2WaitingRunNowClaimOutlivesTTL(t *testing.T) {
+	ids := []string{"p2e-ttl-a", "p2e-ttl-b", "p2e-ttl-c"}
+	h := newManualSlotsHarness(t, ids...)
+	p := h.p
+	var offset atomic.Int64
+	h.repair.handlers.nowFn = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+
+	for _, id := range ids[:2] {
+		if err := p.RunNow(id); err != nil {
+			t.Fatalf("RunNow(%s): %v", id, err)
+		}
+	}
+	waitManual(t, "the first two passes to run", func() bool { return manualRunning(p, ids[:2]) == 2 })
+	third := ids[2]
+	if err := p.RunNow(third); err != nil {
+		t.Fatalf("RunNow(%s): %v", third, err)
+	}
+
+	// The wait outlasts the claim's TTL.
+	offset.Store(int64(par2RunningClaimTTL + time.Hour))
+	if release, ok := h.repair.handlers.TryAcquireRegrab(third); ok {
+		release()
+		t.Fatalf("a re-grab took the entry while its repair-now request waited past the claim TTL")
+	}
+	if kind, _, exists := h.repair.handlers.State(third); !exists || kind != handlerPar2Running {
+		t.Fatalf("waiting request's claim after the TTL = (%q, exists=%v), want par2_running held", kind, exists)
+	}
+
+	p.runningMu.Lock()
+	p.running[ids[0]].cancel()
+	p.runningMu.Unlock()
+	waitManual(t, "the waiting request to start once a slot freed", func() bool { return p.IsRunning(third) })
+	if kind, _, exists := h.repair.handlers.State(third); !exists || kind != handlerPar2Running {
+		t.Fatalf("started pass's claim = (%q, exists=%v), want par2_running", kind, exists)
+	}
+	if _, ok := h.repair.handlers.TryAcquireRegrab(third); ok {
+		t.Fatalf("a re-grab took the entry from the started pass")
+	}
+}
+
+// RunNowStatus reports a request that has to wait for a slot as waiting,
+// and one that starts at once as not waiting.
+func TestPar2RunNowStatusReportsWaiting(t *testing.T) {
+	ids := []string{"p2e-st-a", "p2e-st-b", "p2e-st-c"}
+	h := newManualSlotsHarness(t, ids...)
+	p := h.p
+
+	for _, id := range ids[:2] {
+		waiting, err := p.RunNowStatus(id)
+		if err != nil {
+			t.Fatalf("RunNowStatus(%s): %v", id, err)
+		}
+		if waiting {
+			t.Fatalf("RunNowStatus(%s) = waiting with a slot free", id)
+		}
+	}
+	waiting, err := p.RunNowStatus(ids[2])
+	if err != nil {
+		t.Fatalf("RunNowStatus(%s): %v", ids[2], err)
+	}
+	if !waiting {
+		t.Fatalf("RunNowStatus(%s) = not waiting with both slots taken", ids[2])
 	}
 }

@@ -911,21 +911,29 @@ func (p *Par2Repair) enqueue(nzbID string) {
 // PAR2 repair is disabled outright, or if a pass for this nzbID is already
 // queued/deferred/running.
 func (p *Par2Repair) RunNow(nzbID string) error {
+	_, err := p.runNow(nzbID, false)
+	return err
+}
+
+// RunNowStatus is RunNow, also reporting whether the request has to wait
+// for a manual slot (both are taken) rather than starting at once.
+func (p *Par2Repair) RunNowStatus(nzbID string) (waiting bool, err error) {
 	return p.runNow(nzbID, false)
 }
 
 // runNow is RunNow. fromSweep marks a pass the repair sweep started (see
 // runNowAndWait): that pass queues no follow-up for damage it leaves to
 // another PAR2 set, since the sweep re-grabs what the pass did not repair.
-func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
+// waiting reports that no manual slot was free when the request was taken.
+func (p *Par2Repair) runNow(nzbID string, fromSweep bool) (waiting bool, err error) {
 	if p == nil || nzbID == "" {
-		return fmt.Errorf("nzbID is required")
+		return false, fmt.Errorf("nzbID is required")
 	}
 	if !config.Get().Repair.Par2RepairEnabled() {
-		return fmt.Errorf("par2 repair is disabled")
+		return false, fmt.Errorf("par2 repair is disabled")
 	}
 	if p.IsRunning(nzbID) {
-		return fmt.Errorf("par2 repair already running for this entry")
+		return false, fmt.Errorf("par2 repair already running for this entry")
 	}
 	// An URGENT job waiting for this nzbID would run a second pass after
 	// ours, and its handler claim would be clobbered by the Set below.
@@ -933,7 +941,7 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 	_, urgentQueued := p.urgentSet[nzbID]
 	p.urgentMu.Unlock()
 	if urgentQueued {
-		return fmt.Errorf("par2 repair already queued for this entry")
+		return false, fmt.Errorf("par2 repair already queued for this entry")
 	}
 
 	p.mu.Lock()
@@ -941,7 +949,7 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 	_, dupDeferred := p.deferred[nzbID]
 	if dupQueued || dupDeferred {
 		p.mu.Unlock()
-		return fmt.Errorf("par2 repair already queued for this entry")
+		return false, fmt.Errorf("par2 repair already queued for this entry")
 	}
 	p.queued[nzbID] = struct{}{}
 	p.mu.Unlock()
@@ -957,7 +965,7 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 			p.mu.Lock()
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
-			return fmt.Errorf("a re-grab is handling this entry")
+			return false, fmt.Errorf("a re-grab is handling this entry")
 		}
 	}
 
@@ -973,6 +981,21 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 	p.manualWaiting[nzbID] = cancelled
 	p.mu.Unlock()
 
+	// Take a free slot here, so the caller learns whether the pass starts
+	// now or waits. A waiting request's claim is pinned: its timestamp is
+	// this call's, and the wait has no bound, so the stale-claim reap could
+	// otherwise drop it and let a re-grab take the entry before the pass
+	// starts.
+	held := false
+	select {
+	case slots <- struct{}{}:
+		held = true
+	default:
+		if p.repair != nil && p.repair.handlers != nil {
+			p.repair.handlers.PinPar2Waiting(nzbID)
+		}
+	}
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -984,7 +1007,7 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 			}
 			p.mu.Unlock()
 		}()
-		if !p.waitForManualSlot(nzbID, slots, cancelled) {
+		if !p.waitForManualSlot(nzbID, slots, cancelled, held) {
 			// Deleted or shutting down while it waited: no pass runs, so
 			// nothing else frees the claim taken above.
 			if p.repair != nil && p.repair.handlers != nil {
@@ -993,25 +1016,33 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) error {
 			return
 		}
 		defer func() { <-slots }()
+		if !held && p.repair != nil && p.repair.handlers != nil {
+			// Ends the pin, and restarts the claim's TTL from the pass's
+			// start, as an immediate request's claim effectively does.
+			p.repair.handlers.EnsurePar2Running(nzbID)
+		}
 		p.runPass(nzbID, laneBatch, fromSweep)
 	}()
-	return nil
+	return !held, nil
 }
 
 // waitForManualSlot takes one of the slots RunNow's passes share, waiting
-// for one to free. It returns false, holding no slot, if cancelled is closed
-// (CancelEntry: the entry is being deleted) or the worker stops first.
-func (p *Par2Repair) waitForManualSlot(nzbID string, slots, cancelled chan struct{}) bool {
+// for one to free (held: runNow already took it). It returns false, holding
+// no slot, if cancelled is closed (CancelEntry: the entry is being deleted)
+// or the worker stops first.
+func (p *Par2Repair) waitForManualSlot(nzbID string, slots, cancelled chan struct{}, held bool) bool {
 	var stop <-chan struct{}
 	if p.ctx != nil {
 		stop = p.ctx.Done()
 	}
-	select {
-	case slots <- struct{}{}:
-	case <-cancelled:
-		return false
-	case <-stop:
-		return false
+	if !held {
+		select {
+		case slots <- struct{}{}:
+		case <-cancelled:
+			return false
+		case <-stop:
+			return false
+		}
 	}
 	// select picks at random when a slot and a cancel are both ready.
 	select {

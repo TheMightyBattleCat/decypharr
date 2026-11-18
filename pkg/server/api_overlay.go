@@ -646,11 +646,22 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	if err := par2Repair.RunNow(entry.InfoHash); err != nil {
+	waiting, err := par2Repair.RunNowStatus(entry.InfoHash)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	utils.JSONResponse(w, map[string]string{"status": "queued"}, http.StatusOK)
+	utils.JSONResponse(w, map[string]string{"status": overlayRepairNowStatus(waiting)}, http.StatusOK)
+}
+
+// overlayRepairNowStatus is repair-now's reply status: "waiting" when both
+// manual slots are taken and the pass waits for one, "queued" when it starts
+// at once (the value the GUI has always been sent for that case).
+func overlayRepairNowStatus(waiting bool) string {
+	if waiting {
+		return "waiting"
+	}
+	return "queued"
 }
 
 // par2RefsBackfillEligible reports whether nzbID was rejected by
