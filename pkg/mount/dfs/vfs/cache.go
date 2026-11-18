@@ -1193,6 +1193,14 @@ type CacheItem struct {
 	metaMu sync.RWMutex
 	dlMu   sync.Mutex
 
+	// forgetMu keeps ForgetRange out of a WriteAtNoOverwrite in flight.
+	// The write reads the tracker, writes the buffer and inserts the range
+	// in three steps; a forget landing between them left the tracker
+	// claiming bytes the buffer had just dropped. Writers share it, a
+	// forget takes it alone. Order: forgetMu, then metaMu, then the
+	// buffer's locks; nothing under those two takes forgetMu.
+	forgetMu sync.RWMutex
+
 	metaDirty   atomic.Bool
 	metaFlushCh chan struct{}
 	metaStopCh  chan struct{}
@@ -1550,6 +1558,9 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 	writeRange := ranges.Range{Pos: off, Size: int64(len(p))}
 	n = len(p)
 
+	item.forgetMu.RLock()
+	defer item.forgetMu.RUnlock()
+
 	item.metaMu.RLock()
 	frs := item.info.Rs.FindAll(writeRange)
 	item.metaMu.RUnlock()
@@ -1596,6 +1607,10 @@ func (item *CacheItem) ForgetRange(off, length int64) {
 	if item.buf == nil || length <= 0 {
 		return
 	}
+	// Held across the tracker removal and the punch, so no write runs
+	// between them or straddles them (see forgetMu).
+	item.forgetMu.Lock()
+	defer item.forgetMu.Unlock()
 	item.metaMu.Lock()
 	item.info.Rs.Remove(ranges.Range{Pos: off, Size: length})
 	item.metaMu.Unlock()
