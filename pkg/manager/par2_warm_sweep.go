@@ -5,7 +5,11 @@
 // Recovery data and the PAR2 index itself are still fetched fresh (STAT-ed
 // alive first) - there is no cache for parity data, it doesn't correspond to
 // any file content - but that's a small, bounded cost compared to the
-// bandwidth (and Arr history churn) a full re-grab spends. Anything short of
+// bandwidth (and Arr history churn) a full re-grab spends. So is the one
+// other fetch: when two posted files share a length and the NZB has no
+// resolved PAR2 match cache, the MD5-16k tie-break fetches the first article
+// of each tied file over NNTP, once in the preflight and again in the pass.
+// "Free" means no intact data is fetched, not zero NNTP. Anything short of
 // a clean, fully-warm, fully-completed pass changes nothing: the caller's
 // existing regrab handling runs exactly as it did before this file existed.
 package manager

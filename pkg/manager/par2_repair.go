@@ -73,10 +73,6 @@ const (
 	// window (see Repair.repairWindowOpen) is reconsidered.
 	par2RetryInterval = time.Minute
 
-	// par2JobTimeout is the base bound on one NZB's whole PAR2 pass (index
-	// fetch through verification), so a stalled provider can't wedge the
-	// worker forever. par2JobTimeoutFor extends it by release size.
-	par2JobTimeout = 20 * time.Minute
 	// par2JobTimeoutMax caps par2JobTimeoutFor.
 	par2JobTimeoutMax = 4 * time.Hour
 	// par2RefusalLogInterval bounds how often AutoEnqueue logs a threshold
@@ -94,14 +90,6 @@ const (
 	// side as before. It is the old per-repair memory limit, so every repair
 	// that could run alongside another before still can.
 	defaultLargeRepairBytes = 512 << 20
-
-	// par2JobIdleTimeout cancels a repair that has made no forward progress
-	// for this long WHILE in a network phase (fetching recovery or streaming
-	// intact data). It intentionally does not apply during queued, solving
-	// (pure CPU) or writing phases, where progress timestamps do not move for
-	// legitimate reasons. Comfortably above par2ArticleFetchTimeout so a
-	// single slow-but-valid article never trips it.
-	par2JobIdleTimeout = 120 * time.Second
 
 	// md5_16kSize is the PAR2-defined sample size for tie-breaking a
 	// posted-file/FileDesc length match.
@@ -156,6 +144,27 @@ const (
 // largeRepairBytes is defaultLargeRepairBytes; a var so tests can reach the
 // gate with a small fixture.
 var largeRepairBytes int64 = defaultLargeRepairBytes
+
+// Job deadlines and the idle watchdog. Vars, not consts, only so tests can
+// run them in seconds.
+var (
+	// par2JobTimeout is the base bound on one NZB's whole PAR2 pass (index
+	// fetch through verification), so a stalled provider can't wedge the
+	// worker forever. par2JobTimeoutFor extends it by release size.
+	par2JobTimeout = 20 * time.Minute
+
+	// par2JobIdleTimeout cancels a repair that has made no forward progress
+	// for this long WHILE in a network phase (fetching recovery or streaming
+	// intact data). It intentionally does not apply during queued, solving
+	// (pure CPU) or writing phases, where progress timestamps do not move for
+	// legitimate reasons. Comfortably above par2ArticleFetchTimeout so a
+	// single slow-but-valid article never trips it.
+	par2JobIdleTimeout = 120 * time.Second
+
+	// par2IdlePollInterval is how often watchIdle checks the progress
+	// timestamp.
+	par2IdlePollInterval = 15 * time.Second
+)
 
 // par2ArticleFetchTimeout bounds a single article fetch within a job. A
 // variable only so tests can shorten it.
@@ -6882,8 +6891,7 @@ func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, p
 	if progress == nil {
 		return
 	}
-	const pollInterval = 15 * time.Second
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(par2IdlePollInterval)
 	defer ticker.Stop()
 	for {
 		select {
