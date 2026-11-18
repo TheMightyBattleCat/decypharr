@@ -175,6 +175,29 @@ func TestP2EPar2EndToEnd(t *testing.T) {
 			deadNotFound(h)
 			h.srv.set(f2.ids[3], p2eStall)
 		}},
+		// One intact article's own fetch timeout while the job is live is a
+		// round cut short, not a cancelled job: the dead slice found before
+		// it (a STAT-lie, so only the read finds it) is folded in and the
+		// pass goes round again, where the article answers.
+		{name: "S7b_intact_stall_cut_round_retried", want: p2eCompleted(2), slow: true, dead: func() []p2eSeg { return []p2eSeg{{f1, 1}} }, setup: func(h *p2eHarness) {
+			deadNotFound(h)
+			h.srv.set(f2.ids[2], p2eStatLie)
+			h.srv.set(f2.ids[3], p2eStall)
+		}, during: func(h *p2eHarness) func(done <-chan struct{}) {
+			return func(done <-chan struct{}) {
+				for h.srv.bodyStalled.Load() == 0 {
+					select {
+					case <-done:
+						h.notes = append(h.notes, "stall hook never fired (no BODY stalled)")
+						return
+					case <-time.After(2 * time.Millisecond):
+					}
+				}
+				// The stalled BODY stays unanswered; later asks are served.
+				h.srv.set(f2.ids[3], p2eOK)
+				h.notes = append(h.notes, "f2#3 answers from now on")
+			}
+		}},
 		{name: "S8_recovery_stall", want: p2eFailed("transient"), slow: true, dead: s0, setup: func(h *p2eHarness) {
 			deadNotFound(h)
 			h.srv.set(vol("vol00+").ids[1], p2eStall)

@@ -3368,7 +3368,14 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		// dead. Bail out with the raw error so the backoff classifier sees
 		// context.Canceled/DeadlineExceeded (absent from par2TerminalSubstrings)
 		// and reschedules instead of marking the entry unrepairable.
-		if errors.Is(repairErr, context.Canceled) || errors.Is(repairErr, context.DeadlineExceeded) {
+		//
+		// Only when the job's own ctx has ended: one article's fetch runs
+		// under its own par2ArticleFetchTimeout (see fetchSegment), and a
+		// stalled article comes back wrapping context.DeadlineExceeded
+		// while the job is still live. That is a round cut short by a
+		// transport error, counted by par2FailedRounds below like any
+		// other timeout.
+		if ctx.Err() != nil && (errors.Is(repairErr, context.Canceled) || errors.Is(repairErr, context.DeadlineExceeded)) {
 			p.logger.Warn().
 				Str("entry", entryName).
 				Int("round", round+1).
@@ -3735,8 +3742,9 @@ func (r *par2FailedRounds) end(repairErr error) (round int, cut bool) {
 // 430, a short decode or a corrupt copy, which RepairWith streams past), not
 // a checksum abort, and not one of runRepair's own classed errors (a missing
 // fetcher, a recovered panic). In practice that is a provider timeout or a
-// dropped connection. Cancelled contexts never get here: the round loop
-// returns them first.
+// dropped connection, or one article's own fetch timeout expiring while the
+// job is live. A cancelled job never gets here: the round loop returns it
+// first.
 func par2RoundCutShort(repairErr error) bool {
 	if repairErr == nil || errors.Is(repairErr, par2.ErrSliceUnavailable) || errors.Is(repairErr, par2.ErrChecksumMismatch) {
 		return false
