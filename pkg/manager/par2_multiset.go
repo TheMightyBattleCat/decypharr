@@ -238,6 +238,12 @@ func par2DamageInUnseenSet(ctx context.Context, sources []par2.Source, posted []
 // A one-set release whose damage is in a file the set does not protect has
 // no such volume, and fetches nothing.
 //
+// *gone counts the volumes in a row that were gone (430) across every call
+// of one pass, as fetchMoreVolumes does within one call: at
+// par2RecoveryMaxConsecutiveNotFound the search stops, so a set whose
+// volumes are all gone is not tried one volume at a time. A volume that
+// fetches or fails without a 430 starts the count again.
+//
 // The volume fetched is moved to vols[nextVolIdx] first, the rest keeping
 // their order, so the volumes tried stay the prefix vols[:next] that
 // par2SetAfterVolumes expects. vols is copied before the first move.
@@ -254,6 +260,7 @@ func fetchVolumesForUnseenSet(
 	entryName string,
 	maxConc int,
 	progress *par2JobProgressState,
+	gone *int,
 ) (outVols []par2Volume, next int, outSources []par2.Source, unseen bool, err error) {
 	copied := false
 	for {
@@ -262,6 +269,9 @@ func fetchVolumesForUnseenSet(
 		}
 		if !par2DamageInUnseenSet(ctx, sources, posted, pending) {
 			return vols, nextVolIdx, sources, false, nil
+		}
+		if *gone >= par2RecoveryMaxConsecutiveNotFound {
+			return vols, nextVolIdx, sources, true, nil
 		}
 		known := make(map[string]bool, len(sources))
 		for _, s := range sources {
@@ -286,9 +296,15 @@ func fetchVolumesForUnseenSet(
 		vols[nextVolIdx] = v
 		logger.Info().Str("entry", entryName).Str("volume", v.ref.Name).
 			Msg("par2: a damaged file is in no recovery set fetched so far, fetching a volume of another set")
-		nextVolIdx, _, sources, _, err = fetchMoreVolumes(ctx, logger, fetch, vols[:nextVolIdx+1], nextVolIdx, 1, 0, sources, entryName, maxConc)
+		var notFound int
+		nextVolIdx, _, sources, _, notFound, err = fetchVolumeBatch(ctx, logger, fetch, vols[:nextVolIdx+1], nextVolIdx, 1, 0, sources, entryName, maxConc)
 		if err != nil {
 			return vols, nextVolIdx, sources, true, par2Failf(par2Transient, "fetch recovery volumes: %w", err)
+		}
+		if notFound > 0 {
+			*gone++
+		} else {
+			*gone = 0
 		}
 		if progress != nil {
 			progress.SetRecoveryVolsFetched(nextVolIdx)

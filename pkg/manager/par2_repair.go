@@ -88,12 +88,12 @@ const (
 	par2JobPassFloor = 4 << 20 // bytes per second
 	par2JobPasses    = 3
 
-	// largeRepairBytes is the accumulator size (damaged slices x slice size)
+	// defaultLargeRepairBytes is the accumulator size (damaged slices x slice size)
 	// above which a repair counts as large. Large repairs run one at a time
 	// across every lane (see waitForLargeRepair); smaller ones run side by
 	// side as before. It is the old per-repair memory limit, so every repair
 	// that could run alongside another before still can.
-	largeRepairBytes = 512 << 20
+	defaultLargeRepairBytes = 512 << 20
 
 	// par2JobIdleTimeout cancels a repair that has made no forward progress
 	// for this long WHILE in a network phase (fetching recovery or streaming
@@ -152,6 +152,10 @@ const (
 	// watchdog ignores, so this ceiling is the only bound that applies.
 	par2PostedStatTimeout = 5 * time.Minute
 )
+
+// largeRepairBytes is defaultLargeRepairBytes; a var so tests can reach the
+// gate with a small fixture.
+var largeRepairBytes int64 = defaultLargeRepairBytes
 
 // par2ArticleFetchTimeout bounds a single article fetch within a job. A
 // variable only so tests can shorten it.
@@ -2742,12 +2746,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// every set and does not narrow the volumes to a set seen so far.
 	// nextVolIdx counts the volumes tried, which stay vols[:nextVolIdx].
 	var nextVolIdx int
+	var searchGone int // volumes in a row the search found gone (430)
 	searchUnseenSet := func() error {
 		before := transportFails.Load()
 		var unseen bool
 		var err error
 		vols, nextVolIdx, sources, unseen, err = fetchVolumesForUnseenSet(ctx, p.logger, fetch, vols, nextVolIdx, sources,
-			nzb.Par2Source, pending, entryName, u.ProcessingMaxConnections(), progress)
+			nzb.Par2Source, pending, entryName, u.ProcessingMaxConnections(), progress, &searchGone)
 		if err != nil {
 			return err
 		}
@@ -2792,9 +2797,23 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// volumes under par2UnnamedVolumeFloor stay index files, see
 	// censusUnnamedVolumes): they are already here, and in no file of vols.
 	// Add them, or "no PAR2 recovery volumes retained" goes terminal on data
-	// in hand.
+	// in hand. Slices from a file of vols (a volume the set search fetched)
+	// are already in available by name: not again. They are held through
+	// the repair on top of the k slices it fetches, so the large-repair
+	// gate counts them.
+	var searchHeld int
 	if earlyIdx != nil {
-		available += uint32(len(earlyIdx.Recovery))
+		volNames := make(map[string]bool, len(vols))
+		for _, v := range vols {
+			volNames[v.ref.Name] = true
+		}
+		for _, r := range earlyIdx.Recovery {
+			if r.Source >= 0 && r.Source < len(sources) && volNames[sources[r.Source].Name] {
+				searchHeld++
+			} else {
+				available++
+			}
+		}
 	}
 	if available == 0 {
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, earlyIdx, pending, fetchPosted, cacheSource, tally,
@@ -2817,7 +2836,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			}
 			// Wait here, before the recovery fetch, so a queued large repair
 			// doesn't sit on its downloaded volumes while it waits.
-			if err := p.waitForLargeRepair(ctx, progress, entryName, earlyK, earlyIdx.SliceSize, &largeHeld); err != nil {
+			if err := p.waitForLargeRepair(ctx, progress, entryName, earlyK+searchHeld, earlyIdx.SliceSize, &largeHeld); err != nil {
 				return err
 			}
 		}
@@ -5401,6 +5420,24 @@ func fetchMoreVolumes(
 	entryName string,
 	maxConc int,
 ) (int, uint32, []par2.Source, int, error) {
+	next, slices, out, added, _, err := fetchVolumeBatch(ctx, logger, fetch, vols, nextVolIdx, needed, fetchedSlices, sources, entryName, maxConc)
+	return next, slices, out, added, err
+}
+
+// fetchVolumeBatch is fetchMoreVolumes, also returning how many of the
+// volumes tried were gone (430).
+func fetchVolumeBatch(
+	ctx context.Context,
+	logger zerolog.Logger,
+	fetch articleFetchFunc,
+	vols []par2Volume,
+	nextVolIdx int,
+	needed uint32,
+	fetchedSlices uint32,
+	sources []par2.Source,
+	entryName string,
+	maxConc int,
+) (int, uint32, []par2.Source, int, int, error) {
 	remaining := vols[nextVolIdx:]
 	var shortfall uint32
 	if needed > fetchedSlices {
@@ -5408,7 +5445,7 @@ func fetchMoreVolumes(
 	}
 	batch := computeRecoveryBatch(remaining, shortfall)
 	if len(batch) == 0 {
-		return nextVolIdx, fetchedSlices, sources, 0, nil
+		return nextVolIdx, fetchedSlices, sources, 0, 0, nil
 	}
 
 	if maxConc < 1 {
@@ -5504,9 +5541,9 @@ func fetchMoreVolumes(
 	// short for a reason that says nothing about the recovery data. Say so,
 	// or the caller's "only M recovery slices" shortfall reads as terminal.
 	if err := ctx.Err(); err != nil && fetchedSlices < needed {
-		return nextVolIdx, fetchedSlices, sources, added, err
+		return nextVolIdx, fetchedSlices, sources, added, volsNotFound, err
 	}
-	return nextVolIdx, fetchedSlices, sources, added, nil
+	return nextVolIdx, fetchedSlices, sources, added, volsNotFound, nil
 }
 
 // countPar2TransportFails wraps a PAR2 article fetch so that every failure
