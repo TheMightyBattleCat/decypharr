@@ -2,8 +2,10 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
@@ -118,5 +120,61 @@ func TestPar2MissingSliceChecksumsEverywhereIsTerminal(t *testing.T) {
 
 	if o.Class != "terminal" || !strings.Contains(o.Err, "PAR2 set has no slice checksums for 1 file(s)") {
 		t.Fatalf("pass ended %q class=%q err=%q, want terminal with the missing-checksums reason", o.LogMsg, o.Class, o.Err)
+	}
+}
+
+// Verify reads only the index file. With one file's slice checksums
+// unreadable there, it says it cannot verify instead of vouching for the
+// file against a damaged set.
+func TestPar2VerifyMissingSliceChecksumsCannotVerify(t *testing.T) {
+	servers, fx := newP2eEnv(t, 1)
+	p2eCorruptIFSC(t, servers, fx, fx.par2[0], nil)
+	h := newP2eHarness(t, servers[0], fx, "p2e-verify-missing-ifsc")
+	h.warmup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	pass, reason, err := h.p.Verify(ctx, h.nzbID, fx.posted[0].name)
+	if err != nil {
+		t.Fatalf("Verify error %v, want a cannot-verify reason", err)
+	}
+	if pass || reason != "cannot verify: PAR2 set has no slice checksums for 1 file(s)" {
+		t.Fatalf("Verify = pass %v reason %q, want not passed with the missing-checksums reason", pass, reason)
+	}
+}
+
+// The warm preflight declines when the index has no slice checksums for a
+// file: the pass would fetch volumes for them, so it is not free. No pass
+// runs; the sweep's own re-grab handles the file.
+func TestP2EPar2WarmSweepDeclinesWithMissingSliceChecksums(t *testing.T) {
+	servers, fx := newP2eEnv(t, 1)
+	var id []byte
+	for _, f := range fx.par2 {
+		id = p2eCorruptIFSC(t, servers, fx, f, id)
+	}
+	h, _ := warmHarness(t, servers[0], fx, "p2e-warm-missing-ifsc", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	passed := h.p.attemptWarmSweepRepair(ctx, h.nzbID)
+	h.p.wg.Wait()
+	if passed {
+		t.Fatalf("attemptWarmSweepRepair = true with no slice checksums for a file, want false")
+	}
+	if a, _ := h.p.manager.storage.LatestPar2RepairAttemptForNzb(h.nzbID); a != nil {
+		t.Errorf("attempt %+v recorded, want no pass run", a)
+	}
+	const stage = "PAR2 index has no slice checksums for a file"
+	found := false
+	for _, ln := range h.logs.lines() {
+		if ln["message"] == "par2 warm sweep pass declined; the sweep re-grabs" {
+			found = true
+			if ln["stage"] != stage {
+				t.Errorf("declined at stage %v, want %q", ln["stage"], stage)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no decline log line")
 	}
 }

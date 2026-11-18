@@ -162,6 +162,13 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	if err != nil {
 		return false
 	}
+	// A file's slice checksums unreadable in every index copy: the pass
+	// would fetch volumes for them before the solve (topUpSliceChecksums),
+	// so it is not provably free.
+	stage = "PAR2 index has no slice checksums for a file"
+	if len(idx.MissingChecksums()) > 0 {
+		return false
+	}
 
 	stage = "posted-file match"
 	posted := make([]par2.PostedFile, len(nzb.Par2Source))

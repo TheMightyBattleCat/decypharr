@@ -1370,6 +1370,13 @@ func (p *Par2Repair) Verify(ctx context.Context, nzbID, file string) (pass bool,
 	if err != nil {
 		return false, "", fmt.Errorf("parse par2 index: %w", err)
 	}
+	// Every copy of a file's slice checksums unreadable in the index: the
+	// set is damaged, and a pass would fetch further volumes for them first
+	// (topUpSliceChecksums). Verify reads only the index, so it says it
+	// cannot check rather than vouch for bytes against a damaged set.
+	if missing := idx.MissingChecksums(); len(missing) > 0 {
+		return false, fmt.Sprintf("cannot verify: PAR2 set has no slice checksums for %d file(s)", len(missing)), nil
+	}
 
 	postedRef := *posted
 
