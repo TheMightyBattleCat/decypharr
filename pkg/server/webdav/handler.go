@@ -2,7 +2,9 @@ package webdav
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -64,13 +66,26 @@ func (h *Handler) Routes() chi.Router {
 	// decided live per-request from config, so toggling UseAuth/EnableWebdavAuth
 	// takes effect without rebuilding the router (no restart).
 	r.Use(h.authMiddleware)
+	h.mountRoutes(r)
+	return r
+}
+
+// mountRoutes registers every WebDAV path on r. Split out of Routes so tests
+// can serve the real routes without the readiness gate.
+func (h *Handler) mountRoutes(r chi.Router) {
+	// The internal path is a static prefix, so chi matches it ahead of the
+	// {group} routes below. Its folder levels answer 404: nothing is ever
+	// listed through it.
+	internal := "/" + manager.EntryInternalFolder
+	r.HandleFunc(internal, http.NotFound)
+	r.HandleFunc(internal+"/{infohash}", http.NotFound)
+	r.HandleFunc(internal+"/{infohash}/{file}", h.handleInternalFile)
 
 	r.HandleFunc("/", h.handleRoot)
 	r.HandleFunc("/{group}", h.handleGroup)
 	r.HandleFunc("/{group}/{torrent}", h.handleTorrentFolder)
 	r.HandleFunc("/{group}/{torrent}/{file}", h.handleTorrentFile)
 	r.HandleFunc("/stream/{group}/{torrent}/{file}", h.handleTorrentFile)
-	return r
 }
 
 func (h *Handler) IsDisabled() bool {
@@ -137,6 +152,49 @@ func (h *Handler) handleTorrentFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.handler(currentInfo, nil, w, r)
+}
+
+// handleInternalFile serves webdav/__internal__/<infohash>/<file>, the path
+// our own ffprobe checks (import gate and repair sweep) read through. It finds
+// the file by the stored entry's InfoHash and the file's name, so the caller
+// never builds a folder name: a season split out of a multi-season NZB (its
+// files carry the parent's NZB ID) and a same-name grab need nothing special.
+//
+// Only the internal bearer token opens it, whatever the auth toggles say: a
+// WebDAV password is refused too. It answers GET and HEAD only, and every
+// GET is a verification read (see verificationReadContext).
+func (h *Handler) handleInternalFile(w http.ResponseWriter, r *http.Request) {
+	if !h.isInternalBearer(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	infoHash := utils.PathUnescape(chi.URLParam(r, "infohash"))
+	name := utils.PathUnescape(chi.URLParam(r, "file"))
+	entry, file, err := h.manager.InternalFile(infoHash, name)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("ETag", fmt.Sprintf("\"%x-%x\"", file.AddedOn.Unix(), file.Size))
+	w.Header().Set("Last-Modified", file.AddedOn.UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Type", utils.GetContentType(file.Name))
+	w.Header().Set("Accept-Ranges", "bytes")
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	r = r.WithContext(verificationReadContext(r.Context(), infoHash, file.Name))
+	if err := h.streamResponse(entry, file.Name, file.Size, w, r); err != nil {
+		h.writeStreamError(entry.Name, file.Name, err, w)
+	}
 }
 
 func (h *Handler) commonMiddleware(next http.Handler) http.Handler {

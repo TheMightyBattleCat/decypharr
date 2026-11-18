@@ -134,7 +134,7 @@ func TestVerifyImportFile_OutageReadFailureIsAdmitted(t *testing.T) {
 
 	f, runs := failingFFProbe(t, outageStderr, 1000)
 	d := &Downloader{logger: zerolog.Nop()}
-	ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "E", "f.mkv", "outage-hash",
+	ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "f.mkv", "outage-hash",
 		expectedRuntime{Seconds: 3600, Bytes: 4 << 30})
 	if !ok || conclusive || reason != "" {
 		t.Fatalf("got ok=%v conclusive=%v reason=%q, want admitted but unverified", ok, conclusive, reason)

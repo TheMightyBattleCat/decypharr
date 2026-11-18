@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,12 +14,12 @@ import (
 )
 
 // Once a season split out of a multi-season NZB is marked complete, the
-// repair sweep probes it at webdav/__all__/<sweep candidate name>/<file>,
-// where the name is the season's own folder (managed sweep) or the parent's
-// folder its symlinks point into (Arr sweep).
-// That URL must resolve through the same lookups the WebDAV handler makes
-// (handleTorrentFile -> GetTorrentFile, handleDownload -> GetEntryByName):
-// a 404 there would leave every split season unverifiable by the sweep.
+// repair sweep finds it under the season's own folder (managed sweep) or the
+// parent's folder its symlinks point into (Arr sweep). Either way it probes
+// webdav/__internal__/<infohash>/<file> with the hash the candidate's file
+// carries, and that must resolve through Manager.InternalFile, the lookup
+// the WebDAV handler makes: a 404 there would leave every split season
+// unverifiable by the sweep.
 func TestSweepProbe_SeasonSplitResolvesAfterImport(t *testing.T) {
 	config.Reset()
 	config.SetConfigPath(t.TempDir())
@@ -86,30 +85,28 @@ func TestSweepProbe_SeasonSplitResolvesAfterImport(t *testing.T) {
 	// (collectArrFiles), which for a split season is the parent's folder.
 	probes := map[string]string{"managed": c.name, "arr": parent.GetFolder()}
 	for kind, name := range probes {
-		// Parse the folder and file back out of the URL the sweep's ffprobe
-		// opens, as the WebDAV router's {torrent}/{file} params would be.
-		checker := &ffprobeChecker{baseURL: "http://127.0.0.1:1/webdav/"}
-		target := checker.probeTarget(name, s1.Name)
-		parts := strings.Split(strings.TrimPrefix(target, checker.baseURL+EntryAllFolder+"/"), "/")
-		if len(parts) != 2 {
-			t.Fatalf("%s: unexpected probe URL shape %q", kind, target)
+		// probeFile takes the hash from the candidate's item, as here.
+		item, err := m.GetEntryItem(name)
+		if err != nil || item == nil || item.Files[s1.Name] == nil {
+			t.Fatalf("%s: candidate %q has no item holding %s: %v", kind, name, s1.Name, err)
 		}
-		folder, _ := url.PathUnescape(parts[0])
-		file, _ := url.PathUnescape(parts[1])
+		infoHash := item.Files[s1.Name].InfoHash
 
-		info, err := m.GetTorrentFile(folder, file)
-		if err != nil || info == nil {
-			t.Fatalf("%s: sweep probe %s would 404 (handleTorrentFile): %v", kind, target, err)
+		const base = "http://127.0.0.1:1/webdav/"
+		checker := &ffprobeChecker{baseURL: base}
+		target := checker.probeTarget(infoHash, s1.Name)
+		hash, file := internalTargetParts(t, base, target)
+		for _, folder := range []string{season.GetFolder(), parent.GetFolder()} {
+			if strings.Contains(target, folder) {
+				t.Fatalf("%s: probe URL %s still names folder %q", kind, target, folder)
+			}
 		}
-		if !info.IsRemote() {
-			t.Fatalf("%s: sweep probe %s resolved to a local file, want the streamed one", kind, target)
+		entry, f, err := m.InternalFile(hash, file)
+		if err != nil {
+			t.Fatalf("%s: sweep probe %s would 404 on the internal path: %v", kind, target, err)
 		}
-		entry, err := m.GetEntryByName(info.Parent(), info.Name())
-		if err != nil || entry == nil {
-			t.Fatalf("%s: sweep probe %s would fail in handleDownload: entry=%v err=%v", kind, target, entry, err)
-		}
-		if _, ok := entry.Files[s1.Name]; !ok {
-			t.Fatalf("%s: sweep probe %s streams from entry %q, which has no %s", kind, target, entry.Name, s1.Name)
+		if entry.InfoHash != nzbID || f.Name != s1.Name {
+			t.Fatalf("%s: sweep probe %s streams entry %q file %q, want %q %q", kind, target, entry.InfoHash, f.Name, nzbID, s1.Name)
 		}
 	}
 }

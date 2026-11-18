@@ -127,11 +127,6 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		isMultiSeason, seasons = d.detectMultiSeason(torrent)
 	}
 	torrentMountPath := d.manager.GetTorrentMountPath(torrent)
-	// The folder WebDAV serves the files from. A season entry split out below
-	// is not in the main store until markAsCompleted, so its own name is not
-	// a WebDAV folder yet: its files are served from the parent's folder,
-	// the same one torrentMountPath points at.
-	servedFolder := torrent.GetFolder()
 	if isMultiSeason {
 		seasonResults := convertToMultiSeason(torrent, seasons)
 		for _, result := range seasonResults {
@@ -142,7 +137,7 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 				d.logger.Error().Err(err).Msgf("Failed to save season torrent")
 				continue
 			}
-			if err := d.process(result, torrentMountPath, servedFolder); err != nil {
+			if err := d.process(result, torrentMountPath); err != nil {
 				if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
 					return err
 				}
@@ -153,7 +148,7 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		// it leaves the downloading queue instead of getting re-processed.
 		// (It has no active files of its own by this point, so the ffprobe
 		// import gate in completeEntry is a no-op here regardless.)
-		if err := d.completeEntry(torrent, servedFolder); err != nil {
+		if err := d.completeEntry(torrent); err != nil {
 			if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
 				return err
 			}
@@ -161,26 +156,24 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		}
 		return nil
 	}
-	return d.process(torrent, torrentMountPath, servedFolder)
+	return d.process(torrent, torrentMountPath)
 }
 
-// servedFolder is the folder under webdav/__all__ the entry's files are served
-// from (see download); the ffprobe import gate opens them there.
-func (d *Downloader) process(entry *storage.Entry, mountPath, servedFolder string) error {
+func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 	switch entry.Action {
 	case config.DownloadActionDownload:
-		return d.processDownload(entry, servedFolder)
+		return d.processDownload(entry)
 	case config.DownloadActionSymlink:
-		return d.processSymlink(entry, mountPath, servedFolder)
+		return d.processSymlink(entry, mountPath)
 	case config.DownloadActionNone:
-		if err := d.completeEntry(entry, servedFolder); err != nil {
+		if err := d.completeEntry(entry); err != nil {
 			return err
 		}
 		// Remove entry from queue
 		_ = d.manager.queue.Delete(entry.InfoHash, true, nil)
 		return nil
 	default:
-		return d.processSymlink(entry, mountPath, servedFolder)
+		return d.processSymlink(entry, mountPath)
 	}
 }
 
@@ -213,7 +206,7 @@ func (d *Downloader) process(entry *storage.Entry, mountPath, servedFolder strin
 // actually reads, so it's a separate, unconditional check on the overlay
 // store's padded-segment count rather than something ffprobe's verdict can
 // stand in for.
-func (d *Downloader) completeEntry(entry *storage.Entry, servedFolder string) error {
+func (d *Downloader) completeEntry(entry *storage.Entry) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
 		// By this point processSymlink/processDownload has
 		// already created the symlink tree (or downloaded the file) and,
@@ -231,7 +224,7 @@ func (d *Downloader) completeEntry(entry *storage.Entry, servedFolder string) er
 		d.cleanupRejectedImport(entry)
 		return err
 	}
-	if err := d.ffprobeImportGate(entry, servedFolder); err != nil {
+	if err := d.ffprobeImportGate(entry); err != nil {
 		// By this point processSymlink/processDownload has
 		// already created the symlink tree (or downloaded the file) and,
 		// for symlink NZB entries, warmed the DFS cache for it. The
@@ -377,7 +370,7 @@ func (d *Downloader) importFFProbeChecker() *ffprobeChecker {
 // down the download-completion path every torrent and NZB funnels through,
 // so an unexpected bug in the gate degrades to "proceed without validation"
 // exactly like a missing binary or a timeout would.
-func (d *Downloader) ffprobeImportGate(entry *storage.Entry, servedFolder string) (err error) {
+func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			d.logger.Warn().Interface("panic", r).Str("entry", entry.Name).
@@ -409,14 +402,6 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry, servedFolder string
 		kind = arrKindFromType(a.Type)
 	}
 	expected := expectedRuntime{ArrKind: kind}
-	// Probe the folder the files are served from, not the entry's own: a
-	// season entry split out of a multi-season pack is not a WebDAV folder
-	// until markAsCompleted, so its own name 404s and the file would be
-	// judged unreadable.
-	entryFolder := servedFolder
-	if entryFolder == "" {
-		entryFolder = entry.GetFolder()
-	}
 
 	// One wall-clock budget for the whole entry: every file's verification
 	// passes and back-off waits draw from it, so a slow backing store can
@@ -434,6 +419,10 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry, servedFolder string
 		if !importChecksFile(file, largest) {
 			continue
 		}
+		// The probe opens the file by this hash (the internal WebDAV path),
+		// not by a folder name. A season split out of a multi-season pack
+		// is not stored until markAsCompleted, but its files carry the
+		// parent's NZB ID, and the parent is stored with them.
 		infoHash := file.InfoHash
 		if infoHash == "" {
 			infoHash = entry.InfoHash
@@ -443,7 +432,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry, servedFolder string
 		exp := expected
 		exp.Bytes = file.Size
 
-		ok, conclusive, reason := d.verifyImportFile(budgetCtx, checker, entry, entryFolder, file.Name, infoHash, exp)
+		ok, conclusive, reason := d.verifyImportFile(budgetCtx, checker, entry, file.Name, infoHash, exp)
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
@@ -484,7 +473,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry, servedFolder string
 // ok=false is a genuine broken verdict (caller rejects + re-grabs). ok=true
 // with conclusive=false means "admit but flag dirty": every pass ran out of
 // time and nothing was actually verified.
-func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, entryFolder, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
+func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
 	// One budget for the whole file, deliberately shared across every pass:
 	// the point is to cap what this file can cost the gate in total, so a
 	// runaway read cannot simply be repeated ffprobeImportInconclusiveRetries
@@ -504,7 +493,7 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 		// Coverage is not used here: the import gate never stamps
 		// DecodeVerifiedAt, it only keys on conclusive - which a bounded head
 		// scan of an unseekable file does set, ending the retry loop for it.
-		ok, reason, conclusive, _ = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig, budget)
+		ok, reason, conclusive, _ = checker.checkConfirmed(ctx, infoHash, fileName, exp, false, sig, budget)
 		unregisterDeadSignal(infoHash, fileName, sig)
 
 		if !ok {
@@ -658,7 +647,7 @@ func (d *Downloader) markAsError(entry *storage.Entry, err error) {
 }
 
 // processSymlink creates symlinks for torrent files
-func (d *Downloader) processSymlink(entry *storage.Entry, mountPath, servedFolder string) error {
+func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) error {
 	files := entry.GetActiveFiles()
 	torrentSymlinkPath := entry.DownloadPath()
 	d.logger.Debug().Str("mount_path", mountPath).Msgf("Creating symlinks for %d files in %s", len(files), torrentSymlinkPath)
@@ -698,7 +687,7 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath, servedFolde
 		}
 	}
 
-	return d.completeEntry(entry, servedFolder)
+	return d.completeEntry(entry)
 }
 
 func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, files []*storage.File, mountPath string, symlinkDir string) ([]string, error) {
@@ -940,16 +929,16 @@ func limitedStringSample(values []string, limit int) []string {
 // processDownload downloads all files for an entry with progress tracking
 // For torrents: uses HTTP download from debrid
 // For NZBs: uses parallel NNTP segment download
-func (d *Downloader) processDownload(entry *storage.Entry, servedFolder string) error {
+func (d *Downloader) processDownload(entry *storage.Entry) error {
 	// Check if this is a usenet entry
 	if entry.IsNZB() {
-		return d.processUsenetDownload(entry, servedFolder)
+		return d.processUsenetDownload(entry)
 	}
-	return d.processTorrentDownload(entry, servedFolder)
+	return d.processTorrentDownload(entry)
 }
 
 // processTorrentDownload downloads files from debrid via HTTP
-func (d *Downloader) processTorrentDownload(entry *storage.Entry, servedFolder string) error {
+func (d *Downloader) processTorrentDownload(entry *storage.Entry) error {
 	files := entry.GetActiveFiles()
 	d.logger.Info().Msgf("Downloading %d files...", len(files))
 
@@ -1023,7 +1012,7 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry, servedFolder s
 	if err := p.Wait(); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
-	if err := d.completeEntry(entry, servedFolder); err != nil {
+	if err := d.completeEntry(entry); err != nil {
 		return err
 	}
 	d.logger.Info().Msgf("Downloaded all files for %s", entry.Name)
@@ -1031,7 +1020,7 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry, servedFolder s
 }
 
 // processUsenetDownload downloads NZB files via parallel NNTP segment fetching
-func (d *Downloader) processUsenetDownload(entry *storage.Entry, servedFolder string) error {
+func (d *Downloader) processUsenetDownload(entry *storage.Entry) error {
 	if d.manager.usenet == nil {
 		return fmt.Errorf("usenet client not configured")
 	}
@@ -1099,7 +1088,7 @@ func (d *Downloader) processUsenetDownload(entry *storage.Entry, servedFolder st
 		return fmt.Errorf("NZB download failed: %w", err)
 	}
 
-	if err := d.completeEntry(entry, servedFolder); err != nil {
+	if err := d.completeEntry(entry); err != nil {
 		return err
 	}
 	d.logger.Info().Msgf("Downloaded all NZB files for %s", entry.Name)

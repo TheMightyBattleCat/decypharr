@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +17,12 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
-// A season entry split out of a multi-season NZB is not a WebDAV folder
-// until markAsCompleted writes it to the main store; its files are served
-// from the parent's folder. The import gate must probe them there.
-func TestFFProbeImportGate_SeasonEntryProbesParentFolder(t *testing.T) {
+// A season entry split out of a multi-season NZB is not stored until
+// markAsCompleted, and its own name is no WebDAV folder before then. The
+// import gate opens its files on the internal path by the InfoHash they
+// carry (the parent's NZB ID), with no folder name at all, and that path
+// resolves to the stored parent, which holds the files.
+func TestFFProbeImportGate_SeasonEntryProbesByInfoHash(t *testing.T) {
 	config.Reset()
 	config.SetConfigPath(t.TempDir())
 	t.Cleanup(config.Reset)
@@ -35,16 +38,22 @@ func TestFFProbeImportGate_SeasonEntryProbesParentFolder(t *testing.T) {
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	const base = "http://127.0.0.1:1/webdav/"
 	checker := &ffprobeChecker{
 		binPath:      bin,
 		timeout:      5 * time.Second,
-		baseURL:      "http://127.0.0.1:1/",
+		baseURL:      base,
 		logger:       zerolog.Nop(),
 		tailIntactFn: func(context.Context, string, string, time.Duration) bool { return true },
 	}
 
+	store, err := storage.NewStorage(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	m := &Manager{
-		config: cfg, ctx: t.Context(), arr: arr.NewStorage(), logger: zerolog.Nop(),
+		storage: store, config: cfg, ctx: t.Context(), arr: arr.NewStorage(), logger: zerolog.Nop(),
 		clients: xsync.NewMap[string, debrid.Client](), processingEntries: xsync.NewMap[string, struct{}](),
 	}
 	d := NewDownloadManager(m)
@@ -58,6 +67,10 @@ func TestFFProbeImportGate_SeasonEntryProbesParentFolder(t *testing.T) {
 		Files:     map[string]*storage.File{s1.Name: s1, s2.Name: s2},
 		Providers: map[string]*storage.ProviderEntry{},
 	}
+	// processor.go writes the parent to the main store before download runs.
+	if err := store.AddOrUpdate(parent); err != nil {
+		t.Fatal(err)
+	}
 	seasons := convertToMultiSeason(parent, []SeasonInfo{
 		{SeasonNumber: 1, Files: []*storage.File{s1}, InfoHash: "season-1-id", Name: "Show.S01.1080p"},
 		{SeasonNumber: 2, Files: []*storage.File{s2}, InfoHash: "season-2-id", Name: "Show.S02.1080p"},
@@ -68,7 +81,7 @@ func TestFFProbeImportGate_SeasonEntryProbesParentFolder(t *testing.T) {
 		t.Fatalf("test setup: season folder %q equals the parent's", parentFolder)
 	}
 
-	if err := d.ffprobeImportGate(season, parentFolder); err != nil {
+	if err := d.ffprobeImportGate(season); err != nil {
 		t.Fatalf("gate rejected a healthy season file: %v", err)
 	}
 
@@ -76,15 +89,51 @@ func TestFFProbeImportGate_SeasonEntryProbesParentFolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ffprobe never ran: %v", err)
 	}
-	want := checker.baseURL + EntryAllFolder + "/" + parentFolder + "/" + s1.Name
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if !strings.Contains(line, want) {
-			t.Fatalf("probe did not open the parent's served folder:\n  args: %s\n  want URL: %s", line, want)
+		fields := strings.Fields(line)
+		target := fields[len(fields)-1]
+		hash, file := internalTargetParts(t, base, target)
+		if hash != nzbID || file != s1.Name {
+			t.Fatalf("probe opened %s, want %s__internal__/%s/%s", target, base, nzbID, s1.Name)
 		}
-		if strings.Contains(line, "/"+season.GetFolder()+"/") {
-			t.Fatalf("probe opened the season entry's own folder, which WebDAV does not serve yet: %s", line)
+		for _, folder := range []string{parentFolder, season.GetFolder()} {
+			if strings.Contains(target, folder) {
+				t.Fatalf("probe URL %s still names folder %q", target, folder)
+			}
+		}
+		entry, f, err := m.InternalFile(hash, file)
+		if err != nil {
+			t.Fatalf("probe %s does not resolve: %v", target, err)
+		}
+		if entry.InfoHash != nzbID || f.Name != s1.Name {
+			t.Fatalf("probe %s resolved to entry %q file %q", target, entry.InfoHash, f.Name)
 		}
 	}
+}
+
+// internalTargetParts splits a probe URL into the InfoHash and file name of
+// the internal WebDAV path, failing the test for any other shape. The path
+// is spelled out rather than built from the constant, so the test also pins
+// the route the WebDAV handler serves.
+func internalTargetParts(t *testing.T, base, target string) (hash, file string) {
+	t.Helper()
+	rest, ok := strings.CutPrefix(target, base+"__internal__/")
+	if !ok {
+		t.Fatalf("probe URL %s is not on the internal path %s__internal__/", target, base)
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 {
+		t.Fatalf("probe URL %s: want __internal__/<infohash>/<file>", target)
+	}
+	hash, err := url.PathUnescape(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err = url.PathUnescape(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash, file
 }
 
 // ffprobe -v error prints only this line for a 404 from our own WebDAV. That
@@ -101,7 +150,7 @@ func TestVerifyImportFile_WebDAV404IsInconclusive(t *testing.T) {
 	} {
 		f, _ := failingFFProbe(t, stderr, 1000)
 		d := &Downloader{logger: zerolog.Nop()}
-		ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "E", "f.mkv", "webdav-4xx-hash",
+		ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "f.mkv", "webdav-4xx-hash",
 			expectedRuntime{Seconds: 3600, Bytes: 4 << 30})
 		if !ok || conclusive || reason != "" {
 			t.Fatalf("%q: got ok=%v conclusive=%v reason=%q, want admitted but unverified", stderr, ok, conclusive, reason)

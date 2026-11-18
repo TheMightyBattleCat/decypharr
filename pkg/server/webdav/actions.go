@@ -1,6 +1,7 @@
 package webdav
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"mime"
@@ -73,28 +74,7 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, r *http.Request) {
 	if h.isInternalBearer(r) {
-		// ffprobe/verification read: never let a confirmed-dead segment be
-		// papered over by padding or a PAR2 patch - the real NNTP failure
-		// must surface so a broken grab can't pass validation.
-		// A repair sweep's check also narrows its prefetch while another
-		// file's playback stalls; an import's check doesn't.
-		ctx := manager.ContextForVerificationReadOf(r.Context(), info.InfoHash(), info.Name())
-		// Bridge the probe caller's dead-segment latch (registered by
-		// repair_sweep.probeFile / downloader.ffprobeImportGate) onto the
-		// context the fetcher sees, so a 430 that lands outside ffprobe's
-		// sampling windows still forces a broken verdict.
-		if sig := manager.DeadSignalForVerificationRead(info.InfoHash(), info.Name()); sig != nil {
-			ctx = manager.ContextWithDeadSignal(ctx, sig)
-		}
-		// Same bridge for the probe's byte budget: it is shared across every
-		// range request of one verification, so a runaway decode read is
-		// bounded for the file as a whole (see manager.VerifyBudget). Resolved
-		// per request, so a request made while the checker has a phase open
-		// (seek detection, a bounded head scan) meters against that phase.
-		if b := manager.VerifyBudgetForVerificationRead(info.InfoHash(), info.Name()); b != nil {
-			ctx = manager.ContextWithVerifyBudget(ctx, b)
-		}
-		r = r.WithContext(ctx)
+		r = r.WithContext(verificationReadContext(r.Context(), info.InfoHash(), info.Name()))
 	}
 	etag := fmt.Sprintf("\"%x-%x\"", info.ModTime().Unix(), info.Size())
 	w.Header().Set("ETag", etag)
@@ -127,6 +107,34 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 	if err := h.StreamResponse(entry, info, w, r); err != nil {
 		h.writeStreamError(info.Parent(), info.Name(), err, w)
 	}
+}
+
+// verificationReadContext is the context an internal (ffprobe) read of one
+// file is served under. Keyed by the InfoHash and name the probe registered
+// its signals under.
+func verificationReadContext(parent context.Context, infoHash, name string) context.Context {
+	// ffprobe/verification read: never let a confirmed-dead segment be
+	// papered over by padding or a PAR2 patch - the real NNTP failure
+	// must surface so a broken grab can't pass validation.
+	// A repair sweep's check also narrows its prefetch while another
+	// file's playback stalls; an import's check doesn't.
+	ctx := manager.ContextForVerificationReadOf(parent, infoHash, name)
+	// Bridge the probe caller's dead-segment latch (registered by
+	// repair_sweep.probeFile / downloader.ffprobeImportGate) onto the
+	// context the fetcher sees, so a 430 that lands outside ffprobe's
+	// sampling windows still forces a broken verdict.
+	if sig := manager.DeadSignalForVerificationRead(infoHash, name); sig != nil {
+		ctx = manager.ContextWithDeadSignal(ctx, sig)
+	}
+	// Same bridge for the probe's byte budget: it is shared across every
+	// range request of one verification, so a runaway decode read is
+	// bounded for the file as a whole (see manager.VerifyBudget). Resolved
+	// per request, so a request made while the checker has a phase open
+	// (seek detection, a bounded head scan) meters against that phase.
+	if b := manager.VerifyBudgetForVerificationRead(infoHash, name); b != nil {
+		ctx = manager.ContextWithVerifyBudget(ctx, b)
+	}
+	return ctx
 }
 
 // writeStreamError answers a failed stream and logs it. The entry and file
