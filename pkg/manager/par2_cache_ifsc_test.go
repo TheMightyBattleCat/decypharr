@@ -54,7 +54,7 @@ func buildSingleFileIndexWithIFSC(t *testing.T, sliceSize int, fileID [16]byte, 
 	ifscPkt := buildTestPar2Packet(t, setID, testIFSCType, ifscBody)
 
 	data := append(append(append([]byte{}, mainPkt...), fdPkt...), ifscPkt...)
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "test.par2", Data: data}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "test.par2", Data: data}})
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestJobSliceSourceCacheHitPassesIFSC(t *testing.T) {
 	good := append(repeatByte(0x11, 100), repeatByte(0x22, 100)...)
 	src, fetcher, reader := jobSourceForIFSC(t, map[string][]byte{"a.rar": good}, good)
 
-	data, err := src.ReadSlice(0)
+	data, err := src.ReadSlice(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("ReadSlice(0): %v", err)
 	}
@@ -136,7 +136,7 @@ func TestJobSliceSourceStaleZeroCacheFailsIFSCAndRefetches(t *testing.T) {
 	good := append(repeatByte(0x11, 100), repeatByte(0x22, 100)...)
 	src, fetcher, _ := jobSourceForIFSC(t, map[string][]byte{"a.rar": stale}, good)
 
-	data, err := src.ReadSlice(0)
+	data, err := src.ReadSlice(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("ReadSlice(0): %v", err)
 	}
@@ -159,7 +159,7 @@ func TestJobSliceSourcePartialZeroCacheFailsIFSCAndRefetches(t *testing.T) {
 	good := append(repeatByte(0x11, 100), repeatByte(0x22, 100)...)
 	src, fetcher, _ := jobSourceForIFSC(t, map[string][]byte{"a.rar": partial}, good)
 
-	data, err := src.ReadSlice(0)
+	data, err := src.ReadSlice(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("ReadSlice(0): %v", err)
 	}
@@ -178,7 +178,7 @@ func TestJobSliceSourceCacheMissUsesNNTPUnchanged(t *testing.T) {
 	// No cache content for "a.rar" -> stubCacheReader misses.
 	src, fetcher, reader := jobSourceForIFSC(t, map[string][]byte{}, good)
 
-	data, err := src.ReadSlice(1)
+	data, err := src.ReadSlice(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("ReadSlice(1): %v", err)
 	}

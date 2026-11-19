@@ -3,11 +3,21 @@ package overlay
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+func testEntryDir(t *testing.T, s *Store, id string) string {
+	t.Helper()
+	dir, err := s.entryDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 // A fetcher that passed RecordDead's rejected check and was waiting on the
 // entry lock while the teardown ran must not re-create the manifest.
@@ -28,7 +38,7 @@ func TestRecordDeadWaitingThroughTeardownDoesNotRecreate(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // the fetcher is past the first check, parked on mu
 
 	s.MarkRejected(id)
-	if err := os.RemoveAll(s.entryDir(id)); err != nil {
+	if err := os.RemoveAll(testEntryDir(t, s, id)); err != nil {
 		t.Fatal(err)
 	}
 	mu.Unlock()
@@ -36,7 +46,7 @@ func TestRecordDeadWaitingThroughTeardownDoesNotRecreate(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("RecordDead: %v", err)
 	}
-	if _, err := os.Stat(s.manifestPath(id)); err == nil {
+	if _, err := os.Stat(filepath.Join(testEntryDir(t, s, id), manifestFileName)); err == nil {
 		t.Error("manifest re-created for a rejected, deleted nzbID")
 	}
 }
@@ -59,7 +69,7 @@ func TestWritePatchRefusesRejectedEntry(t *testing.T) {
 	if err := s.WritePatch(id, "movie.mkv", 5, []byte{1, 2, 3, 4}); !errors.Is(err, ErrEntryRejected) {
 		t.Errorf("WritePatch err = %v, want ErrEntryRejected", err)
 	}
-	if _, err := os.Stat(s.entryDir(id)); err == nil {
+	if _, err := os.Stat(testEntryDir(t, s, id)); err == nil {
 		t.Error("WritePatch re-created the overlay dir of a deleted nzbID")
 	}
 

@@ -1,7 +1,13 @@
 package manager
 
 import (
+	"fmt"
+	"sync/atomic"
+
 	"context"
+	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,7 +41,7 @@ func TestTopUpParsedRecoveryRefetchesMisservedVolume(t *testing.T) {
 	vol3 := par2FixtureBytes(t, "fixture.vol3+2.par2")
 
 	// Start from the index alone: zero recovery slices in hand.
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "fixture.par2", Data: indexOnly}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "fixture.par2", Data: indexOnly}})
 	if err != nil {
 		t.Fatalf("seed ParseIndex: %v", err)
 	}
@@ -70,7 +76,7 @@ func TestTopUpParsedRecoveryRefetchesMisservedVolume(t *testing.T) {
 	sources := []par2.Source{{Name: "fixture.par2", Data: indexOnly}}
 
 	gotIdx, nextVolIdx, _, err := topUpParsedRecovery(
-		context.Background(), parallelFetchNopLogger, fetch, vols, 0, want, idx, sources, "entry", 4, progress)
+		context.Background(), parallelFetchNopLogger, fetch, nil, vols, 0, want, idx, sources, "entry", 4, progress)
 	if err != nil {
 		t.Fatalf("topUpParsedRecovery: %v", err)
 	}
@@ -96,7 +102,7 @@ func TestTopUpParsedRecoveryStopsWhenExhausted(t *testing.T) {
 	vol0 := par2FixtureBytes(t, "fixture.vol0+1.par2")
 	vol1 := par2FixtureBytes(t, "fixture.vol1+2.par2")
 
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "fixture.par2", Data: indexOnly}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "fixture.par2", Data: indexOnly}})
 	if err != nil {
 		t.Fatalf("seed ParseIndex: %v", err)
 	}
@@ -112,7 +118,7 @@ func TestTopUpParsedRecoveryStopsWhenExhausted(t *testing.T) {
 
 	const want = 10 // more than the 3 slices these two volumes can ever supply
 	gotIdx, nextVolIdx, _, err := topUpParsedRecovery(
-		context.Background(), parallelFetchNopLogger, fetch, vols, 0, want, idx, nil, "entry", 4, nil)
+		context.Background(), parallelFetchNopLogger, fetch, nil, vols, 0, want, idx, nil, "entry", 4, nil)
 	if err != nil {
 		t.Fatalf("topUpParsedRecovery: %v", err)
 	}
@@ -124,5 +130,40 @@ func TestTopUpParsedRecoveryStopsWhenExhausted(t *testing.T) {
 	}
 	if nextVolIdx != len(vols) {
 		t.Errorf("nextVolIdx = %d, want %d (volume list fully walked)", nextVolIdx, len(vols))
+	}
+}
+
+// TestFirstRecoveryFetchIsCapped covers P-22: with no index to give an early
+// lower bound, hundreds of dead articles must not make the first fetch ask for
+// hundreds of slices. 300 single-slice volumes, 300 pending segments: the
+// first fetch takes at most MaxRepairSlices volumes plus the spare one.
+func TestFirstRecoveryFetchIsCapped(t *testing.T) {
+	pending := map[string][]overlay.DeadSegment{"f.mkv": make([]overlay.DeadSegment, 300)}
+	vols := make([]par2Volume, 300)
+	for i := range vols {
+		vols[i] = par2Volume{ref: storage.Par2FileRef{Name: fmt.Sprintf("v%03d.par2", i)}, start: uint32(i), count: 1}
+	}
+	var fetched atomic.Int32
+	fetch := func(ctx context.Context, id string) ([]byte, error) {
+		fetched.Add(1)
+		return []byte("x"), nil
+	}
+	needed := firstFetchSlices(estimateNeededSlices(pending), 0)
+	if needed != uint32(par2.MaxRepairSlices) {
+		t.Fatalf("needed = %d, want the %d-slice cap", needed, par2.MaxRepairSlices)
+	}
+	_, got, _, _, err := fetchMoreVolumes(context.Background(), zerolog.Nop(), fetch, vols, 0, needed, 0, nil, "e", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got > uint32(par2.MaxRepairSlices)+4+1 { // + one wave of slack + spare volume
+		t.Fatalf("first fetch took %d slices, want about %d", got, par2.MaxRepairSlices)
+	}
+	// An early lower bound from the index wins over the estimate.
+	if n := firstFetchSlices(300, 8); n != 8 {
+		t.Fatalf("with early k=8, needed = %d, want 8", n)
+	}
+	if n := firstFetchSlices(5, 0); n != 5 {
+		t.Fatalf("small estimate = %d, want 5", n)
 	}
 }

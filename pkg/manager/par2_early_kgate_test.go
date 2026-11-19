@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 
@@ -47,7 +48,7 @@ func buildTestIndexN(t *testing.T, sliceSize uint64, specs []earlyFileSpec) (*pa
 		data = append(data, buildTestPar2Packet(t, setID, testFileDescType, b)...)
 	}
 
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "test.par2", Data: data}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "test.par2", Data: data}})
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}

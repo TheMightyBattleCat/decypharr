@@ -286,3 +286,38 @@ func TestReapOverlayDryRunWithNilUsenetNeedsNoUsenet(t *testing.T) {
 		t.Fatalf("Removed=true, want false")
 	}
 }
+
+// TestReapOverlayRefusesPathTraversalID: nzb_id ".." has no storage.Entry,
+// so the verdict is EntryGone/WouldReap. The reap must still refuse it and
+// leave <data>/usenet (the NZB records, beside the overlay root) in place.
+func TestReapOverlayRefusesPathTraversalID(t *testing.T) {
+	m, configDir := newTestManagerForReap(t)
+
+	record := filepath.Join(configDir, "usenet", "meta", "abc.meta")
+	if err := os.MkdirAll(filepath.Dir(record), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(record, []byte("an NZB record"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(configDir, "config.json")
+	if err := os.WriteFile(cfg, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"..", "../.."} {
+		result, err := m.ReapOverlay(id, "whatever.mkv", true)
+		if err == nil {
+			t.Errorf("ReapOverlay(%q): want an error, got nil (mode %q)", id, result.Mode)
+		}
+		if result.Removed {
+			t.Errorf("ReapOverlay(%q): Removed=true, want false", id)
+		}
+		if _, err := os.Stat(record); err != nil {
+			t.Fatalf("ReapOverlay(%q) removed the NZB records: %v", id, err)
+		}
+		if _, err := os.Stat(cfg); err != nil {
+			t.Fatalf("ReapOverlay(%q) removed the data directory: %v", id, err)
+		}
+	}
+}

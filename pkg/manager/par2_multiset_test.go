@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
@@ -49,7 +50,7 @@ func otherSetIndex(name, fileName string) (par2.Source, [16]byte) {
 func multisetFixture(t *testing.T) (sources []par2.Source, set1, set2 [16]byte, vols []par2Volume, posted []storage.PostedFileRef) {
 	t.Helper()
 	ep1 := par2.Source{Name: "fixture.par2", Data: par2FixtureBytes(t, "fixture.par2")}
-	idx1, err := par2.ParseIndex([]par2.Source{ep1})
+	idx1, err := par2.ParseIndex(context.Background(), []par2.Source{ep1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +72,14 @@ func multisetFixture(t *testing.T) (sources []par2.Source, set1, set2 [16]byte, 
 
 func TestChoosePar2SetPicksTheDamagedFilesSet(t *testing.T) {
 	sources, set1, set2, vols, posted := multisetFixture(t)
-	if _, err := par2.ParseIndex(sources); err == nil {
-		t.Fatal("precondition: plain ParseIndex over two sets should fail")
+	// Plain ParseIndex over two sets takes the first Main packet's set
+	// (episode 2's, listed first), whatever the damage.
+	if idx, err := par2.ParseIndex(context.Background(), sources); err != nil || idx.SetID != set2 {
+		t.Fatalf("precondition: plain ParseIndex over two sets: %v, want episode 2's set", err)
 	}
 
 	// Episode 2 damaged only.
-	c := choosePar2Set(sources, vols, posted, map[string][]overlay.DeadSegment{"e02.mkv": {{MessageID: "<e02-1>"}}})
+	c := choosePar2Set(context.Background(), sources, vols, posted, map[string][]overlay.DeadSegment{"e02.mkv": {{MessageID: "<e02-1>"}}})
 	if c.setID != set2 {
 		t.Fatalf("chose %x, want episode 2's set %x", c.setID, set2)
 	}
@@ -86,7 +89,7 @@ func TestChoosePar2SetPicksTheDamagedFilesSet(t *testing.T) {
 	if len(c.vols) != 1 || c.vols[0].ref.Name != "Show.S01E02.vol00+01.par2" {
 		t.Fatalf("vols = %v, want only episode 2's volume", c.vols)
 	}
-	if _, err := par2.ParseIndexSet(append(c.sources, sources...), c.setID); err != nil {
+	if _, err := par2.ParseIndexSet(context.Background(), append(c.sources, sources...), c.setID); err != nil {
 		t.Fatalf("ParseIndexSet on the chosen set: %v", err)
 	}
 
@@ -97,7 +100,7 @@ func TestChoosePar2SetPicksTheDamagedFilesSet(t *testing.T) {
 		"a.mkv": {{MessageID: f1.Segments[0].MessageID}, {MessageID: f2.Segments[1].MessageID}},
 		"b.mkv": {{MessageID: "<e02-2>"}},
 	}
-	c = choosePar2Set(sources, vols, posted, pending)
+	c = choosePar2Set(context.Background(), sources, vols, posted, pending)
 	if c.setID != set1 {
 		t.Fatalf("chose %x, want set 1 %x", c.setID, set1)
 	}
@@ -114,19 +117,19 @@ func TestChoosePar2SetBreaksTiesAndLeavesSingleSetAlone(t *testing.T) {
 
 	// One damaged file in each set: a tie. The lower set ID wins, the same way
 	// on every pass, and the other set's damage waits for the next pass.
-	// Before, a tie handed every set to one ParseIndex, which fails ("belongs
-	// to a different recovery set") and was terminal.
+	// Before, a tie handed every set to one ParseIndex, which failed
+	// ("belongs to a different recovery set") and was terminal.
 	want, other := set1, set2
 	if bytes.Compare(set2[:], set1[:]) < 0 {
 		want, other = set2, set1
 	}
 	tie := map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}, {MessageID: "<e02-1>"}}}
 	for pass := 0; pass < 3; pass++ {
-		c := choosePar2Set(sources, vols, posted, tie)
+		c := choosePar2Set(context.Background(), sources, vols, posted, tie)
 		if c.setID != want || c.deferred != 1 || c.unattributed != 0 {
 			t.Fatalf("pass %d: tie chose %x (deferred %d, unattributed %d), want %x with 1 deferred", pass, c.setID, c.deferred, c.unattributed, want)
 		}
-		if _, err := par2.ParseIndexSet(c.sources, c.setID); err != nil {
+		if _, err := par2.ParseIndexSet(context.Background(), c.sources, c.setID); err != nil {
 			t.Fatalf("ParseIndexSet on the chosen set: %v", err)
 		}
 	}
@@ -138,13 +141,13 @@ func TestChoosePar2SetBreaksTiesAndLeavesSingleSetAlone(t *testing.T) {
 	} else {
 		left = map[string][]overlay.DeadSegment{"x": {{MessageID: "<e02-1>"}}}
 	}
-	if c := choosePar2Set(sources, vols, posted, left); c.setID != other || c.deferred != 0 {
+	if c := choosePar2Set(context.Background(), sources, vols, posted, left); c.setID != other || c.deferred != 0 {
 		t.Fatalf("second pass chose %x (deferred %d), want %x", c.setID, c.deferred, other)
 	}
 
 	// A single set: unchanged.
 	single := sources[1:]
-	c := choosePar2Set(single, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}}})
+	c := choosePar2Set(context.Background(), single, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: posted[0].Segments[0].MessageID}}})
 	if c.setID != ([16]byte{}) || len(c.sources) != 1 || len(c.vols) != 3 || c.unattributed != 0 {
 		t.Fatalf("single set changed: %+v", c)
 	}
@@ -154,7 +157,7 @@ func TestChoosePar2SetBreaksTiesAndLeavesSingleSetAlone(t *testing.T) {
 // and runRepair's error for it is terminal.
 func TestChoosePar2SetReportsUnattributedDamage(t *testing.T) {
 	sources, _, _, vols, posted := multisetFixture(t)
-	c := choosePar2Set(sources, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: "<not-in-any-posted-file>"}}})
+	c := choosePar2Set(context.Background(), sources, vols, posted, map[string][]overlay.DeadSegment{"x": {{MessageID: "<not-in-any-posted-file>"}}})
 	if c.unattributed != 2 || c.setID != ([16]byte{}) {
 		t.Fatalf("unattributed = %d, setID %x; want 2 sets and no choice", c.unattributed, c.setID)
 	}

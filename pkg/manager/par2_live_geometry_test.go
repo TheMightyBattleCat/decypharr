@@ -55,7 +55,7 @@ func TestLivePar2Geometry(t *testing.T) {
 		}
 		sources = append(sources, par2.Source{Name: f.Name, Data: data})
 	}
-	idx, err := par2.ParseIndex(sources)
+	idx, err := par2.ParseIndex(context.Background(), sources)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestLivePar2Geometry(t *testing.T) {
 		if err != nil {
 			return false, err
 		}
-		data, _, err := pf.readRange(local*idx.SliceSize, idx.SliceSize, false)
+		data, _, err := pf.readRange(context.Background(), local*idx.SliceSize, idx.SliceSize, false)
 		if err != nil {
 			return false, err
 		}
@@ -105,7 +105,7 @@ func TestLivePar2Geometry(t *testing.T) {
 			measured++
 			// The last article's size is derived, not measured: check it.
 			last := len(src.Segments) - 1
-			data, err := pf.segmentData(last)
+			data, err := pf.segmentData(context.Background(), last)
 			if err != nil || int64(len(data)) != pf.segSizes[last] {
 				lastBad++
 				t.Logf("%s: last article %d decoded %d bytes (err=%v), geometry says %d", src.Name, last+1, len(data), err, pf.segSizes[last])

@@ -64,3 +64,40 @@ func TestInvalidateRepairedWithoutDFSStillRefreshesReader(t *testing.T) {
 		t.Fatal("reader not refreshed without a DFS mount")
 	}
 }
+
+// After a repair on an encrypted member, the forgotten DFS ranges cover the
+// plaintext bytes the pad spoiled through CBC on either side of the segment,
+// both on the first forget and on the delayed one.
+func TestInvalidateRepairedForgetsCBCNeighboursOfEncryptedSegment(t *testing.T) {
+	nzb := &storage.NZB{Files: []storage.NZBFile{{
+		Name:        "movie.mkv",
+		Size:        300,
+		IsEncrypted: true,
+		Segments: []storage.NZBSegment{
+			{StartOffset: 0, EndOffset: 99},
+			{StartOffset: 100, EndOffset: 199},
+			{StartOffset: 200, EndOffset: 299},
+		},
+	}}}
+	pending := map[string][]overlay.DeadSegment{"movie.mkv": {{Index: 1}}}
+
+	var forgot []string
+	var delayed func()
+	invalidateRepaired(nzb, pending,
+		func(string, []int) {},
+		func(file string, off, length int64) {
+			forgot = append(forgot, fmt.Sprintf("%s %d+%d", file, off, length))
+		},
+		func(_ time.Duration, f func()) { delayed = f },
+	)
+	// [100,200) widens to [96, 208+16) = [96,224).
+	want := []string{"movie.mkv 96+128"}
+	if !reflect.DeepEqual(forgot, want) {
+		t.Fatalf("forgot = %q, want %q", forgot, want)
+	}
+	forgot = nil
+	delayed()
+	if !reflect.DeepEqual(forgot, want) {
+		t.Fatalf("delayed forgot = %q, want %q", forgot, want)
+	}
+}

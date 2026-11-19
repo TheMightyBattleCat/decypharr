@@ -80,8 +80,11 @@ func TestSniffedPar2StaysOutOfReleaseGroups(t *testing.T) {
 			t.Errorf("%s: groups = %d, want 1", tt.name, len(groups))
 			continue
 		}
-		g := groups["X"]
-		if g == nil || g.Type != tt.wantType {
+		var g *FileGroup
+		for _, only := range groups {
+			g = only
+		}
+		if g == nil || g.BaseName != "X" || g.Type != tt.wantType {
 			t.Errorf("%s: group X = %+v, want type %q", tt.name, g, tt.wantType)
 			continue
 		}

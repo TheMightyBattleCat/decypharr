@@ -114,6 +114,8 @@ type fakeRadarr struct {
 	mu        sync.Mutex
 	calls     []string
 	historyID map[string]int // movieIds query value -> grab history ID
+	// byDownload: downloadId query value -> that grab's history records.
+	byDownload map[string][]arr.HistoryRecord
 }
 
 func (f *fakeRadarr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +124,9 @@ func (f *fakeRadarr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	if r.Method == http.MethodGet && r.URL.Path == "/api/v3/history" {
 		var records []arr.HistoryRecord
-		if id := f.historyID[r.URL.Query().Get("movieIds")]; id != 0 {
+		if dl := r.URL.Query().Get("downloadId"); dl != "" {
+			records = f.byDownload[dl]
+		} else if id := f.historyID[r.URL.Query().Get("movieIds")]; id != 0 {
 			records = append(records, arr.HistoryRecord{ID: id})
 		}
 		_ = json.NewEncoder(w).Encode(arr.HistorySchema{Records: records})

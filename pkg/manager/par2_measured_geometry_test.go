@@ -374,10 +374,10 @@ func TestPar2EarlyStoppedPassStaysSuspect(t *testing.T) {
 		t.Fatalf("RepairWith: %v, want an early stop", repairErr)
 	}
 	newly := 3
-	if !par2RoundShouldStop(newly, 0, k, available) {
+	if stop, _ := par2RoundShouldStop(newly, 0, false, k, available); !stop {
 		t.Fatal("round 0 went round again although the enlarged damage cannot fit the recovery budget")
 	}
-	if par2RoundShouldStop(1, 0, 1, 10) {
+	if stop, _ := par2RoundShouldStop(1, 0, false, 1, 10); stop {
 		t.Fatal("stopped although the enlarged damage fits")
 	}
 
@@ -453,7 +453,7 @@ func (w wrongSlices) ReadSlice(int64) ([]byte, error) { return make([]byte, w.si
 // segment whose article is back is patched with its verified bytes; one the
 // STAT sweep saw missing, and one whose fetch fails, are left for parity.
 func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -481,6 +481,7 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 		})
 	}
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	storeNZBRecord(t, m, nzb)
 	forgot := &forgetRecorder{}
 	m.mountManager = forgot
 	var refs []par2DeadRef
@@ -526,7 +527,7 @@ func TestHealFetchableDeadSegmentsPatchesOnlyProvenArticles(t *testing.T) {
 // with no parity and no network matching. It used to return terminal before
 // the heal ever ran.
 func TestHealWithoutRecoveryHealsIntactDeadSegments(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -546,6 +547,7 @@ func TestHealWithoutRecoveryHealsIntactDeadSegments(t *testing.T) {
 	}
 	readerFile.Segments[4].Bytes = 40
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}, Par2Source: []storage.PostedFileRef{ref}}
+	storeNZBRecord(t, m, nzb)
 	pending := map[string][]overlay.DeadSegment{}
 	for _, i := range []int{1, 2, 3} {
 		seg := ref.Segments[i]
@@ -623,7 +625,7 @@ func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: vol}})
+	full, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "i", Data: index}, {Name: "v", Data: vol}})
 	if err != nil || len(full.Recovery) != 2 {
 		t.Fatalf("fixture: %d recovery slices, err %v; want 2", len(full.Recovery), err)
 	}
@@ -649,7 +651,7 @@ func TestFetchWholePar2FileSkipsADeadArticle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchWholePar2File with one dead article: %v", err)
 	}
-	idx, err := par2.ParseIndex([]par2.Source{{Name: "i", Data: index}, {Name: "v", Data: data}})
+	idx, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: "i", Data: index}, {Name: "v", Data: data}})
 	if err != nil {
 		t.Fatalf("ParseIndex: %v", err)
 	}
@@ -715,7 +717,7 @@ func TestPar2JobTimeoutScalesWithReleaseSize(t *testing.T) {
 // whole article. WritePatch used to refuse the whole-article patch, and a
 // repaired first article of a volume could never be stored.
 func TestHealPatchesTheReaderSlotInsideAnArticle(t *testing.T) {
-	m, _ := newTestManagerForReap(t)
+	m := newTestManagerWithNZBRecords(t)
 	p := &Par2Repair{manager: m, logger: zerolog.Nop()}
 
 	content, articles, ref := estimatedFixture()
@@ -746,6 +748,7 @@ func TestHealPatchesTheReaderSlotInsideAnArticle(t *testing.T) {
 	}
 	const nzbID = "nzb-slot"
 	nzb := &storage.NZB{ID: nzbID, Files: []storage.NZBFile{readerFile}}
+	storeNZBRecord(t, m, nzb)
 	var refs []par2DeadRef
 	for _, i := range []int{0, 1} {
 		seg := readerFile.Segments[i]

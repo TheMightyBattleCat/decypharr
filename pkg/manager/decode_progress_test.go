@@ -294,7 +294,7 @@ func TestVerifyImportFile_DecodedThroughIsNotRetried(t *testing.T) {
 	f.baseURL = "http://127.0.0.1:1/"
 	d := &Downloader{logger: zerolog.Nop()}
 
-	ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "E", "f.mkv", "import-hash",
+	ok, conclusive, reason := d.verifyImportFile(context.Background(), f, &storage.Entry{Name: "E"}, "f.mkv", "import-hash",
 		expectedRuntime{Seconds: 6300, EpisodeCountConfirmed: true, Bytes: testSmall})
 
 	if !ok || conclusive || reason != "" {
