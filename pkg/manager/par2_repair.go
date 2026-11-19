@@ -908,8 +908,13 @@ func (p *Par2Repair) enqueue(nzbID string) {
 	case p.queue <- nzbID:
 	default:
 		p.logger.Warn().Str("entry", nzbID).Msg("par2 repair queue full; dropping request")
+		// A CancelEntry between the unlock above and this send marked a
+		// request that never reached the channel. Left in place, that mark
+		// would make takeQueued skip the entry's next request instead,
+		// stranding it in queued until a restart.
 		p.mu.Lock()
 		delete(p.queued, nzbID)
+		delete(p.dropped, nzbID)
 		p.mu.Unlock()
 		if p.repair != nil && p.repair.handlers != nil {
 			p.repair.handlers.Release(nzbID)

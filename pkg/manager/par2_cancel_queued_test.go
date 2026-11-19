@@ -182,3 +182,40 @@ func TestPar2BatchLoopSkipsCancelledRequest(t *testing.T) {
 		t.Fatalf("deleted entry still reads as queued")
 	}
 }
+
+// A request that finds the channel full is not queued, so a drop mark
+// CancelEntry left for its nzbID must go with it: otherwise the next request
+// for the entry, which does sit in the channel, is skipped in its place and
+// the entry reads as queued until a restart.
+func TestPar2QueueFullClearsStaleDropMark(t *testing.T) {
+	p, _ := newTestPar2Repair(t)
+	// CancelEntry ran between enqueue's unlock and its channel send: the
+	// request is marked dropped but the send then finds the channel full.
+	p.mu.Lock()
+	if p.dropped == nil {
+		p.dropped = make(map[string]struct{})
+	}
+	p.dropped["v1"] = struct{}{}
+	p.mu.Unlock()
+	for i := 0; i < cap(p.queue); i++ {
+		p.queue <- "filler"
+	}
+	p.enqueue("v1")
+	if p.IsQueued("v1") {
+		t.Fatalf("request that found the channel full still reads as queued")
+	}
+	for len(p.queue) > 0 {
+		<-p.queue
+	}
+
+	p.enqueue("v1")
+	if len(p.queue) != 1 {
+		t.Fatalf("channel holds %d requests, want 1", len(p.queue))
+	}
+	if !p.takeQueued(<-p.queue) {
+		t.Fatalf("loop would skip the entry's only queued request (stale drop mark)")
+	}
+	if p.IsQueued("v1") {
+		t.Fatalf("entry still reads as queued after its request was taken")
+	}
+}
