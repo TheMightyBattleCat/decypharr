@@ -1370,12 +1370,14 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 		} else {
 			groupKey = item.file.Basefilename
 		}
+		name := item.actualFilename
+		if name == "" {
+			name = item.file.Filename
+		}
 		mapKey := groupKey
-		if item.fileType == storage.NZBFileTypeMedia {
-			name := item.actualFilename
-			if name == "" {
-				name = item.file.Filename
-			}
+		if key, ok := splitMediaPartKey(groupKey, name); ok {
+			mapKey = key
+		} else if item.fileType == storage.NZBFileTypeMedia {
 			mapKey = mediaGroupKey(groupKey, name)
 		}
 
@@ -1416,14 +1418,32 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 // mediaGroupKey keeps a media file whose name ends in its own extension
 // apart from others of the same base name: "x.mkv" and an external "x.flac"
 // are two files, and grouped under "x" alone the second would be appended to
-// the first. A numbered part ("x.mkv.001") keeps the base key, so the parts
-// of a split file still join.
+// the first. A numbered part with no media extension inside ("x.001") keeps
+// the base key; one with ("x.mkv.001") is keyed by splitMediaPartKey.
 func mediaGroupKey(baseKey, name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	if ext == "" || isDigits(ext[1:]) {
 		return baseKey
 	}
 	return baseKey + "\x00" + ext
+}
+
+// splitMediaPartKey gives a numbered part of a media file ("x.mkv.001") a
+// key of its own, whatever type content detection gave it, so every part of
+// the split file joins one group. The bare base key would join it with a RAR
+// volume of the same base ("x.rar") and the parts be read as volumes; the
+// unsplit key (mediaGroupKey's "x\x00.mkv") would append them to a whole
+// "x.mkv" posted beside them.
+func splitMediaPartKey(baseKey, name string) (string, bool) {
+	ext := filepath.Ext(name)
+	if ext == "" || !isDigits(ext[1:]) {
+		return "", false
+	}
+	inner := strings.ToLower(filepath.Ext(strings.TrimSuffix(name, ext)))
+	if inner == "" || !utils.IsMediaFile(inner) {
+		return "", false
+	}
+	return baseKey + "\x00split" + inner, true
 }
 
 func isDigits(s string) bool {

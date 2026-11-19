@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Tensai75/nzbparser"
@@ -167,4 +168,51 @@ func TestMediaFilesSharingABaseNameSurviveTheRecoveryRegroup(t *testing.T) {
 		t.Fatalf("groups = %d, want the archive and two media files", len(got))
 	}
 	assertMkvAndFlacKept(t, p, got)
+}
+
+func groupSummary(groups map[string]*FileGroup) map[storage.NZBFileType][]string {
+	out := map[storage.NZBFileType][]string{}
+	for _, g := range groups {
+		var names []string
+		for _, f := range g.Files {
+			names = append(names, f.Filename)
+		}
+		sort.Strings(names)
+		out[g.Type] = append(out[g.Type], g.BaseName+":"+strings.Join(names, ","))
+	}
+	return out
+}
+
+// A RAR volume and the parts of a split media file can share a base name
+// ("Movie.rar" and "Movie.mkv.001"): they are two files, and grouped as one
+// the media parts would be read as RAR volumes.
+func TestSplitMediaPartsKeepApartFromASameBaseRar(t *testing.T) {
+	p := &NZBParser{logger: zerolog.Nop()}
+	groups := p.groupProcessedFiles([]contentResult{
+		{file: mediaGroupFile("Movie.rar", "Movie", 1, "r1@x"), fileType: storage.NZBFileTypeRar, actualFilename: "Movie.rar"},
+		{file: mediaGroupFile("Movie.mkv.001", "Movie", 2, "p1@x"), fileType: storage.NZBFileTypeMedia, actualFilename: "Movie.mkv.001"},
+		{file: mediaGroupFile("Movie.mkv.002", "Movie", 3, "p2@x"), fileType: storage.NZBFileTypeUnknown, actualFilename: "Movie.mkv.002"},
+	})
+	got := groupSummary(groups)
+	if len(groups) != 2 ||
+		len(got[storage.NZBFileTypeRar]) != 1 || got[storage.NZBFileTypeRar][0] != "Movie:Movie.rar" ||
+		len(got[storage.NZBFileTypeMedia]) != 1 || got[storage.NZBFileTypeMedia][0] != "Movie:Movie.mkv.001,Movie.mkv.002" {
+		t.Fatalf("groups = %v, want a RAR group of Movie.rar and a media group of both .mkv parts", got)
+	}
+}
+
+// An unsplit file and numbered parts of the same name stay apart, as fix 65
+// made them: the parts must not be appended to the whole file.
+func TestSplitMediaPartsKeepApartFromTheUnsplitFile(t *testing.T) {
+	p := &NZBParser{logger: zerolog.Nop()}
+	groups := p.groupProcessedFiles([]contentResult{
+		{file: mediaGroupFile("Movie.mkv", "Movie", 1, "w1@x"), fileType: storage.NZBFileTypeMedia, actualFilename: "Movie.mkv"},
+		{file: mediaGroupFile("Movie.mkv.001", "Movie", 2, "p1@x"), fileType: storage.NZBFileTypeMedia, actualFilename: "Movie.mkv.001"},
+	})
+	got := groupSummary(groups)
+	media := got[storage.NZBFileTypeMedia]
+	sort.Strings(media)
+	if len(groups) != 2 || len(media) != 2 || media[0] != "Movie:Movie.mkv" || media[1] != "Movie:Movie.mkv.001" {
+		t.Fatalf("groups = %v, want Movie.mkv and Movie.mkv.001 in two media groups", got)
+	}
 }
