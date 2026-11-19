@@ -982,9 +982,14 @@ func (p *Par2Repair) runNow(nzbID string, fromSweep bool) (waiting bool, err err
 	// PAR2 failure) - a user-initiated "repair now" re-evaluates from
 	// scratch, same as par2ShouldAutoEnqueue's terminal gate not applying
 	// here either. The one exception is a live re-grab: it is about to
-	// delete the entry, so a pass would run on a vanishing release.
+	// delete the entry, so a pass would run on a vanishing release. A sweep
+	// pass takes that claim over all the same: the sweep's heal holds it
+	// while it tries PAR2, and re-grabs only if the pass does not complete
+	// (runNowAndWait's callers put the claim back then).
 	if p.repair != nil && p.repair.handlers != nil {
-		if !p.repair.handlers.SetUnlessRegrab(nzbID, handlerPar2Running) {
+		if fromSweep {
+			p.repair.handlers.Set(nzbID, handlerPar2Running)
+		} else if !p.repair.handlers.SetUnlessRegrab(nzbID, handlerPar2Running) {
 			p.mu.Lock()
 			delete(p.queued, nzbID)
 			p.mu.Unlock()
