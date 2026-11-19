@@ -146,9 +146,11 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		}
 		// Parent has been fanned out into season entries; mark it complete so
 		// it leaves the downloading queue instead of getting re-processed.
-		// (It has no active files of its own by this point, so the ffprobe
-		// import gate in completeEntry is a no-op here regardless.)
-		if err := d.completeEntry(torrent); err != nil {
+		// Its files stay active (they are the seasons' files), so the ffprobe
+		// import gate is skipped here: each season's completion above already
+		// probed them, and a second pass would read every file through Usenet
+		// again.
+		if err := d.completeSplitParent(torrent); err != nil {
 			if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
 				return err
 			}
@@ -207,6 +209,18 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // store's padded-segment count rather than something ffprobe's verdict can
 // stand in for.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
+	return d.finishEntry(entry, true)
+}
+
+// completeSplitParent completes the parent of a multi-season split once its
+// season entries have been processed. It is completeEntry without the ffprobe
+// import gate: the parent's files are its seasons' files, and each season's
+// completion has already probed them.
+func (d *Downloader) completeSplitParent(entry *storage.Entry) error {
+	return d.finishEntry(entry, false)
+}
+
+func (d *Downloader) finishEntry(entry *storage.Entry, ffprobeGate bool) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
 		// By this point processSymlink/processDownload has
 		// already created the symlink tree (or downloaded the file) and,
@@ -224,15 +238,18 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 		d.cleanupRejectedImport(entry)
 		return err
 	}
-	if err := d.ffprobeImportGate(entry); err != nil {
-		// By this point processSymlink/processDownload has
-		// already created the symlink tree (or downloaded the file) and,
-		// for symlink NZB entries, warmed the DFS cache for it. The
-		// rejection path this error feeds into (processAction ->
-		// entry.MarkAsError) only ever flips the entry's error state, so
-		// without this both would be left behind as permanent orphans.
-		d.cleanupRejectedImport(entry)
-		return err
+	// Skipped for a split parent (see completeSplitParent).
+	if ffprobeGate {
+		if err := d.ffprobeImportGate(entry); err != nil {
+			// By this point processSymlink/processDownload has
+			// already created the symlink tree (or downloaded the file) and,
+			// for symlink NZB entries, warmed the DFS cache for it. The
+			// rejection path this error feeds into (processAction ->
+			// entry.MarkAsError) only ever flips the entry's error state, so
+			// without this both would be left behind as permanent orphans.
+			d.cleanupRejectedImport(entry)
+			return err
+		}
 	}
 	if err := d.paddingImportGate(entry); err != nil {
 		// Same cleanup rationale as the gates above.
