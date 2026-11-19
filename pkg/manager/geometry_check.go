@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
@@ -184,6 +185,10 @@ func classifyGeometry(f *storage.NZBFile, head []byte) geometryVerdict {
 	return v
 }
 
+// geometryHeadReadTimeout caps checkImportGeometry's first-article read; a
+// var so a test can shorten it.
+var geometryHeadReadTimeout = 20 * time.Second
+
 // checkImportGeometry runs classifyGeometry on a Usenet file's stored NZB
 // meta, which costs nothing. With readHead it also reads the file's first
 // matroskaHeadBytes from its first article, in memory only (never the DFS
@@ -207,7 +212,14 @@ func (r *Repair) checkImportGeometry(ctx context.Context, infoHash, name string,
 	// An encrypted file's first article is ciphertext: no header to read.
 	if first := f.Segments[0]; readHead && !f.IsEncrypted && first.StartOffset == 0 && isMatroskaName(name) && spliceBoundaries(f.Segments) == 0 {
 		want := first.SegmentDataStart + min(first.Bytes, matroskaHeadBytes)
-		p, err := u.FetchArticlePrefix(ctx, first.MessageID, int(want))
+		// Capped on its own: the sweep's ctx has no per-file deadline, so a
+		// stalled server would hold the read for the connection's 60 s idle
+		// timeout on every file. Expiry is a failed read like any other
+		// (meta-only verdict); the caller's ctx is untouched, so the sweep
+		// or import never sees it as being stopped.
+		readCtx, cancel := context.WithTimeout(ctx, geometryHeadReadTimeout)
+		p, err := u.FetchArticlePrefix(readCtx, first.MessageID, int(want))
+		cancel()
 		if err == nil && int64(len(p)) == want {
 			prefix = p
 		}
