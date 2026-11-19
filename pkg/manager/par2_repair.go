@@ -3515,7 +3515,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		confirmedMissing, shortRead, corrupt := sliceSource.DeadCauseCounts()
 		kindRound, cut := failedRounds.end(repairErr)
 		if stopErr := par2RoundStopError(len(newlyDamaged), kindRound, cut, k, min(int(available), par2.MaxRepairSlicesFor(idx.SliceSize)),
-			confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr); stopErr != nil {
+			confirmedMissing, corrupt, shortRead, len(checksumBad), repairErr, ctx.Err()); stopErr != nil {
 			return stopErr
 		}
 		p.logger.Info().
@@ -3884,10 +3884,20 @@ func par2RoundCutShort(repairErr error) bool {
 // (after the backoff) can repair it. The cause text is kept for the log, but
 // repairErr is not wrapped, so a 430 inside it cannot make
 // classifyPar2Failure treat the stop as terminal before it sees the tag.
-func par2RoundStopError(newlyDamaged, round int, cut bool, k, budget, confirmedMissing, corrupt, shortRead, checksumBad int, repairErr error) error {
+//
+// jobErr is runRepair's own ctx.Err(). A stop over budget in a round cut by
+// one article's fetch timeout (fetchSegment's par2ArticleFetchTimeout) while
+// the job is still live keeps the class its causes give it: repairErr then
+// wraps context.DeadlineExceeded, which classifyPar2Failure checks before
+// the class, so confirmed-missing damage beyond the budget read as
+// transient. The job's own deadline or cancel still leaves it transient.
+func par2RoundStopError(newlyDamaged, round int, cut bool, k, budget, confirmedMissing, corrupt, shortRead, checksumBad int, repairErr, jobErr error) error {
 	stop, why := par2RoundShouldStop(newlyDamaged, round, cut, k, budget)
 	if !stop {
 		return nil
+	}
+	if why == par2RoundStopOverBudget && jobErr == nil && errors.Is(repairErr, context.DeadlineExceeded) {
+		repairErr = par2ArticleDeadline{repairErr}
 	}
 	capErr := par2RoundCapError(confirmedMissing, corrupt, shortRead, checksumBad, repairErr)
 	switch why {
@@ -3900,6 +3910,17 @@ func par2RoundStopError(newlyDamaged, round int, cut bool, k, budget, confirmedM
 	}
 	return capErr
 }
+
+// par2ArticleDeadline carries a round's repairErr that ended on one
+// article's fetch timeout while the job was live. Its text and its typed
+// parts (an *nntp.Error, a par2Classed, the failover outcomes) stay
+// reachable through errors.As; only errors.Is no longer finds
+// context.DeadlineExceeded, which would make classifyPar2Failure call the
+// stop transient whatever its causes.
+type par2ArticleDeadline struct{ err error }
+
+func (e par2ArticleDeadline) Error() string      { return e.err.Error() }
+func (e par2ArticleDeadline) As(target any) bool { return errors.As(e.err, target) }
 
 // par2RoundCapError names why intact slices were unreadable when the round
 // loop stops, and classes the stop by those causes: a confirmed-dead or

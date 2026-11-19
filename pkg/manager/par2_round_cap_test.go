@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,7 +25,7 @@ func TestPar2RoundStopAtCapWithinBudgetIsTransient(t *testing.T) {
 	if !stop || why != par2RoundStopCap {
 		t.Fatalf("par2RoundShouldStop at the last round = (%v, %v), want (true, round cap)", stop, why)
 	}
-	if err := par2RoundStopError(newly, 0, false, k, budget, 1, 0, 0, 0, timeout); err != nil {
+	if err := par2RoundStopError(newly, 0, false, k, budget, 1, 0, 0, 0, timeout, nil); err != nil {
 		t.Fatalf("round 0 with the damage inside the budget stopped: %v", err)
 	}
 
@@ -34,7 +35,7 @@ func TestPar2RoundStopAtCapWithinBudgetIsTransient(t *testing.T) {
 		// checks for one before the transient tag, so it must not leak through.
 		"430": fmt.Errorf("fetch segment 7: %w", &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "430 no such article"}),
 	} {
-		err := par2RoundStopError(newly, last, false, k, budget, 1, 0, 0, 0, repairErr)
+		err := par2RoundStopError(newly, last, false, k, budget, 1, 0, 0, 0, repairErr, nil)
 		if err == nil {
 			t.Fatalf("%s: round cap did not stop", name)
 		}
@@ -54,7 +55,7 @@ func TestPar2RoundStopOverBudgetOrNothingNewKeepsVerdict(t *testing.T) {
 	last := maxIntactRepairRounds - 1
 	timeout := errors.New("fetch segment 7: i/o timeout")
 
-	over := par2RoundStopError(5, last, false, 98, 100, 5, 0, 0, 0, timeout)
+	over := par2RoundStopError(5, last, false, 98, 100, 5, 0, 0, 0, timeout, nil)
 	if over == nil || strings.Contains(over.Error(), "(transient:") {
 		t.Fatalf("over budget at the cap = %v, want the cause-labelled error", over)
 	}
@@ -65,7 +66,7 @@ func TestPar2RoundStopOverBudgetOrNothingNewKeepsVerdict(t *testing.T) {
 		t.Fatalf("over budget at round 0 = (%v, %v), want (true, over budget)", stop, why)
 	}
 
-	none := par2RoundStopError(0, last, true, 4, 100, 1, 0, 0, 0, timeout)
+	none := par2RoundStopError(0, last, true, 4, 100, 1, 0, 0, 0, timeout, nil)
 	if none == nil || strings.Contains(none.Error(), "(transient:") {
 		t.Fatalf("nothing new at the cap = %v, want the cause-labelled error", none)
 	}
@@ -112,7 +113,7 @@ func TestPar2TransportCutRoundsDoNotCountTowardCap(t *testing.T) {
 		k := 4
 		for i, repairErr := range seq {
 			round, cut := rounds.end(repairErr)
-			if err := par2RoundStopError(1, round, cut, k, budget, 1, 0, 0, 0, repairErr); err != nil {
+			if err := par2RoundStopError(1, round, cut, k, budget, 1, 0, 0, 0, repairErr, nil); err != nil {
 				t.Fatalf("%s: failed round %d (cut=%v) stopped the pass with %d of %d slices: %v", name, i+1, cut, k+1, budget, err)
 			}
 			k++
@@ -132,7 +133,7 @@ func TestPar2TransportCutRoundsAreBounded(t *testing.T) {
 		var rounds par2FailedRounds
 		for i, repairErr := range seq {
 			round, cut := rounds.end(repairErr)
-			if err := par2RoundStopError(newly, round, cut, k, budget, 1, 0, 0, 0, repairErr); err != nil {
+			if err := par2RoundStopError(newly, round, cut, k, budget, 1, 0, 0, 0, repairErr, nil); err != nil {
 				return i + 1, err
 			}
 			k += newly
@@ -165,5 +166,49 @@ func TestPar2TransportCutRoundsAreBounded(t *testing.T) {
 	}
 	if c := classifyPar2Failure(err); !c.terminal {
 		t.Errorf("a cut round over budget with confirmed-missing slices %q classified %+v, want terminal", err, c)
+	}
+}
+
+// Row 73u: a round cut short by one article's fetch timeout (fetchSegment's
+// par2ArticleFetchTimeout) leaves context.DeadlineExceeded in repairErr. When
+// that round goes over budget with confirmed-missing slices and the job is
+// still live, the stop is terminal like any over-budget stop; a deadline or
+// cancel of the job itself stays transient, and so do the in-budget cut cap
+// and a round that found nothing new.
+func TestPar2RoundStopPerArticleDeadlineOverBudget(t *testing.T) {
+	articleDeadline := fmt.Errorf("par2: read intact slice 56: fetch segment 3: %w", context.DeadlineExceeded)
+	const k, budget = 98, 100
+
+	over := par2RoundStopError(5, 0, true, k, budget, 5, 0, 0, 0, articleDeadline, nil)
+	if over == nil {
+		t.Fatal("over budget did not stop")
+	}
+	for _, want := range []string{"confirmed missing across every provider", "context deadline exceeded"} {
+		if !strings.Contains(over.Error(), want) {
+			t.Errorf("over-budget stop %q lost %q", over, want)
+		}
+	}
+	if c := classifyPar2Failure(over); !c.terminal {
+		t.Errorf("over budget with confirmed-missing slices, job live: %q classified %+v, want terminal", over, c)
+	}
+
+	for name, jobErr := range map[string]error{"job deadline": context.DeadlineExceeded, "job cancelled": context.Canceled} {
+		err := par2RoundStopError(5, 0, true, k, budget, 5, 0, 0, 0, articleDeadline, jobErr)
+		if c := classifyPar2Failure(err); c.terminal || c.suspect {
+			t.Errorf("%s: %q classified %+v, want transient", name, err, c)
+		}
+	}
+
+	inBudget := par2RoundStopError(1, maxTransportCutRounds-1, true, 4, budget, 1, 0, 0, 0, articleDeadline, nil)
+	if inBudget == nil {
+		t.Fatal("in-budget cut cap did not stop")
+	}
+	if c := classifyPar2Failure(inBudget); c.terminal || c.suspect {
+		t.Errorf("in-budget cut cap %q classified %+v, want transient", inBudget, c)
+	}
+
+	nothingNew := par2RoundStopError(0, 0, true, 4, budget, 0, 0, 0, 0, articleDeadline, nil)
+	if c := classifyPar2Failure(nothingNew); nothingNew == nil || c.terminal || c.suspect {
+		t.Errorf("nothing new %v classified %+v, want transient", nothingNew, c)
 	}
 }
