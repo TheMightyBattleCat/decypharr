@@ -65,12 +65,21 @@ func TestP2EPar2ObfuscatedPostingRepairs(t *testing.T) {
 // with no ".volNN+MM" marker, so the yEnc headers agree with the NZB record.
 func p2eObfuscate(t *testing.T, srv *p2eServer, fx *p2eFixture, nzb *storage.NZB) {
 	t.Helper()
+	p2eRenamePar2(t, srv, fx, nzb, func(i int) string {
+		return fmt.Sprintf("%08x%08x.par2", 0x5eed0000+i*7919, 0xc0ffee^(i*104729))
+	})
+}
+
+// p2eRenamePar2 re-posts the i-th PAR2 file of nzb as name(i), so the yEnc
+// headers agree with the NZB record.
+func p2eRenamePar2(t *testing.T, srv *p2eServer, fx *p2eFixture, nzb *storage.NZB, name func(i int) string) {
+	t.Helper()
 	for i := range nzb.Par2Files {
 		pf := fx.par2[i]
 		if nzb.Par2Files[i].Name != pf.name {
 			t.Fatalf("Par2Files[%d] is %s, want %s (fixture order changed)", i, nzb.Par2Files[i].Name, pf.name)
 		}
-		name := fmt.Sprintf("%08x%08x.par2", 0x5eed0000+i*7919, 0xc0ffee^(i*104729))
+		name := name(i)
 		nzb.Par2Files[i].Name = name
 		for part, id := range pf.ids {
 			off := int64(part * p2eArticleSize)
@@ -88,6 +97,13 @@ func p2eObfuscate(t *testing.T, srv *p2eServer, fx *p2eFixture, nzb *storage.NZB
 // each, over par2UnnamedVolumeFloor), posted under obfuscated names. It
 // returns the NZB record and the volumes' article IDs.
 func p2eObfuscatedLargeVolumes(t *testing.T, nzbID string) (*p2eServer, *p2eFixture, *storage.NZB, []string) {
+	t.Helper()
+	return p2eLargeVolumes(t, nzbID, p2eObfuscate)
+}
+
+// p2eLargeVolumes is p2eObfuscatedLargeVolumes with the PAR2 files renamed
+// by rename.
+func p2eLargeVolumes(t *testing.T, nzbID string, rename func(*testing.T, *p2eServer, *p2eFixture, *storage.NZB)) (*p2eServer, *p2eFixture, *storage.NZB, []string) {
 	t.Helper()
 	servers, fx := newP2eEnvSets(t, 1, p2eSet{
 		base:  p2eRelease,
@@ -109,10 +125,10 @@ func p2eObfuscatedLargeVolumes(t *testing.T, nzbID string) (*p2eServer, *p2eFixt
 	}
 
 	nzb := fx.nzb(nzbID)
-	p2eObfuscate(t, srv, fx, nzb)
+	rename(t, srv, fx, nzb)
 	vols, idx := censusPar2Volumes(nzb.Par2Files)
 	if len(vols) != 2 || len(idx) != 1 {
-		t.Fatalf("census: %d volumes, %d index files; want both large obfuscated files as volumes and one index file", len(vols), len(idx))
+		t.Fatalf("census: %d volumes, %d index files; want both large renamed files as volumes and one index file", len(vols), len(idx))
 	}
 	if idx[0].Name != nzb.Par2Files[0].Name {
 		t.Fatalf("census kept %s as the index file, want %s", idx[0].Name, nzb.Par2Files[0].Name)
@@ -171,6 +187,50 @@ func TestP2EPar2ObfuscatedPostingLargeVolumesPassEarlyGate(t *testing.T) {
 		t.Fatalf("parse the fixture's index file: %v", err)
 	}
 	vols, _ := censusPar2Volumes(nzb.Par2Files)
+	var census uint32
+	for _, v := range vols {
+		census += v.count
+	}
+	pending := map[string][]overlay.DeadSegment{f3.name: {{MessageID: f3.ids[dead.idx]}}}
+	earlyK := earlyDamagedSliceCheck(index, pending, nzb.Par2Source, nzb.Par2Match, zerolog.Nop())
+	if earlyK == 0 || uint32(earlyK) <= census {
+		t.Fatalf("early check counts %d damaged slices against a census of %d; want more than the census", earlyK, census)
+	}
+	h := runP2eObfuscatedLargeVolumes(t, srv, fx, nzb, volArticles, dead)
+	for _, ln := range h.logs.lines() {
+		if msg, _ := ln["message"].(string); strings.Contains(msg, "early arithmetic check") {
+			t.Errorf("the early gate declined: %v", ln)
+		}
+	}
+}
+
+// The same posting with the volumes named only by number
+// ("p2e.vol-01.par2", "p2e.vol-02.par2"), as on North Glen S20 NTb, and the
+// damage where the early arithmetic gate counts it. Both volumes are one
+// size step, so the census counts one slice each; they were not marked
+// sized, so recountSizedVolumes left them at that and the early gate
+// declined the pass. Marked sized, they are counted from the parsed slice
+// size and the pass repairs.
+func TestP2EPar2NumberedEqualSizeVolumesPassEarlyGate(t *testing.T) {
+	numbered := func(t *testing.T, srv *p2eServer, fx *p2eFixture, nzb *storage.NZB) {
+		p2eRenamePar2(t, srv, fx, nzb, func(i int) string {
+			if i == 0 {
+				return "p2e.par2"
+			}
+			return fmt.Sprintf("p2e.vol-%02d.par2", i)
+		})
+	}
+	srv, fx, nzb, volArticles := p2eLargeVolumes(t, "p2e-numbered-large-early", numbered)
+	if nzb.Par2Files[0].Size >= nzb.Par2Files[1].Size {
+		t.Fatalf("p2e.par2 (%d bytes) is not the smallest; fixture order changed", nzb.Par2Files[0].Size)
+	}
+	vols, _ := censusPar2Volumes(nzb.Par2Files)
+	f3 := fx.posted[2]
+	dead := p2eSeg{f3, 0}
+	index, err := par2.ParseIndex(context.Background(), []par2.Source{{Name: fx.par2[0].name, Data: fx.par2[0].data}})
+	if err != nil {
+		t.Fatalf("parse the fixture's index file: %v", err)
+	}
 	var census uint32
 	for _, v := range vols {
 		census += v.count

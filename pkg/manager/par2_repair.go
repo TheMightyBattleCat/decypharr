@@ -1086,7 +1086,9 @@ func (p *Par2Repair) waitForManualSlot(nzbID string, slots, cancelled chan struc
 // estimateNeededSlices). A true result is not a guarantee - the exact
 // damaged-slice count is only known once the index is parsed - but a false
 // result means a repair pass would certainly fail, so it's safe to use for a
-// GUI's "repairable" hint without running one.
+// GUI's "repairable" hint without running one. When the volumes' sizes
+// cannot give a count (par2RecoveryEstimateUnknown) the coverage check
+// passes, and a pass's own gates decide.
 func (p *Par2Repair) Availability(nzbID string) (repairable bool, reason string) {
 	if p == nil || p.manager.usenet == nil {
 		return false, "usenet client not configured"
@@ -1159,6 +1161,12 @@ func (p *Par2Repair) coverageSufficient(nzbID string, nzb *storage.NZB) (suffici
 		return false, fmt.Sprintf("%d damaged segments exceeds the %d-slice repair cap", needed, par2.MaxRepairSlices)
 	}
 
+	// Equal-size volumes counted from their sizes are one slice each to the
+	// estimate, however many they hold: it cannot refuse, so the pass's
+	// gates decide once the index gives the slice size.
+	if par2RecoveryEstimateUnknown(nzb.Par2Files) {
+		return true, ""
+	}
 	available := par2PostedRecoverySlices(nzb.Par2Files)
 	if available < needed {
 		return false, fmt.Sprintf("only %d recovery slices retained, need at least %d", available, needed)
@@ -1274,7 +1282,8 @@ func par2CoverageGate(pendingSlices uint32, coverage func() (bool, string)) (boo
 
 // par2RecoveryCapacity returns the total number of recovery slices available
 // for nzbID from the retained Par2Files metadata, or -1 if recovery capacity
-// cannot be determined (no Par2Files, no par2 repair, etc.). Does NOT check
+// cannot be determined (no Par2Files, no par2 repair, sizes that cannot
+// give a count - see par2RecoveryEstimateUnknown - etc.). Does NOT check
 // whether PAR2 repair is enabled — callers already know par2Usable.
 func (p *Par2Repair) par2RecoveryCapacity(nzbID string) int {
 	if p == nil || p.manager.usenet == nil {
@@ -1284,7 +1293,54 @@ func (p *Par2Repair) par2RecoveryCapacity(nzbID string) int {
 	if err != nil || len(nzb.Par2Files) == 0 {
 		return -1
 	}
+	if par2RecoveryEstimateUnknown(nzb.Par2Files) {
+		return -1
+	}
 	return int(par2PostedRecoverySlices(nzb.Par2Files))
+}
+
+// par2RecoveryEstimateUnknown reports whether par2PostedRecoverySlices'
+// count says nothing: two or more recovery volumes whose slice counts come
+// from their sizes (an obfuscated posting's, unnamedVolumeSlices > 0, under
+// par2UnnamedVolumeFloor too; or numbered ones, see censusNumberedVolumes)
+// share one size. The estimate counts in steps of the smallest size
+// difference, so equal-size volumes (par2cmdline -u/-n, most posters) are
+// one step and one slice each - a 4.6 MB volume of 16 KiB slices holds 280 -
+// and the checks before a pass refused, or re-grabbed, a posting with plenty
+// of recovery. Only a parsed index (its slice size) can count them; see
+// recountSizedVolumes. Named volumes ("+count", "-end") are exact and never
+// make it unknown; equal-size index files (a season pack's, under twice the
+// smallest) are not volumes.
+func par2RecoveryEstimateUnknown(files []storage.Par2FileRef) bool {
+	vols, _ := censusNamedPar2Volumes(files)
+	var sizes []int64
+	if len(vols) == 0 {
+		base, step := unnamedRecoveryGeometry(files)
+		for _, f := range files {
+			if unnamedVolumeSlices(f.Size, base, step) > 0 {
+				sizes = append(sizes, f.Size)
+			}
+		}
+	} else {
+		for _, v := range vols {
+			if v.sized {
+				sizes = append(sizes, v.ref.Size)
+			}
+		}
+	}
+	return sizesRepeat(sizes)
+}
+
+// sizesRepeat reports whether any two of sizes are equal.
+func sizesRepeat(sizes []int64) bool {
+	seen := make(map[int64]bool, len(sizes))
+	for _, n := range sizes {
+		if seen[n] {
+			return true
+		}
+		seen[n] = true
+	}
+	return false
 }
 
 // par2PostedRecoverySlices is the recovery slices files were posted with,
@@ -4601,8 +4657,9 @@ type par2Volume struct {
 	start uint32
 	count uint32
 	// sized: count was estimated from file sizes alone (an obfuscated
-	// posting, see censusUnnamedVolumes), so recountSizedVolumes may raise
-	// it once a parsed index gives the slice size.
+	// posting, see censusUnnamedVolumes, or numbered volumes of which two
+	// share a size, see censusNumberedVolumes), so recountSizedVolumes may
+	// raise it once a parsed index gives the slice size.
 	sized bool
 }
 
@@ -4679,7 +4736,8 @@ func censusUnnamedVolumes(indexFiles []storage.Par2FileRef) ([]par2Volume, []sto
 // declined a repair the posting holds plenty of recovery for. Every volume
 // repeats the index's metadata at least once, so the new count is at least
 // the real one, as the census's is meant to be; a count is only ever
-// raised. vols is copied before a change. Named volumes are untouched.
+// raised. vols is copied before a change. Named volumes are untouched;
+// numbered ones only when censusNumberedVolumes marked them sized.
 func recountSizedVolumes(vols []par2Volume, files []storage.Par2FileRef, sliceSize int64) []par2Volume {
 	if sliceSize <= 0 {
 		return vols
@@ -4766,6 +4824,13 @@ func censusNamedPar2Volumes(files []storage.Par2FileRef) (vols []par2Volume, ind
 // estimate rounds up; it only sizes the fetch and the early capacity gate,
 // and the solve gates on the slices actually parsed (topUpParsedRecovery). A
 // numbered file no larger than the smallest stays an index file.
+//
+// When two of the volumes share a size (par2cmdline -u/-n), the smallest
+// step is a whole volume, not a slice, and every count is one per step:
+// all of the set's volumes are marked sized, so recountSizedVolumes counts
+// them from the parsed slice size, and the checks before a pass take the
+// estimate as unknown (par2RecoveryEstimateUnknown). A doubling set (North
+// Glen's) keeps its counts.
 func censusNumberedVolumes(vols []par2Volume, indexFiles []storage.Par2FileRef) ([]par2Volume, []storage.Par2FileRef) {
 	base := int64(-1)
 	var numbered []storage.Par2FileRef
@@ -4793,13 +4858,21 @@ func censusNumberedVolumes(vols []par2Volume, indexFiles []storage.Par2FileRef) 
 		return vols, indexFiles
 	}
 	isVol := make(map[string]bool, len(numbered))
+	var volSizes []int64
+	first := len(vols)
 	for _, f := range numbered {
 		n := (f.Size - base + unit - 1) / unit
 		if n <= 0 {
 			continue
 		}
 		isVol[f.Name] = true
+		volSizes = append(volSizes, f.Size)
 		vols = append(vols, par2Volume{ref: f, count: uint32(n)})
+	}
+	if sizesRepeat(volSizes) {
+		for i := first; i < len(vols); i++ {
+			vols[i].sized = true
+		}
 	}
 	kept := indexFiles[:0:0]
 	for _, f := range indexFiles {
