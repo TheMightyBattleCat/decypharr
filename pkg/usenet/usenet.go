@@ -1522,11 +1522,12 @@ func (u *Usenet) fetchArticleExcept(ctx context.Context, messageID string, excep
 // FetchArticlePrefix returns the first n decoded bytes of one NNTP article,
 // held in memory only: no segment cache, no DFS cache, no prefetch. The rest
 // of the body is drained and discarded (the connection stays reusable), so
-// it still costs one article of bandwidth.
+// it still costs one article of bandwidth. The read ends when ctx does,
+// even mid-body on a stalled server.
 func (u *Usenet) FetchArticlePrefix(ctx context.Context, messageID string, n int) ([]byte, error) {
 	var prefix []byte
 	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-		meta, err := conn.GetHeaderPrefix(messageID, n)
+		meta, err := conn.GetHeaderPrefixContext(ctx, messageID, n)
 		if err != nil {
 			return err
 		}
@@ -1553,7 +1554,7 @@ type ArticleHead struct {
 func (u *Usenet) FetchArticleHead(ctx context.Context, messageID string, n int) (ArticleHead, error) {
 	var head ArticleHead
 	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-		meta, err := conn.GetHeaderPrefix(messageID, n)
+		meta, err := conn.GetHeaderPrefixContext(ctx, messageID, n)
 		if err != nil {
 			return err
 		}

@@ -3,6 +3,7 @@ package nntp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -568,6 +569,30 @@ func (c *Connection) GetHeaderPrefixWithTimeout(messageID string, maxSnippet int
 	}
 	putBodyBuf(res.Data)
 	return metadataFromResult(res.Meta, snippet), nil
+}
+
+// GetHeaderPrefixContext is GetHeaderPrefix that ends when ctx does: the
+// connection is closed under the read, so a stalled server costs the caller
+// its own deadline rather than the full StreamBodyTimeout. A connection
+// closed this way is never pooled again (the pool drops closed ones), so no
+// half-read response is left for the next user. When ctx ends first the
+// error is ctx's own, not an NNTP one: the caller gave up, the provider
+// didn't fail, so failover neither retries nor excludes it.
+func (c *Connection) GetHeaderPrefixContext(ctx context.Context, messageID string, maxSnippet int) (*YencMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	meta, err := c.GetHeaderPrefix(messageID, maxSnippet)
+	if !stop() {
+		// The close has started, maybe not finished: finish it here so the
+		// connection is closed before the pool sees it.
+		_ = c.Close()
+		if err != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return meta, err
 }
 
 // GetBody retrieves article body by message ID as raw bytes (used by GetHeader)
