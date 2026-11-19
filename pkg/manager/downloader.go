@@ -146,10 +146,9 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		}
 		// Parent has been fanned out into season entries; mark it complete so
 		// it leaves the downloading queue instead of getting re-processed.
-		// Its files stay active (they are the seasons' files), so the ffprobe
-		// import gate is skipped here: each season's completion above already
-		// probed them, and a second pass would read every file through Usenet
-		// again.
+		// Its files stay active (they are the seasons' files), so no import
+		// gate runs here: each season's completion above already checked
+		// them, and a second pass would ask Usenet about every file again.
 		if err := d.completeSplitParent(torrent); err != nil {
 			if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
 				return err
@@ -209,18 +208,26 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // store's padded-segment count rather than something ffprobe's verdict can
 // stand in for.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
-	return d.finishEntry(entry, true)
+	if err := d.runImportGates(entry); err != nil {
+		return err
+	}
+	return d.finishEntry(entry)
 }
 
 // completeSplitParent completes the parent of a multi-season split once its
-// season entries have been processed. It is completeEntry without the ffprobe
-// import gate: the parent's files are its seasons' files, and each season's
-// completion has already probed them.
+// season entries have been processed. It is completeEntry without the import
+// gates: the parent's files are its seasons' files, and each season's
+// completion has already checked them. A second pass would ask Usenet about
+// every segment again, and a rejection here would clean up and re-grab under
+// the NZB ID every season shares. So the parent completes even when every
+// season was rejected; the seasons carry their own error state.
 func (d *Downloader) completeSplitParent(entry *storage.Entry) error {
-	return d.finishEntry(entry, false)
+	return d.finishEntry(entry)
 }
 
-func (d *Downloader) finishEntry(entry *storage.Entry, ffprobeGate bool) error {
+// runImportGates runs the import gates in order (see completeEntry). A
+// rejection has already cleaned up the import when it returns.
+func (d *Downloader) runImportGates(entry *storage.Entry) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
 		// By this point processSymlink/processDownload has
 		// already created the symlink tree (or downloaded the file) and,
@@ -238,24 +245,27 @@ func (d *Downloader) finishEntry(entry *storage.Entry, ffprobeGate bool) error {
 		d.cleanupRejectedImport(entry)
 		return err
 	}
-	// Skipped for a split parent (see completeSplitParent).
-	if ffprobeGate {
-		if err := d.ffprobeImportGate(entry); err != nil {
-			// By this point processSymlink/processDownload has
-			// already created the symlink tree (or downloaded the file) and,
-			// for symlink NZB entries, warmed the DFS cache for it. The
-			// rejection path this error feeds into (processAction ->
-			// entry.MarkAsError) only ever flips the entry's error state, so
-			// without this both would be left behind as permanent orphans.
-			d.cleanupRejectedImport(entry)
-			return err
-		}
+	if err := d.ffprobeImportGate(entry); err != nil {
+		// By this point processSymlink/processDownload has
+		// already created the symlink tree (or downloaded the file) and,
+		// for symlink NZB entries, warmed the DFS cache for it. The
+		// rejection path this error feeds into (processAction ->
+		// entry.MarkAsError) only ever flips the entry's error state, so
+		// without this both would be left behind as permanent orphans.
+		d.cleanupRejectedImport(entry)
+		return err
 	}
 	if err := d.paddingImportGate(entry); err != nil {
 		// Same cleanup rationale as the gates above.
 		d.cleanupRejectedImport(entry)
 		return err
 	}
+	return nil
+}
+
+// finishEntry reports an entry complete once its import gates (if any) have
+// passed.
+func (d *Downloader) finishEntry(entry *storage.Entry) error {
 	// The gates read under the manager's context and let an import through
 	// when a check is cut short. A shutdown cancels that context, so a check
 	// it cut short says nothing: stop here instead of reporting the import
