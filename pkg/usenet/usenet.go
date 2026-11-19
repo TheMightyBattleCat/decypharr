@@ -1227,6 +1227,15 @@ func (u *Usenet) OverlayEntryExists(nzoID string) bool {
 	return u.overlay.EntryExists(nzoID)
 }
 
+// OverlayManifestGeneration returns nzoID's overlay manifest generation -
+// see overlay.Store.ManifestGeneration. 0 if the store is unavailable.
+func (u *Usenet) OverlayManifestGeneration(nzoID string) uint64 {
+	if u.overlay == nil {
+		return 0
+	}
+	return u.overlay.ManifestGeneration(nzoID)
+}
+
 func (u *Usenet) OverlayDeleteEntry(nzoID string) error {
 	if u.overlay == nil {
 		return nil

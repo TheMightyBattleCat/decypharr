@@ -6,6 +6,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/overlay"
 )
 
@@ -25,8 +26,12 @@ type dfsCachePadForgetter interface {
 // cache marks them in its sidecar (vfs CacheItem.markPads) so they can be
 // forgotten once the records are gone. Encrypted files get the CBC widening
 // a PAR2 forget uses (buildDeadOutputRanges). nil for anything but a usenet
-// entry, and for a file with no such records; the NZB is only read when the
-// file has some.
+// entry, and for a file with no such records.
+//
+// It runs after every DFS chunk, so the result is kept per file with the
+// manifest generation it was built at: while the generation is unchanged
+// the manifest is not read again, and the NZB is only decoded when the
+// file's record set differs from the cached one.
 func (m *Manager) OverlayPadRanges(entry *storage.Entry, filename string, off, end int64) [][2]int64 {
 	if m == nil || m.usenet == nil || entry == nil || entry.Protocol != config.ProtocolNZB || end <= off {
 		return nil
@@ -35,39 +40,9 @@ func (m *Manager) OverlayPadRanges(entry *storage.Entry, filename string, off, e
 	if !m.usenet.OverlayEntryExists(nzbID) {
 		return nil
 	}
-	mf, err := m.usenet.OverlayManifest(nzbID)
-	if err != nil || mf == nil {
+	rs, ok := m.padRanges(nzbID, filename)
+	if !ok {
 		return nil
-	}
-	fe := mf.Files[filename]
-	if fe == nil {
-		return nil
-	}
-	var segs []overlay.DeadSegment
-	var sig strings.Builder
-	for _, d := range fe.DeadSegments {
-		if d.Status != overlay.StatusPatched {
-			segs = append(segs, d)
-			sig.WriteString(strconv.Itoa(d.Index))
-			sig.WriteByte(',')
-		}
-	}
-	if len(segs) == 0 {
-		return nil
-	}
-	// The ranges only change with the record set, so they are kept per
-	// file and rebuilt (one NZB decode) only when the set differs.
-	key := nzbID + "\x00" + filename
-	var rs []outputByteRange
-	if c, ok := m.padRangeCache.Load(key); ok && c.(padRangeCacheEntry).sig == sig.String() {
-		rs = c.(padRangeCacheEntry).ranges
-	} else {
-		nzb, err := m.usenet.GetNZB(nzbID)
-		if err != nil || nzb == nil {
-			return nil
-		}
-		rs = buildDeadOutputRanges(nzb, map[string][]overlay.DeadSegment{filename: segs})[filename]
-		m.padRangeCache.Store(key, padRangeCacheEntry{sig: sig.String(), ranges: rs})
 	}
 	var out [][2]int64
 	for _, r := range rs {
@@ -79,9 +54,63 @@ func (m *Manager) OverlayPadRanges(entry *storage.Entry, filename string, off, e
 	return out
 }
 
+// padRanges returns filename's whole-file pad output ranges, from
+// padRangeCache while the entry's manifest generation is unchanged. ok is
+// false when the manifest or NZB could not be read (nothing is cached
+// then).
+func (m *Manager) padRanges(nzbID, filename string) (rs []outputByteRange, ok bool) {
+	key := nzbID + "\x00" + filename
+	// Taken before the manifest is loaded: a write after this point bumps
+	// it, so the next call re-reads.
+	gen := m.usenet.OverlayManifestGeneration(nzbID)
+	prev, hit := m.padRangeCache.Load(key)
+	if hit && prev.(padRangeCacheEntry).gen == gen {
+		return prev.(padRangeCacheEntry).ranges, true
+	}
+	mf, err := padMarksManifest(m.usenet, nzbID)
+	if err != nil || mf == nil {
+		return nil, false
+	}
+	var segs []overlay.DeadSegment
+	var sig strings.Builder
+	if fe := mf.Files[filename]; fe != nil {
+		for _, d := range fe.DeadSegments {
+			if d.Status != overlay.StatusPatched {
+				segs = append(segs, d)
+				sig.WriteString(strconv.Itoa(d.Index))
+				sig.WriteByte(',')
+			}
+		}
+	}
+	switch {
+	case len(segs) == 0:
+		rs = nil
+	case hit && prev.(padRangeCacheEntry).sig == sig.String():
+		// Same record set under a new generation (another file's records,
+		// or a verdict change): the ranges still hold.
+		rs = prev.(padRangeCacheEntry).ranges
+	default:
+		nzb, err := m.usenet.GetNZB(nzbID)
+		if err != nil || nzb == nil {
+			return nil, false
+		}
+		rs = buildDeadOutputRanges(nzb, map[string][]overlay.DeadSegment{filename: segs})[filename]
+	}
+	m.padRangeCache.Store(key, padRangeCacheEntry{gen: gen, sig: sig.String(), ranges: rs})
+	return rs, true
+}
+
+// padMarksManifest loads the overlay manifest for padRanges; a var so tests
+// can count the reads.
+var padMarksManifest = func(u *usenet.Usenet, nzbID string) (*overlay.Manifest, error) {
+	return u.OverlayManifest(nzbID)
+}
+
 // padRangeCacheEntry is one file's entry in Manager.padRangeCache: its pad
-// output ranges and the record set (segment indices) they were built from.
+// output ranges, the record set (segment indices) they were built from, and
+// the manifest generation they were read at.
 type padRangeCacheEntry struct {
+	gen    uint64
 	sig    string
 	ranges []outputByteRange
 }

@@ -162,6 +162,12 @@ type Store struct {
 	// waiting for ffprobe - whose sampling windows can miss the damaged range
 	// entirely.
 	sweepEntries sync.Map // map[string]*sweepEntry, keyed by nzbID
+
+	// manifestGens holds, per nzbID, the generation of its last manifest
+	// write or removal in this process (see ManifestGeneration). Values come
+	// from genSeq, so they only grow and keys are never deleted.
+	manifestGens sync.Map // map[string]uint64
+	genSeq       atomic.Uint64
 }
 
 // sweepEntry is the per-nzbID value in Store.sweepEntries. deadSeen is a
@@ -718,7 +724,32 @@ func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: rename tmp manifest: %w", err)
 	}
+	s.bumpManifestGen(nzbID)
 	return nil
+}
+
+// bumpManifestGen gives nzbID a new manifest generation. Called after every
+// manifest write and entry-directory removal, never before, so a reader
+// that took the generation before loading the manifest can only pair it
+// with that manifest or a newer one.
+func (s *Store) bumpManifestGen(nzbID string) {
+	s.manifestGens.Store(nzbID, s.genSeq.Add(1))
+}
+
+// ManifestGeneration returns a number that changes whenever nzbID's
+// manifest is written or its overlay directory removed by this process. 0
+// means neither has happened since the process started. A caller that
+// caches something derived from the manifest takes the generation first,
+// then loads the manifest, and can reuse its result while the generation
+// stays the same.
+func (s *Store) ManifestGeneration(nzbID string) uint64 {
+	if s == nil {
+		return 0
+	}
+	if v, ok := s.manifestGens.Load(nzbID); ok {
+		return v.(uint64)
+	}
+	return 0
 }
 
 func writeFileAtomic(dir, finalPath string, data []byte) error {
@@ -1332,6 +1363,7 @@ func (s *Store) DeleteEntry(nzbID string) error {
 		}
 	}
 	err = os.RemoveAll(dir)
+	s.bumpManifestGen(nzbID)
 	mu.Unlock()
 	// The mutex stays in s.locks: goroutines may still hold or wait on it,
 	// and deleting it let a later lockFor mint a second mutex for the same
@@ -1392,7 +1424,9 @@ func (s *Store) clearFileDamage(nzbID, file string, cleared *[]DeadSegment) (pat
 			if dirErr != nil {
 				return false, dirErr
 			}
-			if rmErr := os.RemoveAll(dir); rmErr != nil && !os.IsNotExist(rmErr) {
+			rmErr := os.RemoveAll(dir)
+			s.bumpManifestGen(nzbID)
+			if rmErr != nil && !os.IsNotExist(rmErr) {
 				return false, fmt.Errorf("overlay: clear file damage (last in entry): %w", rmErr)
 			}
 			return false, nil
@@ -1507,7 +1541,9 @@ func (s *Store) deleteFile(nzbID, file string, cleared *[]DeadSegment) (removed 
 		if err != nil {
 			return false, err
 		}
-		if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+		err = os.RemoveAll(dir)
+		s.bumpManifestGen(nzbID)
+		if err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("overlay: delete file (last in entry): %w", err)
 		}
 		return true, nil

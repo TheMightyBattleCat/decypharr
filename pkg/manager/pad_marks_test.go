@@ -3,6 +3,7 @@ package manager
 import (
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,5 +178,62 @@ func TestOverlayPadRangesFollowsNewRecords(t *testing.T) {
 	}
 	if got, want := m.OverlayPadRanges(entry, padFile, 0, 400), [][2]int64{{0, 100}, {100, 200}, {300, 400}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("after a new pad = %v, want %v", got, want)
+	}
+}
+
+// countPadManifestReads swaps padMarksManifest for one that counts its
+// calls, for the length of the test.
+func countPadManifestReads(t *testing.T) *atomic.Int32 {
+	t.Helper()
+	var n atomic.Int32
+	orig := padMarksManifest
+	padMarksManifest = func(u *usenet.Usenet, nzbID string) (*overlay.Manifest, error) {
+		n.Add(1)
+		return orig(u, nzbID)
+	}
+	t.Cleanup(func() { padMarksManifest = orig })
+	return &n
+}
+
+// A DFS stream asks for a damaged file's pad ranges after every chunk. With
+// no record change between two chunks the manifest is read once; a record
+// written between them is read and reported by the next chunk.
+func TestOverlayPadRangesReadsManifestOnlyOnChange(t *testing.T) {
+	m, store, _, entry := newPadMarksManager(t)
+	reads := countPadManifestReads(t)
+
+	if got, want := m.OverlayPadRanges(entry, padFile, 0, 200), [][2]int64{{100, 200}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("chunk 1 = %v, want %v", got, want)
+	}
+	if got, want := m.OverlayPadRanges(entry, padFile, 200, 400), [][2]int64{{300, 400}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("chunk 2 = %v, want %v", got, want)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("manifest reads over two chunks with no record change = %d, want 1", got)
+	}
+	// A file of the same release with no records is cached too.
+	for i := 0; i < 2; i++ {
+		if got := m.OverlayPadRanges(entry, "other.mkv", 0, 400); got != nil {
+			t.Fatalf("file with no records = %v, want nil", got)
+		}
+	}
+	if got := reads.Load(); got != 2 {
+		t.Fatalf("manifest reads after two chunks of a clean file = %d, want 2", got)
+	}
+
+	if d, _ := store.Decide(padNZB, padFile, 0, "<p0>", 100, 1_000_000, 0); d != overlay.DecisionPad {
+		t.Fatalf("fixture: Decide(0) = %v, want DecisionPad", d)
+	}
+	if got, want := m.OverlayPadRanges(entry, padFile, 0, 200), [][2]int64{{0, 100}, {100, 200}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("chunk after a new pad = %v, want %v", got, want)
+	}
+	if got := reads.Load(); got != 3 {
+		t.Fatalf("manifest reads after a record change = %d, want 3", got)
+	}
+	if got, want := m.OverlayPadRanges(entry, padFile, 200, 400), [][2]int64{{300, 400}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("next chunk = %v, want %v", got, want)
+	}
+	if got := reads.Load(); got != 3 {
+		t.Fatalf("manifest reads after the next unchanged chunk = %d, want 3", got)
 	}
 }
