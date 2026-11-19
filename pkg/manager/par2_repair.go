@@ -1926,7 +1926,8 @@ func (p *Par2Repair) runPass(nzbID string, lane repairLane, fromSweep bool) {
 	// Idle watchdog: cancel a repair that stalls with no forward progress
 	// during a network phase. Exits cleanly when the job ends (timeoutCtx is
 	// cancelled by the defers above / the job timeout / preemption / shutdown).
-	go p.watchIdle(timeoutCtx, jobCancel, progress)
+	// Timings are read here, not inside the goroutine, which may outlive the pass.
+	go p.watchIdleWith(timeoutCtx, jobCancel, progress, par2IdlePollInterval, par2JobIdleTimeout)
 
 	pending, err := p.manager.usenet.OverlayPendingRepair(nzbID)
 	if err != nil {
@@ -6993,10 +6994,14 @@ func extractPostedRange(idx *par2.Index, repairedByIndex map[int64][]byte, fileI
 // reference, so a long CPU solve or a queued wait can never trip it. Stops
 // as soon as ctx is done (normal completion, timeout, preemption, shutdown).
 func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, progress *par2JobProgressState) {
+	p.watchIdleWith(ctx, cancel, progress, par2IdlePollInterval, par2JobIdleTimeout)
+}
+
+func (p *Par2Repair) watchIdleWith(ctx context.Context, cancel context.CancelFunc, progress *par2JobProgressState, poll, idle time.Duration) {
 	if progress == nil {
 		return
 	}
-	ticker := time.NewTicker(par2IdlePollInterval)
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
 		select {
@@ -7005,7 +7010,7 @@ func (p *Par2Repair) watchIdle(ctx context.Context, cancel context.CancelFunc, p
 		case <-ticker.C:
 			switch progress.Phase() {
 			case Par2PhaseFetchingRecovery, Par2PhaseStreamingIntact:
-				if time.Since(progress.LastUpdate()) >= par2JobIdleTimeout {
+				if time.Since(progress.LastUpdate()) >= idle {
 					p.logger.Warn().
 						Str("phase", string(progress.Phase())).
 						Dur("idle_for", time.Since(progress.LastUpdate())).
