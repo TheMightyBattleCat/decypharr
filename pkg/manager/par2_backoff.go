@@ -33,6 +33,11 @@ const (
 	// failure (see par2FailureClass.suspect) gets before it is taken at its
 	// word and made terminal: 5m, 10m and 20m of backoff between them.
 	par2SuspectAttemptLimit = 3
+	// par2UnconfirmedPairingLimit is how many consecutive attempts may end on
+	// the same posted file's unconfirmed pairing (see par2UnconfirmedPairing)
+	// before the outcome is terminal: a file none of whose slices can be
+	// read is never confirmed by another pass.
+	par2UnconfirmedPairingLimit = 3
 )
 
 // par2BackoffDuration returns how long to wait before the next automatic
@@ -136,6 +141,15 @@ func par2Fail(class par2Class, err error) error {
 // par2Failf is fmt.Errorf with class.
 func par2Failf(class par2Class, format string, args ...any) error {
 	return &par2Failure{class: class, cause: fmt.Errorf(format, args...)}
+}
+
+// par2UnconfirmedPairing is the transient failure of a pass that withheld
+// patches because posted file posted's pairing with its PAR2 file was not
+// confirmed by a read (see unconfirmedPairingErr). recordPar2Outcome counts
+// consecutive ones naming the same file.
+type par2UnconfirmedPairing struct {
+	par2Failure
+	posted string
 }
 
 // par2TerminalSubstrings are runRepair failure messages that can never
@@ -357,6 +371,26 @@ func (p *Par2Repair) recordPar2Outcome(nzbID string, err error, deadSegmentsDisc
 	// The suspect limit counts suspect failures only: a transient failure
 	// (a timeout) says nothing about whether the suspect cause recurs.
 	class := par2OutcomeClass(err, state.SuspectCount)
+
+	// An unconfirmed pairing is transient because a pass that reads one
+	// slice of the file confirms it. When the same file comes back
+	// par2UnconfirmedPairingLimit times in a row, no read is coming: only a
+	// re-grab replaces the file.
+	var unconfirmed *par2UnconfirmedPairing
+	if errors.As(err, &unconfirmed) {
+		if state.UnconfirmedFile == unconfirmed.posted {
+			state.UnconfirmedCount++
+		} else {
+			state.UnconfirmedFile, state.UnconfirmedCount = unconfirmed.posted, 1
+		}
+		if !class.terminal && state.UnconfirmedCount >= par2UnconfirmedPairingLimit {
+			class.terminal = true
+			class.reason = fmt.Sprintf("posted file %q can never be confirmed against its PAR2 file: re-grab the release", unconfirmed.posted)
+		}
+	} else {
+		state.UnconfirmedFile, state.UnconfirmedCount = "", 0
+	}
+
 	state.Terminal = class.terminal
 	if class.terminal {
 		state.TerminalReason = class.reason

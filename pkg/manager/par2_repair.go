@@ -3693,22 +3693,40 @@ func withholdUnconfirmedRefs(refs []par2DeadRef, unconfirmed map[[16]byte]bool) 
 // unconfirmedPairingErr is the pass's error when patches were withheld for
 // an unconfirmed pairing. Transient: the segments stay recorded dead, and a
 // later pass that reads one slice of the file confirms the pairing.
+//
+// With several files withheld it names the lowest posted name, whatever
+// order the refs came in, so recordPar2Outcome's per-file count sees the
+// same file on every pass.
 func unconfirmedPairingErr(withheld []par2DeadRef, matches []par2.Match, nzb *storage.NZB) error {
-	fid := withheld[0].rng.fileID
-	posted, how := withheld[0].file, "elimination"
-	for _, m := range matches {
-		if m.FileID != fid {
+	var posted, how string
+	seen := make(map[[16]byte]bool, len(withheld))
+	for _, dr := range withheld {
+		fid := dr.rng.fileID
+		if seen[fid] {
 			continue
 		}
-		if m.PostedIndex >= 0 && m.PostedIndex < len(nzb.Par2Source) {
-			posted = nzb.Par2Source[m.PostedIndex].Name
+		seen[fid] = true
+		name, by := dr.file, "elimination"
+		for _, m := range matches {
+			if m.FileID != fid {
+				continue
+			}
+			if m.PostedIndex >= 0 && m.PostedIndex < len(nzb.Par2Source) {
+				name = nzb.Par2Source[m.PostedIndex].Name
+			}
+			if m.Evidence == par2.EvidenceName {
+				by = "a name that differs from the PAR2 file's"
+			}
+			break
 		}
-		if m.Evidence == par2.EvidenceName {
-			how = "a name that differs from the PAR2 file's"
+		if posted == "" || name < posted {
+			posted, how = name, by
 		}
-		break
 	}
-	return par2Failf(par2Transient, "%d dead segment(s) left unpatched: posted file %q was paired with its PAR2 file by %s and no slice of it could be read to confirm the pairing (transient: a pass that reads one confirms it)", len(withheld), posted, how)
+	return &par2UnconfirmedPairing{
+		par2Failure: par2Failure{class: par2Transient, cause: fmt.Errorf("%d dead segment(s) left unpatched: posted file %q was paired with its PAR2 file by %s and no slice of it could be read to confirm the pairing (transient: a pass that reads one confirms it)", len(withheld), posted, how)},
+		posted:      posted,
+	}
 }
 
 // writeRecordedPatches writes the repaired bytes of each placeable recorded

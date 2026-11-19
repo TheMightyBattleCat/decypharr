@@ -24,6 +24,14 @@ type Par2RepairState struct {
 	SuspectCount int    `json:"suspect_count,omitempty"`
 	LastError    string `json:"last_error,omitempty"`
 
+	// UnconfirmedFile and UnconfirmedCount track consecutive attempts that
+	// ended withholding patches because posted file UnconfirmedFile's
+	// pairing with its PAR2 file could not be confirmed by a read (see
+	// pkg/manager.par2UnconfirmedPairing). A different file or any other
+	// outcome starts the count again; at the limit the outcome is terminal.
+	UnconfirmedFile  string `json:"unconfirmed_file,omitempty"`
+	UnconfirmedCount int    `json:"unconfirmed_count,omitempty"`
+
 	// Terminal, once true, means the last failure was classified as one no
 	// amount of retrying can fix on its own (see
 	// pkg/manager.classifyPar2Failure) - the automatic path stops
