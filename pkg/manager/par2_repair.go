@@ -2651,15 +2651,6 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		}
 		return data, nil
 	}, &transportFails)
-	// recoveryShortfall is the "not enough recovery slices" failure for idx,
-	// the index the count came from: its skipped packets make it transient.
-	recoveryShortfall := func(damaged, got int, idx *par2.Index) error {
-		skipped := 0
-		if idx != nil {
-			skipped = len(idx.SkippedPackets)
-		}
-		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()), skipped)
-	}
 
 	nzb, err := u.GetNZB(nzbID)
 	if err != nil {
@@ -2722,6 +2713,17 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	par2Refs := make(map[string]storage.Par2FileRef, len(nzb.Par2Files))
 	for _, f := range nzb.Par2Files {
 		par2Refs[f.Name] = f
+	}
+	// recoveryShortfall is the "not enough recovery slices" failure for idx,
+	// the index the count came from, parsed from srcs: its skipped packets
+	// make it transient, except those a 430'd PAR2 article explains.
+	recoveryShortfall := func(damaged, got int, idx *par2.Index, srcs []par2.Source) error {
+		skipped := par2UnexplainedSkips(idx, srcs, par2Refs, prov)
+		if idx != nil && skipped < len(idx.SkippedPackets) {
+			p.logger.Info().Str("entry", entryName).Int("skipped", len(idx.SkippedPackets)).Int("unexplained", skipped).
+				Msg("par2: PAR2 packets broken by a missing (430) article of their volume count as gone, not mis-served")
+		}
+		return par2RecoveryShortfall(damaged, got, int(transportFails.Load()), skipped)
 	}
 	refetch := func(fctx context.Context, messageID, exceptHost string) ([]byte, string, error) {
 		data, host, err := u.FetchArticleExcept(fctx, messageID, exceptHost)
@@ -3006,7 +3008,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 		p.logger.Info().Str("entry", entryName).Int("damaged", deadCount).
 			Msg("par2: no recovery slices fetched, skipping file matching")
 		return p.healBeforeRecoveryGate(ctx, nzbID, entryName, nzb, idx, pending, fetchPosted, cacheSource, tally,
-			recoveryShortfall(deadCount, 0, idx))
+			recoveryShortfall(deadCount, 0, idx, sources))
 	}
 
 	// The repair stream checks every intact slice against its IFSC checksum,
@@ -3405,7 +3407,7 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 			return err
 		}
 		if k > len(idx.Recovery) {
-			return recoveryShortfall(k, len(idx.Recovery), idx)
+			return recoveryShortfall(k, len(idx.Recovery), idx, sources)
 		}
 
 		// Choose k recovery slices whose solve matrix is invertible for
