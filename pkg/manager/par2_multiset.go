@@ -238,11 +238,13 @@ func par2DamageInUnseenSet(ctx context.Context, sources []par2.Source, posted []
 // A one-set release whose damage is in a file the set does not protect has
 // no such volume, and fetches nothing.
 //
-// *gone counts the volumes in a row that were gone (430) across every call
-// of one pass, as fetchMoreVolumes does within one call: at
-// par2RecoveryMaxConsecutiveNotFound the search stops, so a set whose
-// volumes are all gone is not tried one volume at a time. A volume that
-// fetches or fails without a 430 starts the count again.
+// gone counts, per base name, the volumes in a row that were gone (430)
+// across every call of one pass, as fetchMoreVolumes does within one call:
+// at par2RecoveryMaxConsecutiveNotFound that set is given up and the search
+// moves on to the next unseen set, so a set whose volumes are all gone is
+// not tried one volume at a time and does not use up the search for a live
+// set after it. A volume that fetches or fails without a 430 starts its
+// set's count again.
 //
 // The volume fetched is moved to vols[nextVolIdx] first, the rest keeping
 // their order, so the volumes tried stay the prefix vols[:next] that
@@ -260,7 +262,7 @@ func fetchVolumesForUnseenSet(
 	entryName string,
 	maxConc int,
 	progress *par2JobProgressState,
-	gone *int,
+	gone map[string]int,
 ) (outVols []par2Volume, next int, outSources []par2.Source, unseen bool, err error) {
 	copied := false
 	for {
@@ -270,16 +272,14 @@ func fetchVolumesForUnseenSet(
 		if !par2DamageInUnseenSet(ctx, sources, posted, pending) {
 			return vols, nextVolIdx, sources, false, nil
 		}
-		if *gone >= par2RecoveryMaxConsecutiveNotFound {
-			return vols, nextVolIdx, sources, true, nil
-		}
 		known := make(map[string]bool, len(sources))
 		for _, s := range sources {
 			known[par2BaseName(s.Name)] = true
 		}
 		j := -1
 		for i := nextVolIdx; i < len(vols); i++ {
-			if !known[par2BaseName(vols[i].ref.Name)] {
+			base := par2BaseName(vols[i].ref.Name)
+			if !known[base] && gone[base] < par2RecoveryMaxConsecutiveNotFound {
 				j = i
 				break
 			}
@@ -301,10 +301,10 @@ func fetchVolumesForUnseenSet(
 		if err != nil {
 			return vols, nextVolIdx, sources, true, par2Failf(par2Transient, "fetch recovery volumes: %w", err)
 		}
-		if notFound > 0 {
-			*gone++
+		if base := par2BaseName(v.ref.Name); notFound > 0 {
+			gone[base]++
 		} else {
-			*gone = 0
+			gone[base] = 0
 		}
 		if progress != nil {
 			progress.SetRecoveryVolsFetched(nextVolIdx)

@@ -38,13 +38,13 @@ func (h *p2eHarness) earlyGateAvailable() []float64 {
 // gone along with every one of their volumes (STAT says present, BODY
 // 430s, so the STAT check keeps them). The search for the damaged file's
 // set tried every volume of both unseen sets, one at a time, as each try
-// was its own fetch. It must stop after three volumes gone in a row, as a
-// recovery fetch does, and end terminal.
+// was its own fetch. It must give each set up after three of its own
+// volumes gone in a row, as a recovery fetch does, and end terminal.
 func TestPar2UnseenSetSearchStopsAfterThreeGoneVolumes(t *testing.T) {
 	servers, fx := newP2eEnvSets(t, 1,
 		p2eSet{base: p2eRelease + ".part1", files: []int{0}},
-		p2eSet{base: p2eRelease + ".part2", files: []int{1}},
-		p2eSet{base: p2eRelease + ".part3", files: []int{2}, redundancy: 40},
+		p2eSet{base: p2eRelease + ".part2", files: []int{1}, args: []string{"-s16384", "-r60", "-n5"}},
+		p2eSet{base: p2eRelease + ".part3", files: []int{2}, args: []string{"-s16384", "-r60", "-n5"}},
 	)
 	h := newP2eHarness(t, servers[0], fx, "p2e-unseen-gone-streak")
 	f2 := fx.posted[1]
@@ -60,8 +60,9 @@ func TestPar2UnseenSetSearchStopsAfterThreeGoneVolumes(t *testing.T) {
 	if o.Class != "terminal" {
 		t.Errorf("pass ended %q class %q (err %q), want terminal", o.LogMsg, o.Class, o.Err)
 	}
-	if n := h.loggedUnseenSetSearch(); n != par2RecoveryMaxConsecutiveNotFound {
-		t.Errorf("tried %d volume(s) looking for the set, want %d", n, par2RecoveryMaxConsecutiveNotFound)
+	// Five volumes per set: each set is given up after three of its own.
+	if n := h.loggedUnseenSetSearch(); n != 2*par2RecoveryMaxConsecutiveNotFound {
+		t.Errorf("tried %d volume(s) looking for the set, want %d (three per unseen set)", n, 2*par2RecoveryMaxConsecutiveNotFound)
 	}
 }
 
@@ -157,5 +158,48 @@ func TestPar2UnseenSetSearchEarlyGateCountsVolumesOnce(t *testing.T) {
 	}
 	if o.Class != "terminal" || !strings.Contains(o.Err, "only "+strconv.Itoa(want)+" recovery slices retained") {
 		t.Errorf("pass ended %q class %q (err %q), want terminal with %d slices retained", o.LogMsg, o.Class, o.Err, want)
+	}
+}
+
+// Two unseen sets: part2's index and every one of its five volumes are gone
+// (STAT says present, BODY 430s), and part2 sorts before part3, whose index
+// is gone but whose volumes are live and protect the damaged file. The
+// search gives part2 up after three of its own volumes gone in a row and
+// moves on to part3, whose first volume names the damaged file: the pass
+// repairs. A streak shared by every set ended it terminal after part2's
+// three, on a release part3 could repair.
+func TestPar2UnseenSetSearchGoneSetDoesNotEndSearchForLiveSet(t *testing.T) {
+	servers, fx := newP2eEnvSets(t, 1,
+		p2eSet{base: p2eRelease + ".part1", files: []int{0}},
+		p2eSet{base: p2eRelease + ".part2", files: []int{2}, args: []string{"-s16384", "-r60", "-n5"}},
+		p2eSet{base: p2eRelease + ".part3", files: []int{1}, redundancy: 40},
+	)
+	h := newP2eHarness(t, servers[0], fx, "p2e-unseen-gone-then-live")
+	n2 := 0
+	for _, f := range fx.par2 {
+		if strings.HasPrefix(f.name, p2eRelease+".part2.vol") {
+			n2++
+		}
+	}
+	if n2 <= par2RecoveryMaxConsecutiveNotFound {
+		t.Fatalf("part2 has %d volume(s), want more than %d so the per-set bound shows", n2, par2RecoveryMaxConsecutiveNotFound)
+	}
+	f2 := fx.posted[1]
+	h.recordDead(p2eSeg{f2, 1})
+	servers[0].set(f2.ids[1], p2eNotFound)
+	p2eSetGone(t, servers[0], fx, p2eRelease+".part2.par2")
+	p2eSetVolumes(servers[0], fx, p2eRelease+".part2.", p2eStatLie)
+	p2eSetGone(t, servers[0], fx, p2eRelease+".part3.par2")
+
+	o := h.run(nil)
+	h.report(o)
+	if o.LogMsg != "par2 repair completed" {
+		t.Fatalf("pass ended %q (class %q, err %q), want completed", o.LogMsg, o.Class, o.Err)
+	}
+	if o.Patched != 1 || o.Mismatch != 0 {
+		t.Errorf("overlay: %s, want 1 patch matching the original bytes", o.Overlay)
+	}
+	if n := h.loggedUnseenSetSearch(); n != par2RecoveryMaxConsecutiveNotFound+1 {
+		t.Errorf("tried %d volume(s) looking for the set, want %d (part2's three, then part3's first)", n, par2RecoveryMaxConsecutiveNotFound+1)
 	}
 }

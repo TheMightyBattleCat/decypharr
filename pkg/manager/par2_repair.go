@@ -2766,13 +2766,13 @@ func (p *Par2Repair) runRepair(ctx context.Context, nzbID, entryName string, pen
 	// every set and does not narrow the volumes to a set seen so far.
 	// nextVolIdx counts the volumes tried, which stay vols[:nextVolIdx].
 	var nextVolIdx int
-	var searchGone int // volumes in a row the search found gone (430)
+	searchGone := make(map[string]int) // per set base: volumes in a row the search found gone (430)
 	searchUnseenSet := func() error {
 		before := transportFails.Load()
 		var unseen bool
 		var err error
 		vols, nextVolIdx, sources, unseen, err = fetchVolumesForUnseenSet(ctx, p.logger, fetch, vols, nextVolIdx, sources,
-			nzb.Par2Source, pending, entryName, u.ProcessingMaxConnections(), progress, &searchGone)
+			nzb.Par2Source, pending, entryName, u.ProcessingMaxConnections(), progress, searchGone)
 		if err != nil {
 			return err
 		}
