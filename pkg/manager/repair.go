@@ -129,6 +129,10 @@ type Repair struct {
 	// tests; nil means the real one.
 	deleteEntryFn func(hash string) error
 
+	// probeFileFn replaces probeFile for a sweep's file probes in tests; nil
+	// means the real one.
+	probeFileFn func(ctx context.Context, c *candidate, name string, opts RepairRunOptions, skipDecode bool) fileResult
+
 	// coldPar2Slot lets one sweep PAR2 pass that fetches from Usenet run at
 	// a time (see coldSweepRepair).
 	coldPar2Slot sync.Mutex

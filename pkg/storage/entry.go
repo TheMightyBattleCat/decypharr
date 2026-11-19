@@ -196,15 +196,17 @@ func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
 // Returns the number of entries migrated and any error.
 func (s *Storage) MigrateMetadata() (int, error) {
 	// First, collect all keys that need migration
-	// We check if Protocol is empty as indicator of unmigrated data
 	var keysToMigrate []string
 	_ = s.entries.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
 		// Skip special keys
 		if strings.HasPrefix(key, "__") {
 			return nil
 		}
-		// Check if metadata needs migration (Protocol empty = old format)
-		if meta.Attribute(attributeProtocol) == "" {
+		// The old format has no protocol attribute at all. An entry with no
+		// protocol is saved with the attribute empty; testing the value
+		// would re-save it on every open and file it in the name index again
+		// under the running folder naming.
+		if _, ok := meta.Attributes[attributeProtocol]; !ok {
 			keysToMigrate = append(keysToMigrate, key)
 		}
 		return nil

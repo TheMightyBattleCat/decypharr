@@ -26,7 +26,7 @@ import (
 //
 // Each repair-pool worker now has a home provider and takes chunks only while
 // that provider answers STAT within statSlowFactor of the fastest measured
-// home. A provider that is slower, or not yet measured, keeps a single
+// home, or has not been measured yet. A provider that is slower keeps a single
 // explorer worker that takes one chunk when its last sample is older than its
 // re-test wait, so a provider that speeds up (or recovers from an outage) is
 // picked up again. The wait starts at statExploreAfter and doubles, up to
@@ -223,8 +223,9 @@ func (c *Client) recordStatSample(provider config.UsenetProvider, perStat time.D
 
 // recordStatHits records the average time of a chunk's found articles. A chunk
 // that found nothing leaves the average alone but still counts as a fresh look
-// at the provider, so a provider answering 430 for everything doesn't hand its
-// explorer one chunk after another.
+// at the provider, so a slow provider answering 430 for everything doesn't
+// hand its explorer one chunk after another. (A provider never measured is
+// eligible anyway and needs no explorer; see statEligible.)
 func (c *Client) recordStatHits(provider config.UsenetProvider, hitTime time.Duration, hits int) {
 	pp, ok := c.pools[provider.Host]
 	if !ok {
@@ -269,7 +270,11 @@ func (c *Client) statHomePools() []*ProviderPool {
 
 // statEligible reports whether home currently answers STAT fast enough to take
 // chunks, and the latencies behind the decision. A home over its hard quota is
-// never eligible and doesn't count towards the fastest.
+// never eligible and doesn't count towards the fastest. A home with no
+// measurement yet (lat 0) is eligible: there is nothing to compare it against,
+// and its first hit measures it. It drops out only once it proves slow. Held
+// out until measured, a home whose first chunk after a start found nothing
+// stayed unmeasured, and the whole pool refused STAT work for the re-test wait.
 func (c *Client) statEligible(home *ProviderPool) (ok bool, lat, fastest time.Duration) {
 	l := home.stat.nsPerStat.Load()
 	var best int64
@@ -281,8 +286,11 @@ func (c *Client) statEligible(home *ProviderPool) (ok bool, lat, fastest time.Du
 			best = v
 		}
 	}
-	if l == 0 || c.statHomeBlocked(home) {
+	if c.statHomeBlocked(home) {
 		return false, time.Duration(l), time.Duration(best)
+	}
+	if l == 0 {
+		return true, 0, time.Duration(best)
 	}
 	ref := max(best, int64(statLatencyFloor))
 	factor := int64(statSlowFactor)

@@ -9,6 +9,7 @@ package par2
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
@@ -81,6 +82,11 @@ func verifyPacketMD5(h packetHeader, packet []byte) bool {
 	return md5.Sum(packet[32:]) == h.MD5
 }
 
+// maxRehashedFailures is how many failed packets of one source may re-hash
+// bytes an earlier failed packet already hashed before walkPackets stops
+// walking that source.
+const maxRehashedFailures = 64
+
 // walkPackets calls fn once for every well-formed, MD5-verified packet found
 // in data, back-to-back starting at offset 0 (the layout PAR2 files use - no
 // padding between packets). It stops (without error) at the first byte range
@@ -101,8 +107,23 @@ func verifyPacketMD5(h packetHeader, packet []byte) bool {
 // and an index from a source set where one volume carries a mis-served or
 // mis-decoded article, relying on PAR2's duplication of the structural
 // packets across every volume.
-func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64), fn func(h packetHeader, packet []byte, offset int64) error) error {
+//
+// Lenient mode bounds its own cost. A crafted file of packet headers that
+// each declare "the rest of the file" as their length would otherwise hash
+// the remainder once per header, size²/128 bytes of MD5. A failed packet
+// that starts inside the region an earlier failed packet already hashed
+// re-hashes those bytes; after maxRehashedFailures of those, walkPackets
+// stops walking the source. Damage at separate places costs nothing toward
+// that limit, so every intact packet after it is still salvaged.
+//
+// ctx is checked before every packet: a cancelled or timed-out job returns
+// ctx.Err() instead of finishing the walk.
+func walkPackets(ctx context.Context, data []byte, onChecksumError func(h packetHeader, offset int64), fn func(h packetHeader, packet []byte, offset int64) error) error {
 	lenient := onChecksumError != nil
+	// failedTo is the end of the furthest region hashed for a packet whose
+	// MD5 failed; rehashed counts failed packets that started before it.
+	failedTo := int64(0)
+	rehashed := 0
 	// resync moves past a damaged region in lenient mode: to the next packet
 	// magic after pos, or reports that there is none.
 	resync := func(pos int64) (int64, bool) {
@@ -114,6 +135,9 @@ func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64)
 	}
 	pos := int64(0)
 	for pos+packetHeaderSize <= int64(len(data)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h, err := parsePacketHeader(data[pos:])
 		// Compared as remaining bytes, not pos+Length: a garbage header can
 		// declare a length near MaxInt64, and the sum would wrap negative,
@@ -135,6 +159,12 @@ func walkPackets(data []byte, onChecksumError func(h packetHeader, offset int64)
 				return fmt.Errorf("par2: packet MD5 mismatch at offset %d (type %q)", pos, packetTypeName(h.Type))
 			}
 			onChecksumError(h, pos)
+			if pos < failedTo {
+				if rehashed++; rehashed >= maxRehashedFailures {
+					break
+				}
+			}
+			failedTo = max(failedTo, pos+h.Length)
 			var ok bool
 			if pos, ok = resync(pos); !ok {
 				break

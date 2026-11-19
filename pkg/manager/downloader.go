@@ -146,9 +146,10 @@ func (d *Downloader) download(torrent *storage.Entry) error {
 		}
 		// Parent has been fanned out into season entries; mark it complete so
 		// it leaves the downloading queue instead of getting re-processed.
-		// (It has no active files of its own by this point, so the ffprobe
-		// import gate in completeEntry is a no-op here regardless.)
-		if err := d.completeEntry(torrent); err != nil {
+		// Its files stay active (they are the seasons' files), so no import
+		// gate runs here: each season's completion above already checked
+		// them, and a second pass would ask Usenet about every file again.
+		if err := d.completeSplitParent(torrent); err != nil {
 			if errors.Is(err, context.Canceled) && d.operationContext().Err() != nil {
 				return err
 			}
@@ -207,6 +208,26 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 // store's padded-segment count rather than something ffprobe's verdict can
 // stand in for.
 func (d *Downloader) completeEntry(entry *storage.Entry) error {
+	if err := d.runImportGates(entry); err != nil {
+		return err
+	}
+	return d.finishEntry(entry)
+}
+
+// completeSplitParent completes the parent of a multi-season split once its
+// season entries have been processed. It is completeEntry without the import
+// gates: the parent's files are its seasons' files, and each season's
+// completion has already checked them. A second pass would ask Usenet about
+// every segment again, and a rejection here would clean up and re-grab under
+// the NZB ID every season shares. So the parent completes even when every
+// season was rejected; the seasons carry their own error state.
+func (d *Downloader) completeSplitParent(entry *storage.Entry) error {
+	return d.finishEntry(entry)
+}
+
+// runImportGates runs the import gates in order (see completeEntry). A
+// rejection has already cleaned up the import when it returns.
+func (d *Downloader) runImportGates(entry *storage.Entry) error {
 	if err := d.importAvailabilityGate(entry); err != nil {
 		// By this point processSymlink/processDownload has
 		// already created the symlink tree (or downloaded the file) and,
@@ -239,6 +260,12 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 		d.cleanupRejectedImport(entry)
 		return err
 	}
+	return nil
+}
+
+// finishEntry reports an entry complete once its import gates (if any) have
+// passed.
+func (d *Downloader) finishEntry(entry *storage.Entry) error {
 	// The gates read under the manager's context and let an import through
 	// when a check is cut short. A shutdown cancels that context, so a check
 	// it cut short says nothing: stop here instead of reporting the import
@@ -260,13 +287,15 @@ func (d *Downloader) completeEntry(entry *storage.Entry) error {
 // paddingImportGate (padded/zero-filled segments):
 // the symlink tree (or downloaded file) at entry.DownloadPath(), the DFS
 // cache dir backing it (if one was warmed), and the overlay manifest dir for
-// this infohash. RemoveEntryCacheDir carries its own safety checks (DFS mode
-// + a configured cache dir, resolved path contained within it, and no other
-// live entry still sharing the folder name), so it's always safe to call
-// here even when there's nothing to remove. OverlayDeleteEntry is an
-// os.RemoveAll under a per-nzbID lock and no-ops cleanly when no overlay dir
-// exists; the reap "still the live owner?" guard is deliberately skipped
-// because the entry is confirmed broken and being discarded here.
+// this infohash. A season split frees only its own files from the parent's
+// cache folder (RemoveEntryCache). RemoveEntryCacheDir carries its own
+// safety checks (DFS mode + a configured cache dir, resolved path contained
+// within it, and no other live entry still sharing the folder name), so
+// it's always safe to call here even when there's nothing to remove.
+// OverlayDeleteEntry is an os.RemoveAll under a per-nzbID lock and no-ops
+// cleanly when no overlay dir exists; the reap "still the live owner?"
+// guard is deliberately skipped because the entry is confirmed broken and
+// being discarded here.
 func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	symlinkPath := entry.DownloadPath()
 	if err := os.RemoveAll(symlinkPath); err != nil {
@@ -278,7 +307,7 @@ func (d *Downloader) cleanupRejectedImport(entry *storage.Entry) {
 	}
 
 	nzbID := entryNZBID(entry)
-	if freed, ok := d.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
+	if freed, ok := d.manager.Repair().RemoveEntryCache(entry); ok {
 		d.logger.Info().Str("entry", entry.Name).Int64("bytes_freed", freed).
 			Msg("Import: removed DFS cache dir for rejected import")
 	}
@@ -400,7 +429,6 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		kind = arrKindFromType(a.Type)
 	}
 	expected := expectedRuntime{ArrKind: kind}
-	entryFolder := entry.GetFolder()
 
 	// One wall-clock budget for the whole entry: every file's verification
 	// passes and back-off waits draw from it, so a slow backing store can
@@ -418,6 +446,10 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		if !importChecksFile(file, largest) {
 			continue
 		}
+		// The probe opens the file by this hash (the internal WebDAV path),
+		// not by a folder name. A season split out of a multi-season pack
+		// is not stored until markAsCompleted, but its files carry the
+		// parent's NZB ID, and the parent is stored with them.
 		infoHash := file.InfoHash
 		if infoHash == "" {
 			infoHash = entry.InfoHash
@@ -427,7 +459,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 		exp := expected
 		exp.Bytes = file.Size
 
-		ok, conclusive, reason := d.verifyImportFile(budgetCtx, checker, entry, entryFolder, file.Name, infoHash, exp)
+		ok, conclusive, reason := d.verifyImportFile(budgetCtx, checker, entry, file.Name, infoHash, exp)
 		if !ok {
 			d.logger.Warn().Str("entry", entry.Name).Str("file", file.Name).Str("reason", reason).
 				Msg("Import: ffprobe confirmed broken; rejecting download")
@@ -468,7 +500,7 @@ func (d *Downloader) ffprobeImportGate(entry *storage.Entry) (err error) {
 // ok=false is a genuine broken verdict (caller rejects + re-grabs). ok=true
 // with conclusive=false means "admit but flag dirty": every pass ran out of
 // time and nothing was actually verified.
-func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, entryFolder, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
+func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeChecker, entry *storage.Entry, fileName, infoHash string, exp expectedRuntime) (ok, conclusive bool, reason string) {
 	// One budget for the whole file, deliberately shared across every pass:
 	// the point is to cap what this file can cost the gate in total, so a
 	// runaway read cannot simply be repeated ffprobeImportInconclusiveRetries
@@ -488,7 +520,7 @@ func (d *Downloader) verifyImportFile(ctx context.Context, checker *ffprobeCheck
 		// Coverage is not used here: the import gate never stamps
 		// DecodeVerifiedAt, it only keys on conclusive - which a bounded head
 		// scan of an unseekable file does set, ending the retry loop for it.
-		ok, reason, conclusive, _ = checker.checkConfirmed(ctx, entryFolder, fileName, exp, false, sig, budget)
+		ok, reason, conclusive, _ = checker.checkConfirmed(ctx, infoHash, fileName, exp, false, sig, budget)
 		unregisterDeadSignal(infoHash, fileName, sig)
 
 		if !ok {

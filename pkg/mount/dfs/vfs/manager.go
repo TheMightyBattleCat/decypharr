@@ -286,6 +286,22 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return item.ReadCachedRange(p, off)
 }
 
+// PeekHasCachedRange reports whether PeekCachedRange would find
+// [off, off+length) of filename's cache item under entryName fully cached,
+// without reading the bytes. It looks only at the live in-memory item, as
+// PeekCachedRange does - unlike HasCachedRange, which also trusts the on-disk
+// sidecar of a closed item that PeekCachedRange cannot read from.
+func (m *Manager) PeekHasCachedRange(entryName, filename string, off, length int64) bool {
+	if m.cache == nil || length <= 0 {
+		return false
+	}
+	item, ok := m.cache.PeekItem(entryName, filename)
+	if !ok || item.buf == nil {
+		return false
+	}
+	return item.HasRange(ranges.Range{Pos: off, Size: length})
+}
+
 // HasCachedRange reports whether [off, off+length) of filename's cache item
 // under entryName is already cached, without reading or fetching anything:
 // the live in-memory item if one is open, else its on-disk metadata sidecar.
@@ -335,6 +351,21 @@ func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int6
 		return
 	}
 	m.cache.forgetDiskRange(entryName, filename, off, length)
+}
+
+// ForgetPaddedRanges forgets every range of filename's cache item under
+// entryName that was marked as zero-fill when written (see
+// CacheItem.ForgetPads), and drops the marks: the live item if one is open,
+// otherwise its on-disk sidecar. Returns the bytes forgotten. No-op when
+// there is no VFS cache, no item, or no mark. Never creates a cache item.
+func (m *Manager) ForgetPaddedRanges(entryName, filename string) int64 {
+	if m.cache == nil {
+		return 0
+	}
+	if item, ok := m.cache.PeekItem(entryName, filename); ok {
+		return item.ForgetPads()
+	}
+	return m.cache.forgetDiskPads(entryName, filename)
 }
 
 // CacheCoverage returns filename's cache coverage under entryName: cached

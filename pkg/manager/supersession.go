@@ -316,10 +316,11 @@ func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]stru
 // moves (same folder, same final filename) even though the specific broken
 // copy behind it has already been superseded by a different InfoHash.
 //
-// It queries every eligible Arr regardless of cfg.Repair.Arrs scoping: "does
-// any Arr still use this file" is independent of which Arrs a scheduled
-// repair sweep happens to be scoped to check, and narrowing to that scope could
-// make a file merely excluded from the repair sweep's Arr filter look superseded.
+// It queries every Arr with a host and token (referenceArrs), regardless of
+// cfg.Repair.Arrs scoping or skip_repair: "does any Arr still use this file"
+// is independent of which Arrs a scheduled repair sweep is scoped to check or
+// may act through, and narrowing to either could make a file only such an
+// Arr uses look superseded or stale.
 //
 // Returns an error - never an empty-but-successful map - when there are zero
 // eligible Arrs, on top of the existing per-Arr fetch/resolution failure
@@ -336,7 +337,21 @@ func (r *Repair) deleteSupersededEntry(entryName string, exclude map[string]stru
 // concurrently, so this reports completion order, not a sequential "current
 // Arr"; existing callers that don't need progress just omit it.
 func (r *Repair) buildArrReferencedSet(ctx context.Context, onArrDone ...func(done, total int, name string)) (map[string]map[string]string, error) {
-	return r.buildArrReferencedSetFor(ctx, r.eligibleArrs(nil), onArrDone...)
+	return r.buildArrReferencedSetFor(ctx, r.referenceArrs(), onArrDone...)
+}
+
+// referenceArrs is every Arr with a host and token, skip_repair included:
+// skip_repair keeps repair from acting through an Arr, it does not make the
+// Arr's files unused. eligibleArrs decides who may be acted on.
+func (r *Repair) referenceArrs() []*arr.Arr {
+	all := r.manager.arr.GetAll()
+	out := make([]*arr.Arr, 0, len(all))
+	for _, a := range all {
+		if a != nil && a.Host != "" && a.Token != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // buildArrReferencedSetFor is buildArrReferencedSet over the given Arrs.

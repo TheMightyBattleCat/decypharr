@@ -85,8 +85,9 @@ func recomputeVerdictLocked(fe *FileEntry) {
 
 // Decide records segIndex as dead (if not already known) and returns whether
 // it should be padded under the current policy, plus file's resulting
-// verdict. Only ever called after a segment's article fetch has permanently
-// failed across every provider.
+// verdict. A segment that already has a patch is left unchanged and gets
+// DecisionPatch. Only ever called after a segment's article fetch has
+// permanently failed across every provider.
 func (s *Store) Decide(nzbID, file string, segIndex int, msgID string, segBytes, fileSize int64, totalSegments int) (Decision, Verdict) {
 	return s.decide(nzbID, file, segIndex, msgID, segBytes, fileSize, totalSegments, false)
 }
@@ -145,13 +146,6 @@ func (s *Store) decide(nzbID, file string, segIndex int, msgID string, segBytes,
 	}
 	fe := fileEntryLocked(m, file)
 
-	// A file already failed never pads again - the legacy repair path owns
-	// it now. A viewer's read still may, within the viewer ceilings (see
-	// DecideForViewer).
-	if fe.Verdict == VerdictFailed && !viewer {
-		return DecisionFail, VerdictFailed
-	}
-
 	existing := -1
 	for i := range fe.DeadSegments {
 		if fe.DeadSegments[i].Index == segIndex {
@@ -159,6 +153,21 @@ func (s *Store) decide(nzbID, file string, segIndex int, msgID string, segBytes,
 			break
 		}
 	}
+	// A repair wrote this segment's patch between the caller's patch check
+	// and this call. Marking it padded would hide the patch (PatchBytes
+	// serves only patched records) and serve zeros for a repaired segment,
+	// so leave the record as it is and tell the caller to serve the patch.
+	if existing != -1 && fe.DeadSegments[existing].Status == StatusPatched {
+		return DecisionPatch, fe.Verdict
+	}
+
+	// A file already failed never pads again - the legacy repair path owns
+	// it now. A viewer's read still may, within the viewer ceilings (see
+	// DecideForViewer).
+	if fe.Verdict == VerdictFailed && !viewer {
+		return DecisionFail, VerdictFailed
+	}
+
 	if existing == -1 {
 		fe.DeadSegments = append(fe.DeadSegments, DeadSegment{
 			Index: segIndex, MessageID: msgID, Bytes: segBytes, Status: StatusDead,

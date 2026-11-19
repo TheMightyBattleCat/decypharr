@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -72,8 +73,26 @@ func writeJSONFile(path string, v any) error {
 // StageDBRestore writes the snapshot's database into db.restore-<ts>/ under
 // mainPath, checks that it opens and that the record counts match the
 // snapshot, and records a pending swap. Nothing live is touched: the swap
-// happens at the next start (ApplyPendingRestore).
+// happens at the next start (ApplyPendingRestore). The database is indexed
+// under the running folder naming, since the config is not restored with it;
+// the response warns when the snapshot's config used another one.
 func StageDBRestore(repo Repo, snapshotID, mainPath string) (RestoreDBResponse, error) {
+	running := config.Get().FolderNaming
+	resp, err := stageSnapshotDB(repo, snapshotID, mainPath, running)
+	if err != nil {
+		return resp, err
+	}
+	if snap, err := repo.ReadSnapshot(context.Background(), snapshotID); err == nil {
+		if w := namingMismatchWarning(snap, repo, running); w != "" {
+			resp.Warnings = append(resp.Warnings, w)
+		}
+	}
+	return resp, nil
+}
+
+// stageSnapshotDB is StageDBRestore for a database that will run under
+// naming.
+func stageSnapshotDB(repo Repo, snapshotID, mainPath string, naming config.WebDavFolderNaming) (RestoreDBResponse, error) {
 	ctx := context.Background()
 	snap, err := repo.ReadSnapshot(ctx, snapshotID)
 	if err != nil {
@@ -83,7 +102,7 @@ func StageDBRestore(repo Repo, snapshotID, mainPath string) (RestoreDBResponse, 
 	if !ok || len(entry.StoreBlobs) == 0 {
 		return RestoreDBResponse{}, fmt.Errorf("%w: snapshot %s has no database", ErrInvalid, snapshotID)
 	}
-	return stageDB(snapshotID, snap.Decypharr, entry.Records, mainPath, func(store string) (io.ReadCloser, error) {
+	return stageDB(snapshotID, snap.Decypharr, entry.Records, mainPath, naming, func(store string) (io.ReadCloser, error) {
 		sha, ok := entry.StoreBlobs[store]
 		if !ok {
 			return nil, nil
@@ -94,8 +113,9 @@ func StageDBRestore(repo Repo, snapshotID, mainPath string) (RestoreDBResponse, 
 
 // stageDB is the shared core of StageDBRestore and the archive restore:
 // open returns the exported stream of a store, or (nil, nil) when there is
-// none. records is the total the source recorded, or 0 when unknown.
-func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, open func(store string) (io.ReadCloser, error)) (RestoreDBResponse, error) {
+// none. records is the total the source recorded, or 0 when unknown. naming
+// is the folder naming the restored install will run under.
+func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, naming config.WebDavFolderNaming, open func(store string) (io.ReadCloser, error)) (RestoreDBResponse, error) {
 	if err := checkDBStageable(snapshotID, build, mainPath); err != nil {
 		return RestoreDBResponse{}, err
 	}
@@ -116,7 +136,7 @@ func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, o
 		return RestoreDBResponse{}, err
 	}
 
-	rep, counts, err := importAndOpen(staged, records, open)
+	rep, counts, err := importAndOpenNamed(staged, records, naming, open)
 	if err != nil {
 		return RestoreDBResponse{}, err
 	}
@@ -143,7 +163,13 @@ func stageDB(snapshotID string, build BuildInfo, records int, mainPath string, o
 // way startup will and checks each store's count. It is shared by staging a
 // restore and by the check's restore test.
 func importAndOpen(dir string, records int, open func(store string) (io.ReadCloser, error)) (*storage.ImportReport, map[string]int, error) {
-	rep, err := storage.ImportStores(dir, open)
+	return importAndOpenNamed(dir, records, config.Get().FolderNaming, open)
+}
+
+// importAndOpenNamed is importAndOpen for a database that will run under
+// naming.
+func importAndOpenNamed(dir string, records int, naming config.WebDavFolderNaming, open func(store string) (io.ReadCloser, error)) (*storage.ImportReport, map[string]int, error) {
+	rep, err := storage.ImportStoresNamed(dir, naming, open)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -241,4 +267,80 @@ func checkDBStageable(snapshotID string, build BuildInfo, mainPath string) error
 		return fmt.Errorf("%w: a database restore is already staged; restart to apply it first", ErrBusy)
 	}
 	return nil
+}
+
+// maxConfigJSONBytes caps how much of a snapshot's config.json is read to
+// find its folder naming.
+const maxConfigJSONBytes = 4 << 20
+
+// configFolderNaming reads the folder naming a config.json sets, resolved the
+// way loading the config does: folder_naming, else the first debrid's
+// (deprecated) folder_naming. ok is false when it is not a config file.
+func configFolderNaming(r io.Reader) (naming config.WebDavFolderNaming, ok bool) {
+	var c struct {
+		FolderNaming string `json:"folder_naming"`
+		Debrids      []struct {
+			FolderNaming string `json:"folder_naming"`
+		} `json:"debrids"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r, maxConfigJSONBytes)).Decode(&c); err != nil {
+		return "", false
+	}
+	if c.FolderNaming == "" && len(c.Debrids) > 0 {
+		return config.WebDavFolderNaming(c.Debrids[0].FolderNaming), true
+	}
+	return config.WebDavFolderNaming(c.FolderNaming), true
+}
+
+// configFileFolderNaming is configFolderNaming for the file at p.
+func configFileFolderNaming(p string) (config.WebDavFolderNaming, bool) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	return configFolderNaming(f)
+}
+
+// snapshotFolderNaming is the folder naming of the config.json saved in snap;
+// ok is false when it has none that can be read.
+func snapshotFolderNaming(snap *Snapshot, bs BlobStore) (config.WebDavFolderNaming, bool) {
+	sha := snap.Components[ComponentConfig].Files["config.json"]
+	if sha == "" {
+		return "", false
+	}
+	rc, err := bs.OpenBlob(context.Background(), sha)
+	if err != nil {
+		return "", false
+	}
+	defer rc.Close()
+	return configFolderNaming(rc)
+}
+
+// namingMismatchWarning is the warning for restoring snap's database without
+// its config while the install runs under running: empty when the snapshot's
+// config used the same folder naming, or has none to compare. Items and
+// health records keep the snapshot's folder names, which direct paths (and
+// the Arr links made with them) resolve by; the __all__ listing uses the
+// running naming, so its folders would not open.
+func namingMismatchWarning(snap *Snapshot, bs BlobStore, running config.WebDavFolderNaming) string {
+	theirs, ok := snapshotFolderNaming(snap, bs)
+	if !ok || sameFolderNaming(theirs, running) {
+		return ""
+	}
+	return fmt.Sprintf("the snapshot's config uses folder_naming %q but this install uses %q: folders listed in __all__ will not open until folder_naming is set to %q (or the snapshot's config is restored too)",
+		namingLabel(theirs), namingLabel(running), namingLabel(theirs))
+}
+
+// sameFolderNaming reports whether a and b name folders alike: the default
+// ("") is the entry's file name.
+func sameFolderNaming(a, b config.WebDavFolderNaming) bool {
+	return namingLabel(a) == namingLabel(b)
+}
+
+func namingLabel(n config.WebDavFolderNaming) string {
+	if n == "" {
+		return string(config.WebDavUseFileName)
+	}
+	return string(n)
 }

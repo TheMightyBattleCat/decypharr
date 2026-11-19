@@ -95,6 +95,8 @@ Turn it off to always use providers in priority order. The setting applies withi
 
 The provider stats show each provider's measured rate (`body_mib_s`) and whether it is currently tried after the others (`body_deferred`). Debug logs record each change: `Body routing: provider is too slow, trying the other primaries first` and `... fast enough again, back at its priority position`.
 
+`body_foreign` counts, per provider, the article downloads that turned out to be another upload's article: the yEnc part number or size is not the one asked for, which happens when a provider reuses a message ID. Each one is treated as "no such article" from that provider and the next provider is asked. It is normally 0; the count changes nothing about which provider is asked first.
+
 ## Performance Tuning
 
 ### Connection Limits

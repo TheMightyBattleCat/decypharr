@@ -646,11 +646,22 @@ func (s *Server) handleOverlayRepairNow(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	if err := par2Repair.RunNow(entry.InfoHash); err != nil {
+	waiting, err := par2Repair.RunNowStatus(entry.InfoHash)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	utils.JSONResponse(w, map[string]string{"status": "queued"}, http.StatusOK)
+	utils.JSONResponse(w, map[string]string{"status": overlayRepairNowStatus(waiting)}, http.StatusOK)
+}
+
+// overlayRepairNowStatus is repair-now's reply status: "waiting" when both
+// manual slots are taken and the pass waits for one, "queued" when it starts
+// at once (the value the GUI has always been sent for that case).
+func overlayRepairNowStatus(waiting bool) string {
+	if waiting {
+		return "waiting"
+	}
+	return "queued"
 }
 
 // par2RefsBackfillEligible reports whether nzbID was rejected by
@@ -851,13 +862,26 @@ func (s *Server) handleOverlayReclaim(w http.ResponseWriter, r *http.Request) {
 	// short-circuiting on a stale cause.
 	u.ClearFailedFile(entry.InfoHash, req.File)
 	if removed {
-		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash); ok {
+		if freed, ok := removeReclaimedEntryCache(s.manager.Repair(), entry); ok {
 			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", req.File).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed file")
 		} else {
 			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", req.File).Msg("overlay reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
 		}
 	}
 	utils.JSONResponse(w, map[string]string{"status": "reclaimed"}, http.StatusOK)
+}
+
+// entryCacheRemover frees an entry's DFS cache (manager.Repair).
+type entryCacheRemover interface {
+	RemoveEntryCache(entry *storage.Entry) (int64, bool)
+}
+
+// removeReclaimedEntryCache frees the cached copy of a reclaimed entry's
+// files. It goes through RemoveEntryCache, not RemoveEntryCacheDir, so a
+// season split (which has no cache folder of its own) evicts its files from
+// the parent's folder instead of freeing nothing.
+func removeReclaimedEntryCache(r entryCacheRemover, entry *storage.Entry) (int64, bool) {
+	return r.RemoveEntryCache(entry)
 }
 
 // reclaimOverlayByNzbID deletes an overlay record addressed directly by the
@@ -907,7 +931,7 @@ func (s *Server) reclaimOverlayByNzbID(w http.ResponseWriter, nzbID, file string
 	// comes from the nzbID's own entry. If GetEntry fails the entry is gone
 	// entirely and its cache dir was torn down with it; nothing to evict.
 	if entry, gerr := s.manager.GetEntry(nzbID); gerr == nil && entry != nil {
-		if freed, ok := s.manager.Repair().RemoveEntryCacheDir(entry.GetFolder(), nzbID); ok {
+		if freed, ok := removeReclaimedEntryCache(s.manager.Repair(), entry); ok {
 			s.logger.Info().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Int64("bytes_freed", freed).Msg("removed cached copy for reclaimed superseded overlay record")
 		} else {
 			s.logger.Debug().Str("entry", entry.GetFolder()).Str("file", file).Str("nzb_id", nzbID).Msg("superseded overlay record reclaimed but DFS cache dir not evicted (twin-guard, path mismatch, or already gone)")
@@ -1121,6 +1145,12 @@ func (s *Server) handleOverlayReap(w http.ResponseWriter, r *http.Request) {
 	req.File = strings.TrimSpace(req.File)
 	if req.NzbID == "" || req.File == "" {
 		http.Error(w, "nzb_id and file are required", http.StatusBadRequest)
+		return
+	}
+	// Only an existing overlay entry can be reaped. The store also refuses an
+	// ID that is not a single path element, so ".." never reaches a delete.
+	if u := s.manager.Usenet(); u == nil || !u.OverlayEntryExists(req.NzbID) {
+		http.Error(w, "no overlay entry for that nzb_id", http.StatusNotFound)
 		return
 	}
 

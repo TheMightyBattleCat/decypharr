@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -58,6 +59,9 @@ type Decision int
 const (
 	DecisionFail Decision = iota
 	DecisionPad
+	// DecisionPatch: the segment already has a PAR2 patch (written after
+	// the caller last looked). Nothing was changed; serve the patch.
+	DecisionPatch
 )
 
 // DeadSegment is one confirmed-missing article recorded against a logical file.
@@ -134,6 +138,10 @@ type Store struct {
 	// was before notifications existed for this.
 	failedNotify atomic.Pointer[func(nzbID, file string)]
 
+	// damageClearedNotify is told which dead/padded records DeleteEntry,
+	// DeleteFile or ClearFileDamage removed - see SetDamageClearedNotifier.
+	damageClearedNotify atomic.Pointer[func(nzbID string, removed map[string][]DeadSegment)]
+
 	// policy holds the current padding caps. nil until SetPolicy is called,
 	// in which case Policy() falls back to DefaultPolicy() - the original,
 	// pre-configurable behavior.
@@ -172,11 +180,73 @@ func NewStore(root string, logger zerolog.Logger) (*Store, error) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return nil, fmt.Errorf("overlay: create root dir: %w", err)
 	}
+	removeStaleTempFiles(root, staleTempAge, time.Now(), logger)
 	return &Store{
 		root:   root,
 		logger: logger,
 		locks:  make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// staleTempAge is how old a leftover patch/manifest temp file must be before
+// NewStore removes it. A live write renames its temp file within moments, so
+// anything this old was left by a crash or a kill mid-write.
+const staleTempAge = time.Hour
+
+// removeStaleTempFiles deletes the patch-*.tmp and manifest-*.tmp files that
+// writeFileAtomic and saveManifestLocked leave in an entry directory when the
+// process dies between create and rename. Only regular files directly inside
+// an entry directory, matching those two patterns and last modified before
+// now-maxAge, are removed; anything else is left alone. Errors are logged and
+// skipped: a stray temp file is harmless, so it never fails the store open.
+func removeStaleTempFiles(root string, maxAge time.Duration, now time.Time, logger zerolog.Logger) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		logger.Warn().Err(err).Str("root", root).Msg("overlay: list entries for temp-file cleanup")
+		return
+	}
+	cutoff := now.Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			logger.Warn().Err(err).Str("dir", dir).Msg("overlay: list entry for temp-file cleanup")
+			continue
+		}
+		for _, f := range files {
+			if !f.Type().IsRegular() || !isOverlayTempName(f.Name()) {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			path := filepath.Join(dir, f.Name())
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				logger.Warn().Err(err).Str("path", path).Msg("overlay: remove stale temp file")
+				continue
+			}
+			removed++
+		}
+	}
+	if removed > 0 {
+		logger.Info().Int("removed", removed).Msg("overlay: removed stale temp files left by an interrupted write")
+	}
+}
+
+// isOverlayTempName reports whether name is a temp file from
+// writeFileAtomic ("patch-*.tmp") or saveManifestLocked ("manifest-*.tmp").
+func isOverlayTempName(name string) bool {
+	for _, pattern := range []string{"patch-*.tmp", "manifest-*.tmp"} {
+		if ok, _ := filepath.Match(pattern, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // SetRepairEnqueuer installs the callback EnqueueRepair invokes after a
@@ -253,6 +323,46 @@ func (s *Store) notifyViewerPad(nzbID, file string) {
 	}
 }
 
+// SetDamageClearedNotifier installs the callback told, after DeleteEntry,
+// DeleteFile or ClearFileDamage, which non-patched (dead or padded) records
+// it removed, keyed by file. Those records were the only note of where a
+// viewer was served zero-fill, and the DFS cache may still hold it. Called
+// after the entry's lock is released, and only when something non-patched
+// was removed. fn may be nil to disable it.
+func (s *Store) SetDamageClearedNotifier(fn func(nzbID string, removed map[string][]DeadSegment)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.damageClearedNotify.Store(nil)
+		return
+	}
+	s.damageClearedNotify.Store(&fn)
+}
+
+func (s *Store) notifyDamageCleared(nzbID string, removed map[string][]DeadSegment) {
+	if s == nil || len(removed) == 0 {
+		return
+	}
+	if p := s.damageClearedNotify.Load(); p != nil && *p != nil {
+		(*p)(nzbID, removed)
+	}
+}
+
+// unpatchedOf returns fe's dead and padded (non-patched) records, or nil.
+func unpatchedOf(fe *FileEntry) []DeadSegment {
+	if fe == nil {
+		return nil
+	}
+	var out []DeadSegment
+	for _, d := range fe.DeadSegments {
+		if d.Status != StatusPatched {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // SetPolicy installs the padding caps Decide consults. Call it once at
 // startup and again whenever the source config changes live - Decide never
 // re-derives or re-clamps these values itself.
@@ -296,6 +406,11 @@ func (s *Store) ClearRejected(nzbID string) {
 // ErrEntryRejected is WritePatch's answer for an nzbID whose entry was torn
 // down (MarkRejected) while a repair was still running for it.
 var ErrEntryRejected = errors.New("overlay: entry was deleted; patch not written")
+
+// ErrPatchGeometry is wrapped by WritePatch's refusal of a patch whose length
+// is not the reader's slot for that segment. The refusal is structural: the
+// same pass run again cuts the same bytes and meets it again.
+var ErrPatchGeometry = errors.New("repair and reader segment geometry disagree")
 
 // isRejected reports whether MarkRejected was called for nzbID.
 func (s *Store) isRejected(nzbID string) bool {
@@ -494,27 +609,56 @@ func (s *Store) lockFor(nzbID string) *sync.Mutex {
 	return l
 }
 
-func (s *Store) entryDir(nzbID string) string {
-	return filepath.Join(s.root, nzbID)
+// ErrInvalidNZBID is returned for an nzbID that is not a single, ordinary
+// path element under the store root.
+var ErrInvalidNZBID = errors.New("overlay: invalid nzb id")
+
+// validNZBID reports whether nzbID names one directory directly under the
+// store root. An empty ID, "." or "..", or one containing a path separator
+// would let a join leave the root (".." is <data>/usenet, the NZB records).
+func validNZBID(nzbID string) error {
+	if nzbID == "" || nzbID == "." || nzbID == ".." || strings.ContainsAny(nzbID, `/\`) {
+		return fmt.Errorf("%w: %q", ErrInvalidNZBID, nzbID)
+	}
+	return nil
 }
 
-func (s *Store) manifestPath(nzbID string) string {
-	return filepath.Join(s.entryDir(nzbID), manifestFileName)
+func (s *Store) entryDir(nzbID string) (string, error) {
+	if err := validNZBID(nzbID); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.root, nzbID), nil
+}
+
+func (s *Store) manifestPath(nzbID string) (string, error) {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, manifestFileName), nil
 }
 
 // patchPath names a patch blob deterministically from the logical filename's
 // FNV-1a hash plus its segment index, so arbitrary filenames (any character,
 // any length) never need sanitizing into a filesystem-safe path component.
-func (s *Store) patchPath(nzbID, file string, segIndex int) string {
+func (s *Store) patchPath(nzbID, file string, segIndex int) (string, error) {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return "", err
+	}
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(file))
-	return filepath.Join(s.entryDir(nzbID), fmt.Sprintf("patch_%x_%d.bin", h.Sum64(), segIndex))
+	return filepath.Join(dir, fmt.Sprintf("patch_%x_%d.bin", h.Sum64(), segIndex)), nil
 }
 
 // loadManifestLocked reads the manifest for nzbID, or returns a fresh empty
 // one if none exists yet. Caller must hold lockFor(nzbID).
 func (s *Store) loadManifestLocked(nzbID string) (*Manifest, error) {
-	data, err := os.ReadFile(s.manifestPath(nzbID))
+	path, err := s.manifestPath(nzbID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Manifest{Version: manifestVersion, Files: make(map[string]*FileEntry)}, nil
@@ -538,7 +682,10 @@ func (s *Store) loadManifestLocked(nzbID string) (*Manifest, error) {
 // crash or concurrent read never observes a partially-written manifest.
 // Caller must hold lockFor(nzbID).
 func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
-	dir := s.entryDir(nzbID)
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("overlay: create entry dir: %w", err)
 	}
@@ -556,11 +703,18 @@ func (s *Store) saveManifestLocked(nzbID string, m *Manifest) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: write tmp manifest: %w", err)
 	}
+	// Flush before the rename: without it a crash can keep the rename but
+	// not the data, leaving an empty manifest.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("overlay: sync tmp manifest: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: close tmp manifest: %w", err)
 	}
-	if err := os.Rename(tmpPath, s.manifestPath(nzbID)); err != nil {
+	if err := os.Rename(tmpPath, filepath.Join(dir, manifestFileName)); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: rename tmp manifest: %w", err)
 	}
@@ -580,6 +734,13 @@ func writeFileAtomic(dir, finalPath string, data []byte) error {
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("overlay: write tmp patch: %w", err)
+	}
+	// Flush before the rename: without it a crash can keep the rename but
+	// not the data, leaving an empty patch under a "patched" record.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("overlay: sync tmp patch: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
@@ -642,6 +803,123 @@ func (s *Store) RecordDead(nzbID, file string, segIndex int, msgID string, bytes
 	return s.saveManifestLocked(nzbID, m)
 }
 
+// DeadMove asks MoveDeadSegments to move the not-yet-patched record at From,
+// whose article is MessageID, to index To, where the NZB record now holds
+// that article. Bytes is the reader's slot length at To (0 keeps the
+// recorded one).
+type DeadMove struct {
+	From, To  int
+	MessageID string
+	Bytes     int64
+	// Dropped is set on a returned move whose To already held a record of
+	// the same article: the record at From was a stale duplicate and is gone.
+	Dropped bool
+}
+
+// MoveDeadSegments re-indexes file's dead records whose articles the NZB
+// record now holds at another index (a volume reorder permuted the file's
+// segments after the damage was recorded). All moves are applied under one
+// lock, so two dead records swapping places both move. A move is skipped
+// when the record at From is missing, names another article or is patched,
+// or when its To would be shared with another record. A To that already
+// holds a record of the same article drops the one at From instead. Returns
+// the moves applied (dropped ones flagged).
+func (s *Store) MoveDeadSegments(nzbID, file string, moves []DeadMove) ([]DeadMove, error) {
+	if s.isRejected(nzbID) {
+		return nil, nil
+	}
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return nil, nil
+	}
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return nil, err
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return nil, nil
+	}
+	at := make(map[int]int, len(fe.DeadSegments)) // index → position in fe.DeadSegments
+	for i, d := range fe.DeadSegments {
+		at[d.Index] = i
+	}
+	valid := make(map[int]DeadMove, len(moves)) // keyed by From
+	for _, mv := range moves {
+		i, ok := at[mv.From]
+		if !ok || mv.From == mv.To || mv.To < 0 {
+			continue
+		}
+		if d := fe.DeadSegments[i]; d.MessageID != mv.MessageID || d.Status == StatusPatched {
+			continue
+		}
+		valid[mv.From] = mv
+	}
+	drop := make(map[int]DeadMove) // keyed by From
+	for from, mv := range valid {
+		if j, ok := at[mv.To]; ok && fe.DeadSegments[j].MessageID == mv.MessageID {
+			if _, moving := valid[mv.To]; !moving {
+				mv.Dropped = true
+				drop[from] = mv
+			}
+		}
+	}
+	for from := range drop {
+		delete(valid, from)
+	}
+	// Refuse moves whose target another record would also occupy; each
+	// refusal can free or block another target, so repeat until stable.
+	for changed := true; changed; {
+		changed = false
+		taken := make(map[int]int, len(fe.DeadSegments))
+		for _, d := range fe.DeadSegments {
+			if _, gone := drop[d.Index]; gone {
+				continue
+			}
+			idx := d.Index
+			if mv, ok := valid[d.Index]; ok {
+				idx = mv.To
+			}
+			taken[idx]++
+		}
+		for from, mv := range valid {
+			if taken[mv.To] > 1 {
+				delete(valid, from)
+				changed = true
+			}
+		}
+	}
+	if len(valid) == 0 && len(drop) == 0 {
+		return nil, nil
+	}
+
+	var applied []DeadMove
+	kept := fe.DeadSegments[:0]
+	for _, d := range fe.DeadSegments {
+		if mv, gone := drop[d.Index]; gone {
+			applied = append(applied, mv)
+			continue
+		}
+		if mv, ok := valid[d.Index]; ok {
+			d.Index = mv.To
+			if mv.Bytes > 0 {
+				d.Bytes = mv.Bytes
+			}
+			applied = append(applied, mv)
+		}
+		kept = append(kept, d)
+	}
+	fe.DeadSegments = kept
+	sortDeadSegments(fe)
+	recomputeVerdictLocked(fe)
+	if err := s.saveManifestLocked(nzbID, m); err != nil {
+		return nil, err
+	}
+	return applied, nil
+}
+
 // PatchBytes returns the recovered bytes for a patched segment, if PAR2
 // repair has already written one. The bytes are stored fully post-processed
 // (final logical file bytes) - callers serve them as-is, with no further
@@ -658,21 +936,98 @@ func (s *Store) PatchBytes(nzbID, file string, segIndex int) ([]byte, bool) {
 	if fe == nil {
 		return nil, false
 	}
-	patched := false
+	want := int64(-1)
 	for _, d := range fe.DeadSegments {
 		if d.Index == segIndex && d.Status == StatusPatched {
-			patched = true
+			want = expectedPatchLen(d)
 			break
 		}
 	}
-	if !patched {
+	if want < 0 {
 		return nil, false
 	}
-	data, err := os.ReadFile(s.patchPath(nzbID, file, segIndex))
+	path, err := s.patchPath(nzbID, file, segIndex)
 	if err != nil {
 		return nil, false
 	}
-	return data, true
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, false
+	}
+	if err == nil && (want == 0 || int64(len(data)) == want) {
+		return data, true
+	}
+	// Missing or the wrong length: a crash after the rename can leave a
+	// patch file empty or short under a manifest that says "patched".
+	// Serving it would give the player a short segment, and nothing would
+	// repair it again (sweeps and the reader skip patched segments).
+	s.unpatchBroken(nzbID, file, segIndex)
+	return nil, false
+}
+
+// expectedPatchLen is the length a patched record's blob must have: the
+// PatchBytes WritePatch stored from len(data). Zero (a manifest written
+// before PatchBytes existed) means unknown, and the length is not checked.
+func expectedPatchLen(d DeadSegment) int64 {
+	return d.PatchBytes
+}
+
+// unpatchBroken flips segIndex's patched record back to dead and removes
+// its patch file, after PatchBytes found the file missing or the wrong
+// length. The file is checked again under the lock, so a WritePatch that
+// replaced it in the meantime is left alone.
+func (s *Store) unpatchBroken(nzbID, file string, segIndex int) {
+	mu := s.lockFor(nzbID)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.isRejected(nzbID) {
+		return
+	}
+	m, err := s.loadManifestLocked(nzbID)
+	if err != nil {
+		return
+	}
+	fe := m.Files[file]
+	if fe == nil {
+		return
+	}
+	idx := -1
+	for i := range fe.DeadSegments {
+		if fe.DeadSegments[i].Index == segIndex && fe.DeadSegments[i].Status == StatusPatched {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	want := expectedPatchLen(fe.DeadSegments[idx])
+	path, err := s.patchPath(nzbID, file, segIndex)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(path)
+	if err == nil && (want == 0 || info.Size() == want) {
+		return
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	got := int64(0)
+	if err == nil {
+		got = info.Size()
+	}
+	s.logger.Warn().Str("nzb", nzbID).Str("file", file).Int("segment", segIndex).
+		Int64("patch_bytes", got).Int64("want_bytes", want).
+		Msg("overlay: patch file missing or the wrong length; segment marked dead for repair")
+	fe.DeadSegments[idx].Status = StatusDead
+	fe.DeadSegments[idx].PatchBytes = 0
+	recomputeVerdictLocked(fe)
+	if err := s.saveManifestLocked(nzbID, m); err != nil {
+		s.logger.Warn().Err(err).Str("nzb", nzbID).Msg("overlay: save manifest after unpatching a broken patch")
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // PatchedSegments returns the indices of file's segments PAR2 has written a
@@ -740,13 +1095,20 @@ func (s *Store) WritePatch(nzbID, file string, segIndex int, data []byte) error 
 	}
 	if idx >= 0 {
 		if want := fe.DeadSegments[idx].Bytes; want > 0 && int64(len(data)) != want {
-			return fmt.Errorf("patch for segment %d is %d bytes but the reader's slot is %d (repair and reader segment geometry disagree by %+d; refusing to record a patch that cannot be served)",
-				segIndex, len(data), want, int64(len(data))-want)
+			return fmt.Errorf("patch for segment %d is %d bytes but the reader's slot is %d (%w by %+d; refusing to record a patch that cannot be served)",
+				segIndex, len(data), want, ErrPatchGeometry, int64(len(data))-want)
 		}
 	}
 
-	path := s.patchPath(nzbID, file, segIndex)
-	if err := writeFileAtomic(s.entryDir(nzbID), path, data); err != nil {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
+	path, err := s.patchPath(nzbID, file, segIndex)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(dir, path, data); err != nil {
 		return err
 	}
 
@@ -883,7 +1245,11 @@ func (s *Store) DiskUsage(nzbID string) (patchBytes, manifestBytes int64, err er
 	if s == nil {
 		return 0, 0, nil
 	}
-	entries, err := os.ReadDir(s.entryDir(nzbID))
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return 0, 0, err
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, 0, nil
@@ -918,7 +1284,11 @@ func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
 		if d.Status != StatusPatched {
 			continue
 		}
-		if info, err := os.Stat(s.patchPath(nzbID, file, d.Index)); err == nil {
+		path, err := s.patchPath(nzbID, file, d.Index)
+		if err != nil {
+			return 0
+		}
+		if info, err := os.Stat(path); err == nil {
 			total += info.Size()
 		}
 	}
@@ -927,10 +1297,14 @@ func (s *Store) FilePatchBytes(nzbID, file string, fe *FileEntry) int64 {
 
 // EntryExists reports whether nzbID has an overlay directory on disk.
 func (s *Store) EntryExists(nzbID string) bool {
-	if s == nil || nzbID == "" {
+	if s == nil {
 		return false
 	}
-	_, err := os.Stat(s.entryDir(nzbID))
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(dir)
 	return err == nil
 }
 
@@ -938,9 +1312,26 @@ func (s *Store) EntryExists(nzbID string) bool {
 // patch blob). Called wherever a stored NZB record is torn down - keyed by
 // nzbID (unique), avoiding the name-twin hazard the DFS cache has.
 func (s *Store) DeleteEntry(nzbID string) error {
+	dir, err := s.entryDir(nzbID)
+	if err != nil {
+		return err
+	}
 	mu := s.lockFor(nzbID)
 	mu.Lock()
-	err := os.RemoveAll(s.entryDir(nzbID))
+	var removed map[string][]DeadSegment
+	if s.damageClearedNotify.Load() != nil {
+		if m, lerr := s.loadManifestLocked(nzbID); lerr == nil {
+			for name, fe := range m.Files {
+				if segs := unpatchedOf(fe); len(segs) > 0 {
+					if removed == nil {
+						removed = make(map[string][]DeadSegment)
+					}
+					removed[name] = segs
+				}
+			}
+		}
+	}
+	err = os.RemoveAll(dir)
 	mu.Unlock()
 	// The mutex stays in s.locks: goroutines may still hold or wait on it,
 	// and deleting it let a later lockFor mint a second mutex for the same
@@ -949,6 +1340,7 @@ func (s *Store) DeleteEntry(nzbID string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("overlay: delete entry: %w", err)
 	}
+	s.notifyDamageCleared(nzbID, removed)
 	return nil
 }
 
@@ -961,6 +1353,17 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if s == nil {
 		return false, nil
 	}
+	var cleared []DeadSegment
+	patchesPreserved, err = s.clearFileDamage(nzbID, file, &cleared)
+	if err == nil && len(cleared) > 0 {
+		s.notifyDamageCleared(nzbID, map[string][]DeadSegment{file: cleared})
+	}
+	return patchesPreserved, err
+}
+
+// clearFileDamage is ClearFileDamage under the entry's lock; it sets
+// *cleared to the non-patched records it removed.
+func (s *Store) clearFileDamage(nzbID, file string, cleared *[]DeadSegment) (patchesPreserved bool, err error) {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -973,6 +1376,7 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if !ok {
 		return false, nil
 	}
+	*cleared = unpatchedOf(fe)
 
 	var patched []DeadSegment
 	for _, d := range fe.DeadSegments {
@@ -984,7 +1388,11 @@ func (s *Store) ClearFileDamage(nzbID, file string) (patchesPreserved bool, err 
 	if len(patched) == 0 {
 		delete(m.Files, file)
 		if len(m.Files) == 0 {
-			if rmErr := os.RemoveAll(s.entryDir(nzbID)); rmErr != nil && !os.IsNotExist(rmErr) {
+			dir, dirErr := s.entryDir(nzbID)
+			if dirErr != nil {
+				return false, dirErr
+			}
+			if rmErr := os.RemoveAll(dir); rmErr != nil && !os.IsNotExist(rmErr) {
 				return false, fmt.Errorf("overlay: clear file damage (last in entry): %w", rmErr)
 			}
 			return false, nil
@@ -1061,6 +1469,17 @@ func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	if s == nil {
 		return false, nil
 	}
+	var cleared []DeadSegment
+	removed, err = s.deleteFile(nzbID, file, &cleared)
+	if removed && err == nil && len(cleared) > 0 {
+		s.notifyDamageCleared(nzbID, map[string][]DeadSegment{file: cleared})
+	}
+	return removed, err
+}
+
+// deleteFile is DeleteFile under the entry's lock; it sets *cleared to the
+// non-patched records it removed.
+func (s *Store) deleteFile(nzbID, file string, cleared *[]DeadSegment) (removed bool, err error) {
 	mu := s.lockFor(nzbID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1073,15 +1492,22 @@ func (s *Store) DeleteFile(nzbID, file string) (removed bool, err error) {
 	if !ok {
 		return false, nil
 	}
+	*cleared = unpatchedOf(fe)
 	for _, d := range fe.DeadSegments {
 		if d.Status == StatusPatched {
-			_ = os.Remove(s.patchPath(nzbID, file, d.Index))
+			if path, err := s.patchPath(nzbID, file, d.Index); err == nil {
+				_ = os.Remove(path)
+			}
 		}
 	}
 	delete(m.Files, file)
 
 	if len(m.Files) == 0 {
-		if err := os.RemoveAll(s.entryDir(nzbID)); err != nil && !os.IsNotExist(err) {
+		dir, err := s.entryDir(nzbID)
+		if err != nil {
+			return false, err
+		}
+		if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("overlay: delete file (last in entry): %w", err)
 		}
 		return true, nil

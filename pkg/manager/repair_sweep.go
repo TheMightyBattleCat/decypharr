@@ -121,6 +121,11 @@ type fileResult struct {
 	// no decode check was due. shortBytes is the tail-truncation shortfall.
 	unverifiedReason string
 	shortBytes       int64
+
+	// readFailed is set when the ffprobe read failed twice with no article
+	// reported missing (checkConfirmed's inconclusive end), whether or not a
+	// decode check was due. Only the sweep brake reads it.
+	readFailed bool
 	// unverifiedCause and unverifiedDetail say what ffprobe printed, for a
 	// decoded_with_errors reason.
 	unverifiedCause  string
@@ -149,6 +154,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 
 	ctx = r.attachFFProbeChecker(ctx, log)
 	ctx = contextWithSampleBudget(ctx, newSweepSampleBudget(stickyFailedSampleBudget))
+	ctx = r.withSweepBrake(ctx, run)
 
 	// Resolve auto-repair once: when off, the repair sweep is a pure health check —
 	// it probes and records broken state but attempts no debrid re-insert and
@@ -534,6 +540,9 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		// cancelled context.
 		return &storage.EntryHealth{EntryName: h.EntryName, Status: storage.HealthUnknown}, entryDecode{skipped: true}
 	}
+	// Before any heal of this entry: the file that trips the brake stops
+	// its own entry's heal too.
+	sweepBrakeFrom(ctx).observe(results)
 	if r.autoRepairStillOn(ctx, autoRepair) {
 		r.autoHealResults(ctx, results, heal)
 	}
@@ -544,6 +553,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	broken := r.brokenFiles(c, results)
 	final := rollupStatus(results)
+	unchecked := anyUsenetUnchecked(results)
 
 	h.Status = final
 	h.FileCount = len(names)
@@ -564,9 +574,13 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 	switch final {
 	case storage.HealthHealthy:
-		h.LastOKAt = h.LastCheckedAt
+		if !unchecked {
+			h.LastOKAt = h.LastCheckedAt
+		}
 		h.FailureReason = ""
-		if decodeRan {
+		// A file no news server answered for was never read: a decode stamp
+		// now would let the next sweep skip its decode windows.
+		if decodeRan && !unchecked {
 			h.DecodeVerifiedAt = h.LastCheckedAt
 			h.DecodeVerifiedFingerprint = currentFP
 			h.DecodeVerifiedCoverage = decodeCoverage
@@ -575,7 +589,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.LastFailedAt = h.LastCheckedAt
 		h.FailureReason = topReason(broken)
 	}
-	if final != storage.HealthHealthy || reordered {
+	// An outage proves nothing either way: an entry left Unknown by it keeps
+	// its decode stamp.
+	outageOnly := final == storage.HealthUnknown && unchecked
+	if (final != storage.HealthHealthy && !outageOnly) || reordered {
 		h.DecodeVerifiedAt = time.Time{}
 		h.DecodeVerifiedFingerprint = ""
 		h.DecodeVerifiedCoverage = ""
@@ -586,6 +603,12 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.NextCheckDueAt = h.LastCheckedAt
 		h.Dirty = true
 		h.DirtyReason = "volumes reordered in place"
+	} else if unchecked {
+		// No news server answered for at least one file: nothing was
+		// verified for it, so the next sweep checks it again.
+		h.NextCheckDueAt = h.LastCheckedAt
+		h.Dirty = true
+		h.DirtyReason = "no news server answered the availability check"
 	}
 
 	r.saveHealth(h)
@@ -643,6 +666,10 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 	if !skipDecode && !opts.ForceDecodeVerification && !config.Get().Repair.FFProbeDecodeCheckEnabled() {
 		skipDecode = true
 	}
+	probe := r.probeFile
+	if r.probeFileFn != nil {
+		probe = r.probeFileFn
+	}
 	results := make([]fileResult, len(names))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
@@ -652,7 +679,7 @@ func (r *Repair) probeFiles(ctx context.Context, c *candidate, names []string, o
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, c, name, opts, skipDecode)
+			results[i] = probe(gctx, c, name, opts, skipDecode)
 			return nil
 		})
 	}
@@ -838,12 +865,16 @@ func (r *Repair) probeFile(ctx context.Context, c *candidate, name string, opts 
 			unmarkSweep := registerSweepVerification(res.infoHash, name)
 			started := time.Now()
 			cause := &unverifiedCause{}
-			ok, reason, conclusive, coverage := checker.checkConfirmed(contextWithUnverifiedCause(ctx, cause), c.name, name, exp, skipDecode, sig, budget)
+			ok, reason, conclusive, coverage := checker.checkConfirmed(contextWithUnverifiedCause(ctx, cause), res.infoHash, name, exp, skipDecode, sig, budget)
 			unmarkSweep()
 			unregisterDeadSignal(res.infoHash, name, sig)
 			unregisterVerifyBudget(res.infoHash, name, budget)
 			res.decodeConclusive = conclusive
 			res.decodeCoverage = coverage
+			// Read straight from the cause: get() reports an unset cause as
+			// inconclusive too, and with decoding skipped the reason below is
+			// not filled in.
+			res.readFailed = ok && !conclusive && cause.reason == unverifiedInconclusive
 			if ok && !conclusive && !skipDecode {
 				res.unverifiedReason = cause.get()
 				res.unverifiedCause, res.unverifiedDetail = cause.decodeCause, cause.detail
@@ -926,6 +957,10 @@ func (r *Repair) logFileVerdict(entryName, file string, size int64, budget *Veri
 	switch {
 	case res.broken:
 		ev.Str(logger.FieldStatus, logger.StatusFail).Str("reason", res.reason).Msg("broken")
+	case skipDecode && res.readFailed:
+		// The metadata read failed with no dead article behind it: nothing
+		// was verified now, and "verified earlier" would say otherwise.
+		ev.Str(logger.FieldStatus, logger.StatusWarn).Str(logger.FieldNote, "read failed, not verified").Msg("inconclusive")
 	case skipDecode:
 		ev.Str(logger.FieldStatus, logger.StatusOK).Str(logger.FieldNote, "decode verified earlier").Msg("healthy")
 	case !res.decodeConclusive:
@@ -967,8 +1002,29 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		_, res.confirmedDeadBytes = r.recordDeadSegments(ctx, entry, name)
 		return r.routeAutoRepair(entry, res)
 	}
+	if errors.Is(err, usenet.ErrAvailabilityUnchecked) {
+		// No news server answered: neither healthy nor broken. probeEntry
+		// keeps LastOKAt and marks the entry for the next sweep.
+		res.reason = reasonUsenetUnchecked
+		return res
+	}
 	res.reason = "usenet_probe_error"
 	return res
+}
+
+// reasonUsenetUnchecked is a file whose STAT sample no news server answered
+// (usenet.ErrAvailabilityUnchecked): an outage, not a verdict.
+const reasonUsenetUnchecked = "usenet_not_checked"
+
+// anyUsenetUnchecked reports whether an entry's probe left a file unchecked
+// because no news server answered.
+func anyUsenetUnchecked(results []fileResult) bool {
+	for _, res := range results {
+		if res.reason == reasonUsenetUnchecked {
+			return true
+		}
+	}
+	return false
 }
 
 // par2TerminalWithDamage reports whether nzbID's PAR2 repair state is terminal
@@ -1402,6 +1458,64 @@ func (r *Repair) healBrokenEntryGuarded(ctx context.Context, run *storage.Repair
 	r.healBrokenEntry(ctx, run, statsMu, name, h, bulkOverride)
 }
 
+// applySweepPar2Result drops from h the broken files the sweep's PAR2 pass
+// repaired and records the repair. fixed holds the InfoHashes whose pass
+// completed, but a pass covers a whole release: only a file broken for missing
+// segments with nothing left pending in the overlay (pendingAfter, read now)
+// was repaired by it. A file broken for any other reason, or one whose pending
+// damage can't be read, stays broken and goes on to heal. credited is true
+// when it counted the entry as repaired in run; resolved is true when nothing
+// broken is left, after saving the entry healthy.
+func (r *Repair) applySweepPar2Result(run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, fixed map[string]struct{}, pendingAfter func(nzbID string) (map[string][]overlay.DeadSegment, error)) (credited, resolved bool) {
+	pendingByHash := make(map[string]map[string][]overlay.DeadSegment)
+	repaired := func(bf storage.BrokenFile) bool {
+		if _, ok := fixed[bf.InfoHash]; !ok || bf.Reason != "usenet_segment_missing" || pendingAfter == nil {
+			return false
+		}
+		pending, read := pendingByHash[bf.InfoHash]
+		if !read {
+			p, err := pendingAfter(bf.InfoHash)
+			if err != nil {
+				p = nil
+			} else if p == nil {
+				p = map[string][]overlay.DeadSegment{}
+			}
+			pending = p
+			pendingByHash[bf.InfoHash] = pending
+		}
+		return pending != nil && len(pending[bf.FileName]) == 0
+	}
+	remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
+	for _, bf := range h.BrokenFiles {
+		if !repaired(bf) {
+			remaining = append(remaining, bf)
+		}
+	}
+	filesFixed := len(h.BrokenFiles) - len(remaining)
+	if filesFixed == 0 {
+		return false, false
+	}
+	h.BrokenFiles = remaining
+	h.BrokenCount = len(remaining)
+
+	statsMu.Lock()
+	run.Stats.Repaired++
+	r.saveRun(run)
+	statsMu.Unlock()
+	r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
+		Msg("Repair: resolved via warm PAR2 sweep (cache-only, no re-grab needed)")
+
+	if len(remaining) == 0 {
+		h.Status = storage.HealthHealthy
+		h.FailureReason = ""
+		h.LastRepairAt = time.Now()
+		h.LastOKAt = time.Now()
+		r.saveHealth(h)
+		return true, true
+	}
+	return true, false
+}
+
 // healBrokenEntry runs the Arr delete + blocklist + re-search for one broken
 // entry, then deletes the entry when it's fully broken and every file was
 // handled. It does not verify the outcome: SearchMissing/MarkHistoryFailed only
@@ -1450,30 +1564,13 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		}
 	}
 	if len(fixed) > 0 {
-		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
-		for _, bf := range h.BrokenFiles {
-			if _, ok := fixed[bf.InfoHash]; !ok {
-				remaining = append(remaining, bf)
-			}
+		var pendingAfter func(string) (map[string][]overlay.DeadSegment, error)
+		if r.manager.usenet != nil {
+			pendingAfter = r.manager.usenet.OverlayPendingRepair
 		}
-		filesFixed := len(h.BrokenFiles) - len(remaining)
-		h.BrokenFiles = remaining
-		h.BrokenCount = len(remaining)
-
-		statsMu.Lock()
-		run.Stats.Repaired++
-		parRepaired = true
-		r.saveRun(run)
-		statsMu.Unlock()
-		r.logger.Info().Str("entry", name).Int("files_fixed", filesFixed).
-			Msg("Repair: resolved via warm PAR2 sweep (cache-only, no re-grab needed)")
-
-		if len(remaining) == 0 {
-			h.Status = storage.HealthHealthy
-			h.FailureReason = ""
-			h.LastRepairAt = time.Now()
-			h.LastOKAt = time.Now()
-			r.saveHealth(h)
+		var resolved bool
+		parRepaired, resolved = r.applySweepPar2Result(run, statsMu, name, h, fixed, pendingAfter)
+		if resolved {
 			return
 		}
 	}
@@ -1500,6 +1597,7 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 			Path:      bf.SourcePath,
 			Size:      bf.Size,
 			IsBroken:  true,
+			InfoHash:  bf.InfoHash,
 		})
 	}
 	if len(byArr) == 0 {
@@ -1581,9 +1679,10 @@ type autoRepairFollowsConfigKey struct{}
 // Auto-repair mid-sweep left an hours-long sweep deleting and re-searching
 // until it finished. When the value came from the settings it is re-read
 // here; a per-run override ("Run now" with auto-repair on) is honoured as
-// given. The post-restore hold turns it off whatever the source.
+// given. The post-restore hold turns it off whatever the source, and so does
+// a tripped sweep brake (see sweepBrake).
 func (r *Repair) autoRepairStillOn(ctx context.Context, autoRepair bool) bool {
-	if !autoRepair || r.manager.PostRestoreHold() {
+	if !autoRepair || r.manager.PostRestoreHold() || sweepBrakeFrom(ctx).holding() {
 		return false
 	}
 	if ctx != nil {
@@ -1623,10 +1722,24 @@ func (r *Repair) releaseRegrabClaims(h *storage.EntryHealth) {
 			continue
 		}
 		seen[bf.InfoHash] = struct{}{}
-		if kind, terminal, exists := r.handlers.State(bf.InfoHash); exists && !terminal && kind == handlerRegrab {
-			r.handlers.Release(bf.InfoHash)
-		}
+		r.handlers.ReleaseRegrab(bf.InfoHash)
 	}
+}
+
+// arrDownloadID returns the download ID the Arr was given for the grab behind
+// infoHash. A season entry split out of a multi-season NZB
+// (convertToMultiSeason) is stored under a generated InfoHash the Arr never
+// saw; its grab is the pack's, recorded under the NZB's ID (entryNZBID). Any
+// other ID, or one with no stored entry, is returned unchanged.
+func (r *Repair) arrDownloadID(infoHash string) string {
+	if infoHash == "" || r.manager == nil || r.manager.storage == nil {
+		return infoHash
+	}
+	entry, err := r.manager.GetEntry(infoHash)
+	if err != nil || entry == nil {
+		return infoHash
+	}
+	return entryNZBID(entry)
 }
 
 // repairArrFiles deletes the broken files in one Arr, blocklists their grabs,
@@ -1646,6 +1759,14 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// get blocklisted via MarkHistoryFailed (which Sonarr/Radarr auto-re-searches
 	// when "Redownload Failed" is on — the default). Files with no grab record
 	// (history trimmed, manual import) fall back to an explicit SearchMissing.
+	//
+	// The grab is looked up by the file's own download ID first, so the grab
+	// that produced the broken file is the one blocklisted. The newest grab of
+	// the episode or movie is only the fallback, for when the Arr has no record
+	// of that ID (trimmed history, a manual import): it can be a different
+	// download, such as an upgrade still in flight. A season split out of a
+	// multi-season NZB has a generated ID the Arr never saw, so it is mapped
+	// back to the pack's ID first (arrDownloadID).
 	//
 	// HistoryIDs are deduped per arr — a season-pack grab covers multiple broken
 	// files but only needs one history/failed POST.
@@ -1667,7 +1788,11 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			needSearch = append(needSearch, f)
 			continue
 		}
-		id, _, herr := a.FindGrabHistoryID(mediaID)
+		id := a.FindGrabHistoryIDForDownload(r.arrDownloadID(f.InfoHash), mediaID)
+		var herr error
+		if id == 0 {
+			id, _, herr = a.FindGrabHistoryID(mediaID)
+		}
 		if herr != nil || id == 0 {
 			needSearch = append(needSearch, f)
 			continue
@@ -2632,7 +2757,7 @@ func (r *Repair) ReleaseManualAutoRepairOverride(nzbID string) {
 	if r == nil || r.handlers == nil || nzbID == "" {
 		return
 	}
-	r.handlers.Release(nzbID)
+	r.handlers.ReleaseRegrab(nzbID)
 }
 
 // RepairPlaybackFileNow repairs a file that just failed playback WITHOUT
@@ -2889,7 +3014,7 @@ func (r *Repair) RegrabImportGrab(ctx context.Context, entry *storage.Entry, fil
 				Msg("Import: entry already being handled; skipping re-grab")
 			return nil
 		}
-		defer r.handlers.Release(nzbID)
+		defer r.handlers.ReleaseRegrab(nzbID)
 	}
 
 	a := r.manager.arr.GetOrCreate(entry.Category)
@@ -3214,6 +3339,7 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix,
 // but scoped to a specific media-id resolved through one or more Arrs.
 func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix, forceDecode bool) {
 	ctx = r.attachFFProbeChecker(ctx, r.logger)
+	ctx = r.withSweepBrake(ctx, run)
 	candidates := make(map[string]*candidate)
 	var lastErr error
 	for _, a := range arrs {

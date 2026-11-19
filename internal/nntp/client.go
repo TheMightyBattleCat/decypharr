@@ -36,6 +36,10 @@ type ProviderPool struct {
 	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
 	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
 	timing      providerTiming // per-article phase durations (fetch_timing.go)
+	// foreignBodies counts BODY replies a caller refused as another upload's
+	// article (NewForeignArticleError). Observability only: the refusal is a
+	// 430 like any other, and nothing routes by this count.
+	foreignBodies atomic.Int64
 
 	// Dial cooldown: consecutive createConnection failures open a backoff
 	// window in which checkouts go to another provider instead of paying a
@@ -46,6 +50,24 @@ type ProviderPool struct {
 	// Ported from upstream 5b55a7d5.
 	dialFailStreak    atomic.Int32
 	dialCooldownUntil atomic.Int64 // nanotimeNow deadline; 0 = no cooldown
+}
+
+// errForeignArticle marks a BODY reply the caller refused because its yEnc
+// headers name another article than the one requested (see
+// NewForeignArticleError).
+var errForeignArticle = errors.New("foreign article")
+
+// NewForeignArticleError is the error a caller of ExecuteWithFailover returns
+// for a decoded body whose yEnc headers show it is not the requested article
+// (a different upload under a reused Message-ID). It is a 430 from that
+// provider, so failover and exclusions treat it exactly as one; failover also
+// counts it against the provider (the body_foreign stat).
+func NewForeignArticleError(reason string) *Error {
+	return &Error{
+		Type:    ErrorTypeArticleNotFound,
+		Message: "article belongs to a different upload: " + reason,
+		Err:     errForeignArticle,
+	}
 }
 
 // maxDialCooldown caps the exponential dial backoff, short enough that a
@@ -416,8 +438,39 @@ func isIdleExpired(lastUsed time.Time, now time.Time) bool {
 // queue PAR2 repair on a not-found, and an article one slow provider still
 // holds is not missing.
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
-	var lastErr error
+	_, err := c.executeWithFailover(ctx, providerExclusions{}, fn)
+	return err
+}
+
+// ExecuteWithFailoverExcept is ExecuteWithFailover with the providers named
+// by exceptHosts left out from the start, each the way a 430 leaves it out
+// (with its whole backbone when it has one: a provider on the same backbone
+// serves the same copy). On success it also returns the host of the
+// provider whose connection fn succeeded on. For asking the other providers
+// for an article one provider served a body for that turned out bad only
+// later (a PAR2 packet MD5): nothing is counted against the excluded
+// providers. With no other provider eligible it fails without running fn.
+func (c *Client) ExecuteWithFailoverExcept(ctx context.Context, exceptHosts []string, fn func(conn *Connection) error) (string, error) {
 	var exclusions providerExclusions
+	for _, h := range exceptHosts {
+		found := false
+		for _, p := range c.providers {
+			if p.Host == h {
+				excludeForArticleNotFound(&exclusions, p)
+				found = true
+			}
+		}
+		if !found {
+			exclusions.excludeHost(h)
+		}
+	}
+	return c.executeWithFailover(ctx, exclusions, fn)
+}
+
+// executeWithFailover is ExecuteWithFailover starting from exclusions, and
+// returning the host of the provider fn succeeded on.
+func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExclusions, fn func(conn *Connection) error) (string, error) {
+	var lastErr error
 	// outcomes records what each provider actually answered, so a caller
 	// that turns this into a verdict - the reader pads a segment and queues
 	// a PAR2 repair on a not-found - can say which providers said what. On
@@ -459,7 +512,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 
 	for providerAttempts := 0; providerAttempts < len(c.providers); providerAttempts++ {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 
 		checkoutStart := nanotimeNow()
@@ -499,7 +552,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		pendingErr := c.safeExecute(currentConn, fn)
 		if pendingErr == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
-			return nil
+			return currentProvider.Host, nil
 		}
 		err = retry.Do(
 			func() error {
@@ -514,6 +567,11 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				}
 
 				errProvider = currentProvider
+				if errors.Is(execErr, errForeignArticle) {
+					if pp := c.pools[currentProvider.Host]; pp != nil {
+						pp.foreignBodies.Add(1)
+					}
+				}
 				noteOutcome(currentProvider, execErr)
 				note(currentProvider, execErr)
 				var nntpErr *Error
@@ -599,7 +657,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// Success
 		if err == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
-			return nil
+			return currentProvider.Host, nil
 		}
 
 		// Handle failure
@@ -621,7 +679,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				exclusions.excludeHost(failedProvider.Host)
 			case ErrorTypeYencDecode:
 				if !IsCorruptArticleError(err) {
-					return err
+					return "", err
 				}
 				// Providers on one backbone serve the same damaged copy
 				// (Tower of Coins part087 article 86: 767,964 of 768,000
@@ -631,13 +689,13 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				excludeForArticleNotFound(&exclusions, failedProvider)
 			default:
 				// Non-retriable error, return immediately
-				return err
+				return "", err
 			}
 		} else if customerror.IsPanicError(err) {
 			exclusions.excludeHost(failedProvider.Host)
 		} else {
 			// Unknown error type - return immediately
-			return err
+			return "", err
 		}
 	}
 
@@ -649,17 +707,17 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			}
 			c.logger.Debug().Str("provider", p.Host).Err(terr).
 				Msg("Article not found on the providers that answered; one only timed out, so not treating it as missing")
-			return withOutcomes(terr, outcomes)
+			return "", withOutcomes(terr, outcomes)
 		}
 		if IsCorruptArticleError(lastErr) {
-			return withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
+			return "", withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
 		}
-		return withOutcomes(notFound, outcomes)
+		return "", withOutcomes(notFound, outcomes)
 	}
 	if lastErr != nil {
-		return withOutcomes(lastErr, outcomes)
+		return "", withOutcomes(lastErr, outcomes)
 	}
-	return errors.New("all providers failed")
+	return "", errors.New("all providers failed")
 }
 
 // ProviderOutcome is what one provider answered for one article.
@@ -1381,6 +1439,10 @@ func (c *Client) Stats() map[string]any {
 			// primaries (body_routing.go). 0 until measured.
 			"body_mib_s":    float64(pp.body.bytesPerSec.Load()) / (1 << 20),
 			"body_deferred": c.bodyRoutingOn() && pp.body.slow.Load(),
+			// BODY replies refused as another upload's article (yEnc part
+			// number or size not the one asked for); each was failed over
+			// as a 430. Normally 0.
+			"body_foreign": pp.foreignBodies.Load(),
 			// Per-STAT latency BatchStat routing judges by (stat_routing.go),
 			// 0 until measured, and how many pipelined STAT windows were
 			// discarded because their replies did not line up.
@@ -1656,7 +1718,9 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// is found definitively missing (not-found across all providers), so the
 	// remaining sample's workers stop at their per-chunk ctx.Err() checks
 	// instead of completing the full STAT sweep. defer cancel() also covers
-	// the normal return path.
+	// the normal return path. parent is the caller's context: the call
+	// returns when it ends (see the wait below), not when the bailout fires.
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1697,8 +1761,15 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	// by the pool's worker count, NOT by a per-call pool — so M concurrent
 	// BatchStat calls share the same pool.Capacity() workers in FIFO
 	// arrival order instead of each spinning up its own bank-sized pool.
-	// Tasks write disjoint index ranges of allResults; the only shared
-	// mutable state is the early-bailout cancel.
+	// Tasks write disjoint index ranges of allResults under resMu: once the
+	// caller's context ends the call returns without waiting for chunks still
+	// queued or running, and returned/finished stop their late callbacks from
+	// writing into a result already handed back.
+	var (
+		resMu    sync.Mutex
+		returned bool
+		finished = make([]bool, len(chunks))
+	)
 	markChunkErr := func(startIdx, n int, e error) {
 		for i := startIdx; i < startIdx+n; i++ {
 			allResults[i].Available = false
@@ -1717,19 +1788,27 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 	}()
 	var bailOnce sync.Once
 	var wg sync.WaitGroup
-	for _, ch := range chunks {
+	for ci, ch := range chunks {
 		wg.Add(1)
 		err := c.repairPool.Submit(ctx, ch.messageIDs, hint, func(results []StatResult, taskErr error) {
 			defer wg.Done()
+			resMu.Lock()
+			if returned {
+				resMu.Unlock()
+				return
+			}
+			finished[ci] = true
 			if taskErr != nil {
 				// Mirrors the previous behaviour: a chunk-level connection
 				// error fails the whole chunk (partial results discarded).
 				markChunkErr(ch.startIdx, len(ch.messageIDs), taskErr)
+				resMu.Unlock()
 				return
 			}
 			for i := range results {
 				allResults[ch.startIdx+i] = results[i]
 			}
+			resMu.Unlock()
 			ReportStatProgress(ctx, len(results))
 			// Bail out the rest of the sample as soon as one segment is
 			// definitively missing — not-found on every provider, so the
@@ -1751,11 +1830,36 @@ func (c *Client) batchStat(ctx context.Context, messageIDs []string, exhaustive 
 			// Submit refused the task — caller's ctx expired before a worker
 			// took it, or the pool is shutting down. Synthesize a chunk-wide
 			// error so the result vector still has the right shape.
+			resMu.Lock()
+			finished[ci] = true
 			markChunkErr(ch.startIdx, len(ch.messageIDs), err)
+			resMu.Unlock()
 			wg.Done()
 		}
 	}
-	wg.Wait()
+	// Wait for every chunk, or for the caller's context to end. A chunk can
+	// sit queued for a long time when no worker's home is eligible for it;
+	// the caller's deadline still holds. Chunks not answered by then carry
+	// its error (counted as errors, not as missing).
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+	select {
+	case <-allDone:
+	case <-parent.Done():
+	}
+	resMu.Lock()
+	returned = true
+	if err := parent.Err(); err != nil {
+		for ci, ch := range chunks {
+			if !finished[ci] {
+				markChunkErr(ch.startIdx, len(ch.messageIDs), err)
+			}
+		}
+	}
+	resMu.Unlock()
 
 	result := &BatchStatResult{
 		Results:    allResults,

@@ -196,8 +196,9 @@ func (r *Repair) acquireColdPar2Slot(ctx context.Context) bool {
 	return true
 }
 
-// runNowAndWait starts a pass for nzbID with RunNow and waits until that
-// pass has ended, returning true only if it reached Par2PhaseCompleted. It
+// runNowAndWait starts a pass for nzbID as RunNow does, marked as a sweep
+// pass (see runPass), and waits until that pass has ended, returning true
+// only if it reached Par2PhaseCompleted. It
 // never returns false while the pass is still running or queued - a caller
 // that re-grabs on false would otherwise delete the entry under a pass still
 // writing its patches - except when ctx ends, whose callers stop instead of
@@ -210,7 +211,7 @@ func (p *Par2Repair) runNowAndWait(ctx context.Context, nzbID string) bool {
 	}
 	prior, _ := p.Progress(nzbID)
 	priorStart := prior.StartedAt
-	if err := p.RunNow(nzbID); err != nil {
+	if _, err := p.runNow(nzbID, true); err != nil {
 		if !p.IsRunning(nzbID) && !p.IsQueued(nzbID) {
 			return false
 		}

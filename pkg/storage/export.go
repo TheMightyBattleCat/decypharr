@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/sirrobot01/appendstore"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -271,8 +272,8 @@ type ImportReport struct {
 	// written to the new store.
 	Read     map[string]int `json:"read"`
 	Imported map[string]int `json:"imported"`
-	// OrphanItems and OrphanRepairState were dropped because no entry has
-	// their folder.
+	// OrphanItems and OrphanRepairState were dropped because their key is
+	// not the folder of any imported entry under any folder naming.
 	OrphanItems       int `json:"orphan_items"`
 	OrphanRepairState int `json:"orphan_repair_state"`
 	// EntriesWithoutItems counts entries whose folder has no item record;
@@ -287,8 +288,18 @@ type ImportReport struct {
 // the stream for a store, or (nil, nil) when the snapshot has none. Entries,
 // queue and repair state are re-put with their attributes rebuilt from the
 // value; keys starting "__" are put raw. Items and repair state whose entry
-// is missing are dropped; entries without items are counted.
+// is missing are dropped; entries without items are counted. A key matches
+// an entry if it is the entry's folder under any folder naming, so the import
+// does not depend on the running folder_naming.
 func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
+	return ImportStoresNamed(dir, config.Get().FolderNaming, open)
+}
+
+// ImportStoresNamed is ImportStores for a database that will run under
+// naming: the folder name each entry is indexed under is computed with it.
+// A restore that also restores the snapshot's config passes that config's
+// naming, because the config is moved into place after the import.
+func ImportStoresNamed(dir string, naming config.WebDavFolderNaming, open func(store string) (io.ReadCloser, error)) (*ImportReport, error) {
 	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
 		return nil, fmt.Errorf("import target %s is not empty", dir)
 	}
@@ -299,7 +310,14 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 	defer st.Close()
 
 	rep := &ImportReport{Read: map[string]int{}, Imported: map[string]int{}}
+	// An item or health record is matched to its entry without the config:
+	// the database is imported before the snapshot's config is moved into
+	// place, so the running folder_naming may not be the one the keys were
+	// written under. folders holds every entry's folder under every naming.
+	// (Not the files' InfoHash: the seasons split out of one pack all carry
+	// the pack's, so it would keep a deleted season's item.)
 	folders := map[string]struct{}{}
+	var imported [][]string
 	itemNames := map[string]struct{}{}
 
 	each := func(name string, fn func(key string, value []byte) error) error {
@@ -339,9 +357,15 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 			}
 			entry := ProtoToEntry(&pb)
 			if name == "entries" {
-				folders[entry.GetFolder()] = struct{}{}
+				names := entryFolders(entry)
+				for _, f := range names {
+					folders[f] = struct{}{}
+				}
+				imported = append(imported, names)
 			}
-			return put(name, key, value, entryPutOptions(entry))
+			opts := entryPutOptions(entry)
+			opts.Attributes[attributeName] = GetTorrentFolder(naming, entry)
+			return put(name, key, value, opts)
 		})
 		if err != nil {
 			return nil, err
@@ -395,8 +419,14 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		}
 	}
 
-	for f := range folders {
-		if _, ok := itemNames[f]; !ok {
+	for _, names := range imported {
+		ok := false
+		for _, f := range names {
+			if _, ok = itemNames[f]; ok {
+				break
+			}
+		}
+		if !ok {
 			rep.EntriesWithoutItems++
 		}
 	}
@@ -404,6 +434,36 @@ func ImportStores(dir string, open func(store string) (io.ReadCloser, error)) (*
 		return nil, err
 	}
 	return rep, nil
+}
+
+// folderNamings is every folder_naming GetTorrentFolder knows; "" is the
+// default.
+var folderNamings = []config.WebDavFolderNaming{
+	"",
+	config.WebDavUseFileName,
+	config.WebDavUseOriginalName,
+	config.WebDavUseFileNameNoExt,
+	config.WebDavUseOriginalNameNoExt,
+	config.WebdavUseHash,
+}
+
+// entryFolders is entry's folder under every folder naming, without
+// duplicates or empty names.
+func entryFolders(entry *Entry) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, naming := range folderNamings {
+		f := GetTorrentFolder(naming, entry)
+		if f == "" || f == "." {
+			continue
+		}
+		if _, ok := seen[f]; ok {
+			continue
+		}
+		seen[f] = struct{}{}
+		out = append(out, f)
+	}
+	return out
 }
 
 // Sync flushes every store to disk.

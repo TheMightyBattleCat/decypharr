@@ -2,8 +2,11 @@ package manager
 
 import "strings"
 
-// ffprobeReadFailedTag marks an ffprobe_unreadable reason whose stderr shows
-// the read itself failing rather than the container failing to parse.
+// ffprobeReadFailedTag marks an ffprobe_unreadable or ffprobe_decode_error
+// reason whose stderr shows the read itself failing rather than the
+// container failing to parse or a frame failing to decode.
+// checkConfirmed retries such a read and, if it fails again with no dead
+// segment seen, ends inconclusive instead of broken.
 const ffprobeReadFailedTag = " (read failed)"
 
 // ffprobeReadFailedMarkers are what ffmpeg prints when the bytes stop coming
@@ -16,6 +19,7 @@ var ffprobeReadFailedMarkers = []string{
 	"Connection refused",
 	"Connection timed out",
 	"HTTP error",
+	"Server returned 4", // our own WebDAV: a 404 or 401 says nothing about the file
 	"Server returned 5",
 	"Broken pipe",
 }

@@ -139,6 +139,13 @@ type Config struct {
 	// overlay manifest key. Only meaningful when Overlay is non-nil.
 	OverlayFile string
 
+	// PaddingOff is the playback_padding setting switched off. The overlay
+	// still serves PAR2 patches (they are the file's real bytes), but a
+	// confirmed-missing segment with no patch is never zero-filled, recorded
+	// dead or queued for repair by this reader: its error propagates. The
+	// zero value keeps padding on.
+	PaddingOff bool
+
 	// Logger receives every log call made inside this package (segment
 	// padded, re-fetch-after-wedge, buffer discard failures, etc). Found
 	// live: NewStreamingReader previously always used zerolog.Nop() here -
@@ -242,6 +249,15 @@ func WithOverlay(handle *overlay.Handle, file string) Option {
 	return func(c *Config) {
 		c.Overlay = handle
 		c.OverlayFile = file
+	}
+}
+
+// WithPadding passes the playback_padding setting: false stops this reader
+// zero-filling confirmed-missing segments, while overlay patches are still
+// served (see Config.PaddingOff).
+func WithPadding(enabled bool) Option {
+	return func(c *Config) {
+		c.PaddingOff = !enabled
 	}
 }
 

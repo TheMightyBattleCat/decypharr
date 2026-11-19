@@ -5,7 +5,11 @@
 // Recovery data and the PAR2 index itself are still fetched fresh (STAT-ed
 // alive first) - there is no cache for parity data, it doesn't correspond to
 // any file content - but that's a small, bounded cost compared to the
-// bandwidth (and Arr history churn) a full re-grab spends. Anything short of
+// bandwidth (and Arr history churn) a full re-grab spends. So is the one
+// other fetch: when two posted files share a length and the NZB has no
+// resolved PAR2 match cache, the MD5-16k tie-break fetches the first article
+// of each tied file over NNTP, once in the preflight and again in the pass.
+// "Free" means no intact data is fetched, not zero NNTP. Anything short of
 // a clean, fully-warm, fully-completed pass changes nothing: the caller's
 // existing regrab handling runs exactly as it did before this file existed.
 package manager
@@ -112,13 +116,12 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	if err != nil || entry == nil {
 		return false
 	}
-	// Resolved independently from GetEntry, NOT taken from the caller's
-	// EntryHealth.EntryName - a deleted/superseded grab and its same-named
-	// replacement share an EntryName but not an nzbID, and PeekCachedRange
-	// below is keyed by entryName against the CURRENT mount's cache. Using
-	// any other source for this string risks peeking a stale or unrelated
-	// cache item.
-	entryName := entry.Name
+	// The cache folder comes from this nzbID's entry (newCacheSource), NOT
+	// from the caller's EntryHealth.EntryName - a deleted/superseded grab and
+	// its same-named replacement share an EntryName but not an nzbID, and
+	// PeekCachedRange below is keyed against the CURRENT mount's cache. It is
+	// the mount folder, not entry.Name: the two differ under a non-default
+	// folder_naming (see dfsCacheFolder).
 
 	stage = "no PAR2 data in the NZB record"
 	nzb, err := u.GetNZB(nzbID)
@@ -146,6 +149,9 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	}
 	var sources []par2.Source
 	for _, f := range indexFiles {
+		if par2IndexFileTooLarge(f) {
+			continue
+		}
 		data, ferr := fetchWholePar2File(preflightCtx, u.FetchArticle, f)
 		if ferr != nil {
 			return false
@@ -155,9 +161,16 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	if len(sources) == 0 {
 		return false
 	}
-	setChoice := choosePar2Set(sources, allVols, nzb.Par2Source, pending)
-	idx, err := par2.ParseIndexSet(sources, setChoice.setID)
+	setChoice := choosePar2Set(ctx, sources, allVols, nzb.Par2Source, pending)
+	idx, err := par2.ParseIndexSet(ctx, sources, setChoice.setID)
 	if err != nil {
+		return false
+	}
+	// A file's slice checksums unreadable in every index copy: the pass
+	// would fetch volumes for them before the solve (topUpSliceChecksums),
+	// so it is not provably free.
+	stage = "PAR2 index has no slice checksums for a file"
+	if len(idx.MissingChecksums()) > 0 {
 		return false
 	}
 
@@ -195,14 +208,17 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 		// "warm," so there is nothing this preflight can prove.
 		return false
 	}
-	cacheSource := &cacheSlicedSource{
-		reader:      cacheReader,
-		entryName:   entryName,
-		byMessageID: buildCacheSegmentMap(nzb),
-		deadRanges:  buildDeadOutputRanges(nzb, pending),
-		// cacheBytes/progress deliberately nil: this is a read-only peek,
-		// not real job progress - see cacheSlicedSource.readCached's nil
-		// handling of both fields.
+	// cacheBytes/progress deliberately nil: this is a read-only peek, not
+	// real job progress - see cacheSlicedSource.readCached's nil handling of
+	// both fields.
+	cacheSource := p.newCacheSource(nzbID, entry.Name, cacheReader, nzb, pending, nil, nil)
+	// Check presence only: the pass reads every intact slice from the cache
+	// anyway, so reading them here too doubled the disk reads (a 50 GB
+	// release read twice). The check asks the same live cache item the
+	// pass's PeekCachedRange reads from. A mount without the check falls
+	// back to reading.
+	if probe, ok := cacheReader.(dfsCachePresenceChecker); ok {
+		cacheSource.presence = probe
 	}
 
 	// noFetch never actually fetches; ReadRange below only reaches it on a
@@ -266,21 +282,15 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 	// real length exactly like ReadRange itself clamps (see its doc
 	// comment) - a single miss anywhere fails the whole gate.
 	stage = "intact data not fully cached"
-	for s := int64(0); s < idx.NumSlices(); s++ {
-		if _, damaged := damagedSet[s]; damaged {
-			continue
-		}
-		fileID, local, lerr := idx.SliceLocation(s)
-		if lerr != nil {
-			return false
-		}
+	if !warmIntactSlicesCached(ctx, idx, damagedSet, func(fileID [16]byte, off, n int64) error {
 		f, ok := fetchers[fileID]
 		if !ok {
-			return false
+			return errWarmSweepNoFetch
 		}
-		if _, rerr := f.ReadRange(local*idx.SliceSize, idx.SliceSize); rerr != nil {
-			return false
-		}
+		_, rerr := f.ReadRange(off, n)
+		return rerr
+	}) {
+		return false
 	}
 
 	// Every intact slice this pass needs is already on disk, and recovery
@@ -306,6 +316,31 @@ func (p *Par2Repair) attemptWarmSweepRepair(ctx context.Context, nzbID string) (
 		p.repair.handlers.Set(nzbID, handlerRegrab)
 	}
 	return completed
+}
+
+// warmIntactSlicesCached reports whether every slice of idx outside
+// damagedSet reads from the local cache through read. It stops and reports
+// false as soon as ctx ends: on a large release this loop reads every
+// intact byte from disk, and a cancelled sweep must not wait for that.
+// ctx is the sweep's own context, not the preflight's fetch timeout, so a
+// long cache read is not cut short by a deadline meant for network fetches.
+func warmIntactSlicesCached(ctx context.Context, idx *par2.Index, damagedSet map[int64]struct{}, read func(fileID [16]byte, off, n int64) error) bool {
+	for s := int64(0); s < idx.NumSlices(); s++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		if _, damaged := damagedSet[s]; damaged {
+			continue
+		}
+		fileID, local, err := idx.SliceLocation(s)
+		if err != nil {
+			return false
+		}
+		if read(fileID, local*idx.SliceSize, idx.SliceSize) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // aliveRecoverySlices STATs every article of vols and returns the recovery

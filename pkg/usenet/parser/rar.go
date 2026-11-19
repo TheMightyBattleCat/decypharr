@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -37,6 +38,9 @@ const (
 	RAR5HeaderFlagDataArea      = 0x0002
 	RAR5HeaderFlagSkipIfUnknown = 0x0004
 	RAR5HeaderFlagDataSector    = 0x0008
+	// RAR5HeaderFlagSplitBefore marks a file header whose data continues the
+	// file from the previous volume (the same bit as RAR5HeaderFlagDataSector).
+	RAR5HeaderFlagSplitBefore = 0x0008
 
 	RAR5MainFlagVolume       = 0x0001 // Archive is part of multi-volume set
 	RAR5MainFlagVolumeNumber = 0x0002 // Volume number field is present
@@ -69,6 +73,7 @@ const (
 	RAR4HeaderFlagLongBlock = 0x8000
 	RAR4FileFlagDirectory   = 0x00E0
 	RAR4FileFlagSolid       = 0x0010
+	RAR4FileFlagSplitBefore = 0x0001 // file data continues from the previous volume
 	RAR4FileFlagEncrypted   = 0x0004 // File data is encrypted
 	RAR4FileFlagHighSize    = 0x0100 // 64-bit file size (high 4 bytes follow after low 4 bytes)
 	RAR4ArchiveFlagPassword = 0x0080 // Archive headers are encrypted
@@ -100,9 +105,11 @@ type RARArchiveInfo struct {
 	// the (otherwise NZB-ordered) volumes/segments to the correct sequence. Nil
 	// means "ordering unknown — keep NZB/upload order" (the safe default).
 	VolumeOrder []int
-	// VolumeOrderKnown reports that every volume's number was read and they
-	// are distinct, so the order is verified even when VolumeOrder is nil
-	// because the volumes were already in order.
+	// VolumeOrderKnown reports that every volume's number was read (or, for
+	// the one unnumbered RAR5 volume, is known to be the first) and the
+	// numbers are distinct and contiguous, so the order is verified even when
+	// VolumeOrder is nil because the volumes were already in order. A gap in
+	// the numbers (a volume missing from the NZB) leaves it false.
 	VolumeOrderKnown bool
 }
 
@@ -121,6 +128,9 @@ type RARFileEntry struct {
 	VolumeParts      []*types.RARVolumePart // Parts across volumes
 	CRC32            uint32
 	VolumeIndex      int // Which volume this file starts in
+	// SplitBefore: this header's data continues the file from the previous
+	// volume. A header without it starts a copy of the file.
+	SplitBefore bool
 }
 
 // RARParser handles parsing RAR archives from usenet segments
@@ -584,8 +594,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		}
 		entries = append(entries, volEntry{idx: r.index, num: num, hasNum: hasNum})
 	}
-	volumeOrder := p.resolveVolumeOrder(entries, len(results))
-	orderKnown := orderEstablished(entries, len(results))
+	volumeOrder, orderKnown := p.resolveVolumeOrderKnown(entries, len(results), version == RARVersion5)
 
 	// Sort results by index to maintain NZB/upload order and collect files.
 	// (Internal coordinate systems — baseSegments, volumeOffsetMap — are built
@@ -677,12 +686,44 @@ type volEntry struct {
 //
 // Robustness: real obfuscated postings can have ONE volume whose main header
 // lacks the volume-number bit (observed: 62 of 63 volumes numbered cleanly,
-// one with the bit unset). We tolerate exactly one such hole by inferring it
-// from the single missing value in the otherwise-contiguous sequence. Any
-// more ambiguity than that (2+ missing, duplicates, non-contiguous) → keep
-// posting order rather than risk corrupting an archive that currently
-// assembles.
+// one with the bit unset). RAR5 writes the number in every volume except the
+// first, so that one volume is the first: it is given minNum-1 even when the
+// numbered run has a gap (a volume missing from the NZB), and
+// orderEstablished then reports the gap. Any more ambiguity than that (2+
+// unnumbered, duplicates) → keep posting order rather than risk corrupting an
+// archive that currently assembles.
 func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []int {
+	return p.resolveVolumeOrderFor(entries, totalVolumes, true)
+}
+
+// resolveVolumeOrderKnown is resolveVolumeOrderFor plus whether the order is
+// established (verified at import). A RAR4 number inferred for a volume whose
+// tail could not be read is a guess: a set missing a volume from the NZB looks
+// the same as a set with one unread tail, so the inferred placement is kept
+// but the order is not reported established, and the sweep's volume-order
+// check reads the volumes. RAR5's unnumbered volume is the first by format,
+// so it does not count as a guess.
+func (p *RARParser) resolveVolumeOrderKnown(entries []volEntry, totalVolumes int, unnumberedIsFirst bool) ([]int, bool) {
+	inferred := false
+	if !unnumberedIsFirst {
+		for _, e := range entries {
+			if !e.hasNum {
+				inferred = true
+				break
+			}
+		}
+	}
+	order := p.resolveVolumeOrderFor(entries, totalVolumes, unnumberedIsFirst)
+	return order, !inferred && orderEstablished(entries, totalVolumes)
+}
+
+// resolveVolumeOrderFor is resolveVolumeOrder with the meaning of an
+// unnumbered volume given by the caller. unnumberedIsFirst is true for RAR5,
+// where only the first volume lacks a number. It is false for RAR4, where a
+// volume is unnumbered because its end-of-archive header could not be read,
+// so it may sit anywhere: the single missing value in the run is inferred
+// (an interior hole, or minNum-1 when the run is complete).
+func (p *RARParser) resolveVolumeOrderFor(entries []volEntry, totalVolumes int, unnumberedIsFirst bool) []int {
 	numbered := 0
 	unnumbered := 0
 	for _, e := range entries {
@@ -708,8 +749,7 @@ func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []i
 			seen[e.num] = true
 		}
 	}
-	// Resolve unnumbered volumes. We allow at most one, inferred as the single
-	// missing value in the contiguous span [min..min+len-1] of the numbering.
+	// Resolve unnumbered volumes. We allow at most one.
 	if canOrder && unnumbered > 0 {
 		if unnumbered != 1 {
 			canOrder = false // more than one hole — too ambiguous
@@ -729,38 +769,36 @@ func (p *RARParser) resolveVolumeOrder(entries []volEntry, totalVolumes int) []i
 					maxNum = e.num
 				}
 			}
-			// The numbered volumes should form a contiguous run. The single
-			// unnumbered volume is the one hole. There are two cases:
+			// RAR5: the unnumbered volume is the first (the base archive), so
+			// it belongs at minNum-1, before the run, NOT in an interior gap
+			// and NOT at maxNum+1. A gap in the numbered run is a volume
+			// missing from the NZB; filling it with the first volume moves
+			// the first volume into the middle. orderEstablished reports the
+			// gap instead.
 			//
-			//  1. Interior gap: some value strictly inside [minNum..maxNum] is
-			//     missing. That value is unambiguously the hole.
-			//
-			//  2. No interior gap: [minNum..maxNum] is fully present, so the
-			//     numbered run is already complete and the hole is at a
-			//     BOUNDARY (either minNum-1 or maxNum+1). In RAR multi-volume
-			//     archives the FIRST volume (the base archive) is the one whose
-			//     main header commonly lacks the volume-number field, while the
-			//     continuation volumes carry an incrementing number. So when the
-			//     run is complete, the unnumbered volume belongs at minNum-1
-			//     (before the run), NOT maxNum+1. Placing it after the run
-			//     rotates the true first volume to the end and corrupts assembly.
+			// RAR4 (unnumberedIsFirst false): a unique interior gap is the
+			// hole; with a complete run the hole is at minNum-1 (the first
+			// volume's number is 0, so an unread first volume is the common
+			// case).
 			missing := -1
-			interiorMissing := -1
-			interiorCount := 0
-			for v := minNum; v <= maxNum; v++ {
-				if !present[v] {
-					interiorMissing = v
-					interiorCount++
-				}
-			}
-			if interiorCount == 1 {
-				// Case 1: unique interior hole.
-				missing = interiorMissing
-			} else if interiorCount == 0 {
-				// Case 2: complete run → hole is the base volume, before the run.
+			if unnumberedIsFirst {
 				missing = minNum - 1
+			} else {
+				interiorMissing := -1
+				interiorCount := 0
+				for v := minNum; v <= maxNum; v++ {
+					if !present[v] {
+						interiorMissing = v
+						interiorCount++
+					}
+				}
+				if interiorCount == 1 {
+					missing = interiorMissing
+				} else if interiorCount == 0 {
+					missing = minNum - 1
+				}
+				// (interiorCount > 1 leaves missing = -1 → cannot place uniquely.)
 			}
-			// (interiorCount > 1 leaves missing = -1 → cannot place uniquely.)
 			if missing >= 0 {
 				// Assign the inferred number to the single unnumbered volume.
 				for i := range entries {
@@ -922,6 +960,7 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 		if header.Type == RAR5HeaderTypeFile {
 			file := p.parseRAR5FileHeader(header.Data, header.ExtraSize, volumeIndex, volumeName, dataOffset, dataSize, password)
 			if file != nil {
+				file.SplitBefore = header.Flags&RAR5HeaderFlagSplitBefore != 0
 				files = append(files, file)
 			}
 		}
@@ -948,6 +987,17 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 	}
 
 	return files, volumeNumber, hasVolumeNumber, nil
+}
+
+// rar5DataAreaSize converts a RAR5 header's data-size vint. A value above
+// MaxInt64 would turn negative: the walks would then skip nothing and read
+// the data as the next header, or move their offset backwards. No volume is
+// that large, so it is a header error and the walk stops there.
+func rar5DataAreaSize(v uint64) (int64, error) {
+	if v > math.MaxInt64 {
+		return 0, fmt.Errorf("invalid RAR5 data size: %d (too large)", v)
+	}
+	return int64(v), nil
 }
 
 // rar5HeaderData represents a RAR 5.0 header
@@ -1008,7 +1058,9 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		dataAreaSize = int64(dataSize)
+		if dataAreaSize, err = rar5DataAreaSize(dataSize); err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	// Calculate remaining header data size based on actual bytes consumed
@@ -1068,6 +1120,10 @@ func (p *RARParser) parseRAR5FileHeader(data []byte, extraSize uint64, volumeInd
 	// Read unpacked size (vint)
 	unpackedSize, err := readVInt(r)
 	if err != nil {
+		return nil
+	}
+	// A size above MaxInt64 turns negative as an int64: corrupt or hostile.
+	if unpackedSize > math.MaxInt64 || packedSize < 0 {
 		return nil
 	}
 
@@ -1373,6 +1429,11 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 		packedSize = int64(packedSizeLow)
 		unpackedSize = int64(unpackedSizeLow)
 	}
+	// A high word with its top bit set makes the combined size negative.
+	// No real file is that large, so the header is corrupt or hostile.
+	if packedSize < 0 || unpackedSize < 0 {
+		return nil
+	}
 
 	// Read filename
 	var nameBytes []byte
@@ -1423,6 +1484,7 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 		IsStored:         isStored,
 		IsDirectory:      isDirectory,
 		RAR4Encrypted:    header.Flags&RAR4FileFlagEncrypted != 0,
+		SplitBefore:      header.Flags&RAR4FileFlagSplitBefore != 0,
 		CRC32:            crc32,
 		VolumeIndex:      volumeIndex,
 		VolumeParts: []*types.RARVolumePart{{
@@ -1695,16 +1757,41 @@ func sliceSegmentsForRangeSimple(
 // aggregateFileParts combines file parts across volumes for multi-volume RAR archives
 // When a file spans multiple RAR volumes, each volume contains a file header for the continuation
 // This function merges these into a single RARFileEntry with all volume parts
+//
+// rawFiles must be in volume (posting) order. A name that starts more than
+// once (two archives merged by the obfuscated merge, each holding the same
+// file) is not joined into one file: its copies are told apart by the
+// split-before flag and only one is kept (see pickDuplicateCopy).
 func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry {
 	if len(rawFiles) == 0 {
 		return nil
 	}
 
+	starts := make(map[string]int)
+	for _, file := range rawFiles {
+		if file != nil && !file.SplitBefore {
+			starts[file.Name]++
+		}
+	}
+
 	// Map of filename -> aggregated file entry
 	fileMap := make(map[string]*RARFileEntry)
+	// copies holds, for a name that starts more than once, one chain per start.
+	copies := make(map[string][][]*RARFileEntry)
 
 	for _, file := range rawFiles {
 		if file == nil {
+			continue
+		}
+
+		if starts[file.Name] > 1 {
+			chains := copies[file.Name]
+			if !file.SplitBefore {
+				copies[file.Name] = append(chains, []*RARFileEntry{file})
+			} else if len(chains) > 0 {
+				chains[len(chains)-1] = append(chains[len(chains)-1], file)
+			}
+			// A continuation before any start belongs to no copy we can name.
 			continue
 		}
 
@@ -1713,15 +1800,23 @@ func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry
 			// First occurrence of this file
 			fileMap[file.Name] = file
 		} else {
-			// File continuation from another volume - merge the parts
-			if len(file.VolumeParts) > 0 {
-				// Append volume parts (PartNumber already set correctly during parsing)
-				existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
-				existing.RAR4Encrypted = existing.RAR4Encrypted || file.RAR4Encrypted
-				// Update total packed size
-				existing.PackedSize += file.PackedSize
-			}
+			mergeFilePart(existing, file)
 		}
+	}
+
+	for name, chains := range copies {
+		kept, dropped := pickDuplicateCopy(chains)
+		head := kept[0]
+		for _, part := range kept[1:] {
+			mergeFilePart(head, part)
+		}
+		fileMap[name] = head
+		p.logger.Warn().
+			Str("file", name).
+			Int("copies", len(chains)).
+			Int("volumes_kept", len(kept)).
+			Int("volumes_dropped", dropped).
+			Msg("RAR file appears in more than one archive of this set; serving one copy, not the copies joined")
 	}
 
 	// Convert map back to slice
@@ -1736,4 +1831,50 @@ func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry
 	})
 
 	return result
+}
+
+// mergeFilePart appends a continuation header's parts to the file's entry.
+func mergeFilePart(existing, file *RARFileEntry) {
+	// File continuation from another volume - merge the parts
+	if len(file.VolumeParts) > 0 {
+		// Append volume parts (PartNumber already set correctly during parsing)
+		existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
+		existing.RAR4Encrypted = existing.RAR4Encrypted || file.RAR4Encrypted
+		// Update total packed size
+		existing.PackedSize += file.PackedSize
+	}
+}
+
+// pickDuplicateCopy chooses which copy of a file listed in several archives
+// to serve: the first whose parts hold exactly the size its header gives,
+// else the first. It returns that copy's headers and how many headers the
+// other copies had.
+//
+// An encrypted RAR5 stored file's parts hold its data AES-padded to a whole
+// block, so for one of those the complete size is the header size rounded
+// up to 16 bytes.
+func pickDuplicateCopy(chains [][]*RARFileEntry) (kept []*RARFileEntry, dropped int) {
+	pick := 0
+	for i, chain := range chains {
+		var sum int64
+		for _, f := range chain {
+			for _, vp := range f.VolumeParts {
+				sum += vp.UnpackedSize
+			}
+		}
+		want := chain[0].UncompressedSize
+		if chain[0].IsEncrypted && chain[0].IsStored {
+			want = (want + crypto.BlockSize - 1) / crypto.BlockSize * crypto.BlockSize
+		}
+		if sum == want {
+			pick = i
+			break
+		}
+	}
+	for i, chain := range chains {
+		if i != pick {
+			dropped += len(chain)
+		}
+	}
+	return chains[pick], dropped
 }

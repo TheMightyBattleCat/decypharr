@@ -36,11 +36,34 @@ type MatchSkip struct {
 	Err         error
 }
 
+// MatchEvidence says what paired a posted file with its FileDesc.
+type MatchEvidence string
+
+const (
+	// EvidenceMD5 is a computed MD5-16k equal to the FileDesc's.
+	EvidenceMD5 MatchEvidence = "md5"
+	// EvidenceLengthUnique is a length carried by exactly one FileDesc and
+	// one posted file.
+	EvidenceLengthUnique MatchEvidence = "length-unique"
+	// EvidenceElimination is the last-one-standing deduction: the only
+	// unmatched posted file and FileDesc of a length. Nothing read from the
+	// file backs it.
+	EvidenceElimination MatchEvidence = "elimination"
+	// EvidenceName is the unique-name pass. Nothing read from the file
+	// backs it either.
+	EvidenceName MatchEvidence = "name"
+)
+
 // Match pairs one posted file (by its index in the []PostedFile given to
 // MatchFiles) with the FileID PAR2 protects it as.
 type Match struct {
 	PostedIndex int
 	FileID      [16]byte
+
+	// Evidence is what made the pairing. Empty for a match rebuilt from a
+	// persisted cache, which only holds content-backed pairings (see
+	// Unconfirmed).
+	Evidence MatchEvidence
 
 	// NameMismatch is true when the FileDesc's recorded name differs from
 	// the posted file's own name, despite length (and, if it was tied,
@@ -48,6 +71,15 @@ type Match struct {
 	// already prove it's the right file - but is worth a caller logging: it
 	// usually means the release was renamed after the PAR2 set was created.
 	NameMismatch bool
+}
+
+// Unconfirmed reports a pairing no content backs: by elimination, or by a
+// name that differs from the FileDesc's. Bytes rebuilt for such a file are
+// the FileDesc's, which the posted file may not be, so a caller writing
+// them over the posted file needs its own proof first (a slice of the file
+// read through the pairing that passes its IFSC).
+func (m Match) Unconfirmed() bool {
+	return m.Evidence == EvidenceElimination || (m.Evidence == EvidenceName && m.NameMismatch)
 }
 
 // MatchFiles pairs each posted file to the FileDesc PAR2 recorded for it.
@@ -64,9 +96,13 @@ type Match struct {
 // Match.NameMismatch.
 //
 // A final last-one-standing pass pairs any length group that has come down
-// to exactly one unmatched FileDesc and one unmatched posted file: with
-// every other same-length candidate already claimed, the two can only be
-// each other, so no fetch is needed to confirm it.
+// to exactly one unmatched FileDesc and one unmatched posted file whose
+// MD5-16k was never computed: with every other same-length candidate
+// already claimed, the two are most likely each other. Nothing read
+// confirms it, so the match is marked EvidenceElimination (see
+// Match.Unconfirmed). A posted file whose MD5-16k was computed and matched
+// no unclaimed FileDesc is left out: its hash is evidence against the
+// pairing (a second posted copy of an already-claimed file, for one).
 //
 // Matching is best-effort with respect to fetch failures: if breaking a
 // length tie (or the residual MD5-16k pass) needs a posted file's real
@@ -109,7 +145,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 		}
 
 		if len(fileIDs) == 1 && len(postedIdxs) == 1 {
-			matches = append(matches, newMatch(idx, posted, postedIdxs[0], fileIDs[0]))
+			matches = append(matches, newMatch(idx, posted, postedIdxs[0], fileIDs[0], EvidenceLengthUnique))
 			continue
 		}
 
@@ -147,7 +183,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 				if !ok || sum != fd.MD5_16k || claimed[pi] {
 					continue
 				}
-				matches = append(matches, newMatch(idx, posted, pi, fid))
+				matches = append(matches, newMatch(idx, posted, pi, fid, EvidenceMD5))
 				claimed[pi] = true
 				break
 			}
@@ -204,7 +240,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 			found++
 		}
 		if found == 1 {
-			matches = append(matches, newMatch(idx, posted, pi, cand))
+			matches = append(matches, newMatch(idx, posted, pi, cand, EvidenceMD5))
 			matchedFID[cand] = true
 			matchedPosted[pi] = true
 		}
@@ -213,13 +249,19 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 	// Last-one-standing deduction. After the length and MD5-16k passes have
 	// claimed every file they can prove, a length group that comes down to
 	// exactly one still-unmatched FileDesc and exactly one still-unmatched
-	// posted file can only be paired one way: MatchFiles has already
-	// confirmed the two lengths are equal and eliminated every other
-	// same-length candidate on each side by MD5, so no ambiguity is left.
-	// The pairing needs no fetch. This resolves the common multi-part RAR
-	// case where one dead tie-break article would otherwise leave a file
-	// "retained but unmatched" and starve the repair of fetcher coverage
-	// for slices it could have read intact.
+	// posted file is paired: the lengths are equal and every other
+	// same-length candidate on each side is claimed. This resolves the
+	// common multi-part RAR case where one dead tie-break article would
+	// otherwise leave a file "retained but unmatched" and starve the repair
+	// of fetcher coverage for slices it could have read intact.
+	//
+	// Only posted files never hashed take part. One whose MD5-16k was
+	// computed matched no unclaimed FileDesc, so it is not this one either:
+	// a duplicate posting of a claimed file was paired here with a FileDesc
+	// the NZB never carried, and every read through it failed IFSC. Even a
+	// never-hashed pairing is a deduction, not a proof (the posted file may
+	// be some other file of the same length, wholly dead), so it is marked
+	// EvidenceElimination for the caller to confirm before writing through it.
 	unmatchedFDByLength := make(map[int64][][16]byte)
 	for _, fid := range idx.FileOrder {
 		if matchedFID[fid] {
@@ -233,7 +275,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 	}
 	unmatchedPostedByLength := make(map[int64][]int)
 	for pi := range posted {
-		if matchedPosted[pi] {
+		if matchedPosted[pi] || hashed[pi] {
 			continue
 		}
 		unmatchedPostedByLength[posted[pi].Length] = append(unmatchedPostedByLength[posted[pi].Length], pi)
@@ -244,7 +286,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 			continue
 		}
 		pi, fid := pis[0], fids[0]
-		matches = append(matches, newMatch(idx, posted, pi, fid))
+		matches = append(matches, newMatch(idx, posted, pi, fid, EvidenceElimination))
 		matchedFID[fid] = true
 		matchedPosted[pi] = true
 	}
@@ -257,8 +299,10 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 	// computed. A file whose hash was computed and matched nothing is left
 	// alone: that is evidence it is not the named file. Leaving the file unmatched folded
 	// every one of its slices into the damaged set, which a whole RAR volume
-	// can push past the recovery budget. No fetch; a wrong pairing is still
-	// caught by par2.Repair's per-slice IFSC check, which never fabricates.
+	// can push past the recovery budget. No fetch; a wrong pairing is
+	// caught by par2.Repair's per-slice IFSC check on any slice read through
+	// it. The match is marked EvidenceName; one whose names differ in case
+	// is unconfirmed (see Match.Unconfirmed).
 	unmatchedFDByName := make(map[string][][16]byte)
 	for _, fid := range idx.FileOrder {
 		if matchedFID[fid] {
@@ -281,7 +325,7 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 		if len(fids) != 1 || len(pis) != 1 {
 			continue
 		}
-		matches = append(matches, newMatch(idx, posted, pis[0], fids[0]))
+		matches = append(matches, newMatch(idx, posted, pis[0], fids[0], EvidenceName))
 		matchedFID[fids[0]] = true
 		matchedPosted[pis[0]] = true
 	}
@@ -305,8 +349,8 @@ func MatchFiles(idx *Index, posted []PostedFile) ([]Match, []MatchSkip, error) {
 	return matches, skipped, nil
 }
 
-func newMatch(idx *Index, posted []PostedFile, postedIndex int, fileID [16]byte) Match {
-	m := Match{PostedIndex: postedIndex, FileID: fileID}
+func newMatch(idx *Index, posted []PostedFile, postedIndex int, fileID [16]byte, ev MatchEvidence) Match {
+	m := Match{PostedIndex: postedIndex, FileID: fileID, Evidence: ev}
 	if fd := idx.Files[fileID]; fd != nil {
 		m.NameMismatch = fd.Name != posted[postedIndex].Name
 	}

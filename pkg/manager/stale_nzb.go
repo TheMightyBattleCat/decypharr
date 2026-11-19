@@ -132,7 +132,7 @@ func (r *Repair) PreviewStaleNZBs(ctx context.Context) (StaleNZBPreview, error) 
 	defer r.clearStaleNZBProgress()
 
 	phaseStart := time.Now()
-	initialArrs := len(r.eligibleArrs(nil))
+	initialArrs := len(r.referenceArrs())
 	r.setStaleNZBProgress("Fetching Arr references…", 0, int64(initialArrs), start)
 	refs, err := r.buildArrReferencedSet(ctx, func(done, total int, name string) {
 		r.setStaleNZBProgress(fmt.Sprintf("Fetching %s… (%d/%d)", name, done, total), int64(done), int64(total), start)
@@ -319,7 +319,7 @@ func (r *Repair) CleanupStaleNZBs(ctx context.Context, entryIDs []string, orphan
 		Msg("StaleNZB: cleanup started")
 
 	phaseStart := time.Now()
-	initialArrs := len(r.eligibleArrs(nil))
+	initialArrs := len(r.referenceArrs())
 	r.setStaleNZBProgress("Fetching Arr references…", 0, int64(initialArrs), start)
 	refs, err := r.buildArrReferencedSet(ctx, func(done, total int, name string) {
 		r.setStaleNZBProgress(fmt.Sprintf("Fetching %s… (%d/%d)", name, done, total), int64(done), int64(total), start)
@@ -724,6 +724,47 @@ type dfsEntryCacheUse interface {
 // whether anything was removed.
 func (r *Repair) RemoveEntryCacheDir(entryName, infoHash string) (int64, bool) {
 	return r.removeStaleNZBCacheDir(entryName, infoHash)
+}
+
+// RemoveEntryCache frees the DFS cache of an entry being deleted or
+// rejected. A season split out of a multi-season NZB has no cache folder of
+// its own: its files are cached under the parent's folder (the entry stored
+// under the NZB's ID), which its sibling seasons share. So only this
+// season's files are evicted from that folder, and the folder is never
+// removed. Any other entry goes through RemoveEntryCacheDir.
+func (r *Repair) RemoveEntryCache(entry *storage.Entry) (int64, bool) {
+	if entry == nil {
+		return 0, false
+	}
+	nzbID := entryNZBID(entry)
+	if nzbID == entry.InfoHash {
+		return r.RemoveEntryCacheDir(entry.GetFolder(), entry.InfoHash)
+	}
+	parent, err := r.manager.GetEntry(nzbID)
+	if err != nil || parent == nil {
+		return 0, false
+	}
+	folder := parent.GetFolder()
+	if folder == "" || folder == "." {
+		return 0, false
+	}
+	ev, _ := r.manager.MountManager().(dfsCacheFileEvictor)
+	if ev == nil {
+		return 0, false
+	}
+	var total int64
+	removed := false
+	for name, f := range entry.Files {
+		if f == nil || fileNZBID(entry, f) != nzbID {
+			continue
+		}
+		// ok with nothing freed is a file that was never cached.
+		if freed, ok := ev.EvictCachedFile(folder, name); ok && freed > 0 {
+			total += freed
+			removed = true
+		}
+	}
+	return total, removed
 }
 
 // staleNZBCacheDirPath resolves and validates the DFS cache directory for

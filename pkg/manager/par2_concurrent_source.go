@@ -58,13 +58,20 @@ const (
 // channel for backpressure) - so par2.Repair's sequential ReadSlice calls
 // are served by fetches that already started, or already finished, well
 // before they're needed, instead of one strictly-sequential fetch at a
-// time. A single stalled connection now only holds up its own goroutine's
-// segment, not every other intact slice queued behind it: with N workers
-// in flight, one stuck fetch costs at most one of N concurrent slots for
-// up to its own per-segment timeout, not the whole job's deadline.
+// time. A stalled fetch costs at most its own per-segment timeout, not the
+// whole job's deadline. While it stalls the other workers keep fetching
+// until the read-ahead window below is full; then fetching pauses until the
+// stalled slice arrives, since par2.Repair consumes strictly in order.
 //
-// Memory-bounded: at most 2x maxConcurrency slices are ever buffered ahead
-// of the consumer (the channel's capacity), never the whole recovery set -
+// Memory-bounded: at most 2x maxConcurrency slices exist beyond what the
+// consumer has taken - fetching, queued on the channel or parked in pending
+// combined - never the whole recovery set. The bound is by position: run()
+// takes a slot from slots before it starts each slice, in order, and
+// ReadSlice gives one back for every result it hands out, so a slice is
+// only fetched while it sits fewer than 2x maxConcurrency places past the
+// one par2.Repair is waiting for. The channel alone could not do this:
+// ReadSlice drains it into pending while it waits, so one slow article let
+// every other worker run ahead and park the rest of the release in memory.
 // par2.Repair's own "never hold more than one slice at a time" streaming
 // design is preserved at that layer; this only widens the window from
 // exactly 1 to a small, fixed multiple of the connection limit, matching
@@ -73,12 +80,21 @@ type concurrentSliceSource struct {
 	ctx      context.Context // the pool's context; ReadSlice consults ctx.Err() so a cancelled/timed-out job surfaces as a wrapped context error, not a bare "pool closed early"
 	resultCh chan sliceFetchResult
 	pending  map[int64]sliceFetchResult // out-of-order results not yet consumed - read/written only from ReadSlice's single caller goroutine
+	// slots holds one token per slice started but not yet handed out by
+	// ReadSlice; its capacity is the read-ahead window. run() fills it in
+	// order, ReadSlice drains it. nil (no bound) in hand-built test structs.
+	slots chan struct{}
 
 	// notFoundMu guards notFound - written concurrently by every worker in
 	// run(), read by NotFoundIndices after the pool has drained (or
 	// mid-flight, best-effort). See NotFoundIndices.
 	notFoundMu sync.Mutex
 	notFound   map[int64]deadCause
+
+	// done is closed when run() has returned: every worker has ended, so
+	// nothing writes a counter or notFound any more. nil in hand-built test
+	// structs. See Wait.
+	done chan struct{}
 }
 
 // newConcurrentSliceSource launches maxConcurrency worker goroutines that
@@ -87,35 +103,67 @@ type concurrentSliceSource struct {
 // par2.Repair.ReadSlice will be called with, in the exact sequence it will
 // call them (ascending, skipping already-damaged indices) - see runRepair,
 // which derives this from the same idx.NumSlices()/damaged set par2.Repair
-// itself uses internally, so the two can never disagree.
-func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(globalIdx int64) ([]byte, error)) *concurrentSliceSource {
+// itself uses internally, so the two can never disagree. fetchOne gets the
+// pool's context, a child of ctx: a fetch made with it is aborted when ctx is
+// cancelled, so Wait after a cancel does not wait out a slow article.
+func newConcurrentSliceSource(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(ctx context.Context, globalIdx int64) ([]byte, error)) *concurrentSliceSource {
 	if maxConcurrency < 1 {
 		maxConcurrency = 1
 	}
+	window := maxConcurrency * 2
 	s := &concurrentSliceSource{
 		ctx:      ctx,
-		resultCh: make(chan sliceFetchResult, maxConcurrency*2),
+		resultCh: make(chan sliceFetchResult, window),
 		pending:  make(map[int64]sliceFetchResult),
+		slots:    make(chan struct{}, window),
 		notFound: make(map[int64]deadCause),
+		done:     make(chan struct{}),
 	}
 	go s.run(ctx, order, maxConcurrency, fetchOne)
 	return s
 }
 
-func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(int64) ([]byte, error)) {
+// Wait blocks until run() and every worker it started have returned. Call it
+// after cancelling the source's context: runRepair does so at the end of
+// each round, so no worker of that round still fetches, adds to the pass's
+// byte counters, or records a dead slice once the round's result is used.
+// Returns at once on a hand-built struct with no done channel.
+func (s *concurrentSliceSource) Wait() {
+	if s.done != nil {
+		<-s.done
+	}
+}
+
+func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcurrency int, fetchOne func(context.Context, int64) ([]byte, error)) {
+	if s.done != nil {
+		defer close(s.done)
+	}
 	p := pool.New().WithContext(ctx).WithMaxGoroutines(maxConcurrency)
+dispatch:
 	for _, idx := range order {
 		// A cancelled source (the round is over - see runRepair) must stop
-		// fetching: fetchOne does not take the context, so without these
-		// checks every remaining slice of the release would still be read.
+		// fetching: without these checks every remaining slice of the
+		// release would still be started, each failing on the cancelled
+		// context.
 		if ctx.Err() != nil {
 			break
+		}
+		// Wait for a read-ahead slot. Taken here, in order, and not inside
+		// the worker, so the slice ReadSlice is waiting for has always been
+		// started: workers reaching an acquire out of order could fill the
+		// window with later slices and starve it. A pass that stops reading
+		// early leaves the window full; runRepair cancels the round's
+		// context, which releases this wait and lets resultCh close.
+		select {
+		case s.slots <- struct{}{}:
+		case <-ctx.Done():
+			break dispatch
 		}
 		p.Go(func(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			data, err := fetchOne(idx)
+			data, err := fetchOne(ctx, idx)
 			if err != nil {
 				// This slice's backing data is unreadable at this position:
 				// a hard 430 confirmed across every provider
@@ -172,9 +220,7 @@ func (s *concurrentSliceSource) run(ctx context.Context, order []int64, maxConcu
 // with a confirmed article-not-found (across every provider) so far. Safe
 // to call at any time, including while workers are still running (the
 // returned set just may not be complete yet) - runRepair's retry loop
-// calls it only after par2.Repair has already returned, by which point
-// every worker that was going to report anything has either finished or
-// been abandoned by the pool's context cancellation.
+// calls it only after cancelling the round and Wait, so the set is final.
 func (s *concurrentSliceSource) NotFoundIndices() []int64 {
 	s.notFoundMu.Lock()
 	defer s.notFoundMu.Unlock()
@@ -220,10 +266,12 @@ func (s *concurrentSliceSource) DeadCauseCounts() (confirmedMissing, shortRead, 
 func (s *concurrentSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 	if r, ok := s.pending[globalIdx]; ok {
 		delete(s.pending, globalIdx)
+		s.releaseSlot()
 		return r.data, r.err
 	}
 	for r := range s.resultCh {
 		if r.idx == globalIdx {
+			s.releaseSlot()
 			return r.data, r.err
 		}
 		s.pending[r.idx] = r
@@ -240,4 +288,15 @@ func (s *concurrentSliceSource) ReadSlice(globalIdx int64) ([]byte, error) {
 		return nil, fmt.Errorf("par2: fetch for slice %d interrupted: %w", globalIdx, err)
 	}
 	return nil, fmt.Errorf("par2: no fetch result for slice %d (worker pool closed early)", globalIdx)
+}
+
+// releaseSlot gives back the read-ahead slot of a result ReadSlice has just
+// handed out, error results included: a pass that carries on past an
+// unreadable slice must not lose its slot, or the window shrinks to nothing.
+// Non-blocking, so a struct built without slots (nil) is unaffected.
+func (s *concurrentSliceSource) releaseSlot() {
+	select {
+	case <-s.slots:
+	default:
+	}
 }

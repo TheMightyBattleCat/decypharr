@@ -98,7 +98,7 @@ func foldUncoveredFiles(logger zerolog.Logger, entryName string, idx *par2.Index
 			if terminal {
 				return folded, missingFetcherErr(fid, classifyMiss)
 			}
-			return folded, fmt.Errorf("uncovered file %q (%d slices) does not fit the %d-slice recovery budget (transient: %s)", fd.Name, len(fs), budget, reason)
+			return folded, par2Failf(par2Transient, "uncovered file %q (%d slices) does not fit the %d-slice recovery budget (transient: %s)", fd.Name, len(fs), budget, reason)
 		}
 		for _, s := range fs {
 			if _, ok := damagedSet[s]; !ok {

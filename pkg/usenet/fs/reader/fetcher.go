@@ -500,16 +500,22 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 					Int("segment", segIdx).
 					Str("reason", reason).
 					Msg("Provider returned a different upload's article; trying the next provider")
-				return &nntp.Error{
-					Type:    nntp.ErrorTypeArticleNotFound,
-					Message: "article belongs to a different upload: " + reason,
-				}
+				return nntp.NewForeignArticleError(reason)
 			}
 
-			// Commit (updates cache state to StateOnDisk).
+			// Commit (updates cache state to StateOnDisk). A body no longer
+			// than the segment's header skip stores nothing; that is missing
+			// like the zero-byte case above, so failover and then the overlay
+			// decide instead of the slot staying Fetching with no owner.
 			commitStart := time.Now()
-			writer.Finalize()
+			committed := writer.Finalize()
 			phases.store += time.Since(commitStart)
+			if !committed {
+				return &nntp.Error{
+					Type:    nntp.ErrorTypeArticleNotFound,
+					Message: "article stored no data after its header skip",
+				}
+			}
 			if meta != nil && meta.Part > 0 && meta.Part == int64(seg.Number) && sf.partNumbersMatched.Load() < partNumberTrust {
 				sf.partNumbersMatched.Add(1)
 			}
@@ -633,16 +639,14 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 	file := sf.config.OverlayFile
 
 	if patch, ok := overlayHandle.PatchBytes(file, segIdx); ok {
-		if providers != "" {
-			sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Str("providers", providers).
-				Msg("serving an overlay patch for a segment the providers could not")
-		}
-		if err := sf.cache.Put(segIdx, patch); err != nil {
-			sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
-			return false
-		}
-		sf.setPadded(segIdx, false)
-		return true
+		return sf.putOverlayPatch(segIdx, patch, providers)
+	}
+
+	// Playback padding is switched off: the patch above is served whatever
+	// that setting says, but zero-fill (and the dead record and repair queue
+	// that come with the decision) belongs to it.
+	if sf.config.PaddingOff {
+		return false
 	}
 
 	logicalLen := sf.cache.SegmentDataSize(segIdx)
@@ -657,6 +661,15 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 		decide = overlayHandle.DecideForViewer
 	}
 	decision, _ := decide(file, segIdx, messageID, logicalLen, sf.cache.TotalSize(), sf.cache.SegmentCount())
+	if decision == overlay.DecisionPatch {
+		// A repair wrote the patch after the check above; Decide left the
+		// record patched. Serve it (an unreadable patch fails the read).
+		patch, ok := overlayHandle.PatchBytes(file, segIdx)
+		if !ok {
+			return false
+		}
+		return sf.putOverlayPatch(segIdx, patch, providers)
+	}
 	if decision != overlay.DecisionPad {
 		return false
 	}
@@ -699,6 +712,21 @@ func (sf *SegmentFetcher) handleConfirmedMissing(ctx context.Context, segIdx int
 	// bit is set before that invalidate, so seeing it here means the patch
 	// exists: lay it over the pad.
 	sf.servePatch(segIdx)
+	return true
+}
+
+// putOverlayPatch writes an overlay patch into the cache slot in place of
+// the article the providers could not serve.
+func (sf *SegmentFetcher) putOverlayPatch(segIdx int, patch []byte, providers string) bool {
+	if providers != "" {
+		sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Str("providers", providers).
+			Msg("serving an overlay patch for a segment the providers could not")
+	}
+	if err := sf.cache.Put(segIdx, patch); err != nil {
+		sf.logger.Warn().Err(err).Int("segment", segIdx).Msg("failed to write overlay patch into cache")
+		return false
+	}
+	sf.setPadded(segIdx, false)
 	return true
 }
 

@@ -22,6 +22,18 @@ type dfsCacheRangeReader interface {
 	PeekCachedRange(entryName, filename string, p []byte, off int64) bool
 }
 
+// dfsCachePresenceChecker is satisfied by the same DFS mount MountManager as
+// dfsCacheRangeReader (same type-assertion seam). It answers what
+// PeekCachedRange would answer without reading the bytes, so a check that
+// only needs to know the data is there (the warm sweep preflight) costs no
+// disk read.
+type dfsCachePresenceChecker interface {
+	// PeekHasCachedRange reports whether PeekCachedRange would find
+	// [off, off+length) of filename's cache item under entryName fully
+	// cached.
+	PeekHasCachedRange(entryName, filename string, off, length int64) bool
+}
+
 // dfsCacheRangeForgetter is satisfied by the same DFS mount MountManager as
 // dfsCacheRangeReader (same type-assertion seam - a direct import would
 // cycle). A failed assertion (rclone mode, no mount) just means there is no
@@ -35,6 +47,23 @@ type dfsCacheRangeForgetter interface {
 	// patch is only consulted on a live article-fetch failure, which a
 	// cache hit skips entirely.
 	ForgetCachedRange(entryName, filename string, off, length int64)
+}
+
+// dfsCacheFolder returns the name the DFS cache files nzbID's entry under:
+// the mount folder, entry.GetFolder(), which follows folder_naming. That is
+// entry.Name only with the default naming, so PAR2 must not use the name
+// it logs. A season split out of a multi-season NZB has no folder of its
+// own: its files are served from the parent's folder, and the parent is the
+// entry stored under nzbID. fallback is used when the entry can't be read.
+func (p *Par2Repair) dfsCacheFolder(nzbID, fallback string) string {
+	if p.manager != nil {
+		if entry, err := p.manager.GetEntry(nzbID); err == nil && entry != nil {
+			if folder := entry.GetFolder(); folder != "" && folder != "." {
+				return folder
+			}
+		}
+	}
+	return fallback
 }
 
 // dfsCacheForgetter resolves the DFS range-invalidation seam via the same
@@ -127,10 +156,31 @@ func buildDeadOutputRanges(nzb *storage.NZB, pending map[string][]overlay.DeadSe
 				continue
 			}
 			seg := nf.Segments[d.Index]
-			out[file] = append(out[file], outputByteRange{start: seg.StartOffset, end: seg.EndOffset + 1})
+			r := outputByteRange{start: seg.StartOffset, end: seg.EndOffset + 1}
+			if nf.IsEncrypted {
+				r = widenForCBC(r, nf.Size)
+			}
+			out[file] = append(out[file], r)
 		}
 	}
 	return out
+}
+
+// widenForCBC widens a padded ciphertext range to every plaintext byte the
+// pad can have corrupted. The reader decrypts AES-CBC above the segment
+// cache, and a plaintext block depends on its own ciphertext block and the
+// one before it. A zero-filled [start, end) therefore spoils plaintext from
+// the start of the block holding start to the end of the block after the
+// one holding end-1: up to 15 bytes before and 16 to 31 after. size <= 0
+// leaves the end unclamped.
+func widenForCBC(r outputByteRange, size int64) outputByteRange {
+	const block = 16
+	r.start &^= block - 1
+	r.end = ((r.end + block - 1) &^ (block - 1)) + block
+	if size > 0 && r.end > size {
+		r.end = size
+	}
+	return r
 }
 
 func outputRangeOverlapsAny(rs []outputByteRange, start, end int64) bool {
@@ -150,11 +200,30 @@ func outputRangeOverlapsAny(rs []outputByteRange, start, end int64) bool {
 // exactly.
 type cacheSlicedSource struct {
 	reader      dfsCacheRangeReader
-	entryName   string
+	entryName   string // the DFS cache folder (dfsCacheFolder), not the entry's display name
 	byMessageID map[string][]cacheMapEntry
 	deadRanges  map[string][]outputByteRange
 	cacheBytes  *int64
 	progress    *par2JobProgressState // nil-safe; live cache_bytes for the progress API
+	// presence, when set, turns readCached into a probe: it checks the range
+	// is cached and returns ok with nil bytes, reading nothing from disk. For
+	// the warm sweep preflight only, which needs to know every intact slice
+	// is cached but not its bytes; the pass that follows reads them.
+	presence dfsCachePresenceChecker
+}
+
+// newCacheSource builds a pass's cacheSlicedSource, keyed by the entry's DFS
+// cache folder (dfsCacheFolder; entryName is the fallback). reader,
+// cacheBytes and progress may be nil.
+func (p *Par2Repair) newCacheSource(nzbID, entryName string, reader dfsCacheRangeReader, nzb *storage.NZB, pending map[string][]overlay.DeadSegment, cacheBytes *int64, progress *par2JobProgressState) *cacheSlicedSource {
+	return &cacheSlicedSource{
+		reader:      reader,
+		entryName:   p.dfsCacheFolder(nzbID, entryName),
+		byMessageID: buildCacheSegmentMap(nzb),
+		deadRanges:  buildDeadOutputRanges(nzb, pending),
+		cacheBytes:  cacheBytes,
+		progress:    progress,
+	}
 }
 
 // readCached returns exactly n bytes if [dataStart, dataStart+n) of
@@ -163,7 +232,9 @@ type cacheSlicedSource struct {
 // current dead/padded set for that file (never trust cache bytes for the
 // unknowns being solved for - see buildDeadOutputRanges), and the DFS cache
 // actually has those output bytes present right now. ok=false for any
-// other reason at all - the caller must fetch from Usenet instead.
+// other reason at all - the caller must fetch from Usenet instead. With
+// presence set, a hit returns nil bytes: the range is cached, nothing was
+// read.
 func (s *cacheSlicedSource) readCached(messageID string, dataStart, n int64) ([]byte, bool) {
 	if s == nil || s.reader == nil || n <= 0 {
 		return nil, false
@@ -177,6 +248,12 @@ func (s *cacheSlicedSource) readCached(messageID string, dataStart, n int64) ([]
 		outEnd := outStart + n
 		if outputRangeOverlapsAny(s.deadRanges[m.fileName], outStart, outEnd) {
 			continue // overlaps a dead/padded range - that's zeros on disk, not real data
+		}
+		if s.presence != nil {
+			if !s.presence.PeekHasCachedRange(s.entryName, m.fileName, outStart, n) {
+				continue
+			}
+			return nil, true
 		}
 		buf := make([]byte, n)
 		if !s.reader.PeekCachedRange(s.entryName, m.fileName, buf, outStart) {

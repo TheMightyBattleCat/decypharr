@@ -272,6 +272,11 @@ func ReadFileHeaderStart(prefix []byte) (FileHeaderStart, bool) {
 					return FileHeaderStart{}, false
 				}
 			}
+			// size and dataSize are 64-bit vints from the post: converting a
+			// huge one to int goes negative and walks off backwards.
+			if size > uint64(len(prefix)) {
+				return FileHeaderStart{}, false
+			}
 			end := bodyStart + int(size)
 			if end > len(prefix) {
 				return FileHeaderStart{}, false
@@ -282,7 +287,14 @@ func ReadFileHeaderStart(prefix []byte) (FileHeaderStart, bool) {
 			if typ == 5 { // end of archive
 				return FileHeaderStart{}, false
 			}
-			off = end + int(dataSize)
+			if dataSize > uint64(len(prefix)) { // the next header is past prefix
+				return FileHeaderStart{}, false
+			}
+			next := end + int(dataSize)
+			if next <= off {
+				return FileHeaderStart{}, false
+			}
+			off = next
 		}
 		return FileHeaderStart{}, false
 	case bytes.HasPrefix(prefix, rar4Signature):

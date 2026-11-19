@@ -18,6 +18,10 @@ const (
 	EntryBadFolder     string = "__bad__"
 	EntryTorrentFolder string = "torrents"
 	EntryNZBFolder     string = "nzbs"
+	// EntryInternalFolder is the WebDAV prefix of the internal-only path
+	// <infohash>/<file> our own ffprobe checks read through (see
+	// InternalFile). It is never a group: nothing lists it.
+	EntryInternalFolder string = "__internal__"
 
 	EntryKindSystem   string = "system"
 	EntryKindProvider string = "provider"
@@ -190,6 +194,25 @@ func (m *Manager) GetEntryInfo(name string) (*FileInfo, error) {
 		canDelete: true,
 		kind:      EntryKindEntry,
 	}, nil
+}
+
+// InternalFile resolves the file an internal read asks for by the stored
+// entry's InfoHash and the file's name, with no folder name involved. For a
+// season split out of a multi-season NZB the hash is the parent's NZB ID its
+// files carry: the parent stays stored under it and keeps the files.
+func (m *Manager) InternalFile(infoHash, fileName string) (*storage.Entry, *storage.File, error) {
+	if infoHash == "" || fileName == "" {
+		return nil, nil, fmt.Errorf("internal read needs an infohash and a file name")
+	}
+	entry, err := m.storage.Get(infoHash)
+	if err != nil || entry == nil {
+		return nil, nil, fmt.Errorf("entry %s not found", infoHash)
+	}
+	file, err := entry.GetFile(fileName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("file %s not found in entry %s: %w", fileName, infoHash, err)
+	}
+	return entry, file, nil
 }
 
 func (m *Manager) GetTorrentFile(torrentName, fileName string) (*FileInfo, error) {

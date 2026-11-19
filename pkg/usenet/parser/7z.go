@@ -140,7 +140,30 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, passwords 
 	}
 
 	// Parse non-RAR files as regular files
-	for _, file := range nonRARFiles {
+	plain, err := sevenZipPlainFiles(nonRARFiles, folderFiles, password, baseSegments, group.Groups)
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, plain...)
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files found in 7z archive")
+	}
+
+	p.logger.Info().
+		Int("total_extracted", len(files)).
+		Msg("7z archive processing complete")
+
+	return files, nil
+}
+
+// sevenZipPlainFiles maps the 7z's non-RAR entries to files. A compressed
+// entry cannot be streamed: its offset is real but the bytes there are
+// LZMA data, not the file. A compressed media file fails the import, as
+// a compressed RAR does; any other compressed entry (an .nfo) is skipped.
+func sevenZipPlainFiles(entries []sevenzip.FileInfo, folderFiles map[int]int, password string, baseSegments []storage.NZBSegment, groups map[string]struct{}) ([]*storage.NZBFile, error) {
+	var files []*storage.NZBFile
+	for _, file := range entries {
 		internal := NormalizeArchivePath(file.Name)
 		if internal == "" {
 			continue
@@ -158,8 +181,15 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, passwords 
 			}
 			nzbFile.Name = name
 			nzbFile.InternalPath = internal
-			nzbFile.Groups = getGroupsList(group.Groups)
+			nzbFile.Groups = getGroupsList(groups)
 			files = append(files, nzbFile)
+			continue
+		}
+
+		if file.Compressed {
+			if utils.IsMediaFile(file.Name) {
+				return nil, fmt.Errorf("%s is compressed inside a 7z; cannot stream (re-pack with -mx0)", file.Name)
+			}
 			continue
 		}
 
@@ -183,21 +213,13 @@ func (p *SevenZParser) Process(ctx context.Context, group *FileGroup, passwords 
 			Name:         name,
 			InternalPath: internal,
 			Size:         int64(file.Size),
-			IsStored:     !file.Compressed,
-			Groups:       getGroupsList(group.Groups),
+			IsStored:     true,
+			Groups:       getGroupsList(groups),
 			Segments:     segments,
 			Password:     password,
 			FileType:     storage.NZBFileTypeSevenZip,
 		})
 	}
-
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no files found in 7z archive")
-	}
-
-	p.logger.Info().
-		Int("total_extracted", len(files)).
-		Msg("7z archive processing complete")
 
 	return files, nil
 }
@@ -401,7 +423,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		}
 		volEntries = append(volEntries, volEntry{idx: r.index, num: r.num, hasNum: r.hasNum})
 	}
-	if volumeOrder := p.rarParser.resolveVolumeOrder(volEntries, len(results)); volumeOrder != nil {
+	if volumeOrder := p.rarParser.resolveVolumeOrderFor(volEntries, len(results), version == RARVersion5); volumeOrder != nil {
 		if inverse := buildInversePermutation(volumeOrder, len(rarFiles)); inverse != nil {
 			p.rarParser.renumberVolumeParts(rarFileEntries, inverse)
 			p.logger.Debug().

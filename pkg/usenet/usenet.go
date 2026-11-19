@@ -544,23 +544,30 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}
 
-	var overlayOpts []reader.Option
-	if u.overlay != nil && file.NzbID != "" && config.Get().Repair.PlaybackPaddingEnabled() {
-		overlayOpts = []reader.Option{reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name)}
-	}
-
-	// Every line the reader logs names its file: a playback stall or a slow
-	// fetch could otherwise be tied to a title only by working back from
-	// segment numbers. Passed here rather than with the overlay options,
-	// which are absent when playback padding is off.
-	readerLog := u.logger.With().Str("nzb_id", file.NzbID).Str("file", file.Name).Logger()
-	readerOpts := append([]reader.Option{reader.WithLogger(readerLog)}, overlayOpts...)
-
 	return &fsEntry{
 		fs:         usenetFS,
 		volumes:    volumes,
-		readerOpts: readerOpts,
+		readerOpts: u.readerOptions(file),
 	}, nil
+}
+
+// readerOptions are the single-volume reader's options for file. The overlay
+// handle is attached whatever playback_padding says: a PAR2 patch is the
+// file's real bytes, so it is served with padding off too. Only the zero-fill
+// of a segment with no patch follows the setting (reader.WithPadding).
+func (u *Usenet) readerOptions(file *storage.NZBFile) []reader.Option {
+	// Every line the reader logs names its file: a playback stall or a slow
+	// fetch could otherwise be tied to a title only by working back from
+	// segment numbers. Passed apart from the overlay options, which are
+	// absent when there is no overlay store or NZB ID.
+	readerLog := u.logger.With().Str("nzb_id", file.NzbID).Str("file", file.Name).Logger()
+	opts := []reader.Option{reader.WithLogger(readerLog)}
+	if u.overlay != nil && file.NzbID != "" {
+		opts = append(opts,
+			reader.WithOverlay(u.overlay.Handle(file.NzbID), file.Name),
+			reader.WithPadding(config.Get().Repair.PlaybackPaddingEnabled()))
+	}
+	return opts
 }
 
 // getOrCreateEntry returns the fsEntry and its cache key to avoid redundant key computation.
@@ -681,11 +688,23 @@ func (u *Usenet) DropIdleReader(nzoID, filename string) bool {
 // was is first copied to the volume-order-backup folder beside the meta
 // store under its own time, and that path is returned: copying it back over
 // the record (RestoreNZBRecord) undoes the change.
-func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*storage.NZBFile) string, segs []storage.NZBSegment) (string, error) {
+//
+// guard, when not nil, is asked first under the same lock, before anything is
+// written: an error from it leaves the record and the backup folder alone and
+// is returned as it is. The caller's checks made before it read the volumes
+// over the network can have changed by now (an overlay record naming an
+// article by its place, a PAR2 pass that loaded the old layout).
+func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*storage.NZBFile) string, guard func() error, segs []storage.NZBSegment) (string, error) {
 	src := u.nzbStorage.MetaFilePath(nzoID)
 	dir := filepath.Join(filepath.Dir(u.nzbStorage.MetaDir()), "volume-order-backup")
 	backup := filepath.Join(dir, fmt.Sprintf("%s.%s", filepath.Base(src), time.Now().UTC().Format("20060102T150405.000")))
+	var refused error
 	err := u.nzbStorage.Update(nzoID, func(nzb *storage.NZB) (bool, error) {
+		if guard != nil {
+			if refused = guard(); refused != nil {
+				return false, refused
+			}
+		}
 		f := nzb.GetFileByName(filename)
 		if f == nil {
 			return false, fmt.Errorf("file %q is not in the record", filename)
@@ -710,6 +729,9 @@ func (u *Usenet) ReorderFileSegments(nzoID, filename, wantKey string, key func(*
 		f.Segments = segs
 		return true, nil
 	})
+	if refused != nil {
+		return "", refused
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to store the reordered layout: %w", err)
 	}
@@ -1014,8 +1036,14 @@ func (u *Usenet) checkFileSkippingPatched(ctx context.Context, nzoID, filename s
 	return u.checkAvailability(ctx, filename, messageIDs)
 }
 
+// CheckFileAvailability is the post-parse import check for one file. It fails
+// open when no news server answered: ErrAvailabilityUnchecked becomes nil.
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
-	return u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
+	err := u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
+	if errors.Is(err, ErrAvailabilityUnchecked) {
+		return nil
+	}
+	return err
 }
 
 // RecordOverlayDead records a confirmed-dead segment against the overlay
@@ -1057,6 +1085,15 @@ func (u *Usenet) OverlayWritePatch(nzoID, filename string, segIndex int, data []
 		return fmt.Errorf("overlay store unavailable")
 	}
 	return u.overlay.WritePatch(nzoID, filename, segIndex, data)
+}
+
+// OverlayMoveDeadSegments re-indexes filename's dead records whose articles
+// the NZB record now holds elsewhere - see overlay.Store.MoveDeadSegments.
+func (u *Usenet) OverlayMoveDeadSegments(nzoID, filename string, moves []overlay.DeadMove) ([]overlay.DeadMove, error) {
+	if u.overlay == nil {
+		return nil, fmt.Errorf("overlay store unavailable")
+	}
+	return u.overlay.MoveDeadSegments(nzoID, filename, moves)
 }
 
 // OverlayListNZBIDs returns every nzbID with recorded overlay state. Empty
@@ -1287,6 +1324,16 @@ func (u *Usenet) SetOverlayViewerPadNotifier(fn func(nzoID, file string)) {
 	u.overlay.SetViewerPadNotifier(fn)
 }
 
+// SetOverlayDamageClearedNotifier installs the callback told which
+// non-patched records an overlay delete or clear removed - see
+// overlay.Store.SetDamageClearedNotifier.
+func (u *Usenet) SetOverlayDamageClearedNotifier(fn func(nzoID string, removed map[string][]overlay.DeadSegment)) {
+	if u.overlay == nil {
+		return
+	}
+	u.overlay.SetDamageClearedNotifier(fn)
+}
+
 // overlayPolicyFromConfig derives the overlay padding-cap Policy from repair
 // config - already clamped by config's load/save path (see
 // RepairConfig.PadMaxRunSegments and friends), so this is a plain field copy.
@@ -1401,17 +1448,7 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 		if err != nil {
 			return err
 		}
-		if check != nil {
-			if reason := check(meta); reason != "" {
-				u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
-					Msg("Provider returned a different upload's article; trying the next provider")
-				return &nntp.Error{
-					Type:    nntp.ErrorTypeArticleNotFound,
-					Message: "article belongs to a different upload: " + reason,
-				}
-			}
-		}
-		return nil
+		return u.refuseForeign(messageID, meta, check)
 	})
 	if err != nil {
 		return nil, err
@@ -1421,14 +1458,76 @@ func (u *Usenet) FetchArticleChecked(ctx context.Context, messageID string, chec
 	return out, nil
 }
 
+// refuseForeign applies check to an article's yEnc headers: nil to accept
+// it, or the error that makes failover ask the next provider.
+func (u *Usenet) refuseForeign(messageID string, meta *nntp.YencMetadata, check ArticleCheck) error {
+	if check == nil {
+		return nil
+	}
+	if reason := check(meta); reason != "" {
+		u.logger.Debug().Str("message_id", messageID).Str("reason", reason).
+			Msg("Provider returned a different upload's article; trying the next provider")
+		return nntp.NewForeignArticleError(reason)
+	}
+	return nil
+}
+
+// FetchArticleServedBy is FetchArticle that also returns the host of the
+// provider that served the body, so a caller that finds the body bad only
+// later (a PAR2 packet whose MD5 fails) can ask the others with
+// FetchArticleExcept.
+func (u *Usenet) FetchArticleServedBy(ctx context.Context, messageID string) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, nil, nil)
+}
+
+// FetchArticleExcept fetches one article from every provider but exceptHost
+// (and the providers on its backbone), returning the body and the host that
+// served it. Nothing is counted against exceptHost. With no other provider
+// it fails without asking anyone.
+func (u *Usenet) FetchArticleExcept(ctx context.Context, messageID, exceptHost string) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost}, nil)
+}
+
+// FetchArticleCheckedServedBy is FetchArticleChecked that also returns the
+// host of the provider that served the body, for a caller that may find the
+// body bad only after decode and ask the others (FetchArticleCheckedExcept).
+func (u *Usenet) FetchArticleCheckedServedBy(ctx context.Context, messageID string, check ArticleCheck) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, nil, check)
+}
+
+// FetchArticleCheckedExcept is FetchArticleExcept with FetchArticleChecked's
+// identity check applied to every other provider's copy.
+func (u *Usenet) FetchArticleCheckedExcept(ctx context.Context, messageID, exceptHost string, check ArticleCheck) ([]byte, string, error) {
+	return u.fetchArticleExcept(ctx, messageID, []string{exceptHost}, check)
+}
+
+func (u *Usenet) fetchArticleExcept(ctx context.Context, messageID string, except []string, check ArticleCheck) ([]byte, string, error) {
+	var buf bytes.Buffer
+	host, err := u.nntp.ExecuteWithFailoverExcept(ctx, except, func(conn *nntp.Connection) error {
+		buf.Reset()
+		_, meta, err := conn.StreamBodyMeta(messageID, &buf)
+		if err != nil {
+			return err
+		}
+		return u.refuseForeign(messageID, meta, check)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, host, nil
+}
+
 // FetchArticlePrefix returns the first n decoded bytes of one NNTP article,
 // held in memory only: no segment cache, no DFS cache, no prefetch. The rest
 // of the body is drained and discarded (the connection stays reusable), so
-// it still costs one article of bandwidth.
+// it still costs one article of bandwidth. The read ends when ctx does,
+// even mid-body on a stalled server.
 func (u *Usenet) FetchArticlePrefix(ctx context.Context, messageID string, n int) ([]byte, error) {
 	var prefix []byte
 	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-		meta, err := conn.GetHeaderPrefix(messageID, n)
+		meta, err := conn.GetHeaderPrefixContext(ctx, messageID, n)
 		if err != nil {
 			return err
 		}
@@ -1455,7 +1554,7 @@ type ArticleHead struct {
 func (u *Usenet) FetchArticleHead(ctx context.Context, messageID string, n int) (ArticleHead, error) {
 	var head ArticleHead
 	err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
-		meta, err := conn.GetHeaderPrefix(messageID, n)
+		meta, err := conn.GetHeaderPrefixContext(ctx, messageID, n)
 		if err != nil {
 			return err
 		}
@@ -1701,9 +1800,21 @@ func (u *Usenet) OverlayScreenFile(ctx context.Context, nzoID, filename string) 
 	return result, nil
 }
 
+// ErrAvailabilityUnchecked is checkAvailability's "could not ask": no news
+// server answered any sampled STAT (every one failed with an error, none was
+// found and none reported missing). The file is neither available nor
+// missing. The sweep records it Unknown and re-checks it next sweep; the
+// import checks fail open on it.
+var ErrAvailabilityUnchecked = errors.New("no news server answered the availability check")
+
 // checkAvailability batch-STATs the given sampled message ids. The NNTP client
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
+//
+// It returns nil when the sample is available (or some of it answered present
+// and the rest failed with errors), customerror.UsenetSegmentMissingError when
+// a sampled article is definitively missing, and ErrAvailabilityUnchecked when
+// nothing was answered at all.
 func (u *Usenet) checkAvailability(ctx context.Context, fileName string, messageIDs []string) error {
 	if len(messageIDs) == 0 {
 		return nil
@@ -1711,24 +1822,33 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 
 	result, err := u.nntp.BatchStat(ctx, messageIDs)
 	if err != nil {
-		// Connection/system error - log and continue (don't fail availability check)
+		// Connection/system error: nothing was checked.
 		u.logger.Warn().
 			Err(err).
 			Str("file", fileName).
-			Msg("Non-fatal error during availability check, ignoring")
-		return nil
+			Msg("Availability check could not ask any news server")
+		return fmt.Errorf("%w: %w", ErrAvailabilityUnchecked, err)
 	}
 
 	// Check if all sampled segments are available.
 	// Distinguish genuine article-not-found from connection errors:
 	//   TotalCount = FoundCount + notFoundCount + ErrorCount
 	// Only treat a file as unavailable when segments are definitively missing
-	// (notFoundCount > 0). Connection errors mean we couldn't check — treat
-	// those the same as the top-level error path above (non-fatal, skip check).
+	// (notFoundCount > 0). Connection errors mean we couldn't check: with
+	// some articles found the sample passes; with none found it is unchecked.
 	if !result.AllAvailable() {
 		notFoundCount := result.TotalCount - result.FoundCount - result.ErrorCount
 		if result.ErrorCount > 0 && notFoundCount == 0 {
 			// All failures were connection errors, not missing articles.
+			if result.FoundCount == 0 {
+				// Debug: during an outage every file a sweep probes ends here.
+				u.logger.Debug().
+					Str("file", fileName).
+					Int("sampled_segments", len(messageIDs)).
+					Int("error_count", result.ErrorCount).
+					Msg("Availability check got no answer from any news server")
+				return ErrAvailabilityUnchecked
+			}
 			return nil
 		}
 		// At least some segments are definitively missing.

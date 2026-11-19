@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/bits"
 	"path/filepath"
@@ -458,7 +459,52 @@ func rar4EndNumbers(ctx context.Context, f *storage.NZBFile, vols []layoutVolume
 // volumeOrderCache keeps each file's verdict for the life of the process, so
 // a file listed Unverified for another reason is not re-read every sweep. Keyed
 // by the stored layout, so a re-import or a reordered file is checked again.
-var volumeOrderCache sync.Map // map[string]volumeOrderVerdict
+// A check that reached no verdict (a head or tail article could not be read)
+// is kept as a volumeOrderNoVerdict, which only delays the next read: it is
+// never a verdict, and it is never persisted.
+var volumeOrderCache sync.Map // map[string]volumeOrderVerdict | volumeOrderNoVerdict
+
+// volumeOrderNoVerdict marks a layout whose last check reached no verdict; it
+// is not read again before retryAt.
+type volumeOrderNoVerdict struct {
+	retryAt time.Time
+}
+
+// volumeOrderRetryAfter is how long a layout whose check reached no verdict
+// waits before it is read again. A var for tests.
+var volumeOrderRetryAfter = 6 * time.Hour
+
+// errVolumeOrderRetryLater is returned for a layout whose last check reached
+// no verdict and whose retry time has not come.
+var errVolumeOrderRetryLater = errors.New("the last check reached no verdict; not retried yet")
+
+// readVolumeOrder returns the cached verdict for a stored layout, or reads
+// one with checkFileVolumeOrder and caches it. A read that reaches no verdict
+// is remembered as such until volumeOrderRetryAfter has passed, unless ctx
+// itself ended (a stopped sweep says nothing about the articles).
+func readVolumeOrder(ctx context.Context, key string, f *storage.NZBFile, posted []storage.PostedFileRef, head volumeHeadFunc, body volumeBodyFunc) (volumeOrderVerdict, error) {
+	if cached, ok := volumeOrderCache.Load(key); ok {
+		switch c := cached.(type) {
+		case volumeOrderVerdict:
+			return c, nil
+		case volumeOrderNoVerdict:
+			if time.Now().Before(c.retryAt) {
+				return volumeOrderVerdict{}, errVolumeOrderRetryLater
+			}
+		}
+	}
+	cctx, cancel := context.WithTimeout(ctx, volumeOrderTimeout)
+	defer cancel()
+	v, err := checkFileVolumeOrder(cctx, f, posted, head, body)
+	if err != nil {
+		if ctx.Err() == nil {
+			volumeOrderCache.Store(key, volumeOrderNoVerdict{retryAt: time.Now().Add(volumeOrderRetryAfter)})
+		}
+		return volumeOrderVerdict{}, err
+	}
+	volumeOrderCache.Store(key, v)
+	return v, nil
+}
 
 // volumeOrderKey names a file's stored layout: its release, its name and
 // every article in order. The first and last articles alone would not do - two
@@ -491,14 +537,8 @@ func (r *Repair) checkVolumeOrder(ctx context.Context, infoHash, name string) (v
 	if f == nil || f.FileType != storage.NZBFileTypeRar || len(f.Segments) == 0 {
 		return volumeOrderVerdict{}, false
 	}
-	key := volumeOrderKey(infoHash, f)
-	if cached, ok := volumeOrderCache.Load(key); ok {
-		return cached.(volumeOrderVerdict), true
-	}
-	cctx, cancel := context.WithTimeout(ctx, volumeOrderTimeout)
-	defer cancel()
 	started := time.Now()
-	v, err := checkFileVolumeOrder(cctx, f, nzb.Par2Source,
+	v, err := readVolumeOrder(ctx, volumeOrderKey(infoHash, f), f, nzb.Par2Source,
 		func(ctx context.Context, id string) (usenet.ArticleHead, error) {
 			return u.FetchArticleHead(ctx, id, parser.EncryptedVolumeHeadBytes)
 		},
@@ -507,7 +547,6 @@ func (r *Repair) checkVolumeOrder(ctx context.Context, infoHash, name string) (v
 		r.logger.Debug().Err(err).Str("entry", nzb.Name).Str("file", name).Msg("Repair: volume order check reached no verdict")
 		return v, false
 	}
-	volumeOrderCache.Store(key, v)
 	r.logger.Debug().Str("entry", nzb.Name).Str("file", name).Int("volumes", v.volumes).Int("numbered", v.numbered).
 		Str("source", v.source).Bool("misordered", v.misordered).Int("out_of_place", v.outOfPlace).
 		Dur("took", time.Since(started)).Msg("Repair: checked the stored volume order")
@@ -518,7 +557,8 @@ func (r *Repair) checkVolumeOrder(ctx context.Context, infoHash, name string) (v
 // earlier probe recorded for the layout it still has, or else a fresh read of
 // its volumes' headers, which the caller records. A misordered file is logged
 // when it is first found. Nil when the file is not a multi-volume RAR file or
-// the check reached no verdict; that file is read again on the next probe.
+// the check reached no verdict; that file is read again on a later probe,
+// once volumeOrderRetryAfter has passed (see readVolumeOrder).
 func (r *Repair) volumeOrderOnce(ctx context.Context, c *candidate, infoHash, name string) *storage.VolumeOrderCheck {
 	u := r.manager.usenet
 	if u == nil {

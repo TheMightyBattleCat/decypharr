@@ -2,6 +2,7 @@ package par2
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -60,7 +61,8 @@ type Index struct {
 	Recovery []RecoverySliceRef
 
 	// SkippedPackets lists packets walkPackets skipped during the parse
-	// because their packet MD5 did not verify. PAR2 duplicates the structural
+	// because their packet MD5 did not verify, plus RecvSlic packets whose
+	// data is not exactly one slice (dropped by finalize). PAR2 duplicates the structural
 	// packets (Main/FileDesc/IFSC) into every volume, so a skip here is
 	// frequently covered by a clean copy in another source; when it is not,
 	// the shortfall surfaces downstream - a missing FileDesc fails finalize,
@@ -68,6 +70,11 @@ type Index struct {
 	// damaged-slice count. Non-empty means the index was assembled from a
 	// partially-unreadable source set.
 	SkippedPackets []SkippedPacket
+
+	// OtherSetPackets counts packets of other recovery sets that the parse
+	// ignored: a release can carry one set per episode, and a source list
+	// built from it mixes them. Not a fault, unlike SkippedPackets.
+	OtherSetPackets int
 
 	// fileBase[i] is the global slice index at which FileOrder[i]'s slices
 	// begin. Same length and order as FileOrder; built once by finalize.
@@ -89,28 +96,33 @@ type Source struct {
 // recognized by packet MD5 and only processed once. RecvSlic packet bodies
 // are never copied - only their location is recorded (RecoverySliceRef) -
 // so scanning even a source that includes large recovery volumes stays cheap.
-func ParseIndex(sources []Source) (*Index, error) {
-	return parseIndex(sources, nil)
+//
+// A source list that mixes recovery sets (a season pack posted as one PAR2
+// set per episode) is parsed as the set of the first Main packet found, in
+// source order; packets of the other sets are counted in OtherSetPackets and
+// ignored. Use ParseIndexSet to choose the set.
+func ParseIndex(ctx context.Context, sources []Source) (*Index, error) {
+	return parseIndex(ctx, sources, nil)
 }
 
 // ParseIndexSet is ParseIndex restricted to one recovery set: packets of any
 // other set are ignored rather than failing the parse. A release that carries
 // several PAR2 sets (a season pack posted as one PAR2 set per episode) has
-// them all in its source list; ParseIndex refuses such a mix outright. A zero
-// setID behaves exactly like ParseIndex.
-func ParseIndexSet(sources []Source, setID [16]byte) (*Index, error) {
+// them all in its source list. A zero setID behaves exactly like ParseIndex.
+func ParseIndexSet(ctx context.Context, sources []Source, setID [16]byte) (*Index, error) {
 	if setID == ([16]byte{}) {
-		return parseIndex(sources, nil)
+		return parseIndex(ctx, sources, nil)
 	}
-	return parseIndex(sources, &setID)
+	return parseIndex(ctx, sources, &setID)
 }
 
 // SourceSetIDs returns the recovery set of each source's first valid packet
-// (zero when the source has none), in source order.
-func SourceSetIDs(sources []Source) [][16]byte {
+// (zero when the source has none), in source order. A cancelled ctx leaves
+// the remaining sources zero; callers check ctx.Err() before trusting them.
+func SourceSetIDs(ctx context.Context, sources []Source) [][16]byte {
 	out := make([][16]byte, len(sources))
 	for i, src := range sources {
-		_ = walkPackets(src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+		_ = walkPackets(ctx, src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
 			out[i] = h.RecoverySetID
 			return errStopWalk
 		})
@@ -120,10 +132,40 @@ func SourceSetIDs(sources []Source) [][16]byte {
 
 var errStopWalk = fmt.Errorf("par2: stop walk")
 
-func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
+// firstMainSetID returns the recovery set of the first valid Main packet, in
+// source order. A recovery volume often starts with recovery-slice packets,
+// and in a mixed list the first packet of all can belong to a set whose Main
+// packet was never fetched; the Main packet names a set the index can be
+// built from.
+func firstMainSetID(ctx context.Context, sources []Source) ([16]byte, bool) {
+	for _, src := range sources {
+		var id [16]byte
+		found := false
+		_ = walkPackets(ctx, src.Data, func(packetHeader, int64) {}, func(h packetHeader, _ []byte, _ int64) error {
+			if h.Type != typeMain {
+				return nil
+			}
+			id, found = h.RecoverySetID, true
+			return errStopWalk
+		})
+		if found {
+			return id, true
+		}
+	}
+	return [16]byte{}, false
+}
+
+func parseIndex(ctx context.Context, sources []Source, want *[16]byte) (*Index, error) {
 	idx := &Index{
 		Files:  make(map[[16]byte]*FileDesc),
 		Slices: make(map[[16]byte][]SliceChecksum),
+	}
+	if want == nil {
+		// With no Main packet anywhere, the parse below fails with "no Main
+		// packet found" (or "no PAR2 packets") as before.
+		if id, ok := firstMainSetID(ctx, sources); ok {
+			want = &id
+		}
 	}
 	seen := make(map[[16]byte]struct{})
 	haveSetID := false
@@ -136,9 +178,10 @@ func parseIndex(sources []Source, want *[16]byte) (*Index, error) {
 				Type:   packetTypeName(h.Type),
 			})
 		}
-		err := walkPackets(src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
+		err := walkPackets(ctx, src.Data, onBad, func(h packetHeader, packet []byte, offset int64) error {
 			if want != nil && h.RecoverySetID != *want {
-				return nil // another recovery set in the same release
+				idx.OtherSetPackets++ // another recovery set in the same release
+				return nil
 			}
 			if !haveSetID {
 				idx.SetID = h.RecoverySetID
@@ -228,6 +271,9 @@ func (idx *Index) parseFileDesc(body []byte) error {
 	copy(fd.FileMD5[:], body[16:32])
 	copy(fd.MD5_16k[:], body[32:48])
 	fd.Length = int64(binary.LittleEndian.Uint64(body[48:56]))
+	if fd.Length < 0 {
+		return fmt.Errorf("par2: FileDesc packet declares a negative file length (%d)", fd.Length)
+	}
 
 	name := body[fixed:]
 	if i := bytes.IndexByte(name, 0); i >= 0 {
@@ -286,14 +332,55 @@ func (idx *Index) finalize() error {
 		if !ok {
 			return fmt.Errorf("par2: Main packet references file %x with no FileDesc packet", id)
 		}
+		// Check the file's own count before adding it, so a single huge file
+		// cannot overflow the running total.
+		n := ceilDiv(fd.Length, idx.SliceSize)
+		if n < 0 || n > maxInputSlices {
+			return fmt.Errorf("par2: file %x needs %d slices, exceeding the %d spec limit", id, n, maxInputSlices)
+		}
 		idx.fileBase[i] = total
-		total += ceilDiv(fd.Length, idx.SliceSize)
+		total += n
 	}
 	idx.numSlices = total
-	if total > maxInputSlices {
+	if total < 0 || total > maxInputSlices {
 		return fmt.Errorf("par2: recovery set has %d input slices, exceeding the %d spec limit", total, maxInputSlices)
 	}
+	// A recovery packet whose data is not exactly one slice is not a recovery
+	// slice: the solve refuses it, so it must never be counted or picked.
+	// Report it with the other skipped packets.
+	kept := idx.Recovery[:0]
+	for _, r := range idx.Recovery {
+		if r.Length != idx.SliceSize {
+			idx.SkippedPackets = append(idx.SkippedPackets, SkippedPacket{
+				Source: r.Source,
+				Offset: r.Offset - packetHeaderSize - 4,
+				Type:   "RecvSlic",
+			})
+			continue
+		}
+		kept = append(kept, r)
+	}
+	idx.Recovery = kept
 	return nil
+}
+
+// MissingChecksums returns, in FileOrder, the files of the set that do not
+// hold exactly one IFSC checksum per slice. The IFSC packet is copied into
+// every PAR2 file, so a file listed here had every copy of it unreadable in
+// the sources parsed; a repair stream fails at that file's first intact slice.
+// Other volumes of the set carry the packet too. Call after a successful parse.
+func (idx *Index) MissingChecksums() [][16]byte {
+	var missing [][16]byte
+	for _, id := range idx.FileOrder {
+		fd, ok := idx.Files[id]
+		if !ok {
+			continue
+		}
+		if int64(len(idx.Slices[id])) != ceilDiv(fd.Length, idx.SliceSize) {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 // NumSlices returns the total number of input slices across every file in
@@ -421,7 +508,7 @@ func ceilDiv(a, b int64) int64 {
 	if a <= 0 {
 		return 0
 	}
-	return (a + b - 1) / b
+	return (a-1)/b + 1 // not (a+b-1)/b, which overflows for a near MaxInt64
 }
 
 // fileIDLess orders two FileIDs as PAR2 v2.0 defines "sorted" for the Main

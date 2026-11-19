@@ -236,7 +236,7 @@ class DecypharrUtils {
                         ${icons[type]}
                     </svg>
                     <div class="min-w-0 flex-1 break-words">
-                        <span class="text-sm">${message.replace(/\n/g, '<br>')}</span>
+                        <span class="text-sm">${this.escapeHtml(String(message ?? '')).replace(/\n/g, '<br>')}</span>
                     </div>
                     <button class="btn btn-sm btn-ghost btn-circle" onclick="window.decypharrUtils.closeToast('${toastId}');">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

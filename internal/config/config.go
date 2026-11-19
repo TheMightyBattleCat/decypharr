@@ -1175,7 +1175,10 @@ func clearHotFields(c *Config) {
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false
 	c.Categories = nil
-	c.FolderNaming = ""
+	// FolderNaming is deliberately cold: entries keep the folder (and item
+	// key) they were saved under until each is re-saved, so a live change
+	// would leave the listing mixed across entries. A restart makes the
+	// change explicit; existing folders still keep their old names.
 	c.CustomFolders = nil
 	c.VirtualFolders = nil
 	c.DefaultDownloadAction = ""

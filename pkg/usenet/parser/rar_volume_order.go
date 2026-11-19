@@ -184,17 +184,26 @@ func rar4TailVolumeNumbers(ctx context.Context, volumes []*types.Volume, want []
 }
 
 // orderEstablished reports whether entries give every one of total volumes a
-// distinct number - after resolveVolumeOrder has placed any hole it could.
+// distinct number and the numbers form one contiguous run - after
+// resolveVolumeOrder has placed any hole it could. A gap means a volume is
+// missing from the NZB, so the order of what is present is not verified.
 func orderEstablished(entries []volEntry, total int) bool {
 	if len(entries) != total {
 		return false
 	}
 	seen := make(map[int]bool, len(entries))
-	for _, e := range entries {
+	minNum, maxNum := 0, 0
+	for i, e := range entries {
 		if !e.hasNum || seen[e.num] {
 			return false
 		}
 		seen[e.num] = true
+		if i == 0 || e.num < minNum {
+			minNum = e.num
+		}
+		if i == 0 || e.num > maxNum {
+			maxNum = e.num
+		}
 	}
-	return true
+	return len(entries) == 0 || maxNum-minNum == len(entries)-1
 }

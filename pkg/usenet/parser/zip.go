@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	fs2 "io/fs"
+	"math"
 	"path"
 	"path/filepath"
 	"sort"
@@ -346,9 +347,14 @@ func findZIP64EndOfCentralDirectory(data []byte, eocdPos int) (int64, int64, int
 		if binary.LittleEndian.Uint32(data[i:]) != ZIPZIP64EndOfCentralDirSig {
 			continue
 		}
-		totalEntries := int64(binary.LittleEndian.Uint64(data[i+32:]))
-		centralDirSize := int64(binary.LittleEndian.Uint64(data[i+40:]))
-		return totalEntries, centralDirSize, int64(i), true
+		totalEntries := binary.LittleEndian.Uint64(data[i+32:])
+		centralDirSize := binary.LittleEndian.Uint64(data[i+40:])
+		if totalEntries > math.MaxInt64 || centralDirSize > math.MaxInt64 {
+			// Negative as int64: a directory size of -1 put the directory
+			// start past its end and the slice below it panicked.
+			return 0, 0, 0, false
+		}
+		return int64(totalEntries), int64(centralDirSize), int64(i), true
 	}
 	return 0, 0, 0, false
 }
@@ -404,6 +410,7 @@ func (p *ZIPParser) parseCentralDirEntry(r *bytes.Reader) (*ZIPFileEntry, error)
 	uncompressedSize := int64(header.UncompressedSize)
 	compressedSize := int64(header.CompressedSize)
 	localHeaderOffset := int64(header.LocalHeaderOffset)
+	outOfRange := false
 
 	// Parse the extra field: for ZIP64 archives the 32-bit size/offset fields
 	// hold 0xFFFFFFFF sentinels and the real 64-bit values live in the ZIP64
@@ -427,9 +434,15 @@ func (p *ZIPParser) parseCentralDirEntry(r *bytes.Reader) (*ZIPFileEntry, error)
 					if len(f) < 8 {
 						return 0, false
 					}
-					v := int64(binary.LittleEndian.Uint64(f))
+					u := binary.LittleEndian.Uint64(f)
 					f = f[8:]
-					return v, true
+					if u > math.MaxInt64 {
+						// Negative as int64. No real archive is that large,
+						// so the entry is corrupt or hostile: drop it.
+						outOfRange = true
+						return 0, false
+					}
+					return int64(u), true
 				}
 				if header.UncompressedSize == 0xFFFFFFFF {
 					if v, ok := take(); ok {
@@ -454,6 +467,12 @@ func (p *ZIPParser) parseCentralDirEntry(r *bytes.Reader) (*ZIPFileEntry, error)
 	// Skip comment
 	if _, err := r.Seek(int64(header.CommentLength), io.SeekCurrent); err != nil {
 		return nil, err
+	}
+
+	if outOfRange {
+		// The reader is already past this entry, so the walk carries on with
+		// the next one.
+		return nil, nil
 	}
 
 	// Check if directory
@@ -490,6 +509,16 @@ func (p *ZIPParser) calculateZIPDataOffset(ctx context.Context, volumes []*types
 	// Data starts at: LocalHeaderOffset + 30 + filename_length + extra_field_length
 
 	headerOffset := file.LocalHeaderOffset
+	if len(volumes) == 0 {
+		return 0, fmt.Errorf("no volumes")
+	}
+	// The header is read from the first volume only. An offset that leaves
+	// no room for its 30 bytes there (a corrupt or hostile central
+	// directory) cannot be read: refuse it before the NNTP lookup. A size of
+	// 0 is unknown and left to the read.
+	if size := volumes[0].Size; headerOffset < 0 || (size > 0 && headerOffset > size-30) {
+		return 0, fmt.Errorf("local header offset %d is beyond the volume (%d bytes)", headerOffset, size)
+	}
 
 	// Create a temporary FS to read the local header
 	usenetFS, err := fs.NewFS(ctx, p.manager, p.maxConcurrent, 0, volumes, p.logger) // 0 prefetch for parsing

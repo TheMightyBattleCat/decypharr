@@ -176,6 +176,17 @@ func (m *Manager) PeekCachedRange(entryName, filename string, p []byte, off int6
 	return m.vfs.PeekCachedRange(entryName, filename, p, off)
 }
 
+// PeekHasCachedRange reports whether PeekCachedRange would find
+// [off, off+length) of filename's cache item under entryName fully cached,
+// without reading it - see vfs.Manager.PeekHasCachedRange. False when there
+// is no VFS mount.
+func (m *Manager) PeekHasCachedRange(entryName, filename string, off, length int64) bool {
+	if m.vfs == nil {
+		return false
+	}
+	return m.vfs.PeekHasCachedRange(entryName, filename, off, length)
+}
+
 // HasCachedRange reports whether [off, off+length) of filename's cache item
 // under entryName is already cached - see vfs.Manager.HasCachedRange. False
 // when there is no VFS mount.
@@ -206,6 +217,16 @@ func (m *Manager) ForgetCachedRange(entryName, filename string, off, length int6
 		return
 	}
 	m.vfs.ForgetCachedRange(entryName, filename, off, length)
+}
+
+// ForgetPaddedRanges forgets the ranges of filename's cache item under
+// entryName that were marked as zero-fill when written - see
+// vfs.Manager.ForgetPaddedRanges. No-op when there is no VFS mount.
+func (m *Manager) ForgetPaddedRanges(entryName, filename string) int64 {
+	if m.vfs == nil {
+		return 0
+	}
+	return m.vfs.ForgetPaddedRanges(entryName, filename)
 }
 
 // CacheCoverage returns filename's cache coverage under entryName - cached

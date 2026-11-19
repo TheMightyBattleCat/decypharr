@@ -153,6 +153,10 @@ type Manager struct {
 	backup atomic.Pointer[backupHolder]
 	// backupSvc is the concrete service, for Start and Stop.
 	backupSvc *backup.BackupService
+
+	// padRangeCache holds each damaged file's pad byte ranges for
+	// OverlayPadRanges, so a DFS stream doesn't decode the NZB per chunk.
+	padRangeCache sync.Map // nzbID+"\x00"+file -> padRangeCacheEntry
 }
 
 // New creates a new Manager instance
@@ -344,6 +348,7 @@ func (m *Manager) init() {
 		m.usenet.SetOverlayRepairEnqueuer(m.par2Repair.AutoEnqueue)
 		m.usenet.SetOverlayFailedNotifier(m.notifyOverlayFileFailed)
 		m.usenet.SetOverlayViewerPadNotifier(m.onViewerPaddedFailedFile)
+		m.usenet.SetOverlayDamageClearedNotifier(m.onOverlayDamageCleared)
 	}
 
 	// Initialize the read-ahead precache service (see precache.go). Depends
@@ -919,6 +924,11 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	// on to the re-grabbed replacement's (different) nzbID. Best-effort: a
 	// failure here must never block deleting the entry record itself, since
 	// from the user's perspective the entry is already gone either way.
+	if torr.IsNZB() && m.par2Repair != nil {
+		// A PAR2 pass for the entry would read the whole release, fail at
+		// the patch write and record and notify that failure.
+		m.par2Repair.CancelEntry(infohash)
+	}
 	if torr.IsNZB() && m.usenet != nil {
 		if err := m.usenet.Delete(infohash); err != nil {
 			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete usenet/overlay state for entry")
@@ -931,6 +941,13 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
 	}
+	// Its PAR2 backoff/terminal row: only a successful pass deleted one, so
+	// every deleted entry with a failed pass left its row behind.
+	if torr.IsNZB() {
+		if err := m.storage.DeletePar2RepairState(infohash); err != nil {
+			m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Failed to delete PAR2 repair state for entry")
+		}
+	}
 	m.strm.RemoveEntryAsync(torr)
 
 	// Its DFS cache too. Before this only the stale-NZB sweep and the manual
@@ -939,7 +956,7 @@ func (m *Manager) deleteEntry(infohash string, removePlacements bool) error {
 	// same-name entry still claims it or a file in it is open; the sidecar's
 	// InfoHash keeps a replacement from reading the old bytes either way.
 	if torr.IsNZB() && m.repair != nil {
-		if freed, ok := m.repair.RemoveEntryCacheDir(torr.GetFolder(), infohash); ok {
+		if freed, ok := m.repair.RemoveEntryCache(torr); ok {
 			m.logger.Debug().Str("entry", torr.Name).Str("infohash", infohash).Int64("bytes_freed", freed).
 				Msg("Removed DFS cache dir for deleted entry")
 		}

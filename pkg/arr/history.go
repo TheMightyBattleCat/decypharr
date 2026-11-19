@@ -250,6 +250,36 @@ func (a *Arr) CleanupQueue() error {
 	return nil
 }
 
+// FindGrabHistoryIDForDownload returns the ID of the "grabbed" history record
+// for downloadID - the ID the Arr was given for the grab, so the record of the
+// grab that produced a file rather than the newest grab of its episode or
+// movie. A season pack has one record per episode; the one for mediaDBID
+// (episode for Sonarr, movie for Radarr) is preferred, else any record of the
+// grab, since failing any of them blocklists the same release. Returns 0 when
+// the Arr has no record for downloadID or the lookup fails.
+func (a *Arr) FindGrabHistoryIDForDownload(downloadID string, mediaDBID int) int {
+	if a == nil || downloadID == "" {
+		return 0
+	}
+	history := a.GetHistory(downloadID, "1") // eventType 1 = grabbed
+	if history == nil {
+		return 0
+	}
+	id := 0
+	for _, r := range history.Records {
+		if r.ID == 0 || !strings.EqualFold(r.DownloadID, downloadID) {
+			continue
+		}
+		if mediaDBID > 0 && ((a.Type == Sonarr && r.EpisodeID == mediaDBID) || (a.Type == Radarr && r.MovieID == mediaDBID)) {
+			return r.ID
+		}
+		if id == 0 {
+			id = r.ID
+		}
+	}
+	return id
+}
+
 // FindGrabHistoryID returns the ID and downloadId of the most recent "grabbed"
 // history record for the given episode (Sonarr) or movie (Radarr). Returns
 // (0, "", nil) when no grab record is found (e.g. history trimmed, manual import).
