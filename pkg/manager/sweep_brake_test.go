@@ -248,3 +248,74 @@ func TestSweepBrakeGatesAutoRepairStillOn(t *testing.T) {
 		t.Fatal("healthy files after the trip released the brake")
 	}
 }
+
+// One pack whose every file ffprobe cannot open (a fake or wrong-password
+// release) counts once: it does not trip the brake alone, and the pack is
+// healed. Five different entries with one such file each still trip it, and
+// failed reads within one entry still count per file.
+func TestSweepBrakeOneUnreadablePackCountsOnce(t *testing.T) {
+	pack := func(n int, res fileResult) []fileResult {
+		out := make([]fileResult, n)
+		for i := range out {
+			out[i] = res
+			out[i].name = fmt.Sprintf("E%02d.mkv", i+1)
+		}
+		return out
+	}
+
+	b := &sweepBrake{}
+	b.observe(pack(sweepBrakeLimit, brakeUnreadable))
+	if b.holding() || b.inARow != 1 {
+		t.Fatalf("one pack of %d unreadable files: tripped=%v count=%d, want not tripped, count 1", sweepBrakeLimit, b.holding(), b.inARow)
+	}
+
+	b = &sweepBrake{}
+	for range sweepBrakeLimit {
+		b.observe(pack(1, brakeUnreadable))
+	}
+	if !b.holding() {
+		t.Fatalf("%d entries with one unreadable file each did not trip the brake", sweepBrakeLimit)
+	}
+
+	b = &sweepBrake{}
+	b.observe(pack(sweepBrakeLimit, brakeReadFailed))
+	if !b.holding() {
+		t.Fatalf("one entry with %d failed reads did not trip the brake", sweepBrakeLimit)
+	}
+
+	tagged := fileResult{protocol: config.ProtocolNZB, broken: true, reason: ffprobeReasonUnreadable + ffprobeReadFailedTag + ": short read"}
+	b = &sweepBrake{}
+	b.observe(pack(sweepBrakeLimit, tagged))
+	if !b.holding() {
+		t.Fatalf("one entry with %d read-failed unreadable files did not trip the brake", sweepBrakeLimit)
+	}
+
+	// Through the sweep: the pack is healed and no notification is sent.
+	repair, got := newTestRepairForBrake(t)
+	const entry = "garbage-pack"
+	files := make(map[string]*storage.File)
+	byFile := make(map[string]fileResult)
+	for _, res := range pack(sweepBrakeLimit, brakeUnreadable) {
+		res.infoHash = "nzb-pack"
+		files[res.name] = &storage.File{Name: res.name, InfoHash: res.infoHash}
+		byFile[res.name] = res
+	}
+	repair.probeFileFn = func(_ context.Context, _ *candidate, name string, _ RepairRunOptions, _ bool) fileResult {
+		return byFile[name]
+	}
+	candidates := map[string]*candidate{entry: {name: entry, item: &storage.EntryItem{Name: entry, Files: files}}}
+	run := &storage.RepairRun{ID: "brake-pack"}
+	ctx := repair.withSweepBrake(context.Background(), run)
+	if err := repair.probeAndHealCandidates(ctx, run, candidates, []string{entry}, newHealCache(), RepairRunOptions{}, true, &supersessionContext{}); err != nil {
+		t.Fatalf("probeAndHealCandidates: %v", err)
+	}
+	if sweepBrakeFrom(ctx).holding() {
+		t.Error("the sweep's brake tripped on one unreadable pack")
+	}
+	if !run.WasHealed(entry) {
+		t.Error("the unreadable pack was not healed")
+	}
+	if n := waitCallbacks(got, 0); n != 0 {
+		t.Errorf("got %d notifications, want none", n)
+	}
+}

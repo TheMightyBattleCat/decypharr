@@ -12,7 +12,8 @@ import (
 )
 
 // sweepBrakeLimit is how many Usenet files in a row may end with a failed read
-// or an unreadable container before a sweep stops healing.
+// or an unreadable container before a sweep stops healing. An entry's
+// unreadable containers count once between them (see observe).
 const sweepBrakeLimit = 5
 
 // sweepBrake stops a sweep's healing once its verdicts have all turned bad at
@@ -78,13 +79,26 @@ func realMissingArticleReason(reason string) bool {
 	return false
 }
 
+// unreadableContainer reports an ffprobe verdict that the container cannot
+// be parsed, with no failed read behind it: permanent, never retried.
+func unreadableContainer(res fileResult) bool {
+	return !res.readFailed && strings.HasPrefix(res.reason, ffprobeReasonUnreadable) &&
+		!strings.Contains(res.reason, ffprobeReadFailedTag)
+}
+
 // observe folds one entry's file results into the count, in file order. Once
 // tripped the brake holds for the rest of the sweep; onTrip runs once.
+//
+// An entry's unreadable containers add 1 between them: one fake or
+// wrong-password pack gives that verdict for every file, and on its own
+// says nothing about the news servers. Failed reads count per file, and a
+// run of different entries with unreadable files still trips.
 func (b *sweepBrake) observe(results []fileResult) {
 	if b == nil {
 		return
 	}
 	reason := ""
+	countedUnreadable := false
 	b.mu.Lock()
 	for _, res := range results {
 		if b.tripped {
@@ -92,6 +106,12 @@ func (b *sweepBrake) observe(results []fileResult) {
 		}
 		switch sweepBrakeSignal(res) {
 		case brakeCount:
+			if unreadableContainer(res) {
+				if countedUnreadable {
+					continue
+				}
+				countedUnreadable = true
+			}
 			b.inARow++
 			if b.inARow >= sweepBrakeLimit {
 				b.tripped = true
