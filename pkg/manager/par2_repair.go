@@ -5598,9 +5598,9 @@ func computeRecoveryBatch(vols []par2Volume, shortfall uint32) []par2Volume {
 // cumulative slice count satisfies the shortfall plus one slack volume,
 // then processes it in maxConc-sized waves. Between waves, results are
 // walked in volume order to maintain a consecutive-not-found streak:
-// when the streak reaches par2RecoveryMaxConsecutiveNotFound the remaining
-// waves are skipped. Transport/transient errors reset the streak,
-// matching the prior sequential implementation's semantics.
+// every volume a wave fetched is kept, and when the streak left at the end
+// of a wave reaches par2RecoveryMaxConsecutiveNotFound the remaining waves
+// are skipped. Successes and transport/transient errors reset the streak.
 //
 // Returns the updated position/count/sources so a later call - after
 // discovering MORE damage than originally estimated (see runRepair's retry
@@ -5692,21 +5692,17 @@ func fetchVolumeBatch(
 
 		p.Wait()
 
-		// Walk results in volume order: maintain the consecutive-not-found
-		// streak across wave boundaries, same semantics as the prior
-		// sequential loop.
-		abort := false
+		// Walk every result in volume order, keeping the consecutive-not-found
+		// streak across wave boundaries. A volume fetched whole is kept even
+		// when three gone ones came before it in the same wave: nextVolIdx
+		// moves past the whole wave, so a volume dropped here would never be
+		// asked for again. Only the streak left at the end of the wave stops
+		// the waves after it.
 		for _, r := range results {
-			if abort {
-				break
-			}
 			switch {
 			case r.notFound:
 				consecutiveNotFound++
 				volsNotFound++
-				if consecutiveNotFound >= par2RecoveryMaxConsecutiveNotFound {
-					abort = true
-				}
 			case r.err != nil:
 				consecutiveNotFound = 0
 				volsErrored++
@@ -5721,7 +5717,7 @@ func fetchVolumeBatch(
 		waveStart = waveEnd
 		nextVolIdx += len(wave)
 
-		if abort || fetchedSlices >= needed {
+		if consecutiveNotFound >= par2RecoveryMaxConsecutiveNotFound || fetchedSlices >= needed {
 			break
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -308,9 +309,48 @@ func TestFetchMoreVolumes_PreCancelledCtx(t *testing.T) {
 }
 
 func TestFetchMoreVolumes_WaveBoundaryStreakCarry(t *testing.T) {
-	// maxConc=2: wave 1=[v0,v1], wave 2=[v2,v3].
-	// v0=430, v1=430 (streak=2), v2=430 (streak=3) → abort.
-	// v3 would succeed but is past the abort point.
+	// maxConc=2: waves [v0,v1], [v2,v3], [v4,v5]. v0..v3 430: the streak
+	// is 2 after wave 1 and 4 after wave 2, so wave 3 is never asked.
+	vols := []par2Volume{
+		makeTestVol("v0.par2", 1, "a@news"),
+		makeTestVol("v1.par2", 2, "b@news"),
+		makeTestVol("v2.par2", 4, "c@news"),
+		makeTestVol("v3.par2", 8, "d@news"),
+		makeTestVol("v4.par2", 16, "e@news"),
+		makeTestVol("v5.par2", 32, "f@news"),
+	}
+	base := mockVolumeFetch(
+		map[string][]byte{"e@news": []byte("d4"), "f@news": []byte("d5")},
+		map[string]bool{"a@news": true, "b@news": true, "c@news": true, "d@news": true},
+	)
+	var mu sync.Mutex
+	asked := map[string]bool{}
+	fetch := func(ctx context.Context, id string) ([]byte, error) {
+		mu.Lock()
+		asked[id] = true
+		mu.Unlock()
+		return base(ctx, id)
+	}
+
+	nextIdx, fetched, sources, added, err := fetchMoreVolumes(
+		context.Background(), parallelFetchNopLogger, fetch, vols, 0, 63, 0, nil, "test-entry", 2,
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nextIdx != 4 || added != 0 || fetched != 0 || len(sources) != 0 {
+		t.Fatalf("got nextIdx=%d added=%d fetched=%d sources=%d, want 4/0/0/0", nextIdx, added, fetched, len(sources))
+	}
+	if asked["e@news"] || asked["f@news"] {
+		t.Fatalf("wave 3 was asked after a streak of 4 gone volumes: %v", asked)
+	}
+}
+
+func TestFetchMoreVolumes_SuccessLaterInWaveKept(t *testing.T) {
+	// maxConc=2: wave 1=[v0,v1] (streak 2), wave 2=[v2,v3]: v2 430 makes
+	// the streak 3, but v3 in the same wave was fetched whole. It is kept,
+	// and resets the streak.
 	vols := []par2Volume{
 		makeTestVol("v0.par2", 1, "a@news"),
 		makeTestVol("v1.par2", 2, "b@news"),
@@ -322,15 +362,147 @@ func TestFetchMoreVolumes_WaveBoundaryStreakCarry(t *testing.T) {
 		map[string]bool{"a@news": true, "b@news": true, "c@news": true},
 	)
 
-	_, fetched, sources, added, err := fetchMoreVolumes(
+	nextIdx, fetched, sources, added, err := fetchMoreVolumes(
 		context.Background(), parallelFetchNopLogger, fetch, vols, 0, 15, 0, nil, "test-entry", 2,
 	)
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if added != 0 || fetched != 0 || len(sources) != 0 {
-		t.Fatalf("got added=%d fetched=%d sources=%d, want 0/0/0", added, fetched, len(sources))
+	if nextIdx != 4 || added != 1 || fetched != 8 {
+		t.Fatalf("got nextIdx=%d added=%d fetched=%d, want 4/1/8", nextIdx, added, fetched)
+	}
+	if got := sourceNames(sources); len(got) != 1 || got[0] != "v3.par2" {
+		t.Fatalf("sources = %v, want [v3]", got)
+	}
+}
+
+func TestFetchMoreVolumes_WaveKeepsVolumesAfterThreeGone(t *testing.T) {
+	// One wave of [gone, gone, gone, alive, alive]: v3 and v4 were fetched
+	// whole and nextVolIdx moves past the wave, so dropping them would mean
+	// they are never asked again this pass.
+	vols := []par2Volume{
+		makeTestVol("v0.par2", 1, "a@news"),
+		makeTestVol("v1.par2", 2, "b@news"),
+		makeTestVol("v2.par2", 4, "c@news"),
+		makeTestVol("v3.par2", 8, "d@news"),
+		makeTestVol("v4.par2", 16, "e@news"),
+	}
+	fetch := mockVolumeFetch(
+		map[string][]byte{"d@news": []byte("d3"), "e@news": []byte("d4")},
+		map[string]bool{"a@news": true, "b@news": true, "c@news": true},
+	)
+
+	nextIdx, fetched, sources, added, err := fetchMoreVolumes(
+		context.Background(), parallelFetchNopLogger, fetch, vols, 0, 31, 0, nil, "test-entry", 8,
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nextIdx != 5 || added != 2 || fetched != 24 {
+		t.Fatalf("got nextIdx=%d added=%d fetched=%d, want 5/2/24", nextIdx, added, fetched)
+	}
+	if got := sourceNames(sources); len(got) != 2 || got[0] != "v3.par2" || got[1] != "v4.par2" {
+		t.Fatalf("sources = %v, want [v3 v4]", got)
+	}
+}
+
+func TestFetchMoreVolumes_SequentialStopsBeforeTail(t *testing.T) {
+	// Control: the same volumes one per wave stop at the third gone volume
+	// and leave v3, v4 for a later fetch.
+	vols := []par2Volume{
+		makeTestVol("v0.par2", 1, "a@news"),
+		makeTestVol("v1.par2", 2, "b@news"),
+		makeTestVol("v2.par2", 4, "c@news"),
+		makeTestVol("v3.par2", 8, "d@news"),
+		makeTestVol("v4.par2", 16, "e@news"),
+	}
+	fetch := mockVolumeFetch(
+		map[string][]byte{"d@news": []byte("d3"), "e@news": []byte("d4")},
+		map[string]bool{"a@news": true, "b@news": true, "c@news": true},
+	)
+
+	nextIdx, _, _, added, err := fetchMoreVolumes(
+		context.Background(), parallelFetchNopLogger, fetch, vols, 0, 31, 0, nil, "test-entry", 1,
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nextIdx != 3 || added != 0 {
+		t.Fatalf("got nextIdx=%d added=%d, want 3/0", nextIdx, added)
+	}
+}
+
+func TestFetchMoreVolumes_WaveTopUpKeepsLiveTail(t *testing.T) {
+	// [alive, gone, gone, gone, alive] fetched as topUpParsedRecovery does:
+	// a second call from where the first stopped, while the first added
+	// something. One volume per wave reaches v4 on the second call; one
+	// wave must not fetch v4 and then drop it.
+	vols := []par2Volume{
+		makeTestVol("v0.par2", 1, "a@news"),
+		makeTestVol("v1.par2", 2, "b@news"),
+		makeTestVol("v2.par2", 4, "c@news"),
+		makeTestVol("v3.par2", 8, "d@news"),
+		makeTestVol("v4.par2", 16, "e@news"),
+	}
+	fetch := mockVolumeFetch(
+		map[string][]byte{"a@news": []byte("d0"), "e@news": []byte("d4")},
+		map[string]bool{"b@news": true, "c@news": true, "d@news": true},
+	)
+	run := func(maxConc int) []string {
+		next, fetched, sources, added, err := fetchMoreVolumes(
+			context.Background(), parallelFetchNopLogger, fetch, vols, 0, 31, 0, nil, "test-entry", maxConc)
+		if err != nil {
+			t.Fatalf("maxConc %d first call: %v", maxConc, err)
+		}
+		if added == 0 {
+			return sourceNames(sources)
+		}
+		_, _, sources, _, err = fetchMoreVolumes(
+			context.Background(), parallelFetchNopLogger, fetch, vols, next, 31, fetched, sources, "test-entry", maxConc)
+		if err != nil {
+			t.Fatalf("maxConc %d second call: %v", maxConc, err)
+		}
+		return sourceNames(sources)
+	}
+	for _, maxConc := range []int{1, 8} {
+		got := run(maxConc)
+		if len(got) != 2 || got[0] != "v0.par2" || got[1] != "v4.par2" {
+			t.Errorf("maxConc %d: sources = %v, want [v0 v4]", maxConc, got)
+		}
+	}
+}
+
+func TestFetchMoreVolumes_StreakBrokenInWaveRunsNextWave(t *testing.T) {
+	// maxConc=4: wave 1=[gone, gone, gone, alive] ends with the streak
+	// reset by v3, so wave 2=[v4, v5] still runs.
+	vols := []par2Volume{
+		makeTestVol("v0.par2", 1, "a@news"),
+		makeTestVol("v1.par2", 2, "b@news"),
+		makeTestVol("v2.par2", 4, "c@news"),
+		makeTestVol("v3.par2", 8, "d@news"),
+		makeTestVol("v4.par2", 16, "e@news"),
+		makeTestVol("v5.par2", 32, "f@news"),
+	}
+	fetch := mockVolumeFetch(
+		map[string][]byte{"d@news": []byte("d3"), "e@news": []byte("d4"), "f@news": []byte("d5")},
+		map[string]bool{"a@news": true, "b@news": true, "c@news": true},
+	)
+
+	nextIdx, fetched, sources, added, err := fetchMoreVolumes(
+		context.Background(), parallelFetchNopLogger, fetch, vols, 0, 63, 0, nil, "test-entry", 4,
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nextIdx != 6 || added != 3 || fetched != 56 {
+		t.Fatalf("got nextIdx=%d added=%d fetched=%d, want 6/3/56", nextIdx, added, fetched)
+	}
+	if got := sourceNames(sources); len(got) != 3 || got[0] != "v3.par2" || got[1] != "v4.par2" || got[2] != "v5.par2" {
+		t.Fatalf("sources = %v, want [v3 v4 v5]", got)
 	}
 }
 
