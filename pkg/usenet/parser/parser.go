@@ -284,8 +284,12 @@ func availabilityThenPar2Refs(
 			// Arr's add times out at 100s), a timeout, a refused connection
 			// or every provider at its quota says nothing about the posting,
 			// and tagging it would mark the content dead and have the Arr
-			// blocklist a release that may be fine.
-			if nntp.IsArticleNotFoundError(statErr) {
+			// blocklist a release that may be fine. Failover returns one
+			// provider's 430 while another could not be dialled, sat in its
+			// dial cooldown or was over its quota; that 430 is marked
+			// partial and is "could not check" too, since the provider not
+			// asked may hold the article.
+			if nntp.IsArticleNotFoundError(statErr) && !nntp.IsPartialNotFound(statErr) {
 				return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w: %w", group.ActualFilename, segment.Id, statErr, ErrReleaseUnavailable)
 			}
 			return nil, nil, fmt.Errorf("could not check segment %s <%s>: %w", group.ActualFilename, segment.Id, statErr)
@@ -775,7 +779,8 @@ func (p *NZBParser) fetchYencHeaderFast(ctx context.Context, messageID string) (
 // bookkeeping, not something worth failing the whole NZB parse over.
 //
 // Returns notFound=true only when the fetch failed because the article is
-// genuinely absent from the provider (nntp.IsArticleNotFoundError) - the
+// genuinely absent from the provider (nntp.IsArticleNotFoundError, and not a
+// partial not-found that some provider never answered) - the
 // signal buildPar2RefsWithFetch counts toward its early-abort threshold. A
 // fetch that fails for any other reason (timeout, connection drop, transport
 // parse failure) also falls back to the estimate below, but leaves notFound
@@ -793,7 +798,7 @@ func realPar2SegmentRefs(ctx context.Context, logger zerolog.Logger, filename st
 		// complete" WARN (files_probed / fell_back_to_estimate / not_found).
 		logger.Trace().Err(err).Str("file", filename).Msg("Failed to fetch real yEnc size for PAR2 source file; falling back to an XML-bytes estimate")
 		refs, total = par2SegmentRefsFallback(segs)
-		return refs, total, err != nil && nntp.IsArticleNotFoundError(err), false
+		return refs, total, err != nil && nntp.IsArticleNotFoundError(err) && !nntp.IsPartialNotFound(err), false
 	}
 
 	fileSize := yencData.Size

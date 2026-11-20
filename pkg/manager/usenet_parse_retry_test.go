@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
@@ -61,6 +62,27 @@ func TestRetryNZBParseOnlyRetriesErrorsThatMayPass(t *testing.T) {
 	}
 	if m.retryNZBParse(t.Context(), job, transient) {
 		t.Fatalf("retryNZBParse after %d parses = true, want the download to fail", nzbParseMaxAttempts)
+	}
+}
+
+// A 430 failover settled on while a provider was never asked is the
+// parser's "could not check": parsed again, not failed as a dead release.
+func TestRetryNZBParseRetriesAPartialNotFound(t *testing.T) {
+	m := &Manager{logger: zerolog.Nop()}
+	m.jobQueue = NewJobQueue(t.Context(), 1, func(context.Context, *Job) {})
+	t.Cleanup(m.jobQueue.Close)
+
+	partial := &nntp.PartialNotFoundError{
+		Err:     &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"},
+		Unasked: []string{"down.example"},
+	}
+	err := fmt.Errorf("could not check segment release.rar <seg1>: %w", partial)
+	job := &Job{ID: "nzb-1", Type: JobTypeNZB, Entry: &storage.Entry{InfoHash: "nzb-1", Name: "release"}}
+	if !m.retryNZBParse(t.Context(), job, err) {
+		t.Fatalf("retryNZBParse(%v) = false, want another parse", err)
+	}
+	if job.ParseAttempts != 1 {
+		t.Fatalf("ParseAttempts = %d, want 1", job.ParseAttempts)
 	}
 }
 
