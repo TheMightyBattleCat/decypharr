@@ -2072,6 +2072,13 @@ func (c *Client) batchStatOnProvider(ctx context.Context, provider config.Usenet
 		window, windowHitTime, statErr := conn.StatBatch(messageIDs[start:end])
 		took := time.Since(began)
 		stopCancel()
+		if errors.Is(statErr, errBadCommandArg) {
+			// Refused before anything was written: the connection is
+			// in step and the provider did nothing wrong.
+			c.returnOrReleaseConn(conn, providerCfg)
+			c.recordStatHits(provider, hitTime, hits)
+			return append(results, window...), statErr
+		}
 		if statErr != nil {
 			c.release(conn)
 			if ctxErr := ctx.Err(); ctxErr != nil {

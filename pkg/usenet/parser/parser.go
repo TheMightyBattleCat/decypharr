@@ -184,9 +184,13 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	}()
 
 	// Parse raw XML
-	raw, oneCopy, passwords, err := parseNZBWithPasswords(bytes.NewReader(content))
+	raw, oneCopy, badIDs, passwords, err := parseNZBWithPasswords(bytes.NewReader(content))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse NZB content: %w", err)
+	}
+	if len(badIDs) > 0 {
+		p.logger.Warn().Str("filename", filename).Int("files", len(badIDs)).Strs("dropped", badIDs[:min(len(badIDs), 5)]).
+			Msg("NZB lists files with message IDs that cannot be sent to a news server; left them out")
 	}
 	if len(oneCopy) > 0 {
 		p.logger.Warn().Str("filename", filename).Int("files", len(oneCopy)).Strs("subjects", oneCopy[:min(len(oneCopy), 5)]).

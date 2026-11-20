@@ -40,7 +40,7 @@ func TestWithPasswordMeta(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			out := WithPasswordMeta([]byte(test.doc), tricky)
-			nzb, _, passwords, err := parseNZBWithPasswords(strings.NewReader(string(out)))
+			nzb, _, _, passwords, err := parseNZBWithPasswords(strings.NewReader(string(out)))
 			if err != nil {
 				t.Fatalf("%v\n%s", err, out)
 			}
@@ -77,7 +77,7 @@ func TestMovePasswordIntoNZB(t *testing.T) {
 	if name != "Show.S01.nzb" {
 		t.Fatalf("name = %q", name)
 	}
-	_, _, passwords, err := parseNZBWithPasswords(strings.NewReader(string(out)))
+	_, _, _, passwords, err := parseNZBWithPasswords(strings.NewReader(string(out)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestMovePasswordIntoNZB(t *testing.T) {
 
 func TestParseNZBKeepsEveryPassword(t *testing.T) {
 	doc := `<nzb><head><meta type="password">one</meta><meta type="Password"> two </meta><meta type="password"></meta><meta type="password"><![CDATA[th&ree]]></meta></head>` + passwordTestFiles
-	nzb, _, passwords, err := parseNZBWithPasswords(strings.NewReader(doc))
+	nzb, _, _, passwords, err := parseNZBWithPasswords(strings.NewReader(doc))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,9 +2,12 @@ package parser
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/Tensai75/nzbparser"
 	"github.com/Tensai75/subjectparser"
@@ -25,7 +28,7 @@ import (
 //
 // dropped names the subjects it kept a single copy of.
 func parseNZB(r io.Reader) (nzb *nzbparser.Nzb, dropped []string, err error) {
-	nzb, dropped, _, err = parseNZBWithPasswords(r)
+	nzb, dropped, _, _, err = parseNZBWithPasswords(r)
 	return nzb, dropped, err
 }
 
@@ -33,7 +36,11 @@ func parseNZB(r io.Reader) (nzb *nzbparser.Nzb, dropped []string, err error) {
 // in document order. Meta values are character data: entities are decoded,
 // so a password with "&" is not handed on as "&amp;". Nzb.Meta keeps one
 // value per type and would drop all but the last password.
-func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, passwords []string, err error) {
+//
+// Segment message IDs are cleaned the same way (see cleanSegmentIDs); badIDs
+// names each file dropped for an ID that cannot be sent, with the reason. An
+// NZB left with no file that way is an error.
+func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, badIDs, passwords []string, err error) {
 	var x struct {
 		XMLName  xml.Name           `xml:"nzb"`
 		Comment  string             `xml:",comment"`
@@ -44,7 +51,11 @@ func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, passwords 
 	decoder.CharsetReader = charset.NewReaderLabel
 	decoder.Strict = false // as nzbparser: ignore unknown or malformed character entities
 	if err := decoder.Decode(&x); err != nil {
-		return nil, nil, nil, fmt.Errorf("unable to parse NZB file: %s", err.Error())
+		return nil, nil, nil, nil, fmt.Errorf("unable to parse NZB file: %s", err.Error())
+	}
+	files, badIDs := cleanSegmentIDs(x.Files)
+	if len(files) == 0 && len(badIDs) > 0 {
+		return nil, nil, badIDs, nil, fmt.Errorf("unable to parse NZB file: no file has valid message IDs (%s)", badIDs[0])
 	}
 
 	nzb = &nzbparser.Nzb{Comment: x.Comment, Meta: make(map[string]string, len(x.Metadata))}
@@ -54,7 +65,7 @@ func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, passwords 
 			passwords = append(passwords, md.value())
 		}
 	}
-	nzb.Files, dropped = keepOneCopyPerSubject(x.Files)
+	nzb.Files, dropped = keepOneCopyPerSubject(files)
 
 	nzbparser.MakeUnique(nzb)
 	nzbparser.ScanNzbFile(nzb)
@@ -64,7 +75,65 @@ func parseNZBWithPasswords(r io.Reader) (nzb *nzbparser.Nzb, dropped, passwords 
 		segs := nzb.Files[i].Segments
 		sort.SliceStable(segs, func(a, b int) bool { return segs[a].Number < segs[b].Number })
 	}
-	return nzb, dropped, passwords, nil
+	return nzb, dropped, badIDs, passwords, nil
+}
+
+// cleanSegmentIDs returns files with each segment ID in the form sent to the
+// news server, and without the files holding an ID that cannot be sent.
+//
+// nzbparser reads a segment ID as the element's raw inner XML: entities are
+// not decoded and line breaks inside it are kept. An escaped "&" would be
+// asked for as "&amp;" (a 430 for an article the provider holds), and a line
+// break would send what follows it as a second NNTP command, leaving the
+// connection one reply behind for every later user of it. Each ID is
+// decoded, trimmed, and stripped of one pair of enclosing angle brackets; a
+// file with an ID that is then empty, or holds a byte outside printable
+// ASCII or an inner angle bracket, is dropped. bad names each dropped file
+// with the reason.
+func cleanSegmentIDs(files nzbparser.NzbFiles) (kept nzbparser.NzbFiles, bad []string) {
+	kept = files[:0:0]
+	for _, f := range files {
+		segs := make(nzbparser.NzbSegments, len(f.Segments))
+		var why error
+		for i, seg := range f.Segments {
+			id, err := cleanMessageID(seg.Id)
+			if err != nil {
+				why = fmt.Errorf("article %d: %w", seg.Number, err)
+				break
+			}
+			seg.Id = id
+			segs[i] = seg
+		}
+		if why != nil {
+			bad = append(bad, fmt.Sprintf("%q: %v", f.Subject, why))
+			continue
+		}
+		f.Segments = segs
+		kept = append(kept, f)
+	}
+	return kept, bad
+}
+
+var errEmptyMessageID = errors.New("empty message ID")
+
+// cleanMessageID returns raw (a segment element's inner XML) as a bare
+// message ID: entities decoded, surrounding white space and one pair of
+// enclosing angle brackets removed. It fails when the result is empty or
+// holds a byte outside 0x21-0x7e or an angle bracket.
+func cleanMessageID(raw string) (string, error) {
+	id := strings.TrimSpace(html.UnescapeString(raw))
+	if len(id) >= 2 && id[0] == '<' && id[len(id)-1] == '>' {
+		id = id[1 : len(id)-1]
+	}
+	if id == "" {
+		return "", errEmptyMessageID
+	}
+	for i := 0; i < len(id); i++ {
+		if b := id[i]; b < 0x21 || b > 0x7e || b == '<' || b == '>' {
+			return "", fmt.Errorf("message ID %q holds byte 0x%02x", id, b)
+		}
+	}
+	return id, nil
 }
 
 // keepOneCopyPerSubject returns files with each subject's duplicate <file>

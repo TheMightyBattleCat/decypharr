@@ -396,9 +396,21 @@ func (c *Connection) sendCommandArg(command, arg string) error {
 	return c.writer.Flush()
 }
 
+// errBadCommandArg refuses a command argument that would end the command
+// line early. A message ID holding CR LF sends a second command; the server
+// answers both, and the connection is left one reply behind for its next
+// user. Nothing is written, so the connection stays in step and can be
+// pooled. It is not an *Error: never read as a missing article or a dead
+// connection, and failover returns it at once.
+var errBadCommandArg = errors.New("command argument holds CR, LF or NUL; not sent")
+
 // writeCommandArg buffers one command line without flushing it or touching
-// the connection's deadlines.
+// the connection's deadlines. An argument holding CR, LF or NUL is refused
+// before anything is buffered.
 func (c *Connection) writeCommandArg(command, arg string) error {
+	if strings.ContainsAny(arg, "\r\n\x00") {
+		return fmt.Errorf("%s %q: %w", command, arg, errBadCommandArg)
+	}
 	if _, err := c.writer.WriteString(command); err != nil {
 		return err
 	}
@@ -412,6 +424,59 @@ func (c *Connection) writeCommandArg(command, arg string) error {
 	}
 	_, err := c.writer.WriteString("\r\n")
 	return err
+}
+
+// sendFailure wraps an error from sendCommandArg. A refused argument passes
+// through as is (see errBadCommandArg); anything else is a connection error.
+func sendFailure(what string, err error) error {
+	if errors.Is(err, errBadCommandArg) {
+		return err
+	}
+	return NewConnectionError(fmt.Errorf("%s: %w", what, err))
+}
+
+// echoedMessageID returns the message ID a 222/223 status line echoes: its
+// first field in angle brackets. Empty when the line echoes none. message may
+// start with the status code ("222 0 <id>") or not ("0 <id>").
+func echoedMessageID(message string) string {
+	for _, f := range strings.Fields(message) {
+		if len(f) > 2 && f[0] == '<' && f[len(f)-1] == '>' {
+			return f
+		}
+	}
+	return ""
+}
+
+// replyForOtherArticle reports whether a 222/223 status line echoes a message
+// ID other than asked (already through FormatMessageID). Such a reply belongs
+// to an earlier command: the connection is out of step with its replies.
+// Case is ignored so a server that folds case is not read as out of step.
+func replyForOtherArticle(asked, message string) (echoed string, other bool) {
+	echoed = echoedMessageID(message)
+	return echoed, echoed != "" && !strings.EqualFold(echoed, asked)
+}
+
+// errReplyOutOfStep marks a reply that does not belong to the command just
+// sent: an echoed message ID other than asked, or a status the command
+// cannot return. The connection is closed, never pooled, and the error is a
+// connection error so failover asks again on another connection.
+var errReplyOutOfStep = errors.New("reply out of step with the command")
+
+// strayReply reports whether code cannot be the reply to a BODY or STAT whose
+// success code is success: any other code below 400 (a 111 or 2xx belongs to
+// some other command), or 500, unknown command, which both mandatory
+// commands never get. Every other 4xx/5xx is a reply either may receive.
+func strayReply(code, success int) bool {
+	return code != success && (code < 400 || code == 500)
+}
+
+// outOfStep closes the connection, logs why, and returns the connection
+// error for a reply that does not belong to the command sent.
+func (c *Connection) outOfStep(command, asked, detail string) error {
+	_ = c.Close()
+	c.logger.Warn().Str("provider", c.address).Str("command", command).Str("asked", asked).Str("reply", detail).
+		Msg("NNTP reply does not belong to the command sent; closed the connection")
+	return NewConnectionError(fmt.Errorf("%w: %s %s answered %q", errReplyOutOfStep, command, asked, detail))
 }
 
 // readResponse reads a response from the NNTP server
@@ -477,7 +542,7 @@ func (c *Connection) readMultilineResponse() (*Response, error) {
 func (c *Connection) GetArticle(messageID string) (*Article, error) {
 	messageID = FormatMessageID(messageID)
 	if err := c.sendCommandArg("ARTICLE", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send ARTICLE command: %w", err))
+		return nil, sendFailure("failed to send ARTICLE command", err)
 	}
 
 	resp, err := c.readMultilineResponse()
@@ -503,7 +568,7 @@ func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc
 	sentNS := nanotimeNow()
 	c.firstReadNS = 0
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nntpyenc.BodyResult{}, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
+		return nntpyenc.BodyResult{}, sendFailure("failed to send BODY command", err)
 	}
 
 	res, err := c.nextBodyWithIdleDeadline(idle)
@@ -523,7 +588,17 @@ func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc
 	if res.StatusCode != 222 {
 		putBodyBuf(res.Data)
 		res.Data = nil
+		if strayReply(res.StatusCode, 222) {
+			return res, c.outOfStep("BODY", messageID, res.Message)
+		}
 		return res, classifyNNTPError(res.StatusCode, res.Message)
+	}
+	if _, other := replyForOtherArticle(messageID, res.Message); other {
+		// Another article's body, already read in full: it passes its own
+		// CRC and size, so only the echoed ID tells it apart.
+		putBodyBuf(res.Data)
+		res.Data = nil
+		return res, c.outOfStep("BODY", messageID, res.Message)
 	}
 	if c.timing != nil && c.firstReadNS > 0 {
 		doneNS := nanotimeNow()
@@ -599,7 +674,7 @@ func (c *Connection) GetHeaderPrefixContext(ctx context.Context, messageID strin
 func (c *Connection) GetBody(messageID string) ([]byte, error) {
 	messageID = FormatMessageID(messageID)
 	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
+		return nil, sendFailure("failed to send BODY command", err)
 	}
 
 	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
@@ -711,7 +786,7 @@ func (c *Connection) readDotBytes() ([]byte, error) {
 func (c *Connection) GetHead(messageID string) ([]byte, error) {
 	messageID = FormatMessageID(messageID)
 	if err := c.sendCommandArg("HEAD", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send HEAD command: %w", err))
+		return nil, sendFailure("failed to send HEAD command", err)
 	}
 
 	// Read the initial response
@@ -820,12 +895,20 @@ func (c *Connection) Stat(messageID string) (articleNumber int, echoedID string,
 	messageID = FormatMessageID(messageID)
 
 	if err = c.sendCommandArg("STAT", messageID); err != nil {
-		return 0, "", NewConnectionError(fmt.Errorf("failed to send STAT: %w", err))
+		return 0, "", sendFailure("failed to send STAT", err)
 	}
 
 	resp, err := c.readResponseWithDeadline(timeouts.StreamBodyTimeout)
 	if err != nil {
 		return 0, "", NewConnectionError(fmt.Errorf("failed to read STAT response: %w", err))
+	}
+	if strayReply(resp.Code, 223) {
+		return 0, "", c.outOfStep("STAT", messageID, fmt.Sprintf("%d %s", resp.Code, resp.Message))
+	}
+	if resp.Code == 223 {
+		if _, other := replyForOtherArticle(messageID, resp.Message); other {
+			return 0, "", c.outOfStep("STAT", messageID, fmt.Sprintf("%d %s", resp.Code, resp.Message))
+		}
 	}
 	return parseStatResponse(resp)
 }
@@ -862,8 +945,11 @@ var errStatDesync = errors.New("STAT pipeline replies out of step with commands"
 // article into a false 430. The DATE is the check: its 111 must come exactly
 // after the last STAT reply. A 111 in a STAT slot, anything but 111 after the
 // last one, bytes left over after it, a reply that is neither 223 nor
-// not-found, or a transport error fails the whole window as a connection
-// error. The connection is then unusable and the caller must release it.
+// not-found, a 223 echoing a message ID other than asked, or a transport
+// error fails the whole window as a connection error. The connection is
+// then unusable and the caller must release it. A message ID holding CR, LF
+// or NUL fails the window with errBadCommandArg before anything is written;
+// the connection is still usable.
 func (c *Connection) StatBatch(messageIDs []string) ([]StatResult, time.Duration, error) {
 	results := make([]StatResult, len(messageIDs))
 	for i, id := range messageIDs {
@@ -881,10 +967,25 @@ func (c *Connection) StatBatch(messageIDs []string) ([]StatResult, time.Duration
 		return results, 0, connErr
 	}
 
+	// Refuse the whole window before buffering anything: a line refused
+	// part way would leave the STATs before it in the write buffer, to go
+	// out ahead of the next command on this connection.
+	asked := make([]string, len(messageIDs))
+	for i, id := range messageIDs {
+		asked[i] = FormatMessageID(id)
+		if strings.ContainsAny(asked[i], "\r\n\x00") {
+			err := fmt.Errorf("STAT %q: %w", asked[i], errBadCommandArg)
+			for j := range results {
+				results[j].Error = err
+			}
+			return results, 0, err
+		}
+	}
+
 	_ = c.conn.SetWriteDeadline(utils.Now().Add(timeouts.HandshakeTimeout))
 	var werr error
-	for _, id := range messageIDs {
-		if werr = c.writeCommandArg("STAT", FormatMessageID(id)); werr != nil {
+	for _, id := range asked {
+		if werr = c.writeCommandArg("STAT", id); werr != nil {
 			break
 		}
 	}
@@ -908,6 +1009,11 @@ func (c *Connection) StatBatch(messageIDs []string) ([]StatResult, time.Duration
 		}
 		now := time.Now()
 		_, _, statErr := parseStatResponse(resp)
+		if statErr == nil {
+			if echoed, other := replyForOtherArticle(asked[i], resp.Message); other {
+				return fail(fmt.Errorf("%w: reply %d/%d was for %s, asked %s", errStatDesync, i+1, len(results), echoed, asked[i]))
+			}
+		}
 		switch {
 		case statErr == nil:
 			results[i].Available = true

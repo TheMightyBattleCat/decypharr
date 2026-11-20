@@ -83,7 +83,7 @@ func TestRequestBodyDecodesAndReusesConnection(t *testing.T) {
 	)
 
 	for i, want := range [][]byte{first, second} {
-		res, err := c.requestBody("<x@y>", timeouts.StreamBodyTimeout)
+		res, err := c.requestBody([]string{"<a@b>", "<c@d>"}[i], timeouts.StreamBodyTimeout)
 		if err != nil {
 			t.Fatalf("requestBody %d: %v", i+1, err)
 		}

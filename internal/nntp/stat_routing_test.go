@@ -43,6 +43,12 @@ type fakeNNTP struct {
 	maxQueued atomic.Int64 // most command bytes already waiting when a STAT was answered
 	bodyReqs  atomic.Int64
 	wg        sync.WaitGroup
+
+	// extraReply holds raw text sent, unasked, after the STAT or BODY reply
+	// for a message ID: a reply the connection's next command will read.
+	extraReply map[string]string
+	dates      atomic.Int64 // DATE commands received
+	accepts    atomic.Int64 // connections accepted
 }
 
 func startFakeNNTP(t *testing.T, delay time.Duration, missing ...string) *fakeNNTP {
@@ -63,6 +69,7 @@ func startFakeNNTP(t *testing.T, delay time.Duration, missing ...string) *fakeNN
 			if err != nil {
 				return
 			}
+			s.accepts.Add(1)
 			s.wg.Add(1)
 			go s.serve(conn)
 		}
@@ -115,7 +122,9 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 			if s.extraLine[id] {
 				_, _ = w.WriteString("223 0 <stray@test>\r\n")
 			}
+			_, _ = w.WriteString(s.extraReply[id])
 		case line == "DATE":
+			s.dates.Add(1)
 			if s.noDate {
 				continue
 			}
@@ -129,6 +138,7 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 				break
 			}
 			_, _ = w.WriteString("222 0 <" + id + ">\r\n" + body + ".\r\n")
+			_, _ = w.WriteString(s.extraReply[id])
 		case line == "QUIT":
 			_, _ = w.WriteString("205 bye\r\n")
 			_ = w.Flush()
