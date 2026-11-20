@@ -645,6 +645,11 @@ func (c *Config) loadConfig() error {
 		// The parser's error quotes the file text (secrets); leave it out.
 		return fmt.Errorf("config.json is not valid JSON (%s): fix it or restore it from a backup", configFile)
 	}
+	// An auth.json that exists but cannot be read is not "no login yet":
+	// stop here so setDefaults never writes a new token over it.
+	if _, _, err := loadAuthFile(c.AuthFile()); err != nil {
+		return err
+	}
 	hadSessionSecret := c.SessionSecret != ""
 	hadStrmSecret := c.Strm.Secret != ""
 
@@ -738,11 +743,27 @@ func (c *Config) GetAuth() *Auth {
 	if c.Auth != nil {
 		return new(*c.Auth)
 	}
-	auth := &Auth{}
-	if data, err := os.ReadFile(c.AuthFile()); err == nil {
-		_ = json.Unmarshal(data, auth)
-	}
+	auth, _, _ := loadAuthFile(c.AuthFile())
 	return auth
+}
+
+// loadAuthFile reads auth.json. A missing file is the first start (empty
+// Auth, exists false, no error); a file that exists but cannot be read or
+// decoded returns an error, so it is never taken for "no login yet".
+func loadAuthFile(path string) (*Auth, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &Auth{}, false, nil
+	}
+	if err != nil {
+		return &Auth{}, true, fmt.Errorf("auth.json is unreadable (%s: %w): fix it or remove it to set a new login", path, err)
+	}
+	auth := &Auth{}
+	if err := json.Unmarshal(data, auth); err != nil {
+		// The parser's error quotes the file text (secrets); leave it out.
+		return &Auth{}, true, fmt.Errorf("auth.json is unreadable (%s is not valid JSON): fix it or remove it to set a new login", path)
+	}
+	return auth, true, nil
 }
 
 // SaveAuth stores auth in auth.json (owner-only) with a new session version,
@@ -760,7 +781,7 @@ func (c *Config) SaveAuth(auth *Auth) error {
 	if err := os.Chmod(c.AuthFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.WriteFile(c.AuthFile(), data, 0600); err != nil {
+	if err := writeFileAtomic(c.AuthFile(), data, 0600); err != nil {
 		return err
 	}
 	c.Auth = &updated
@@ -829,6 +850,29 @@ func (c *Config) migrateNotifications() {
 	// Auto-enable notifications if any URL is configured
 	if c.Notifications.WebhookURL != "" || c.Notifications.CallbackURL != "" {
 		c.Notifications.Enabled = true
+	}
+}
+
+// setAuthDefaults loads auth.json and, when auth is on and no API token
+// exists, generates one. It never writes over an auth.json it could not
+// read: loadConfig and Save refuse to go on with such a file.
+func (c *Config) setAuthDefaults() {
+	if !c.UseAuth {
+		c.Auth = nil
+		return
+	}
+	if c.Auth == nil {
+		auth, _, err := loadAuthFile(c.AuthFile())
+		if err != nil {
+			return
+		}
+		c.Auth = auth
+	}
+	if c.Auth.APIToken == "" {
+		if token, err := generateAPIToken(); err == nil {
+			c.Auth.APIToken = token
+			_ = c.SaveAuth(c.Auth)
+		}
 	}
 }
 
@@ -982,22 +1026,7 @@ func (c *Config) setDefaults() {
 			}
 		}
 	}
-	// Load the auth file
-	c.Auth = c.GetAuth()
-
-	// Generate API token if auth is enabled and no token exists
-	if c.UseAuth {
-		if c.Auth == nil {
-			c.Auth = &Auth{}
-		}
-		if c.Auth.APIToken == "" {
-			if token, err := generateAPIToken(); err == nil {
-				c.Auth.APIToken = token
-				// Save the updated auth config
-				_ = c.SaveAuth(c.Auth)
-			}
-		}
-	}
+	c.setAuthDefaults()
 
 	// Set folder naming from first debrid if available
 	if len(c.Debrids) > 0 && c.FolderNaming == "" {
@@ -1126,6 +1155,11 @@ func RepairPolicyDefaults() RepairConfig {
 }
 
 func (c *Config) Save() error {
+	if c.UseAuth && c.Auth == nil {
+		if _, _, err := loadAuthFile(c.AuthFile()); err != nil {
+			return err
+		}
+	}
 	c.setDefaults()
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
