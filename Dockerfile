@@ -20,6 +20,9 @@ RUN apk add --no-cache clang lld && \
     xx-apk add --no-cache gcc g++ musl-dev libc-dev fuse-dev
 
 COPY go.mod go.sum ./
+# go.mod replaces appendstore with this patched copy; it must be present
+# before the download.
+COPY third_party/ ./third_party/
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download -x
 

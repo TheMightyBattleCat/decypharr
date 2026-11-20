@@ -73,17 +73,6 @@ func Start(ctx context.Context) error {
 
 		srv.SetRestartFunc(restartFunc)
 
-		resetFunc := func() {
-
-			config.Reset()
-			// Stop manager to reset ready channel and cleanup resources
-			if err := mgr.Reset(); err != nil {
-				_log.Warn().Err(err).Msg("Failed to reset manager")
-			}
-			// refresh GC
-			runtime.GC()
-		}
-
 		shutdownFunc := func() {
 			config.Reset()
 			// Stop manager to cleanup all resources including mounts
@@ -115,8 +104,14 @@ func Start(ctx context.Context) error {
 			cancelSvc()
 			_log.Info().Msg("Restarting Decypharr...")
 			<-serviceResult
+			if err := resetForRestart(mgr); err != nil {
+				// The manager is stopped and its storage closed: starting the
+				// services again would run them on nothing. Exit non-zero so
+				// the service manager restarts into a clean start.
+				_log.Error().Err(err).Msg("Restart failed: the manager could not be reopened; stopping")
+				return err
+			}
 			_log.Info().Msg("Decypharr has been restarted.")
-			resetFunc()
 			svcCtx, cancelSvc = context.WithCancel(ctx)
 
 		case err := <-serviceResult:
@@ -128,6 +123,25 @@ func Start(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// managerResetter is the part of *manager.Manager a restart needs.
+type managerResetter interface {
+	Reset() error
+}
+
+// resetForRestart reloads the configuration and reopens the manager (its
+// storage and schedulers) between two runs of the services. An error means
+// the manager is left stopped and the caller must not start the services
+// again.
+func resetForRestart(mgr managerResetter) error {
+	config.Reset()
+	err := mgr.Reset()
+	runtime.GC()
+	if err != nil {
+		return fmt.Errorf("restart: %w", err)
+	}
+	return nil
 }
 
 // downloadStopTimeout bounds how long shutdown waits for cancelled downloads

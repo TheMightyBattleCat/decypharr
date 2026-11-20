@@ -204,7 +204,11 @@ func (r *Repair) PreviewStaleNZBs(ctx context.Context) (StaleNZBPreview, error) 
 
 	phaseStart = time.Now()
 	r.setStaleNZBProgress("Classifying orphans", 0, int64(len(candidates)), start)
-	known := r.buildStaleNZBKnownKeys()
+	known, err := r.buildStaleNZBKnownKeys()
+	if err != nil {
+		r.logger.Error().Err(err).Msg("StaleNZB: preview failed - could not read the entries orphans are checked against")
+		return StaleNZBPreview{}, fmt.Errorf("cannot check NZB files for orphans: %w", err)
+	}
 	for i, c := range candidates {
 		if i%staleNZBProgressStride == 0 {
 			r.setStaleNZBProgress("Classifying orphans", int64(i), int64(len(candidates)), start)
@@ -405,12 +409,18 @@ func (r *Repair) CleanupStaleNZBs(ctx context.Context, entryIDs []string, orphan
 	// requested ID, since either would be quadratic against a large library.
 	orphanCandidates := make(map[string]staleNZBOrphanCandidate)
 	var orphanKnown staleNZBKnownKeys
+	var orphanKnownErr error
 	if len(orphanIDs) > 0 {
 		phaseStart = time.Now()
 		for _, c := range r.collectOrphanNZBCandidates() {
 			orphanCandidates[c.ID] = c
 		}
-		orphanKnown = r.buildStaleNZBKnownKeys()
+		orphanKnown, orphanKnownErr = r.buildStaleNZBKnownKeys()
+		if orphanKnownErr != nil {
+			r.logger.Error().Err(orphanKnownErr).
+				Int("requested_orphans", len(orphanIDs)).
+				Msg("StaleNZB: deleting no orphans - could not read the entries they are checked against")
+		}
 		r.logger.Debug().
 			Dur("duration", time.Since(phaseStart)).
 			Int("candidates", len(orphanCandidates)).
@@ -432,6 +442,10 @@ func (r *Repair) CleanupStaleNZBs(ctx context.Context, entryIDs []string, orphan
 		}
 		seenOrphans[id] = struct{}{}
 
+		if orphanKnownErr != nil {
+			result.Skipped = append(result.Skipped, StaleNZBSkip{ID: id, Reason: "entry list could not be read"})
+			continue
+		}
 		c, ok := orphanCandidates[id]
 		if !ok {
 			result.Skipped = append(result.Skipped, StaleNZBSkip{ID: id, Reason: "orphan files no longer present"})
@@ -900,19 +914,25 @@ func (r *Repair) collectOrphanNZBCandidates() []staleNZBOrphanCandidate {
 // (or worse) on a library with tens of thousands of NZB files.
 type staleNZBKnownKeys struct {
 	hashes map[string]struct{} // every entry's InfoHash (raw rows, via ForEachMeta)
-	names  map[string]struct{} // every entry-item Name (pkg/storage.GetEntryItems)
+	names  map[string]struct{} // every entry-item Name (pkg/storage.EntryItemNames)
 }
 
-func (r *Repair) buildStaleNZBKnownKeys() staleNZBKnownKeys {
+// buildStaleNZBKnownKeys takes the snapshot. An error means it is
+// incomplete: every file would look ownerless, so callers must not list or
+// delete orphans on it.
+func (r *Repair) buildStaleNZBKnownKeys() (staleNZBKnownKeys, error) {
 	hashes := make(map[string]struct{})
-	_ = r.manager.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
+	if err := r.manager.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
 		hashes[meta.InfoHash] = struct{}{}
 		return nil
-	})
-	return staleNZBKnownKeys{
-		hashes: hashes,
-		names:  r.manager.storage.GetEntryItems(),
+	}); err != nil {
+		return staleNZBKnownKeys{}, fmt.Errorf("read the entry list: %w", err)
 	}
+	names, err := r.manager.storage.EntryItemNames()
+	if err != nil {
+		return staleNZBKnownKeys{}, fmt.Errorf("read the entry item list: %w", err)
+	}
+	return staleNZBKnownKeys{hashes: hashes, names: names}, nil
 }
 
 func (k staleNZBKnownKeys) has(id string) bool {

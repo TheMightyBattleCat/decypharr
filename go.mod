@@ -135,3 +135,7 @@ require (
 	modernc.org/sqlite v1.21.1 // indirect
 	zombiezen.com/go/sqlite v0.13.1 // indirect
 )
+
+// Patched copy: a failed append no longer leaves a partial record (see
+// third_party/appendstore/README.md).
+replace github.com/sirrobot01/appendstore => ./third_party/appendstore

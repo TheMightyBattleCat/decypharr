@@ -39,24 +39,66 @@ type Storage struct {
 	healthCountsBuiltAt time.Time
 }
 
-func createItemStores(baseDir string, baseOptions appendstore.Options) (map[string]*appendstore.Store, error) {
+// rebuildableStoreNames are the stores that hold only history or state the
+// program rebuilds as it runs. When one of them is damaged, start-up moves
+// the file aside and starts it empty instead of refusing to start.
+var rebuildableStoreNames = map[string]bool{
+	"repair_runs":          true,
+	"par2_repair_attempts": true,
+	"regrab_guard":         true,
+}
+
+// corruptStoreSuffix starts the name a damaged rebuildable store is moved to:
+// <name>.db.corrupt-<time>.
+const corruptStoreSuffix = ".corrupt-"
+
+func createItemStores(baseDir string, baseOptions appendstore.Options, log zerolog.Logger) (map[string]*appendstore.Store, error) {
 	items := make(map[string]*appendstore.Store)
+	closeOpened := func() {
+		for _, it := range items {
+			_ = it.Close()
+		}
+	}
 	for _, name := range storeNames {
 		path := filepath.Join(baseDir, name+".db")
 		store, err := appendstore.Open(path, baseOptions)
+		if err != nil && errors.Is(err, appendstore.ErrCorruptedData) && rebuildableStoreNames[name] {
+			store, err = reopenCorruptStore(path, baseOptions, err, log)
+		}
 		if err != nil {
-			for _, it := range items {
-				_ = it.Close()
-			}
+			closeOpened()
 			if errors.Is(err, appendstore.ErrUnsupportedVersion) {
 				return nil, fmt.Errorf("the %s database was written by a newer version of Decypharr and this build cannot read it. "+
 					"Upgrade Decypharr, or restore the copy saved before the upgrade (a .bak file beside %s): %w", name, path, err)
+			}
+			if errors.Is(err, appendstore.ErrCorruptedData) {
+				return nil, fmt.Errorf("the %s database (%s) is damaged and cannot be opened. "+
+					"Stop Decypharr and restore the db folder from a backup: %w", name, path, err)
 			}
 			return nil, fmt.Errorf("failed to create %s store: %w", name, err)
 		}
 		items[name] = store
 	}
 	return items, nil
+}
+
+// reopenCorruptStore moves a damaged store file aside and opens a fresh one
+// in its place. openErr is the error the damaged file gave.
+func reopenCorruptStore(path string, options appendstore.Options, openErr error, log zerolog.Logger) (*appendstore.Store, error) {
+	aside := path + corruptStoreSuffix + time.Now().UTC().Format("20060102T150405Z")
+	if err := os.Rename(path, aside); err != nil {
+		return nil, errors.Join(openErr, fmt.Errorf("move the damaged file aside: %w", err))
+	}
+	store, err := appendstore.Open(path, options)
+	if err != nil {
+		return nil, errors.Join(openErr, fmt.Errorf("open a fresh store after moving the damaged file to %s: %w", aside, err))
+	}
+	log.Error().
+		Err(openErr).
+		Str("database", path).
+		Str("moved_to", aside).
+		Msg("Database was damaged: moved it aside and started it empty. Its history is lost unless the db folder is restored from a backup")
+	return store, nil
 }
 
 func dropLegacyStores(baseDir string, log zerolog.Logger) {
@@ -105,7 +147,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 		},
 	}
 
-	itemStores, err := createItemStores(dbPath, baseOptions)
+	itemStores, err := createItemStores(dbPath, baseOptions, log)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create item stores: %w", err)
 	}

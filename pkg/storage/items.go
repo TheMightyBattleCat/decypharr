@@ -7,12 +7,20 @@ import (
 
 // GetEntryItems returns all entry item names
 func (s *Storage) GetEntryItems() map[string]struct{} {
+	items, _ := s.EntryItemNames()
+	return items
+}
+
+// EntryItemNames is GetEntryItems with the store's error: a caller that
+// treats a missing name as "nothing owns this" must not act on a partial or
+// empty set.
+func (s *Storage) EntryItemNames() (map[string]struct{}, error) {
 	items := make(map[string]struct{})
-	_ = s.entryItems.ForEachMetadata(func(key string, _ *appendstore.Metadata) error {
+	err := s.entryItems.ForEachMetadata(func(key string, _ *appendstore.Metadata) error {
 		items[key] = struct{}{}
 		return nil
 	})
-	return items
+	return items, err
 }
 
 // UpdateEntryItem updates an entry item from an entry

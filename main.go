@@ -24,6 +24,9 @@ func main() {
 		if r := recover(); r != nil {
 			log.Printf("FATAL: Recovered from panic in main: %v\n", r)
 			debug.PrintStack()
+			// Returning from main would exit 0: a service manager would take
+			// a failed start for a clean stop and not restart it.
+			os.Exit(1)
 		}
 	}()
 
