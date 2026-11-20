@@ -222,6 +222,38 @@ func IsArticleNotFoundError(err error) bool {
 	return false
 }
 
+// PartialNotFoundError is a not-found that failover settled on while some
+// configured provider gave no answer for the article: its dial failed, it
+// sat in its dial cooldown or it was outside the serving tier (over its
+// hard quota). It unwraps to the 430, so IsArticleNotFoundError still holds
+// and playback pads as before; callers that turn a 430 into a verdict
+// against a release check IsPartialNotFound first, because the provider
+// that was not asked may hold the article.
+type PartialNotFoundError struct {
+	Err     error
+	Unasked []string // hosts that gave no answer
+}
+
+func (e *PartialNotFoundError) Error() string { return e.Err.Error() }
+func (e *PartialNotFoundError) Unwrap() error { return e.Err }
+
+// IsPartialNotFound reports whether err is a not-found that not every
+// provider answered.
+func IsPartialNotFound(err error) bool {
+	var p *PartialNotFoundError
+	return errors.As(err, &p)
+}
+
+// UnaskedProviders returns the hosts a partial not-found never heard from,
+// or nil.
+func UnaskedProviders(err error) []string {
+	var p *PartialNotFoundError
+	if errors.As(err, &p) {
+		return p.Unasked
+	}
+	return nil
+}
+
 // IsCorruptArticleError reports whether err is a decode failure caused by the
 // article itself (wrong size, CRC mismatch, no =yend) rather than by the
 // connection or the destination writer, which classifyTransferError also

@@ -290,6 +290,26 @@ func NewSegmentFetcher(
 // Fetch downloads a segment synchronously, with deduplication.
 // Multiple goroutines calling Fetch for the same segment will share the download.
 func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
+	return verificationReadError(ctx, segIdx, sf.fetch(ctx, segIdx))
+}
+
+// verificationReadError turns a partial not-found (some provider never
+// answered for the article) into a plain read failure for a verification
+// read, which must not take it for a dead segment: the provider that was
+// down, cooling down or over its quota may hold the article. However the
+// read got it - a fresh fetch, a slot another read left Failed, or a shared
+// in-flight fetch - the 430 is not passed on, so nothing above reads it as
+// missing, and fetchWithRetry asks the providers again. The slot itself
+// keeps the 430, so a playback read still pads it.
+func verificationReadError(ctx context.Context, segIdx int, err error) error {
+	if err == nil || !paddingDisabled(ctx) || !nntp.IsPartialNotFound(err) {
+		return err
+	}
+	return fmt.Errorf("segment %d: article not found on the providers that answered, but %s gave no answer: %v",
+		segIdx, strings.Join(nntp.UnaskedProviders(err), ", "), err)
+}
+
+func (sf *SegmentFetcher) fetch(ctx context.Context, segIdx int) error {
 retry:
 	// Fast path: already cached, or wait out an in-progress eviction so we
 	// don't dedup/fetch against a segment whose disk range is mid-punch.
@@ -575,13 +595,18 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 				// run's probeFile can short-circuit to a broken verdict
 				// without waiting on (or being fooled by) ffprobe. This branch
 				// is the playback-read path - a viewer hitting the same dead
-				// article while the sweep probes the entry.
-				sf.config.Overlay.MarkSweepDead()
+				// article while the sweep probes the entry. Not for a 430
+				// some provider never answered (down, cooling down, over
+				// quota): it may hold the article, so that is no verdict.
+				if !nntp.IsPartialNotFound(err) {
+					sf.config.Overlay.MarkSweepDead()
+				}
 				sf.logger.Debug().
 					Str("component", "fetcher").
 					Str("entry", sf.config.Overlay.NzbID()).
 					Str("file", sf.config.OverlayFile).
 					Int("segment", segIdx).
+					Strs("unasked", nntp.UnaskedProviders(err)).
 					Msg("segment not padded: entry under sweep probe")
 			} else if sf.handleConfirmedMissing(ctx, segIdx, messageID, nntp.DescribeOutcomes(nntp.FailoverOutcomes(err))) {
 				// The slot now holds patch/pad bytes and is OnDisk, so the
@@ -597,7 +622,11 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		// previously invisible in logs (see the "verification read" comment
 		// above). DEBUG, not INFO: the sweep's own ffprobe-failure log
 		// already captures the downstream effect at INFO.
-		if paddingDisabled(ctx) && nntp.IsArticleNotFoundError(err) {
+		// A 430 settled on while some provider was never asked is not
+		// evidence the article is gone: Fetch hands the verification read a
+		// plain failure for it instead (verificationReadError), which the
+		// checker counts as a failed read, not a dead segment.
+		if paddingDisabled(ctx) && nntp.IsArticleNotFoundError(err) && !nntp.IsPartialNotFound(err) {
 			sf.logger.Debug().Str("component", "fetcher").Int("segment", segIdx).Msg("segment dead during verification read")
 			// Mechanism B: trip the dead-segment signal the ffprobe checker
 			// attached to this read's context (via the WebDAV handler), so it

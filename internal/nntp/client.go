@@ -712,6 +712,22 @@ func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExc
 		if IsCorruptArticleError(lastErr) {
 			return "", withOutcomes(lastErr, outcomes) // corrupt everywhere else: keep the decode error, as before
 		}
+		// Every provider that answered is in exclusions now: a 430 or a
+		// corrupt copy excludes its backbone (or host), a timeout,
+		// connection error or busy reply its host, and the caller's own
+		// exceptions were there from the start. One that is not was never
+		// asked: its dial failed, it sat in its dial cooldown, or it was
+		// outside the serving tier. The 430 stays a 430 (playback pads on
+		// it), marked partial so a verdict against the release can tell.
+		var unasked []string
+		for _, p := range c.providers {
+			if !exclusions.excludes(p) {
+				unasked = append(unasked, p.Host)
+			}
+		}
+		if len(unasked) > 0 {
+			return "", &PartialNotFoundError{Err: withOutcomes(notFound, outcomes), Unasked: unasked}
+		}
 		return "", withOutcomes(notFound, outcomes)
 	}
 	if lastErr != nil {
