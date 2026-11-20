@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	json "github.com/bytedance/sonic"
@@ -641,7 +642,8 @@ func (c *Config) loadConfig() error {
 
 	// Parse JSON
 	if err := json.Unmarshal(data, &c); err != nil {
-		return fmt.Errorf("error parsing config JSON: %w", err)
+		// The parser's error quotes the file text (secrets); leave it out.
+		return fmt.Errorf("config.json is not valid JSON (%s): fix it or restore it from a backup", configFile)
 	}
 	hadSessionSecret := c.SessionSecret != ""
 	hadStrmSecret := c.Strm.Secret != ""
@@ -1129,10 +1131,7 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(c.JsonFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.WriteFile(c.JsonFile(), data, 0600); err != nil {
+	if err := writeFileAtomic(c.JsonFile(), data, 0600); err != nil {
 		fmt.Printf("Failed to write config file: %v\n", err)
 		return err
 	}
@@ -1250,4 +1249,48 @@ func (c *Config) SetupError() string {
 		return err.Error()
 	}
 	return ""
+}
+
+// writeFileAtomic replaces path with data so a failed or interrupted write
+// leaves the old file in place: it writes a temp file in the same folder,
+// syncs it, renames it over the target and syncs the folder.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	fail := func(err error) error {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		// A single-file bind mount cannot be replaced by rename.
+		if errors.Is(err, syscall.EBUSY) {
+			return os.WriteFile(path, data, perm)
+		}
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
