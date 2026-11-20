@@ -1018,13 +1018,16 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 }
 
 // raceForConnection spawns goroutines that race to acquire a connection slot.
-// Returns as soon as any provider has availability.
+// Returns as soon as any provider has a connection: the first one is handed
+// over at once, without waiting for the other racers to finish a ping or a
+// dial.
 //
 // Each goroutine reports exactly one result (success or error) via resultCh, or
-// exits silently if it never acquired a slot. A WaitGroup + channel-close ensures
-// the receiver loop always terminates, and any extra connections won by multiple
-// goroutines are properly returned to the pool — preventing slot leaks under heavy
-// concurrent import load.
+// exits silently if it never acquired a slot. Racers still running when the
+// call returns put back any connection they get once innerCtx is done, and a
+// drain goroutine returns the connections already sent, so no slot is left
+// taken whichever way the call ends. A WaitGroup + channel-close ends the
+// drain.
 //
 // allowDial is passed to getOrCreateFromPool: false while some eligible
 // provider is warm, so a cooling-down one is not dialed.
@@ -1091,51 +1094,42 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 		cancel()
 	}()
 
-	// Drain all results:
-	//  - First success becomes the winner; cancel() is called to stop remaining goroutines.
-	//  - Any subsequent successes (from goroutines that raced to completion before cancel
-	//    reached them) have their connections returned to the pool to prevent slot leaks.
-	//  - Errors are collected so we can return a meaningful error if there is no winner.
-	var winConn *Connection
-	var winProvider config.UsenetProvider
-	var lastErr error
+	// drain gives back every connection still to come; it ends when the
+	// last racer has finished and resultCh is closed.
+	drain := func() {
+		for r := range resultCh {
+			if r.conn != nil {
+				c.returnOrReleaseConn(r.conn, r.provider)
+			}
+		}
+	}
 
+	// The first success is handed to the caller at once; errors are kept so
+	// there is a meaningful one to return when no racer wins.
+	var lastErr error
 	for {
 		select {
 		case r, ok := <-resultCh:
 			if !ok {
-				// Channel closed — all goroutines have finished.
-				if winConn != nil {
-					return winConn, winProvider, nil
-				}
+				// Channel closed: every racer finished without a connection.
 				if lastErr != nil {
 					return nil, config.UsenetProvider{}, lastErr
 				}
 				return nil, config.UsenetProvider{}, errors.New("failed to get connection from any provider")
 			}
 			if r.err == nil && r.conn != nil {
-				if winConn == nil {
-					winConn = r.conn
-					winProvider = r.provider
-					cancel() // Tell losing goroutines to stop ASAP.
-				} else {
-					// Extra winner arrived before cancel propagated — release it.
-					c.returnOrReleaseConn(r.conn, r.provider)
-				}
-			} else if r.err != nil {
+				cancel() // Tell losing goroutines to stop ASAP.
+				go drain()
+				return r.conn, r.provider, nil
+			}
+			if r.err != nil {
 				lastErr = r.err
 			}
 		case <-ctx.Done():
-			// Parent context cancelled — cancel inner, drain remaining connections
-			// in background so we don't block the caller.
+			// Parent context cancelled: no winner is held here, so cancel the
+			// racers and give back in the background whatever they still send.
 			cancel()
-			go func() {
-				for r := range resultCh {
-					if r.conn != nil {
-						c.returnOrReleaseConn(r.conn, r.provider)
-					}
-				}
-			}()
+			go drain()
 			return nil, config.UsenetProvider{}, ctx.Err()
 		}
 	}
@@ -1333,6 +1327,11 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 	// Set deadline for handshake (greeting + auth)
 	// If the server doesn't respond quickly during setup, we should abort.
 	_ = netConn.SetDeadline(utils.Now().Add(timeouts.HandshakeTimeout))
+	// The deadline ignores ctx: close the socket when ctx ends, so a dial the
+	// caller no longer wants (a lost pool race) frees its slot at once rather
+	// than after a server that never greets runs out the handshake timeout.
+	stopCloseOnCancel := context.AfterFunc(ctx, func() { _ = netConn.Close() })
+	defer stopCloseOnCancel()
 
 	// Read greeting
 	line, err := reader.ReadString('\n')
@@ -1351,6 +1350,11 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 			_ = netConn.Close()
 			return nil, fmt.Errorf("auth: %w", err)
 		}
+	}
+
+	if !stopCloseOnCancel() {
+		// ctx ended as the handshake finished: the socket is already closed.
+		return nil, NewConnectionError(fmt.Errorf("handshake: %w", ctx.Err()))
 	}
 
 	// Clear deadline for normal operation
