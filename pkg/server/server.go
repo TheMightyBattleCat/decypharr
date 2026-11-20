@@ -184,6 +184,9 @@ func (s *Server) Restart() {
 	}
 }
 
+// shutdownGrace is how long Start waits for open responses before closing them.
+var shutdownGrace = 10 * time.Second
+
 func (s *Server) Start(ctx context.Context) error {
 	cfg := config.Get()
 
@@ -205,7 +208,17 @@ func (s *Server) Start(ctx context.Context) error {
 
 	<-ctx.Done()
 	s.logger.Info().Msg("Shutting down gracefully...")
-	return srv.Shutdown(context.Background())
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	began := time.Now()
+	err := srv.Shutdown(shutdownCtx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		// A long playback response never ends by itself: cut it so the
+		// stop (or settings restart) can go on.
+		s.logger.Warn().Msgf("Open HTTP responses still running after %.0f s; closing them", time.Since(began).Seconds())
+		return srv.Close()
+	}
+	return err
 }
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
