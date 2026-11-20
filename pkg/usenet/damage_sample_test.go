@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 func makeSegments(n int) []SegmentRef {
@@ -15,14 +18,19 @@ func makeSegments(n int) []SegmentRef {
 	return segs
 }
 
+// err430 is the 430 failover returns once every provider said not found.
+func err430() error {
+	return &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430, Message: "no such article"}
+}
+
 func alwaysPass(_ context.Context, _ SegmentRef) error { return nil }
 
-func alwaysFail(_ context.Context, _ SegmentRef) error { return errors.New("430") }
+func alwaysFail(_ context.Context, _ SegmentRef) error { return err430() }
 
 func failSet(dead map[int]struct{}) func(context.Context, SegmentRef) error {
 	return func(_ context.Context, seg SegmentRef) error {
 		if _, ok := dead[seg.Index]; ok {
-			return errors.New("430")
+			return err430()
 		}
 		return nil
 	}
@@ -260,5 +268,68 @@ func TestContextCancellation(t *testing.T) {
 
 	if result.Verdict == VerdictClean {
 		t.Error("cancelled context should not produce CLEAN verdict")
+	}
+}
+
+// A fetch that failed for any reason other than a 430 every provider gave says
+// nothing about the article: the sample must not call the file broken on it.
+func TestSampleCountsOnlyACompleteNotFoundAsDead(t *testing.T) {
+	segs := makeSegments(200)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"cancelled", context.Canceled},
+		{"timeout", nntp.NewTimeoutError(errors.New("i/o timeout"))},
+		{"quota", errors.New("no eligible providers available")},
+		{"partial 430", &nntp.PartialNotFoundError{Err: err430(), Unasked: []string{"down.example"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := SampleFileDamage(context.Background(), segs, []int{5},
+				func(context.Context, SegmentRef) error { return tc.err }, SampleOpts{})
+			if res.Verdict != VerdictInconclusive || res.SegmentsFailed != 0 || res.ExtrapolatedDeadCount != 0 {
+				t.Fatalf("got %+v, want inconclusive with no failed segment", res)
+			}
+			if res.SegmentsUnanswered == 0 || res.SegmentsSampled != 0 {
+				t.Fatalf("got %+v, want every fetch unanswered and none sampled", res)
+			}
+		})
+	}
+	// Control: a complete 430 still counts.
+	res := SampleFileDamage(context.Background(), segs, nil, alwaysFail, SampleOpts{})
+	if res.Verdict != VerdictBroken || res.SegmentsFailed < 3 {
+		t.Fatalf("complete 430: got %+v, want broken", res)
+	}
+}
+
+// A sample whose caller stopped is inconclusive even if 430s arrived first.
+func TestSampleStoppedContextIsInconclusive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var n atomic.Int64
+	fetch := func(c context.Context, _ SegmentRef) error {
+		if n.Add(1) >= 2 {
+			cancel()
+			return c.Err()
+		}
+		return err430()
+	}
+	res := SampleFileDamage(ctx, makeSegments(50), nil, fetch, SampleOpts{})
+	if res.Verdict != VerdictInconclusive {
+		t.Fatalf("got %+v, want inconclusive once the caller's context ended", res)
+	}
+}
+
+// A few passes among mostly unanswered fetches do not clear a file.
+func TestSampleMostlyUnansweredIsInconclusive(t *testing.T) {
+	var n atomic.Int64
+	fetch := func(context.Context, SegmentRef) error {
+		if n.Add(1) <= 5 {
+			return nil
+		}
+		return nntp.NewTimeoutError(errors.New("i/o timeout"))
+	}
+	res := SampleFileDamage(context.Background(), makeSegments(640), nil, fetch, SampleOpts{})
+	if res.Verdict != VerdictInconclusive || res.SegmentsPassed == 0 {
+		t.Fatalf("got %+v, want inconclusive with some passes", res)
 	}
 }

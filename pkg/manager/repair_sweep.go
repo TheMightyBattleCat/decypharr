@@ -412,6 +412,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // run.Stats.Unverified.
 func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool, sc *supersessionContext) (*storage.EntryHealth, entryDecode) {
 	s := r.manager.storage
+	// A sticky-failed file the probe finds still broken is re-grabbed from
+	// inside the probe; it asks this run's auto-repair (Recheck's fix).
+	ctx = contextWithStickyRegrabAutoRepair(ctx, autoRepair)
 	// Lazily load the entry body. Enumeration only recorded the name, so the
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
 	// (nil tells the worker not to count it).

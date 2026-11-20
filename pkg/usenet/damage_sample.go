@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 type SampleVerdict string
@@ -50,10 +52,15 @@ const (
 )
 
 type SampleResult struct {
-	Verdict               SampleVerdict
-	SegmentsSampled       int
-	SegmentsFailed        int
-	SegmentsPassed        int
+	Verdict         SampleVerdict
+	SegmentsSampled int
+	SegmentsFailed  int
+	SegmentsPassed  int
+	// SegmentsUnanswered counts fetches that failed for a reason other than
+	// a 430 every provider gave (a cancelled context, a quota or auth reply,
+	// a timeout, a provider that could not be asked). They are neither
+	// passed nor failed and are left out of SegmentsSampled.
+	SegmentsUnanswered    int
 	RecordedDeadRecovered int
 	ExtrapolatedDeadCount int
 	CoverageFraction      float64
@@ -66,6 +73,11 @@ type SampleResult struct {
 // sample slots with segments spread evenly across the full range so dead-
 // article runs—which cluster on disk—are detected more efficiently per byte
 // than a contiguous head-region sample would.
+//
+// Only a 430 that every provider gave counts as a dead article. A fetch that
+// failed otherwise says nothing about the article, so the verdict is
+// inconclusive when the caller's context ends, when nothing was answered, or
+// when most of the sample went unanswered without reaching a verdict early.
 func SampleFileDamage(
 	ctx context.Context,
 	segments []SegmentRef,
@@ -88,8 +100,9 @@ func SampleFileDamage(
 	}
 
 	type probeResult struct {
-		index  int
-		failed bool
+		index      int
+		failed     bool
+		unanswered bool
 	}
 
 	const concurrency = 4
@@ -103,6 +116,7 @@ func SampleFileDamage(
 	}
 	close(work)
 
+	parent := ctx
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -119,7 +133,8 @@ func SampleFileDamage(
 					return
 				}
 				err := fetchBody(ctx, seg)
-				results <- probeResult{index: seg.Index, failed: err != nil}
+				dead := err != nil && nntp.IsArticleNotFoundError(err) && !nntp.IsPartialNotFound(err)
+				results <- probeResult{index: seg.Index, failed: dead, unanswered: err != nil && !dead}
 			}
 		}()
 	}
@@ -133,6 +148,7 @@ func SampleFileDamage(
 		sampled           int
 		failed            int
 		passed            int
+		unanswered        int
 		deadRecovered     int
 		consecutivePasses int
 		allDeadPassed     = true
@@ -142,6 +158,10 @@ func SampleFileDamage(
 	deadChecked := make(map[int]bool, len(deadSet))
 
 	for r := range results {
+		if r.unanswered {
+			unanswered++
+			continue
+		}
 		sampled++
 
 		if r.failed {
@@ -158,6 +178,10 @@ func SampleFileDamage(
 				cancel()
 				// Drain remaining results already in flight.
 				for extra := range results {
+					if extra.unanswered {
+						unanswered++
+						continue
+					}
 					sampled++
 					if extra.failed {
 						failed++
@@ -203,6 +227,10 @@ func SampleFileDamage(
 				aborted.Store(true)
 				cancel()
 				for extra := range results {
+					if extra.unanswered {
+						unanswered++
+						continue
+					}
 					sampled++
 					if extra.failed {
 						failed++
@@ -230,10 +258,14 @@ func SampleFileDamage(
 
 	verdict := VerdictInconclusive
 	switch {
+	case parent.Err() != nil || sampled == 0:
+		// Stopped, or no provider answered a single fetch: no evidence.
 	case abortReason == AbortFailureLimit:
 		verdict = VerdictBroken
 	case abortReason == AbortCleanStreakDead:
 		verdict = VerdictClean
+	case unanswered > sampled:
+		// Most of the sample could not be fetched: too thin to call.
 	case failed == 0:
 		verdict = VerdictClean
 	case failed > 0 && float64(failed)/float64(sampled) > 0.5:
@@ -245,6 +277,7 @@ func SampleFileDamage(
 		SegmentsSampled:       sampled,
 		SegmentsFailed:        failed,
 		SegmentsPassed:        passed,
+		SegmentsUnanswered:    unanswered,
 		RecordedDeadRecovered: deadRecovered,
 		ExtrapolatedDeadCount: extrapolated,
 		CoverageFraction:      coverage,

@@ -12,6 +12,16 @@ import (
 
 type sampleBudgetKey struct{}
 
+// stickyRegrabAutoRepairKey carries the probing run's auto-repair value (a
+// sweep's autoRepair, a Recheck's fix) to regrabStickyFailed, which re-grabs
+// from inside the probe and so must pass the same gate as the run's own heals.
+// A context without it never re-grabs.
+type stickyRegrabAutoRepairKey struct{}
+
+func contextWithStickyRegrabAutoRepair(ctx context.Context, autoRepair bool) context.Context {
+	return context.WithValue(ctx, stickyRegrabAutoRepairKey{}, autoRepair)
+}
+
 func contextWithSampleBudget(ctx context.Context, b *sweepSampleBudget) context.Context {
 	return context.WithValue(ctx, sampleBudgetKey{}, b)
 }
@@ -134,6 +144,9 @@ func (r *Repair) reconcileStickyFailed(ctx context.Context, c *candidate, entry 
 
 	sampleCtx := usenet.ContextForVerificationRead(ctx)
 	sampleResult, err := r.manager.usenet.RunDamageSample(sampleCtx, nzbID, name, usenet.SampleOpts{})
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		if par2Usable {
 			return res, false
@@ -257,15 +270,20 @@ func (r *Repair) forgetCachedPads(entry *storage.Entry, nzbID, name string, pads
 
 // regrabStickyFailed routes a sticky-Failed file the sampler confirmed still
 // broken to the same guarded blocklist+re-search path a live playback failure
-// uses. auto=true so regrabGuard applies.
+// uses. auto=true so regrabGuard applies. It re-grabs only when the probing
+// run may heal now (autoRepairStillOn: auto-repair or Recheck's fix on, no
+// post-restore hold, brake not tripped); otherwise the file is listed
+// broken and left to the run's own broken-entry handling.
 func (r *Repair) regrabStickyFailed(ctx context.Context, c *candidate, entry *storage.Entry, name string, res fileResult) fileResult {
 	res.healthy = false
 	res.reason = "sticky_failed_sample_broken"
-	if sweepBrakeFrom(ctx).holding() {
-		// The sweep's brake has tripped: no re-grab from here either. The
-		// file is left unknown, and the next sweep samples it again.
+	autoRepair, _ := ctx.Value(stickyRegrabAutoRepairKey{}).(bool)
+	if !r.autoRepairStillOn(ctx, autoRepair) {
+		// Listed broken for the run's own handling, which heals a broken
+		// entry only under the same gate.
+		res.broken = true
 		r.logger.Debug().Str("entry", entry.Name).Str("file", name).
-			Msg("Repair: sticky-failed regrab skipped; sweep healing is stopped")
+			Msg("Repair: sticky-failed regrab skipped; healing is off for this run")
 		return res
 	}
 	acted, guardReason, err := r.repairPlaybackFileNow(ctx, c.name, name, true, false)
