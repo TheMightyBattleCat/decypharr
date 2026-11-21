@@ -170,6 +170,9 @@ class FileBrowser {
             this.bindStaleNZBsConfirmButton(this.refs.staleNZBsDeleteAllBtn, () => this.getStaleNZBRows().map(r => r.key));
         }
 
+        // Row actions: one delegated listener per event type on the list
+        this.bindEntryListEvents();
+
         // Hide context menu on click outside
         document.addEventListener('click', (e) => {
             if (!this.refs.contextMenu.contains(e.target)) {
@@ -441,7 +444,7 @@ class FileBrowser {
         parts.forEach(part => {
             currentPath += '/' + part;
             const displayName = decodeURIComponent(part);
-            html += `<li><a href="${window.urlBase}browse?path=${encodeURIComponent(currentPath)}" data-path="${currentPath}">${this.escapeHtml(displayName)}</a></li>`;
+            html += `<li><a href="${window.urlBase}browse?path=${encodeURIComponent(currentPath)}" data-path="${this.escapeAttr(currentPath)}">${this.escapeHtml(displayName)}</a></li>`;
         });
 
         this.refs.breadcrumbNav.innerHTML = html;
@@ -472,79 +475,136 @@ class FileBrowser {
 
         this.refs.emptyState.classList.add('hidden');
 
-        this.refs.fileBrowserList.innerHTML = this.state.entries.map(entry => {
-            const icons = {
-                virtual: '<i class="bi bi-folder-symlink text-info text-lg" aria-hidden="true"></i>',
-                provider: '<i class="bi bi-cloud text-secondary text-lg" aria-hidden="true"></i>',
-                system: '<i class="bi bi-folder-fill text-warning text-lg" aria-hidden="true"></i>',
-                entry: '<i class="bi bi-folder-fill text-warning text-lg" aria-hidden="true"></i>',
-                file: '<i class="bi bi-file-earmark text-info" aria-hidden="true"></i>'
-            };
-            const icon = entry.is_dir ? (icons[entry.kind] || icons.entry) : icons.file;
-            const badges = {
-                virtual: '<span class="badge badge-info badge-outline badge-sm">Virtual view</span>',
-                provider: '<span class="badge badge-secondary badge-outline badge-sm">Provider</span>',
-                system: '<span class="badge badge-ghost badge-sm">Library</span>'
-            };
-            const kindBadge = badges[entry.kind] || '';
-            const isActionable = this.isActionableEntry(entry);
-            const canOpen = entry.is_dir || isActionable;
-
-            const entryId = entry.info_hash || entry.path;
-            const isChecked = this.state.selectedEntries.has(entryId);
-            const actionMenu = isActionable ? `
-                <div class="dropdown dropdown-end">
-                    <button type="button" tabindex="0" class="btn btn-ghost btn-xs" aria-label="Actions for ${this.escapeAttr(entry.name)}">
-                        <i class="bi bi-three-dots-vertical" aria-hidden="true"></i>
-                    </button>
-                    <ul tabindex="0" class="dropdown-content menu p-2 shadow bg-base-200 rounded-box w-56 z-50" aria-label="Actions">
-                        ${!entry.is_dir ? `<li><button type="button" onclick="window.fileBrowser.downloadFile('${this.escapeJs(entry.path)}', '${this.escapeJs(entry.name)}')"><i class="bi bi-download" aria-hidden="true"></i> Download</button></li>` : ''}
-                        ${entry.kind === 'entry' ? `<li><button type="button" onclick="window.fileBrowser.recheckEntry('${this.escapeJs(entry.name)}')"><i class="bi bi-search-heart" aria-hidden="true"></i> Recheck health</button></li>` : ''}
-                        ${entry.can_delete ? `<li><button type="button" onclick="window.fileBrowser.deleteTorrent('${this.escapeJs(entry.info_hash)}', '${this.escapeJs(entry.name)}')" class="text-error"><i class="bi bi-trash" aria-hidden="true"></i> Delete original item</button></li>` : ''}
-                    </ul>
-                </div>` : '<span aria-hidden="true">—</span>';
-
-            return `
-                <tr class="group hover:bg-base-200 transition-colors"
-                    data-entry='${this.escapeAttr(JSON.stringify(entry))}'
-                    data-entry-id="${this.escapeAttr(entryId)}"
-                    ${isActionable ? `oncontextmenu="window.fileBrowser.showContextMenu(event, ${this.escapeAttr(JSON.stringify(entry))});"` : ''}>
-                    <td onclick="event.stopPropagation();">
-                        <label class="${isActionable ? 'cursor-pointer' : ''}">
-                            <span class="sr-only">Select ${this.escapeHtml(entry.name)}</span>
-                            <input type="checkbox" aria-label="Select ${this.escapeAttr(entry.name)}"
-                                   class="checkbox checkbox-sm checkbox-primary entry-checkbox"
-                                   data-entry-id="${this.escapeAttr(entryId)}"
-                                   ${isChecked ? 'checked' : ''}
-                                   ${isActionable ? '' : 'disabled'}
-                                   onchange="window.fileBrowser.handleEntrySelect('${this.escapeAttr(entryId)}', this.checked, ${this.escapeAttr(JSON.stringify(entry))})">
-                        </label>
-                    </td>
-                    <td>${icon}</td>
-                    <td>
-                        ${canOpen ? `<button type="button" onclick="window.fileBrowser.handleEntryClick('${this.escapeJs(entry.path)}', ${entry.is_dir}, '${this.escapeJs(entry.name)}');" class="text-left hover:text-primary transition-colors"><span class="font-medium">${this.escapeHtml(entry.name)}</span></button>` : `<span class="font-medium">${this.escapeHtml(entry.name)}</span>`}
-                        ${kindBadge ? `<span class="ml-2">${kindBadge}</span>` : ''}
-                    </td>
-                    <td>
-                        ${entry.size <= 0 ? '-' : this.formatSize(entry.size)}
-                    </td>
-                    <td class="text-xs text-base-content/70">
-                        ${entry.mod_time || '-'}
-                    </td>
-                    <td>
-                        ${entry.active_debrid ? `<span>${this.escapeHtml(entry.active_debrid)}</span>` : '-'}
-                    </td>
-                    <td ${entry.kind === 'entry' ? `data-health-cell="${this.escapeAttr(entry.name)}"` : ''}>
-                        ${entry.kind === 'entry' ? this.healthBadge(this.state.health.get(entry.name)) : '—'}
-                    </td>
-                    <td onclick="event.stopPropagation();">
-                        ${actionMenu}
-                    </td>
-                </tr>
-            `;
-        }).join('');
+        this.refs.fileBrowserList.innerHTML = this.state.entries.map(entry => this.rowHtml(entry)).join('');
 
         this.updateSelectionUI();
+    }
+
+    // rowHtml renders one table row. Names and paths come from posters and
+    // debrid accounts, so they are written only as escaped text and data-*
+    // attributes, never into an on* handler: the delegated listeners bound in
+    // bindEntryListEvents read them back from the row.
+    rowHtml(entry) {
+        const icons = {
+            virtual: '<i class="bi bi-folder-symlink text-info text-lg" aria-hidden="true"></i>',
+            provider: '<i class="bi bi-cloud text-secondary text-lg" aria-hidden="true"></i>',
+            system: '<i class="bi bi-folder-fill text-warning text-lg" aria-hidden="true"></i>',
+            entry: '<i class="bi bi-folder-fill text-warning text-lg" aria-hidden="true"></i>',
+            file: '<i class="bi bi-file-earmark text-info" aria-hidden="true"></i>'
+        };
+        const icon = entry.is_dir ? (icons[entry.kind] || icons.entry) : icons.file;
+        const badges = {
+            virtual: '<span class="badge badge-info badge-outline badge-sm">Virtual view</span>',
+            provider: '<span class="badge badge-secondary badge-outline badge-sm">Provider</span>',
+            system: '<span class="badge badge-ghost badge-sm">Library</span>'
+        };
+        const kindBadge = badges[entry.kind] || '';
+        const isActionable = this.isActionableEntry(entry);
+        const canOpen = entry.is_dir || isActionable;
+
+        const entryId = entry.info_hash || entry.path;
+        const isChecked = this.state.selectedEntries.has(entryId);
+        const actionMenu = isActionable ? `
+            <div class="dropdown dropdown-end">
+                <button type="button" tabindex="0" class="btn btn-ghost btn-xs" aria-label="Actions for ${this.escapeAttr(entry.name)}">
+                    <i class="bi bi-three-dots-vertical" aria-hidden="true"></i>
+                </button>
+                <ul tabindex="0" class="dropdown-content menu p-2 shadow bg-base-200 rounded-box w-56 z-50" aria-label="Actions">
+                    ${!entry.is_dir ? `<li><button type="button" data-action="download" data-path="${this.escapeAttr(entry.path)}" data-name="${this.escapeAttr(entry.name)}"><i class="bi bi-download" aria-hidden="true"></i> Download</button></li>` : ''}
+                    ${entry.kind === 'entry' ? `<li><button type="button" data-action="recheck" data-name="${this.escapeAttr(entry.name)}"><i class="bi bi-search-heart" aria-hidden="true"></i> Recheck health</button></li>` : ''}
+                    ${entry.can_delete ? `<li><button type="button" data-action="delete" data-name="${this.escapeAttr(entry.name)}" class="text-error"><i class="bi bi-trash" aria-hidden="true"></i> Delete original item</button></li>` : ''}
+                </ul>
+            </div>` : '<span aria-hidden="true">—</span>';
+
+        return `
+            <tr class="group hover:bg-base-200 transition-colors"
+                data-entry='${this.escapeAttr(JSON.stringify(entry))}'
+                data-entry-id="${this.escapeAttr(entryId)}">
+                <td>
+                    <label class="${isActionable ? 'cursor-pointer' : ''}">
+                        <span class="sr-only">Select ${this.escapeHtml(entry.name)}</span>
+                        <input type="checkbox" aria-label="Select ${this.escapeAttr(entry.name)}"
+                               class="checkbox checkbox-sm checkbox-primary entry-checkbox"
+                               data-entry-id="${this.escapeAttr(entryId)}"
+                               ${isChecked ? 'checked' : ''}
+                               ${isActionable ? '' : 'disabled'}
+                               data-action="select">
+                    </label>
+                </td>
+                <td>${icon}</td>
+                <td>
+                    ${canOpen ? `<button type="button" data-action="open" data-path="${this.escapeAttr(entry.path)}" data-name="${this.escapeAttr(entry.name)}" class="text-left hover:text-primary transition-colors"><span class="font-medium">${this.escapeHtml(entry.name)}</span></button>` : `<span class="font-medium">${this.escapeHtml(entry.name)}</span>`}
+                    ${kindBadge ? `<span class="ml-2">${kindBadge}</span>` : ''}
+                </td>
+                <td>
+                    ${entry.size <= 0 ? '-' : this.formatSize(entry.size)}
+                </td>
+                <td class="text-xs text-base-content/70">
+                    ${entry.mod_time || '-'}
+                </td>
+                <td>
+                    ${entry.active_debrid ? `<span>${this.escapeHtml(entry.active_debrid)}</span>` : '-'}
+                </td>
+                <td ${entry.kind === 'entry' ? `data-health-cell="${this.escapeAttr(entry.name)}"` : ''}>
+                    ${entry.kind === 'entry' ? this.healthBadge(this.state.health.get(entry.name)) : '—'}
+                </td>
+                <td>
+                    ${actionMenu}
+                </td>
+            </tr>
+        `;
+    }
+
+    // entryAction finds the element an event on the list acted on and the
+    // row's entry, decoded from its data-entry JSON.
+    entryAction(event) {
+        const el = event.target.closest('[data-action]');
+        const row = event.target.closest('tr[data-entry]');
+        if (!row || !this.refs.fileBrowserList.contains(row)) return null;
+        let entry;
+        try {
+            entry = JSON.parse(row.dataset.entry);
+        } catch {
+            return null;
+        }
+        return {el, entry, entryId: row.dataset.entryId};
+    }
+
+    bindEntryListEvents() {
+        const list = this.refs.fileBrowserList;
+        if (!list) return;
+
+        list.addEventListener('click', (e) => {
+            const hit = this.entryAction(e);
+            if (!hit || !hit.el) return;
+            const {el, entry} = hit;
+            switch (el.dataset.action) {
+                case 'open':
+                    this.handleEntryClick(entry.path, entry.is_dir, entry.name);
+                    break;
+                case 'download':
+                    this.downloadFile(entry.path, entry.name);
+                    break;
+                case 'recheck':
+                    this.recheckEntry(entry.name);
+                    break;
+                case 'delete':
+                    this.deleteTorrent(entry.info_hash, entry.name);
+                    break;
+            }
+        });
+
+        list.addEventListener('change', (e) => {
+            const hit = this.entryAction(e);
+            if (!hit || !hit.el || hit.el.dataset.action !== 'select') return;
+            this.handleEntrySelect(hit.entryId, hit.el.checked, hit.entry);
+        });
+
+        list.addEventListener('contextmenu', (e) => {
+            const hit = this.entryAction(e);
+            if (!hit || !this.isActionableEntry(hit.entry)) return;
+            this.showContextMenu(e, hit.entry);
+        });
     }
 
     isActionableEntry(entry) {
@@ -726,12 +786,16 @@ class FileBrowser {
     }
 
     escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return String(text ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     escapeAttr(text) {
+        if (text == null) return '';
         if (typeof text !== 'string') {
             text = JSON.stringify(text);
         }
@@ -741,13 +805,6 @@ class FileBrowser {
             .replace(/>/g, '&gt;')
             .replace(/'/g, '&#39;')
             .replace(/"/g, '&quot;');
-    }
-
-    escapeJs(text) {
-        if (typeof text !== 'string') {
-            text = String(text);
-        }
-        return text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
     }
 
     // Multi-select methods
