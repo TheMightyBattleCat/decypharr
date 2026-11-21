@@ -939,7 +939,7 @@
                         <div class="card bg-base-200 compact">
                             <div class="card-body">
                                 <div class="flex justify-between items-start mb-2">
-                                    <h4 class="font-medium text-sm truncate flex-1 mr-2">${transfer.name || 'Unknown'}</h4>
+                                    <h4 class="font-medium text-sm truncate flex-1 mr-2">${escapeText(transfer.name || 'Unknown')}</h4>
                                     <span class="text-xs text-base-content/70">${window.decypharrUtils.formatBytes(transfer.speed || 0)}/s</span>
                                 </div>
                                 <div class="flex items-center gap-2">
@@ -986,6 +986,12 @@
             contentEl.innerHTML = html;
         }
 
+        // Every server-supplied string written into innerHTML goes through this:
+        // User-Agents, torrent and file names are chosen by whoever sent them.
+        function escapeText(value) {
+            return window.decypharrUtils.escapeHtml(String(value ?? ''));
+        }
+
         function updateActiveStreams(activeStreamsData) {
             const streamsCount = document.getElementById('streams-count');
             const streamsTabCount = document.getElementById('streams-tab-count');
@@ -1012,7 +1018,7 @@
                 const sourceBadge = stream.source === 'nzb'
                     ? '<span class="badge badge-accent badge-xs">NZB</span>'
                     : '<span class="badge badge-secondary badge-xs">Torrent</span>';
-                const debridInfo = stream.debrid ? `<span class="text-xs text-base-content/60">${stream.debrid}</span>` : '';
+                const debridInfo = stream.debrid ? `<span class="text-xs text-base-content/60">${escapeText(stream.debrid)}</span>` : '';
 
                 // Format client info - truncate long user agents
                 let clientDisplay = '';
@@ -1024,7 +1030,7 @@
                         const match = clientText.match(/^([^\s\/]+(?:\/[\d.]+)?)/);
                         clientText = match ? match[1] : clientText.substring(0, 30) + '...';
                     }
-                    clientDisplay = `<span class="badge badge-ghost badge-xs" title="${stream.client}">${clientText}</span>`;
+                    clientDisplay = `<span class="badge badge-ghost badge-xs" title="${escapeText(stream.client)}">${escapeText(clientText)}</span>`;
                 }
 
                 html += `
@@ -1037,8 +1043,8 @@
                                         ${debridInfo}
                                         ${clientDisplay}
                                     </div>
-                                    <h4 class="font-medium text-sm truncate" title="${stream.entry_name}">${stream.entry_name}</h4>
-                                    <p class="text-xs text-base-content/70 truncate" title="${stream.file_name}">${stream.file_name}</p>
+                                    <h4 class="font-medium text-sm truncate" title="${escapeText(stream.entry_name)}">${escapeText(stream.entry_name)}</h4>
+                                    <p class="text-xs text-base-content/70 truncate" title="${escapeText(stream.file_name)}">${escapeText(stream.file_name)}</p>
                                 </div>
                                 <div class="text-right flex-shrink-0 ml-2">
                                     <div class="text-sm font-mono">${window.decypharrUtils.formatBytes(stream.file_size)}</div>
@@ -1161,28 +1167,27 @@
                 }
 
                 html += `
-                    <div class="card bg-base-200" id="debrid-card-${profile.name.replace(/\s+/g, '-')}">
+                    <div class="card bg-base-200" id="debrid-card-${escapeText(profile.name.replace(/\s+/g, '-'))}">
                         <div class="card-body p-4">
                             <div class="flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
                                 <div>
                                     <div class="flex items-center gap-2">
-                                        <h3 class="card-title text-lg">${profile.name || 'Unknown Service'}</h3>
+                                        <h3 class="card-title text-lg">${escapeText(profile.name || 'Unknown Service')}</h3>
                                         <span class="badge badge-secondary badge-sm">Debrid</span>
                                     </div>
-                                    <p class="text-sm text-base-content/70">${profile.username || 'No username'}</p>
+                                    <p class="text-sm text-base-content/70">${escapeText(profile.username || 'No username')}</p>
                                 </div>
                                 <div class="text-left sm:text-right">
                                     <div class="flex flex-wrap items-center gap-2 sm:justify-end">
                                         <button
                                             class="btn btn-xs btn-ghost debrid-speed-test-btn"
-                                            data-provider="${profile.name}"
-                                            onclick="runDebridSpeedTest('${profile.name}');">
+                                            data-provider="${escapeText(profile.name)}">
                                             Test Speed
                                         </button>
                                         <div class="text-sm font-mono">${formatNumber(profile.points || 0)} points</div>
                                     </div>
-                                    <div id="debrid-speed-result-${profile.name.replace(/\s+/g, '-')}" class="text-xs mt-1">${debridSpeedResultHtml}</div>
-                                    <div class="text-xs text-base-content/70">Type: ${profile.type || 'Unknown'}</div>
+                                    <div id="debrid-speed-result-${escapeText(profile.name.replace(/\s+/g, '-'))}" class="text-xs mt-1">${debridSpeedResultHtml}</div>
+                                    <div class="text-xs text-base-content/70">Type: ${escapeText(profile.type || 'Unknown')}</div>
                                     <div class="text-xs text-base-content/70">Expires: ${profile.expiration ? new Date(profile.expiration).toLocaleDateString() : 'Unknown'}</div>
                                 </div>
                             </div>
@@ -1354,7 +1359,7 @@
                             <div class="flex justify-between items-start">
                                 <div>
                                     <div class="flex items-center gap-1">
-                                        <span class="font-medium text-xs">${provider.host}</span>
+                                        <span class="font-medium text-xs">${escapeText(provider.host)}</span>
                                         <span class="badge ${provider.ssl ? 'badge-success' : 'badge-warning'} badge-xs">${provider.ssl ? 'SSL' : 'Plain'}</span>
                                         <span class="badge ${provider.tier === 'backup' ? 'badge-secondary' : 'badge-info'} badge-xs">${provider.tier === 'backup' ? 'Backup' : 'Primary'}</span>
                                     </div>
@@ -1364,14 +1369,13 @@
                                     ${speedResultHtml}
                                     <button
                                         class="btn btn-xs btn-ghost speed-test-btn"
-                                        data-provider="${provider.host}"
-                                        title="Run Speed Test"
-                                        onclick="runSpeedTest('${provider.host}');">
+                                        data-provider="${escapeText(provider.host)}"
+                                        title="Run Speed Test">
                                         Test Speed
                                     </button>
                                 </div>
                             </div>
-                            <div id="speed-result-${provider.host.replace(/\./g, '-')}" class="text-xs mt-1"></div>
+                            <div id="speed-result-${escapeText(provider.host.replace(/\./g, '-'))}" class="text-xs mt-1"></div>
                             ${(() => {
                                 const used = provider.bytes_used || 0;
                                 const q = provider.quota_bytes || 0;
@@ -1645,7 +1649,7 @@
         // Speed test function for NNTP providers
         window.runSpeedTest = async function (providerHost) {
             const resultDiv = document.getElementById(`speed-result-${providerHost.replace(/\./g, '-')}`);
-            const button = document.querySelector(`button[data-provider="${providerHost}"]`);
+            const button = Array.from(document.querySelectorAll('button.speed-test-btn')).find(b => b.dataset.provider === providerHost);
 
             if (!resultDiv || !button) return;
 
@@ -1668,7 +1672,7 @@
                 const result = await response.json();
 
                 if (result.error) {
-                    resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${result.error}</span>`;
+                    resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${escapeText(result.error)}</span>`;
                 } else {
                     const testedAt = result.tested_at ? new Date(result.tested_at).toLocaleTimeString() : '';
                     resultDiv.innerHTML = `
@@ -1680,7 +1684,7 @@
                     `;
                 }
             } catch (error) {
-                resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${error.message}</span>`;
+                resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${escapeText(error.message)}</span>`;
             } finally {
                 button.disabled = false;
                 button.innerHTML = 'Test Speed';
@@ -1691,7 +1695,7 @@
         window.runDebridSpeedTest = async function (providerName) {
             const sanitizedName = providerName.replace(/\s+/g, '-');
             const resultDiv = document.getElementById(`debrid-speed-result-${sanitizedName}`);
-            const button = document.querySelector(`button.debrid-speed-test-btn[data-provider="${providerName}"]`);
+            const button = Array.from(document.querySelectorAll('button.debrid-speed-test-btn')).find(b => b.dataset.provider === providerName);
 
             if (!resultDiv || !button) return;
 
@@ -1714,7 +1718,7 @@
                 const result = await response.json();
 
                 if (result.error) {
-                    resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${result.error}</span>`;
+                    resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${escapeText(result.error)}</span>`;
                 } else {
                     const testedAt = result.tested_at ? new Date(result.tested_at).toLocaleTimeString() : '';
                     // Convert MB/s to Mbps (multiply by 8)
@@ -1731,12 +1735,24 @@
                     `;
                 }
             } catch (error) {
-                resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${error.message}</span>`;
+                resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${escapeText(error.message)}</span>`;
             } finally {
                 button.disabled = false;
                 button.innerHTML = 'Test Speed';
             }
         };
+
+        // Speed-test buttons carry the provider in a data attribute; one
+        // delegated listener runs the test (no names inside inline handlers).
+        document.addEventListener('click', (event) => {
+            const btn = event.target.closest && event.target.closest('button[data-provider]');
+            if (!btn) return;
+            if (btn.classList.contains('debrid-speed-test-btn')) {
+                window.runDebridSpeedTest(btn.dataset.provider);
+            } else if (btn.classList.contains('speed-test-btn')) {
+                window.runSpeedTest(btn.dataset.provider);
+            }
+        });
 
         // Event listeners
         refreshBtn.addEventListener('click', loadStats);

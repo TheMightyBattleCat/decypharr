@@ -1378,7 +1378,7 @@ class RepairManager {
             const duration = start && end ? this.formatDuration(end - start) : (start ? 'running' : '-');
             tr.innerHTML = `
                 <td class="font-mono text-sm">${start ? start.toLocaleString() : '-'}</td>
-                <td>${run.trigger || '-'}</td>
+                <td>${this.escape(run.trigger || '-')}</td>
                 <td>${this.statusBadge(run.status)}</td>
                 <td>${run.stats?.probed ?? 0}</td>
                 <td class="${run.stats?.broken ? 'text-error font-medium' : ''}">${run.stats?.broken ?? 0}</td>
@@ -1388,7 +1388,7 @@ class RepairManager {
                     ? `<button type="button" class="link link-hover text-warning font-medium" data-unverified-run title="List the entries still unverified from this run">${run.stats.unverified}</button>`
                     : 0}</td>
                 <td>${duration}</td>
-                <td class="text-xs text-error">${run.error || ''}</td>
+                <td class="text-xs text-error">${this.escape(run.error || '')}</td>
             `;
             tr.querySelector('[data-unverified-run]')?.addEventListener('click', () => {
                 this.openUnverifiedModal({runId: run.id, runLabel: start ? start.toLocaleString() : run.id});
@@ -1404,7 +1404,7 @@ class RepairManager {
             failed: 'badge-error',
             cancelled: 'badge-warning',
         }[status] || 'badge-ghost';
-        return `<span class="badge ${cls}">${status || 'unknown'}</span>`;
+        return `<span class="badge ${cls}">${this.escape(status || 'unknown')}</span>`;
     }
 
     formatDuration(ms) {
