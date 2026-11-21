@@ -22,11 +22,18 @@ func (q *QBit) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	sid, err := sids.issue(username, password)
+	if err != nil {
+		http.Error(w, "could not start a session", http.StatusInternalServerError)
+		return
+	}
+	// Only download clients use this cookie; no page script needs it.
 	cookie := &http.Cookie{
 		Name:     "SID",
-		Value:    createSID(username, password),
+		Value:    sid,
 		Path:     "/",
-		SameSite: http.SameSiteNoneMode,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
 	}
 	http.SetCookie(w, cookie)
 	_, _ = w.Write([]byte("Ok."))

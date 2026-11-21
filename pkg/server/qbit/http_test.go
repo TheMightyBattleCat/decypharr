@@ -39,13 +39,7 @@ func TestHandleLoginAlwaysReturnsSID(t *testing.T) {
 	if len(cookies) != 1 || cookies[0].Name != "SID" || cookies[0].Value == "" {
 		t.Fatalf("login cookies = %#v, want one SID cookie", cookies)
 	}
-	username, password, err := extractFromSID(cookies[0].Value)
-	if err != nil {
-		t.Fatalf("decode SID: %v", err)
-	}
-	if username != "homarr-user" || password != "homarr-password" {
-		t.Fatalf("SID credentials = %q/%q", username, password)
-	}
+	assertSIDHidesCredentials(t, cookies[0].Value, "homarr-user", "homarr-password")
 }
 
 func TestWriteTorrentAddErrorPreservesSemantics(t *testing.T) {
