@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/textproto"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -491,6 +492,10 @@ func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExc
 	// provider remains unanswered, even when a later provider only failed to
 	// connect: that is no answer about the article.
 	var notFound error
+	// refused holds the providers that refused the command (481/482,
+	// 502, 480, 451, 500/501): no answer about the article, so a 430 from
+	// another provider is not one every provider gave.
+	var refused []config.UsenetProvider
 	noteOutcome := func(provider config.UsenetProvider, err error) {
 		var nntpErr *Error
 		if !errors.As(err, &nntpErr) {
@@ -611,6 +616,17 @@ func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExc
 						// Article not found - not retriable, try next provider
 						return retry.Unrecoverable(execErr)
 
+					case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
+						// A refusal that says nothing about the article: go
+						// to the next provider. The session's state is
+						// unknown (a lost login refuses every later command
+						// the same way), so close it rather than pool it.
+						releasedConn := currentConn
+						currentConn = nil
+						c.release(releasedConn)
+						c.noteRefusal(currentProvider, execErr)
+						return retry.Unrecoverable(execErr)
+
 					case ErrorTypeYencDecode:
 						// A corrupt copy fails the same way on every retry here, so
 						// go to the next provider. Close the connection rather than
@@ -677,6 +693,9 @@ func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExc
 				excludeForArticleNotFound(&exclusions, failedProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
 				exclusions.excludeHost(failedProvider.Host)
+			case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
+				exclusions.excludeHost(failedProvider.Host)
+				refused = append(refused, failedProvider)
 			case ErrorTypeYencDecode:
 				if !IsCorruptArticleError(err) {
 					return "", err
@@ -717,11 +736,18 @@ func (c *Client) executeWithFailover(ctx context.Context, exclusions providerExc
 		// connection error or busy reply its host, and the caller's own
 		// exceptions were there from the start. One that is not was never
 		// asked: its dial failed, it sat in its dial cooldown, or it was
-		// outside the serving tier. The 430 stays a 430 (playback pads on
+		// outside the serving tier. One that refused the command is
+		// excluded but gave no answer either, unless a provider on its
+		// backbone gave the 430. The 430 stays a 430 (playback pads on
 		// it), marked partial so a verdict against the release can tell.
 		var unasked []string
 		for _, p := range c.providers {
 			if !exclusions.excludes(p) {
+				unasked = append(unasked, p.Host)
+			}
+		}
+		for _, p := range refused {
+			if !exclusions.excludesBackbone(p) && !slices.Contains(unasked, p.Host) {
 				unasked = append(unasked, p.Host)
 			}
 		}
@@ -804,9 +830,30 @@ func outcomeKind(err error) string {
 		return "busy"
 	case ErrorTypeYencDecode:
 		return "decode"
+	case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
+		return "refused"
 	default:
 		return "other"
 	}
+}
+
+// noteRefusal handles a refusal status (4xx/5xx other than a 430/423 or a
+// busy reply) from a live session on provider: the provider's other idle
+// sessions most likely refuse too (a block run out, a lapsed account, a
+// lost login), so they are closed, and the provider is routed around like
+// one whose dial failed until a dial to it succeeds again. A refusal made
+// up on this side (Code below 400, e.g. a malformed reply) leaves the pool.
+func (c *Client) noteRefusal(provider config.UsenetProvider, err error) {
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) || nntpErr.Code < 400 {
+		return
+	}
+	pp := c.pools[provider.Host]
+	if pp == nil {
+		return
+	}
+	c.flushIdle(pp)
+	pp.noteDialFailure()
 }
 
 // ExecuteOnce runs fn on a single connection from any available provider,
@@ -834,6 +881,10 @@ func (c *Client) ExecuteOnce(ctx context.Context, fn func(conn *Connection) erro
 		case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
 			// Potentially dead connection - don't return it to the pool.
 			c.release(conn)
+		case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
+			// A refusing session: its state is unknown, don't pool it.
+			c.release(conn)
+			c.noteRefusal(provider, execErr)
 		default:
 			c.returnOrReleaseConn(conn, provider)
 		}
