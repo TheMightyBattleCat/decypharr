@@ -323,8 +323,8 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 
 		nzoID, err := s.addNZBURL(ctx, url, _arr, action, password)
 		if err != nil {
-			s.logger.Error().Err(err).Str("url", url).Msg("Failed to add NZB from URL")
-			errors = append(errors, fmt.Sprintf("Failed to add %s: %v", url, err))
+			s.logger.Error().Err(err).Str("url", utils.RedactURL(url)).Msg("Failed to add NZB from URL")
+			errors = append(errors, fmt.Sprintf("Failed to add %s: %v", utils.RedactURL(url), err))
 			continue
 		}
 		if nzoID != "" {
@@ -598,12 +598,12 @@ func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, actio
 	// Download NZB content
 	filename, content, err := utils.DownloadFile(url)
 	if err != nil {
-		s.logger.Error().Err(err).Str("url", url).Msg("Failed to download NZB from URL")
+		s.logger.Error().Err(err).Str("url", utils.RedactURL(url)).Msg("Failed to download NZB from URL")
 		return "", fmt.Errorf("failed to download NZB from URL: %w", err)
 	}
 
 	if len(content) == 0 {
-		s.logger.Warn().Str("url", url).Msg("Downloaded content is empty")
+		s.logger.Warn().Str("url", utils.RedactURL(url)).Msg("Downloaded content is empty")
 		return "", fmt.Errorf("downloaded content is empty")
 	}
 	return s.addNZBFile(ctx, content, filename, arr, action, password)

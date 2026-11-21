@@ -102,12 +102,12 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 			if trimmed := strings.TrimSpace(u); trimmed != "" {
 				filename, content, err := utils.DownloadFile(trimmed, utils.WithHeader("User-Agent", s.nzbUserAgent))
 				if err != nil {
-					results = append(results, &manager.ImportRequest{Status: "error", Error: fmt.Sprintf("Failed to fetch NZB from URL %s: %v", trimmed, err)})
+					results = append(results, &manager.ImportRequest{Status: "error", Error: fmt.Sprintf("Failed to fetch NZB from URL %s: %v", utils.RedactURL(trimmed), err)})
 					continue
 				}
 				req := manager.NewNZBRequest(filename, downloadFolder, content, instance, config.DownloadAction(action), callbackUrl, manager.ImportTypeAPI, skipMultiSeason)
 				results = append(results, req)
-				tasks = append(tasks, addTask{request: req, source: trimmed})
+				tasks = append(tasks, addTask{request: req, source: utils.RedactURL(trimmed)})
 			}
 		}
 	}

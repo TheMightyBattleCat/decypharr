@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -126,10 +127,15 @@ func WithHeader(key, value string) DownloadOptions {
 	}
 }
 
-func DownloadFile(url string, options ...DownloadOptions) (string, []byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func DownloadFile(link string, options ...DownloadOptions) (string, []byte, error) {
+	req, err := http.NewRequest("GET", link, nil)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to create request: %w", err)
+		// The parse error quotes the whole URL, key included.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return "", nil, fmt.Errorf("failed to create request for %s: %w", RedactURL(link), err)
 	}
 
 	// Apply options to the request
@@ -140,7 +146,13 @@ func DownloadFile(url string, options ...DownloadOptions) (string, []byte, error
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to download file: %w", err)
+		// client.Do wraps the failure in a *url.Error that quotes the full
+		// URL; keep only the inner error and name the redacted URL.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return "", nil, fmt.Errorf("failed to download %s: %w", RedactURL(link), err)
 	}
 	defer resp.Body.Close()
 
@@ -148,7 +160,7 @@ func DownloadFile(url string, options ...DownloadOptions) (string, []byte, error
 		return "", nil, fmt.Errorf("failed to download file: status code %d", resp.StatusCode)
 	}
 
-	filename := getFilenameFromResponse(resp, url)
+	filename := getFilenameFromResponse(resp, link)
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -273,4 +285,54 @@ func IsValidURL(s string) bool {
 	// Full parse for edge cases (ports, userinfo, IPv6, etc.)
 	u, err := url.Parse(s)
 	return err == nil && u.Host != ""
+}
+
+// redactedQueryKeys are the query parameters that carry an indexer or
+// tracker credential in a download link.
+var redactedQueryKeys = map[string]bool{
+	"apikey": true, "api_key": true, "r": true, "token": true, "key": true, "passkey": true,
+}
+
+// RedactURL returns raw with credentials masked, safe for logs and error
+// text: query values of credential keys become "***" and a userinfo password
+// is dropped. An unparseable value yields scheme and host only (or "" when
+// even that cannot be found).
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Parsing can fail on the very characters a key contains, so fall
+		// back to cutting everything after the host.
+		rest := raw
+		scheme := ""
+		if i := strings.Index(rest, "://"); i > 0 {
+			scheme, rest = rest[:i+3], rest[i+3:]
+		} else {
+			return ""
+		}
+		if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+			rest = rest[:i]
+		}
+		if i := strings.LastIndex(rest, "@"); i >= 0 {
+			rest = rest[i+1:]
+		}
+		return scheme + rest
+	}
+	if u.User != nil {
+		u.User = url.User(u.User.Username())
+	}
+	if u.RawQuery != "" {
+		parts := strings.Split(u.RawQuery, "&")
+		for i, part := range parts {
+			k, _, _ := strings.Cut(part, "=")
+			if dk, err := url.QueryUnescape(k); err == nil {
+				k = dk
+			}
+			if redactedQueryKeys[strings.ToLower(k)] {
+				ek, _, _ := strings.Cut(part, "=")
+				parts[i] = ek + "=***"
+			}
+		}
+		u.RawQuery = strings.Join(parts, "&")
+	}
+	return u.String()
 }
