@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -30,26 +31,60 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if !s.requestAuthenticated(r, cfg) {
-			if isAPI {
-				s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
-			} else {
-				http.Redirect(w, r, "/login", http.StatusSeeOther)
-			}
+		if s.validSession(r, cfg) {
+			next.ServeHTTP(w, r)
 			return
 		}
+		if s.isValidAPIToken(r) {
+			next.ServeHTTP(w, markTokenOnly(r))
+			return
+		}
+		if isAPI {
+			s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
+		} else {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+		}
+	})
+}
 
+type tokenOnlyKey struct{}
+
+// markTokenOnly records that r got in with the API token alone, with no
+// signed-in session.
+func markTokenOnly(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), tokenOnlyKey{}, true))
+}
+
+// authedBySession reports whether r is the owner's own session rather than a
+// caller holding only the API token. The token is also the password the Arrs
+// store for the qBittorrent and SABnzbd APIs, so it must not be able to read
+// the stored secrets, change the login or replace the config. With the login
+// off, or before one is stored, there is no session to ask for and every
+// request counts as the owner's.
+func authedBySession(r *http.Request) bool {
+	tokenOnly, _ := r.Context().Value(tokenOnlyKey{}).(bool)
+	return !tokenOnly
+}
+
+// requireSession refuses a request that authenticated with the API token
+// alone (see authedBySession).
+func (s *Server) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authedBySession(r) {
+			s.sendJSONError(w, "This action needs a signed-in session; the API token is not enough", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// requestAuthenticated reports whether r carries a valid API token or a
-// session cookie. A session is valid only for the credentials it logged in
-// under: saving the credentials again (a new password, a new API token)
-// changes their session version.
-func (s *Server) requestAuthenticated(r *http.Request, cfg *config.Config) bool {
-	if s.isValidAPIToken(r) {
-		return true
+// validSession reports whether r carries a session cookie that is valid for
+// the stored credentials. A session is valid only for the credentials it
+// logged in under: saving the credentials again (a new password, a new API
+// token) changes their session version.
+func (s *Server) validSession(r *http.Request, cfg *config.Config) bool {
+	if s.cookie == nil {
+		return false
 	}
 	session, err := s.cookie.Get(r, "auth-session")
 	auth, ok := session.Values["authenticated"].(bool)
@@ -60,15 +95,20 @@ func (s *Server) requestAuthenticated(r *http.Request, cfg *config.Config) bool 
 
 // setupAuthMiddleware guards the setup wizard's write routes. They are public
 // only while no credential is stored (a fresh install, or the login turned
-// off). Once one is, they need the same token or session as /api, whatever
+// off). Once one is, they need the owner's signed-in session, whatever
 // SetupComplete says: a config that stops validating must not hand the
 // wizard (turn the login off, install a provider, restore an archive over
-// config.json and auth.json) to anyone who can reach the port.
+// config.json and auth.json) to anyone who can reach the port, nor to a
+// caller holding only the API token (see authedBySession).
 func (s *Server) setupAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := config.Get()
-		if !cfg.UseAuth || cfg.NeedsAuth() || s.requestAuthenticated(r, cfg) {
+		if !cfg.UseAuth || cfg.NeedsAuth() || s.validSession(r, cfg) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if s.isValidAPIToken(r) {
+			s.sendJSONError(w, "The setup wizard needs a signed-in session; the API token is not enough", http.StatusForbidden)
 			return
 		}
 		s.sendJSONError(w, "Authentication required: a login is already set up", http.StatusUnauthorized)

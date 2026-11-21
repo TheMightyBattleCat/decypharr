@@ -129,15 +129,15 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/backups/jobs/{name}/run", s.handleBackupRunJob)
 			r.Post("/backups/snapshots/{id}/verify", s.handleBackupVerify)
 			r.Get("/backups/snapshots/{id}/download", s.handleBackupDownload)
-			r.Post("/backups/snapshots/{id}/restore/db", s.handleBackupRestoreDB)
-			r.Post("/backups/snapshots/{id}/restore/nzb", s.handleBackupRestoreNZB)
+			r.With(s.requireSession).Post("/backups/snapshots/{id}/restore/db", s.handleBackupRestoreDB)
+			r.With(s.requireSession).Post("/backups/snapshots/{id}/restore/nzb", s.handleBackupRestoreNZB)
 			r.Post("/backups/snapshots/{id}/restore/links/plan", s.handleBackupLinksPlan)
-			r.Post("/backups/snapshots/{id}/restore/links/apply", s.handleBackupLinksApply)
+			r.With(s.requireSession).Post("/backups/snapshots/{id}/restore/links/apply", s.handleBackupLinksApply)
 			r.Get("/backups/config-history", s.handleBackupConfigHistory)
 			r.Get("/backups/config-history/{id}/diff", s.handleBackupConfigDiff)
-			r.Post("/backups/config-history/{id}/revert", s.handleBackupConfigRevert)
+			r.With(s.requireSession).Post("/backups/config-history/{id}/revert", s.handleBackupConfigRevert)
 			r.Get("/backups/removed", s.handleBackupListRemoved)
-			r.Post("/backups/removed/{key}/restore", s.handleBackupRestoreRemoved)
+			r.With(s.requireSession).Post("/backups/removed/{key}/restore", s.handleBackupRestoreRemoved)
 			r.Post("/backups/retention/preview", s.handleBackupRetentionPreview)
 			r.Post("/backups/schedule/check", s.handleBackupScheduleCheck)
 
@@ -180,13 +180,16 @@ func (s *Server) WebRoutes() http.Handler {
 
 			// Config/Auth
 			r.Get("/config", s.handleGetConfig)
-			r.Post("/config", s.handleUpdateConfig)
+			// A caller holding only the API token (an Arr's download-client
+			// password) reads the config with its secrets blanked and cannot
+			// replace it, change the login or rotate a token.
+			r.With(s.requireSession).Post("/config", s.handleUpdateConfig)
 			r.Post("/virtual-folders/preview", s.handlePreviewVirtualFolder)
 			r.Post("/mount/cache/cleanup", s.handleRunMountCacheCleanup)
 			r.Post("/mount/cache/purge", s.handlePurgeMountCache)
-			r.Post("/refresh-token", s.handleRefreshAPIToken)
-			r.Post("/update-auth", s.handleUpdateAuth)
-			r.Post("/webhook-token/refresh", s.handleRefreshWebhookToken)
+			r.With(s.requireSession).Post("/refresh-token", s.handleRefreshAPIToken)
+			r.With(s.requireSession).Post("/update-auth", s.handleUpdateAuth)
+			r.With(s.requireSession).Post("/webhook-token/refresh", s.handleRefreshWebhookToken)
 			r.Post("/webhook-teardown", s.handleUpdateWebhookTeardown)
 		})
 	})

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/version"
@@ -32,7 +33,19 @@ type mountCachePurger interface {
 }
 
 func (s *Server) handleGetArrs(w http.ResponseWriter, r *http.Request) {
-	utils.JSONResponse(w, s.manager.Arr().GetAll(), http.StatusOK)
+	arrs := s.manager.Arr().GetAll()
+	if authedBySession(r) {
+		utils.JSONResponse(w, arrs, http.StatusOK)
+		return
+	}
+	// The API token alone does not read the Arrs' API keys. Copies: GetAll
+	// returns the live Arrs.
+	shown := make([]arr.Arr, len(arrs))
+	for i, a := range arrs {
+		shown[i] = *a
+		shown[i].Token = ""
+	}
+	utils.JSONResponse(w, shown, http.StatusOK)
 }
 
 func (s *Server) handleGetVersion(w http.ResponseWriter, r *http.Request) {
@@ -289,9 +302,17 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	arrStorage := s.manager.Arr()
 	cfg := *config.Get()
 	cfg.Arrs = arrStorage.SyncToConfig()
-	s.shownArrsMu.Lock()
-	s.shownArrs = cfg.Arrs
-	s.shownArrsMu.Unlock()
+	bySession := authedBySession(r)
+	if bySession {
+		// Only the settings page's read sets the list its save is laid over;
+		// a token caller cannot save (requireSession), and its blanked Arrs
+		// must never reach a save.
+		s.shownArrsMu.Lock()
+		s.shownArrs = cfg.Arrs
+		s.shownArrsMu.Unlock()
+	} else {
+		blankConfigSecrets(&cfg)
+	}
 
 	// Create response with API token info
 	type ConfigResponse struct {
@@ -307,13 +328,49 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	// AddOrUpdate API token and auth information
 	auth := cfg.GetAuth()
 	if auth != nil {
-		if auth.APIToken != "" {
+		if auth.APIToken != "" && bySession {
 			response.APIToken = auth.APIToken
 		}
 		response.AuthUsername = auth.Username
 	}
 
 	utils.JSONResponse(w, response, http.StatusOK)
+}
+
+// blankConfigSecrets clears every stored secret in cfg, a copy of the
+// config, for a caller holding only the API token: debrid keys, Arr API
+// keys, news-server and archive passwords, the SMB and rclone RC passwords,
+// the Plex token, the STRM signing secret, the Arr webhook token and the
+// notification URLs, which carry their own keys (the session secret is
+// never sent at all). The slices are copied first: cfg
+// shares them with the live config. A new secret setting belongs here and
+// in TestTokenOnlyConfigReadHasNoSecrets.
+func blankConfigSecrets(cfg *config.Config) {
+	cfg.Debrids = slices.Clone(cfg.Debrids)
+	for i := range cfg.Debrids {
+		cfg.Debrids[i].APIKey = ""
+		cfg.Debrids[i].DownloadAPIKeys = nil
+		cfg.Debrids[i].RcPass = ""
+	}
+	cfg.Arrs = slices.Clone(cfg.Arrs)
+	for i := range cfg.Arrs {
+		cfg.Arrs[i].Token = ""
+	}
+	cfg.Usenet.Providers = slices.Clone(cfg.Usenet.Providers)
+	for i := range cfg.Usenet.Providers {
+		cfg.Usenet.Providers[i].Password = ""
+	}
+	cfg.Usenet.ArchivePasswords = nil
+	cfg.SMB.Password = ""
+	cfg.Mount.ExternalRclone.RCPassword = ""
+	cfg.Plex.Token = ""
+	cfg.Strm.Secret = ""
+	cfg.WebhookToken = ""
+	cfg.Notifications.WebhookURL = ""
+	cfg.Notifications.CallbackURL = ""
+	cfg.DiscordWebhook = ""
+	cfg.CallbackURL = ""
+	cfg.SessionSecret = ""
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {

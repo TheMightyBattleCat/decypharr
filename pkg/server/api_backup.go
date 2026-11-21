@@ -196,6 +196,12 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 		s.writeBackupError(w, fmt.Errorf("%w: component must be db, config or links", backup.ErrInvalid))
 		return
 	}
+	if comp == backup.ComponentConfig && !authedBySession(r) {
+		// config.json holds every stored secret; the API token alone does
+		// not read them (see authedBySession).
+		s.sendJSONError(w, "Downloading the config needs a signed-in session; the API token is not enough", http.StatusForbidden)
+		return
+	}
 	res, err := s.backupService().Download(r.Context(), chi.URLParam(r, "id"), comp)
 	if err != nil {
 		s.writeBackupError(w, err)

@@ -114,14 +114,22 @@ func TestSetupRoutesNeedTheStoredLoginWhenTheConfigStopsValidating(t *testing.T)
 				t.Fatalf("anonymous setup calls changed the config: use_auth=%v providers=%+v", after.UseAuth, after.Usenet.Providers)
 			}
 
-			// The stored API token passes the guard (the handler then refuses
-			// the malformed body itself).
+			// The stored API token alone is refused (it is also the Arrs'
+			// download-client password); the owner's session passes the
+			// guard (the handler then refuses the malformed body itself).
 			req := httptest.NewRequest(http.MethodPost, "/api/setup/complete", strings.NewReader("{"))
 			req.Header.Set("Authorization", "Bearer tok")
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
-			if rec.Code == http.StatusUnauthorized {
-				t.Errorf("POST /api/setup/complete with the API token: 401, want the guard passed")
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("POST /api/setup/complete with the API token: %d, want 403", rec.Code)
+			}
+			req = httptest.NewRequest(http.MethodPost, "/api/setup/complete", strings.NewReader("{"))
+			req.AddCookie(signIn(t, router))
+			rec = httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("POST /api/setup/complete with a session: %d, want the guard passed", rec.Code)
 			}
 
 			login := httptest.NewRecorder()
