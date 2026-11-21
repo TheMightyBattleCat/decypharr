@@ -286,6 +286,17 @@ func (r *Repair) regrabStickyFailed(ctx context.Context, c *candidate, entry *st
 			Msg("Repair: sticky-failed regrab skipped; healing is off for this run")
 		return res
 	}
+	// The heal's PAR2 pass takes the release's claim over, so hold it first,
+	// as handleAutoDamage does. Refused means another re-grab or pass owns
+	// the release: leave it to that one, and don't list the file broken, or
+	// the run's own heal would start a second one unclaimed.
+	release, ok := r.handlers.TryAcquireRegrab(entryNZBID(entry))
+	if !ok {
+		r.logger.Debug().Str("entry", entry.Name).Str("file", name).
+			Msg("Repair: sticky-failed regrab skipped; entry already being handled")
+		return res
+	}
+	defer release()
 	acted, guardReason, err := r.repairPlaybackFileNow(ctx, c.name, name, true, false)
 	switch {
 	case err != nil:

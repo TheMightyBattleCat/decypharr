@@ -1069,26 +1069,56 @@ func (r *Repair) par2TerminalWithDamage(nzbID, fileName string) bool {
 // cache-only warm pass always, and a normal pass when
 // config.Repair.Par2RepairOnSweep is on (see coldSweepRepair).
 func (r *Repair) routeAutoRepair(entry *storage.Entry, res fileResult) fileResult {
-	nzbID := entry.InfoHash
-
-	if !r.handlers.TryAcquire(nzbID, handlerRegrab) {
-		if state, err := r.manager.storage.GetPar2RepairState(nzbID); err == nil && state != nil && state.Terminal {
-			// PAR2 already proved this release unrepairable - reclaim the
-			// stuck terminal claim for the sweep's own regrab path instead of
-			// deferring to it forever (Set clears terminal atomically).
-			r.handlers.Set(nzbID, handlerRegrab)
-		} else {
-			// Already being handled (an in-flight re-grab from another
-			// candidate, or a rare race with a manual action) - defer to it.
-			res.reason = "usenet_segment_missing_deferred"
-			return res
-		}
+	if !r.claimSweepRegrab(entry.InfoHash) {
+		// Already being handled (an in-flight re-grab from another
+		// candidate, or a rare race with a manual action) - defer to it.
+		res.reason = "usenet_segment_missing_deferred"
+		return res
 	}
 	// Released once healBrokenEntry has processed this candidate's broken
 	// files - see probeAndHealCandidates.
 	res.broken = true
 	res.reason = "usenet_segment_missing"
 	return res
+}
+
+// claimSweepRegrab takes nzbID's re-grab claim for a heal the sweep (or
+// FixBroken) is about to run. A claim left by a PAR2 pass that proved the
+// release unrepairable is reclaimed instead of deferred to for ever (Set
+// clears terminal atomically); any other live claim refuses.
+func (r *Repair) claimSweepRegrab(nzbID string) bool {
+	if r.handlers.TryAcquire(nzbID, handlerRegrab) {
+		return true
+	}
+	if state, err := r.manager.storage.GetPar2RepairState(nzbID); err == nil && state != nil && state.Terminal {
+		r.handlers.Set(nzbID, handlerRegrab)
+		return true
+	}
+	return false
+}
+
+// claimBrokenEntry claims every release behind h's broken files for a heal,
+// all or none: when one is refused, the claims already taken are released
+// and ok is false. Files with no InfoHash are healed unclaimed, as before.
+func (r *Repair) claimBrokenEntry(h *storage.EntryHealth) (claimed []string, ok bool) {
+	seen := make(map[string]struct{}, len(h.BrokenFiles))
+	for _, bf := range h.BrokenFiles {
+		if bf.InfoHash == "" {
+			continue
+		}
+		if _, dup := seen[bf.InfoHash]; dup {
+			continue
+		}
+		seen[bf.InfoHash] = struct{}{}
+		if !r.claimSweepRegrab(bf.InfoHash) {
+			for _, id := range claimed {
+				r.handlers.ReleaseRegrab(id)
+			}
+			return nil, false
+		}
+		claimed = append(claimed, bf.InfoHash)
+	}
+	return claimed, true
 }
 
 // sweepDamageCountTimeout bounds recordDeadSegments' count of every dead
@@ -1351,10 +1381,27 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 		if run.WasHealed(name) {
 			return true
 		}
+		// The heal's PAR2 pass takes the release's claim over (runNow with
+		// fromSweep), so the heal must hold it first: unclaimed, it would
+		// overwrite a running re-grab's claim and two heals of one release
+		// would run at once. The stop-schedule caller holds no claims of its
+		// own here: every probed entry released its claims (finalizeBrokenEntry,
+		// or the cut-short probe) before the probe pass returned.
+		claimed, ok := r.claimBrokenEntry(h)
+		if !ok {
+			r.logger.Debug().Str("entry", name).
+				Msg("Repair: broken entry already being handled; deferring to it")
+			return true
+		}
 		if automatic {
 			r.healBrokenEntryGuarded(ctx, run, &statsMu, name, h, false)
 		} else {
 			r.healBrokenEntry(ctx, run, &statsMu, name, h, false)
+		}
+		// Released by the IDs claimed, not from h: a PAR2 fix drops files
+		// from h during the heal.
+		for _, id := range claimed {
+			r.handlers.ReleaseRegrab(id)
 		}
 		return true
 	})
