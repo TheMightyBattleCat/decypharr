@@ -154,10 +154,19 @@ func (s *fakeNNTP) serve(conn net.Conn) {
 // bandwidth tracker and reaper.
 func newStatTestClient(t *testing.T, providers []config.UsenetProvider, percent int) *Client {
 	t.Helper()
+	return newStatTestClientBW(t, providers, percent, nil)
+}
+
+// newStatTestClientBW is newStatTestClient with the bandwidth tracker set
+// before the repair pool's workers start: they read c.bw, so a test must not
+// assign it afterwards.
+func newStatTestClientBW(t *testing.T, providers []config.UsenetProvider, percent int, bw *BandwidthTracker) *Client {
+	t.Helper()
 	c := &Client{
 		pools:     map[string]*ProviderPool{},
 		providers: providers,
 		logger:    zerolog.Nop(),
+		bw:        bw,
 	}
 	for _, p := range providers {
 		c.pools[p.Host] = &ProviderPool{

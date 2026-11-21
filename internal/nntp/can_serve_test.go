@@ -28,8 +28,7 @@ func TestCanServe(t *testing.T) {
 	})
 
 	t.Run("reserve band", func(t *testing.T) {
-		c := newStatTestClient(t, []config.UsenetProvider{primary, backup}, 100)
-		c.bw = quotaTracker(primary.Host, 95, 100, 10)
+		c := newStatTestClientBW(t, []config.UsenetProvider{primary, backup}, 100, quotaTracker(primary.Host, 95, 100, 10))
 		ok, reason := c.CanServe(context.Background())
 		if ok || !strings.Contains(reason, "quota") {
 			t.Fatalf("bulk CanServe = %v (%q), want false naming the quota (backup alone is fill-only)", ok, reason)
@@ -43,8 +42,7 @@ func TestCanServe(t *testing.T) {
 	})
 
 	t.Run("hard quota", func(t *testing.T) {
-		c := newStatTestClient(t, []config.UsenetProvider{primary}, 100)
-		c.bw = quotaTracker(primary.Host, 100, 100, 10)
+		c := newStatTestClientBW(t, []config.UsenetProvider{primary}, 100, quotaTracker(primary.Host, 100, 100, 10))
 		if ok, _ := c.CanServe(urgent); ok {
 			t.Fatal("urgent CanServe = true with the only primary over its hard quota")
 		}
