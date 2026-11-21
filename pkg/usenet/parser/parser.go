@@ -247,8 +247,11 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 // client.
 type segmentStatFunc func(ctx context.Context, messageID string) error
 
+// statSegment runs at PriorityUrgent so a primary in its quota reserve band
+// still answers it: one STAT per grab is far below any reserve, and without
+// it every grab fails while each primary is past its soft quota.
 func (p *NZBParser) statSegment(ctx context.Context, messageID string) error {
-	return p.manager.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+	return p.manager.ExecuteWithFailover(nntp.WithPriority(ctx, nntp.PriorityUrgent), func(conn *nntp.Connection) error {
 		_, _, statErr := conn.Stat(messageID)
 		return statErr
 	})

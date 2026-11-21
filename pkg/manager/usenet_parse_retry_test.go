@@ -16,7 +16,18 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
+// stubNZBProviders replaces the usenet provider check for one test.
+func stubNZBProviders(t *testing.T, ready func() (bool, string)) {
+	t.Helper()
+	orig := nzbProvidersReady
+	nzbProvidersReady = func(*Manager, context.Context) (bool, string) { return ready() }
+	t.Cleanup(func() { nzbProvidersReady = orig })
+}
+
+func providersReady() (bool, string) { return true, "" }
+
 func TestRetryNZBParseOnlyRetriesErrorsThatMayPass(t *testing.T) {
+	stubNZBProviders(t, providersReady)
 	m := &Manager{logger: zerolog.Nop()}
 	m.jobQueue = NewJobQueue(t.Context(), 1, func(context.Context, *Job) {})
 	t.Cleanup(m.jobQueue.Close)
@@ -68,6 +79,7 @@ func TestRetryNZBParseOnlyRetriesErrorsThatMayPass(t *testing.T) {
 // A 430 failover settled on while a provider was never asked is the
 // parser's "could not check": parsed again, not failed as a dead release.
 func TestRetryNZBParseRetriesAPartialNotFound(t *testing.T) {
+	stubNZBProviders(t, providersReady)
 	m := &Manager{logger: zerolog.Nop()}
 	m.jobQueue = NewJobQueue(t.Context(), 1, func(context.Context, *Job) {})
 	t.Cleanup(m.jobQueue.Close)

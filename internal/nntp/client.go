@@ -856,6 +856,29 @@ func (c *Client) noteRefusal(provider config.UsenetProvider, err error) {
 	pp.noteDialFailure()
 }
 
+// CanServe reports whether a checkout with ctx's priority could be handed a
+// connection now, without taking one: some provider sits in the lead tier
+// for that priority (not blocked, not demoted by its quota) and at least one
+// such provider is not cooling down after failed dials. When it is false the
+// reason says which, and an error from that checkout is about the providers,
+// not about the article asked for.
+func (c *Client) CanServe(ctx context.Context) (bool, string) {
+	leadExists := false
+	for _, p := range c.providers {
+		if c.providerTier(ctx, p) != tierLead {
+			continue
+		}
+		leadExists = true
+		if pp := c.pools[p.Host]; pp != nil && pp.isWarm() {
+			return true, ""
+		}
+	}
+	if !leadExists {
+		return false, "no primary provider can take requests (every one is over its quota, or none is configured)"
+	}
+	return false, "every primary provider is cooling down after failed connections"
+}
+
 // ExecuteOnce runs fn on a single connection from any available provider,
 // with no retry and no cross-provider failover - unlike ExecuteWithFailover,
 // one failure is the final answer. For latency-sensitive, best-effort

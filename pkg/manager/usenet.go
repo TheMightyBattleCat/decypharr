@@ -93,6 +93,26 @@ const (
 	// nzbParseRetryDelay is the wait before the second parse; it doubles for
 	// each later one.
 	nzbParseRetryDelay = 30 * time.Second
+	// nzbProviderWaitCap bounds the wait of a queued NZB whose parse no
+	// provider can take (see nzbProviderWaitDelay).
+	nzbProviderWaitCap = 15 * time.Minute
+)
+
+// nzbProviderWaitDelay is the first wait of a queued NZB whose parse no
+// provider can take; it doubles for each later wait up to
+// nzbProviderWaitCap. These waits never count against nzbParseMaxAttempts.
+// A var so tests can shorten it.
+var nzbProviderWaitDelay = 30 * time.Second
+
+// parseQueuedNZB and nzbProvidersReady stand for the usenet client's parse
+// and its provider check; vars so tests can replace them.
+var (
+	parseQueuedNZB = func(m *Manager, ctx context.Context, id, name string, content []byte, category string) (*storage.NZB, map[string]*parser.FileGroup, error) {
+		return m.usenet.ParseWithID(ctx, id, name, content, category)
+	}
+	nzbProvidersReady = func(m *Manager, ctx context.Context) (bool, string) {
+		return m.usenet.CanServe(ctx)
+	}
 )
 
 // errJobSettled tells processJob that the job already recorded its outcome
@@ -119,14 +139,54 @@ func (m *Manager) rejectDamagedNZB(job *Job, cause error) {
 		Msg("NZB rejected: release confirmed unavailable; queued as failed so the Arr blocklists and re-searches")
 }
 
+// waitForNZBProvider puts a queued NZB's parse off while no provider can
+// take its STAT (every primary over its quota, or every one cooling down
+// after failed dials): an error then says nothing about the release, and
+// failing the download would have the Arr blocklist it. The wait doubles
+// from nzbProviderWaitDelay to nzbProviderWaitCap and does not count as a
+// parse attempt. It reports whether it scheduled the job again.
+func (m *Manager) waitForNZBProvider(ctx context.Context, job *Job) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	ok, reason := nzbProvidersReady(m, ctx)
+	if ok {
+		return false
+	}
+	delay := nzbProviderWait(job.ProviderWaits)
+	job.ProviderWaits++
+	ev := m.logger.Debug()
+	if job.ProviderWaits == 1 {
+		ev = m.logger.Warn()
+	}
+	ev.Str("name", job.Entry.Name).
+		Str("reason", reason).
+		Int("wait", job.ProviderWaits).
+		Dur("retry_in", delay).
+		Msg("No usenet provider can check this NZB now; it stays queued and is parsed when one can")
+	m.jobQueue.Retry(job, delay)
+	return true
+}
+
+// nzbProviderWait is the wait before the next parse of an NZB already put
+// off waits times: nzbProviderWaitDelay doubled per wait, at most
+// nzbProviderWaitCap.
+func nzbProviderWait(waits int) time.Duration {
+	return min(nzbProviderWaitDelay<<min(max(waits, 0), 10), nzbProviderWaitCap)
+}
+
 // retryNZBParse schedules another parse of a queued NZB after a parse error
 // that may pass (a provider or connection error), until nzbParseMaxAttempts.
-// It reports false when the error should fail the download now: the release
-// is confirmed dead, the NZB itself is invalid, the attempts are used up, or
-// the manager is stopping.
+// While no provider can take the parse at all, it waits instead without
+// counting an attempt (waitForNZBProvider). It reports false when the error
+// should fail the download now: the release is confirmed dead, the NZB
+// itself is invalid, the attempts are used up, or the manager is stopping.
 func (m *Manager) retryNZBParse(ctx context.Context, job *Job, err error) bool {
 	if ctx.Err() != nil || errors.Is(err, parser.ErrReleaseUnavailable) || errors.Is(err, usenet.ErrInvalidNZB) {
 		return false
+	}
+	if m.waitForNZBProvider(ctx, job) {
+		return true
 	}
 	if job.ParseAttempts+1 >= nzbParseMaxAttempts {
 		return false
@@ -154,11 +214,14 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 		if job.Request == nil {
 			return fmt.Errorf("NZB job has no request or processing payload")
 		}
+		if m.waitForNZBProvider(ctx, job) {
+			return errJobSettled
+		}
 		content, err := os.ReadFile(job.Entry.Magnet)
 		if err != nil {
 			return fmt.Errorf("read staged NZB: %w", err)
 		}
-		meta, groups, err := m.usenet.ParseWithID(ctx, job.Entry.InfoHash, job.Request.Name, content, job.Request.Arr.Name)
+		meta, groups, err := parseQueuedNZB(m, ctx, job.Entry.InfoHash, job.Request.Name, content, job.Request.Arr.Name)
 		if err != nil {
 			if errors.Is(err, parser.ErrReleaseUnavailable) {
 				// A missing article at the parse stat is a definitive

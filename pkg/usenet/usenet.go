@@ -823,6 +823,18 @@ func (u *Usenet) cleanupIdleFS() {
 	}
 }
 
+// CanServe reports whether a request at ctx's priority could be sent to a
+// provider now (see nntp.Client.CanServe). When false, the reason says why.
+// The import asks at its own (normal) priority, not the parse STAT's urgent
+// one: the archive reads that follow the STAT run at normal priority and
+// would fail the download at once while every primary is in its reserve.
+func (u *Usenet) CanServe(ctx context.Context) (bool, string) {
+	if u == nil || u.nntp == nil {
+		return false, "no usenet providers are configured"
+	}
+	return u.nntp.CanServe(ctx)
+}
+
 // Parse processes an NZB for download/streaming (quick parse, defers archive extraction)
 func (u *Usenet) Parse(ctx context.Context, name string, content []byte, category string) (*storage.NZB, map[string]*parser.FileGroup, error) {
 	return u.ParseWithID(ctx, "", name, content, category)

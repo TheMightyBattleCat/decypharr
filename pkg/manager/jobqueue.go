@@ -34,6 +34,7 @@ type Job struct {
 	Entry          *storage.Entry               // Entry created during processing
 	ResumeExisting bool                         // Continue an already persisted provider placement
 	ParseAttempts  int                          // NZB parses already retried after an error (see retryNZBParse)
+	ProviderWaits  int                          // NZB parses put off because no provider could take them (see waitForNZBProvider)
 	CreatedAt      time.Time
 }
 
