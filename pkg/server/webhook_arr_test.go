@@ -114,3 +114,52 @@ func TestHandleArrWebhook_WrongMethod(t *testing.T) {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
 	}
 }
+
+func TestUpdateWebhookTeardown_RefusedWithoutToken(t *testing.T) {
+	config.Get().WebhookToken = ""
+	t.Cleanup(func() {
+		config.Get().WebhookToken = ""
+		config.Get().ArrWebhookTeardown = false
+	})
+	s := newTestServerForWebhook()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/webhook-teardown", strings.NewReader(`{"enabled":true}`))
+	rec := httptest.NewRecorder()
+	s.handleUpdateWebhookTeardown(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rec.Body.String(), "generate a webhook token first") {
+		t.Errorf("body = %q, want the generate-a-token hint", rec.Body.String())
+	}
+	if config.Get().ArrWebhookTeardown {
+		t.Error("teardown was switched on with no token")
+	}
+
+	// Switching it off is always allowed.
+	req = httptest.NewRequest(http.MethodPost, "/api/webhook-teardown", strings.NewReader(`{"enabled":false}`))
+	rec = httptest.NewRecorder()
+	s.handleUpdateWebhookTeardown(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("disable status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+// With teardown on in a loaded config but no token, a delete event must do
+// nothing. The Server has a nil manager, so reaching the cleanup would panic.
+func TestHandleArrWebhook_DeleteIgnoredWithoutToken(t *testing.T) {
+	config.Get().WebhookToken = ""
+	config.Get().ArrWebhookTeardown = true
+	t.Cleanup(func() { config.Get().ArrWebhookTeardown = false })
+	s := newTestServerForWebhook()
+
+	body := `{"eventType":"EpisodeFileDelete","episodeFile":{"relativePath":"a.mkv"}}`
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/arr", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleArrWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}

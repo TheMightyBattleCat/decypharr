@@ -2118,6 +2118,13 @@ class ConfigManager {
 
         if (!emptyState || !configuredState) return;
 
+        // Teardown needs a webhook token; the server refuses it without one.
+        const teardownBox = document.getElementById('arrWebhookTeardown');
+        if (teardownBox) {
+            teardownBox.disabled = !token;
+            teardownBox.title = token ? '' : 'Generate a webhook token first';
+        }
+
         if (!token) {
             emptyState.classList.remove('hidden');
             configuredState.classList.add('hidden');

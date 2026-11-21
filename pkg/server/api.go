@@ -897,6 +897,10 @@ func (s *Server) handleUpdateWebhookTeardown(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if req.Enabled && config.Get().WebhookToken == "" {
+		http.Error(w, "generate a webhook token first", http.StatusBadRequest)
+		return
+	}
 	cfg, err := config.Update(func(next *config.Config) error {
 		next.ArrWebhookTeardown = req.Enabled
 		return nil

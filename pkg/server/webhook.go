@@ -200,6 +200,7 @@ func (s *Server) tautulliAuth(next http.Handler) http.Handler {
 // configured - not at startup, since config can change without a restart via
 // /api/config, and re-checking here always reflects the current value.
 var arrWebhookWarnedUnauthenticated bool
+var arrWebhookWarnedDeleteNoToken bool
 
 // handleRefreshWebhookToken generates a new Arr webhook token and saves it,
 // for the settings page's Generate/Refresh Token action.
@@ -292,6 +293,17 @@ func (s *Server) handleArrWebhook(w http.ResponseWriter, r *http.Request) {
 		// MovieDelete/SeriesDelete carry no single file to act on; the
 		// scheduled sweep covers these regardless.
 		s.logger.Debug().Str("event_type", payload.EventType).Msg("Arr webhook: event type not handled, ignoring")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if config.Get().WebhookToken == "" {
+		// Any caller can reach this route without a token, so a delete
+		// notice is not trusted to remove a download.
+		if !arrWebhookWarnedDeleteNoToken {
+			arrWebhookWarnedDeleteNoToken = true
+			s.logger.Warn().Msg("Arr webhook: file delete ignored, no webhook_token configured")
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}

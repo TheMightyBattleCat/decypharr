@@ -346,14 +346,14 @@ func TestDedicatedSettingsHandlersLeaveThePreviousSnapshotAlone(t *testing.T) {
 		{"plex", func(w http.ResponseWriter) {
 			s.handleUpdatePlexConfig(w, httptest.NewRequest(http.MethodPut, "/api/plex/config", strings.NewReader(`{"plex_url":"http://plex.example.test:32400","plex_token":"plex-token"}`)))
 		}, func(c *config.Config) bool { return c.Plex.Token == "plex-token" }},
-		{"webhook teardown", func(w http.ResponseWriter) {
-			s.handleUpdateWebhookTeardown(w, httptest.NewRequest(http.MethodPut, "/api/webhook/teardown", strings.NewReader(`{"enabled":true}`)))
-		}, func(c *config.Config) bool { return c.ArrWebhookTeardown }},
 		{"webhook token", func(w http.ResponseWriter) {
 			if _, err := s.refreshWebhookToken(); err != nil {
 				t.Fatalf("refreshWebhookToken: %v", err)
 			}
 		}, func(c *config.Config) bool { return c.WebhookToken != "" }},
+		{"webhook teardown", func(w http.ResponseWriter) {
+			s.handleUpdateWebhookTeardown(w, httptest.NewRequest(http.MethodPut, "/api/webhook/teardown", strings.NewReader(`{"enabled":true}`)))
+		}, func(c *config.Config) bool { return c.ArrWebhookTeardown }},
 	}
 	for _, step := range steps {
 		before := config.Get()
