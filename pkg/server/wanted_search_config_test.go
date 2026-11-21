@@ -29,7 +29,7 @@ func withLiveArrs(t *testing.T, arrs ...config.Arr) *Server {
 	if err := live.Save(); err != nil {
 		t.Fatal(err)
 	}
-	return &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	return &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 }
 
 // liveConfigBody is the live config as a settings save would post it, with

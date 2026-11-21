@@ -25,14 +25,17 @@ func (s *Server) WebRoutes() http.Handler {
 	r.Post("/login", s.LoginHandler)
 	r.Get("/register", s.RegisterHandler)
 	r.Post("/register", s.RegisterHandler)
-	r.Post("/skip-auth", s.skipAuthHandler)
 
-	// Setup wizard - public, no auth required
+	// Setup wizard - public until a login is stored (setupAuthMiddleware)
 	r.Get("/setup", s.SetupHandler)
-	r.Post("/api/setup/complete", s.setupCompleteHandler)
-	r.Post("/api/setup/restore/snapshots", s.setupRestoreListHandler)
-	r.Post("/api/setup/restore", s.setupRestoreHandler)
-	r.Post("/api/setup/restore/upload", s.setupRestoreUploadHandler)
+	r.Group(func(r chi.Router) {
+		r.Use(s.setupAuthMiddleware)
+		r.Post("/skip-auth", s.skipAuthHandler)
+		r.Post("/api/setup/complete", s.setupCompleteHandler)
+		r.Post("/api/setup/restore/snapshots", s.setupRestoreListHandler)
+		r.Post("/api/setup/restore", s.setupRestoreHandler)
+		r.Post("/api/setup/restore/upload", s.setupRestoreUploadHandler)
+	})
 
 	// Protected routes - require auth
 	r.Group(func(r chi.Router) {

@@ -24,6 +24,34 @@ func newTestManager(t *testing.T) *manager.Manager {
 	return m
 }
 
+// newSettingsTestManager is newTestManager for a test that saves settings: a
+// save is refused unless the result passes Validate, so the config gets a
+// Usenet provider (added after the manager is built, so nothing dials it)
+// until the test ends.
+func newSettingsTestManager(t *testing.T) *manager.Manager {
+	t.Helper()
+	m := newTestManager(t)
+	var added bool
+	if _, err := config.Update(func(c *config.Config) error {
+		if len(c.Debrids) == 0 && len(c.Usenet.Providers) == 0 {
+			c.Usenet.Providers = []config.UsenetProvider{{Host: "news.invalid", Port: 563, Username: "u", Password: "p", SSL: true, MaxConnections: 1}}
+			added = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if added {
+		t.Cleanup(func() {
+			_, _ = config.Update(func(c *config.Config) error {
+				c.Usenet.Providers = nil
+				return nil
+			})
+		})
+	}
+	return m
+}
+
 // TestHandleUpdateConfig_PreservesWebhookToken guards against the config
 // save wiping webhook_token: the settings form has no field for it, so a
 // PUT /api/config that omits it decodes to an empty string unless
@@ -38,7 +66,7 @@ func TestHandleUpdateConfig_PreservesWebhookToken(t *testing.T) {
 
 	s := &Server{
 		logger:  zerolog.Nop(),
-		manager: newTestManager(t),
+		manager: newSettingsTestManager(t),
 	}
 
 	// A payload shaped like what the current settings form actually submits:
@@ -99,7 +127,7 @@ func TestHandleUpdateConfig_KeepsRepairSettingsTheFormDoesNotSend(t *testing.T) 
 	live.Repair.Par2UrgentConcurrency = 5
 	live.Repair.Par2RepairOnSweep = true
 
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 	body := `{"bind_address":"0.0.0.0","port":"8282","download_folder":"/tmp/downloads",
 		"repair":{"enabled":false,"schedule":"23:10","workers":3,"auto_repair":true}}`
 	rec := httptest.NewRecorder()
@@ -128,7 +156,7 @@ func TestHandleUpdateRepairConfig_PartialBodyKeepsOtherRepairSettings(t *testing
 	live.Repair.AutoRepair = true
 	live.Repair.FFProbePath = "/opt/ffmpeg/ffprobe"
 
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 	body := `{"playback_padding":true,"par2_repair":true,"pad_max_run_segments":4,"par2_repair_mode":"auto_threshold","par2_repair_min_segments":32}`
 	rec := httptest.NewRecorder()
 	s.handleUpdateRepairConfig(rec, httptest.NewRequest(http.MethodPut, "/api/repair/config", strings.NewReader(body)))
@@ -158,7 +186,7 @@ func TestHandleUpdatePrecacheConfig_PartialBodyKeepsOtherSettings(t *testing.T) 
 	live.Precache.PrecacheEvictAfterWatched = true
 	live.Precache.PrecacheMaxBytes = &capBytes
 
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 	body := `{"precache_threshold_percent":20,"precache_whole_season":false,"precache_next_episodes":3}`
 	rec := httptest.NewRecorder()
 	s.handleUpdatePrecacheConfig(rec, httptest.NewRequest(http.MethodPut, "/api/precache/config", strings.NewReader(body)))
@@ -199,7 +227,7 @@ func TestHandleUpdateConfig_PreferFasterServersAppliesWithoutRestart(t *testing.
 		t.Fatalf("normalizing the live config: %v", err)
 	}
 
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 	for _, on := range []bool{false, true} {
 		body := `{"usenet":{"prefer_faster_servers":false}}`
 		if on {
@@ -258,7 +286,7 @@ func TestConfigHandlersUseSnapshots(t *testing.T) {
 		t.Fatalf("normalizing the config: %v", err)
 	}
 	before := config.Get()
-	mgr := newTestManager(t)
+	mgr := newSettingsTestManager(t)
 	mgr.Arr().AddOrUpdate(&arr.Arr{Name: "manual", Host: "http://example.test", Token: "token", Source: arr.SourceManual})
 	server := &Server{logger: zerolog.Nop(), manager: mgr}
 	response := httptest.NewRecorder()
@@ -302,7 +330,7 @@ func TestDedicatedSettingsHandlersLeaveThePreviousSnapshotAlone(t *testing.T) {
 		config.Reset()
 		config.SetConfigPath(previousPath)
 	})
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 
 	steps := []struct {
 		name    string
@@ -424,7 +452,7 @@ func TestHandleUpdateConfig_UnchangedStartupSettingsDoNotRestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("normalizing the config: %v", err)
 	}
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 	save := func(body string) bool {
 		t.Helper()
 		rec := httptest.NewRecorder()
@@ -460,7 +488,7 @@ func TestHandleUpdateConfig_UnchangedStartupSettingsDoNotRestart(t *testing.T) {
 func TestHandleUpdateConfig_RejectsInvalidHearsayBlocklist(t *testing.T) {
 	s := &Server{
 		logger:  zerolog.Nop(),
-		manager: newTestManager(t),
+		manager: newSettingsTestManager(t),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(`{"hearsay":{"blocklist":["10.0.0.1"]}}`))

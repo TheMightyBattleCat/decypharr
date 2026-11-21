@@ -22,7 +22,7 @@ import (
 // stored host and key are not a credential.
 func TestCompatibilityAPIsAuthenticateBeforeProbing(t *testing.T) {
 	useTestAuth(t, "ui-password", "server-token")
-	mgr := newTestManager(t)
+	mgr := newSettingsTestManager(t)
 
 	var probes atomic.Int64
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +94,7 @@ func TestConfigAPIKeepsSessionSecretPrivate(t *testing.T) {
 	if secret == "" {
 		t.Fatal("no session secret generated")
 	}
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t)}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t)}
 
 	response := httptest.NewRecorder()
 	s.handleGetConfig(response, httptest.NewRequest(http.MethodGet, "/api/config", nil))

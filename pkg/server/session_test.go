@@ -110,7 +110,7 @@ func TestSessionWithoutVersionIsRefused(t *testing.T) {
 // not, since it does not save auth.json.
 func TestSettingsSaveKeepsBrowserSession(t *testing.T) {
 	cfg := useTestAuth(t, "password", "token")
-	s := &Server{logger: zerolog.Nop(), manager: newTestManager(t), cookie: sessions.NewCookieStore([]byte(cfg.SecretKey()))}
+	s := &Server{logger: zerolog.Nop(), manager: newSettingsTestManager(t), cookie: sessions.NewCookieStore([]byte(cfg.SecretKey()))}
 
 	login := httptest.NewRecorder()
 	s.LoginHandler(login, httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"admin","password":"password"}`)))

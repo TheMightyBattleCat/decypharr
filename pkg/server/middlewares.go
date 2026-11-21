@@ -30,21 +30,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Check for API token first
-		if s.isValidAPIToken(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Fall back to session authentication. A session is valid only for
-		// the credentials it logged in under: saving the credentials again (a
-		// new password, a new API token) changes their session version.
-		session, err := s.cookie.Get(r, "auth-session")
-		auth, ok := session.Values["authenticated"].(bool)
-		version, hasVersion := session.Values["auth_version"].(string)
-		currentAuth := cfg.GetAuth()
-
-		if err != nil || !ok || !auth || !hasVersion || currentAuth == nil || version != currentAuth.SessionVersion {
+		if !s.requestAuthenticated(r, cfg) {
 			if isAPI {
 				s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
 			} else {
@@ -54,6 +40,38 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		next.ServeHTTP(w, r)
+	})
+}
+
+// requestAuthenticated reports whether r carries a valid API token or a
+// session cookie. A session is valid only for the credentials it logged in
+// under: saving the credentials again (a new password, a new API token)
+// changes their session version.
+func (s *Server) requestAuthenticated(r *http.Request, cfg *config.Config) bool {
+	if s.isValidAPIToken(r) {
+		return true
+	}
+	session, err := s.cookie.Get(r, "auth-session")
+	auth, ok := session.Values["authenticated"].(bool)
+	version, hasVersion := session.Values["auth_version"].(string)
+	currentAuth := cfg.GetAuth()
+	return err == nil && ok && auth && hasVersion && currentAuth != nil && version == currentAuth.SessionVersion
+}
+
+// setupAuthMiddleware guards the setup wizard's write routes. They are public
+// only while no credential is stored (a fresh install, or the login turned
+// off). Once one is, they need the same token or session as /api, whatever
+// SetupComplete says: a config that stops validating must not hand the
+// wizard (turn the login off, install a provider, restore an archive over
+// config.json and auth.json) to anyone who can reach the port.
+func (s *Server) setupAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := config.Get()
+		if !cfg.UseAuth || cfg.NeedsAuth() || s.requestAuthenticated(r, cfg) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		s.sendJSONError(w, "Authentication required: a login is already set up", http.StatusUnauthorized)
 	})
 }
 
@@ -94,6 +112,13 @@ func (s *Server) setupRedirectMiddleware(next http.Handler) http.Handler {
 			strings.HasPrefix(r.URL.Path, "/assets") ||
 			strings.HasPrefix(r.URL.Path, "/images") ||
 			r.URL.Path == "/version" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// With a login stored, the owner can still sign in and open the
+		// settings page to undo a config that stopped validating; both stay
+		// behind the login.
+		if (r.URL.Path == "/login" || r.URL.Path == "/settings") && cfg.UseAuth && !cfg.NeedsAuth() {
 			next.ServeHTTP(w, r)
 			return
 		}

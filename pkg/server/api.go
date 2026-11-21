@@ -446,6 +446,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		newConfig.Arrs = validArrs
 
+		// A config that fails Validate makes the install look new: every
+		// page goes to the setup wizard. Refuse it, with the reason.
+		if err := newConfig.Validate(); err != nil {
+			invalid = true
+			return err
+		}
+
 		// Update saves what the callback leaves in current. The save also
 		// applies defaults, so the restart comparison below sees a
 		// fully-normalized config on both sides.
