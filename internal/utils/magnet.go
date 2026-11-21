@@ -3,9 +3,11 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -71,11 +73,11 @@ func GetMagnetFromFile(file io.Reader, filePath string, rmTrackerUrls bool) (*Ma
 	return m, nil
 }
 
-func GetMagnetFromUrl(url string, rmTrackerUrls bool) (*Magnet, error) {
+func GetMagnetFromUrl(ctx context.Context, url string, rmTrackerUrls bool) (*Magnet, error) {
 	if strings.HasPrefix(url, "magnet:") {
 		return GetMagnetInfo(url, rmTrackerUrls)
 	} else if strings.HasPrefix(url, "http") {
-		return OpenMagnetHttpURL(url, rmTrackerUrls)
+		return OpenMagnetHttpURL(ctx, url, rmTrackerUrls)
 	}
 	return nil, fmt.Errorf("invalid url")
 }
@@ -124,20 +126,33 @@ func ReadMagnetFile(file io.Reader) string {
 	return ""
 }
 
-func OpenMagnetHttpURL(magnetLink string, rmTrackerUrls bool) (*Magnet, error) {
-	resp, err := http.Get(magnetLink)
-	if err != nil {
-		return nil, fmt.Errorf("error making GET request: %v", err)
+// OpenMagnetHttpURL fetches a .torrent from link. It ends when ctx is
+// cancelled or after two minutes, and refuses a body over 32 MiB.
+func OpenMagnetHttpURL(ctx context.Context, link string, rmTrackerUrls bool) (*Magnet, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer func(resp *http.Response) {
-		err := resp.Body.Close()
-		if err != nil {
-			return
-		}
-	}(resp) // Ensure the response is closed after the function ends
-	torrentData, err := io.ReadAll(resp.Body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %v", err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return nil, fmt.Errorf("error making GET request for %s: %w", RedactURL(link), err)
+	}
+	client := &http.Client{Timeout: downloadTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return nil, fmt.Errorf("error making GET request for %s: %w", RedactURL(link), err)
+	}
+	defer resp.Body.Close()
+	torrentData, err := readCapped(resp.Body, maxTorrentBytes, "torrent file")
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 	return GetMagnetFromBytes(torrentData, rmTrackerUrls)
 }

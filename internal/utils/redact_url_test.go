@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -36,14 +37,14 @@ func TestDownloadFileErrorHasNoKey(t *testing.T) {
 	}
 	addr := l.Addr().String()
 	l.Close() // nothing listens: connection refused
-	_, _, err = DownloadFile("http://" + addr + "/dl?apikey=SECRET&r=SECRET2")
+	_, _, err = DownloadFile(context.Background(), "http://"+addr+"/dl?apikey=SECRET&r=SECRET2")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
 	if strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("error leaks the key: %v", err)
 	}
-	_, _, err = DownloadFile("http://" + addr + "/dl?apikey=SECRET\x7f")
+	_, _, err = DownloadFile(context.Background(), "http://"+addr+"/dl?apikey=SECRET\x7f")
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("bad-URL error leaks the key: %v", err)
 	}

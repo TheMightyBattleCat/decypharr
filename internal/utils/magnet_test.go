@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -115,7 +116,7 @@ func TestGetMagnetFromUrl_MagnetLink_StripTrue(t *testing.T) {
 		t.Fatalf("Failed to load magnet URL from test file: %v", err)
 	}
 
-	magnet, err := GetMagnetFromUrl(magnetUrl, true)
+	magnet, err := GetMagnetFromUrl(context.Background(), magnetUrl, true)
 	if err != nil {
 		t.Fatalf("GetMagnetFromUrl failed: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestGetMagnetFromUrl_MagnetLink_StripFalse(t *testing.T) {
 		t.Fatalf("Failed to load magnet URL from test file: %v", err)
 	}
 
-	magnet, err := GetMagnetFromUrl(magnetUrl, false)
+	magnet, err := GetMagnetFromUrl(context.Background(), magnetUrl, false)
 	if err != nil {
 		t.Fatalf("GetMagnetFromUrl failed: %v", err)
 	}
@@ -163,7 +164,7 @@ func testMagnetFromHttpTorrent(t *testing.T, torrentPath string, rmTrackerUrls b
 	defer server.Close()
 
 	// Test the function with the mock server URL
-	magnet, err := GetMagnetFromUrl(server.URL, rmTrackerUrls)
+	magnet, err := GetMagnetFromUrl(context.Background(), server.URL, rmTrackerUrls)
 	if err != nil {
 		t.Fatalf("GetMagnetFromUrl failed: %v", err)
 	}

@@ -63,7 +63,7 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	if urls := r.FormValue("urls"); urls != "" {
 		for u := range strings.SplitSeq(urls, "\n") {
 			if trimmed := strings.TrimSpace(u); trimmed != "" {
-				magnet, err := utils.GetMagnetFromUrl(trimmed, rmTrackerUrls)
+				magnet, err := utils.GetMagnetFromUrl(r.Context(), trimmed, rmTrackerUrls)
 				if err != nil {
 					results = append(results, &manager.ImportRequest{Status: "error", Error: fmt.Sprintf("Failed to parse URL %s: %v", trimmed, err)})
 					continue
@@ -100,7 +100,7 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	if nzbURLs := r.FormValue("nzbURLs"); nzbURLs != "" {
 		for u := range strings.SplitSeq(nzbURLs, "\n") {
 			if trimmed := strings.TrimSpace(u); trimmed != "" {
-				filename, content, err := utils.DownloadFile(trimmed, utils.WithHeader("User-Agent", s.nzbUserAgent))
+				filename, content, err := utils.DownloadFile(r.Context(), trimmed, utils.UserAgentOption(config.Get().NZBUserAgent))
 				if err != nil {
 					results = append(results, &manager.ImportRequest{Status: "error", Error: fmt.Sprintf("Failed to fetch NZB from URL %s: %v", utils.RedactURL(trimmed), err)})
 					continue

@@ -18,7 +18,7 @@ import (
 
 // All torrent-related helpers goes here
 func (q *QBit) addMagnet(ctx context.Context, url string, arr *arr.Arr, debrid string, action config.DownloadAction, callbackURL string, rmTrackerUrls, skipMultiSeason bool) error {
-	magnet, err := utils.GetMagnetFromUrl(url, rmTrackerUrls)
+	magnet, err := utils.GetMagnetFromUrl(ctx, url, rmTrackerUrls)
 	if err != nil {
 		return customerror.NewError(fmt.Errorf("error parsing magnet link: %w", err), http.StatusBadRequest, "invalid_magnet", false, false).Permanent()
 	}

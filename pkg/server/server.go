@@ -59,15 +59,14 @@ type ContentResponse struct {
 }
 
 type Server struct {
-	router       *chi.Mux
-	logger       zerolog.Logger
-	manager      *manager.Manager
-	stats        *stats.Collector
-	cookie       *sessions.CookieStore
-	templates    *template.Template
-	nzbUserAgent string
-	urlBase      string
-	restartFunc  func()
+	router      *chi.Mux
+	logger      zerolog.Logger
+	manager     *manager.Manager
+	stats       *stats.Collector
+	cookie      *sessions.CookieStore
+	templates   *template.Template
+	urlBase     string
+	restartFunc func()
 
 	// shownArrs is the Arr list the last settings read returned and no save
 	// has used yet. See takeShownArrs.

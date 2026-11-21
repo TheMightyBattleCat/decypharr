@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,8 +128,36 @@ func WithHeader(key, value string) DownloadOptions {
 	}
 }
 
-func DownloadFile(link string, options ...DownloadOptions) (string, []byte, error) {
-	req, err := http.NewRequest("GET", link, nil)
+// Limits for fetching an NZB or .torrent from a URL. Package vars so tests
+// can shrink them.
+var (
+	downloadTimeout = 2 * time.Minute
+	maxNZBBytes     = int64(256 << 20)
+	maxTorrentBytes = int64(32 << 20)
+)
+
+// ErrDownloadTooLarge is returned when a fetched body exceeds its cap.
+var ErrDownloadTooLarge = errors.New("response too large")
+
+// readCapped reads r whole, failing once it holds more than limit bytes.
+func readCapped(r io.Reader, limit int64, what string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s larger than %d MiB: %w", what, limit>>20, ErrDownloadTooLarge)
+	}
+	return data, nil
+}
+
+// DownloadFile fetches an NZB from link. It ends when ctx is cancelled or
+// after two minutes, and refuses a body over 256 MiB.
+func DownloadFile(ctx context.Context, link string, options ...DownloadOptions) (string, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", link, nil)
 	if err != nil {
 		// The parse error quotes the whole URL, key included.
 		var uerr *url.Error
@@ -143,7 +172,7 @@ func DownloadFile(link string, options ...DownloadOptions) (string, []byte, erro
 		opt(req)
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: downloadTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		// client.Do wraps the failure in a *url.Error that quotes the full
@@ -162,7 +191,7 @@ func DownloadFile(link string, options ...DownloadOptions) (string, []byte, erro
 
 	filename := getFilenameFromResponse(resp, link)
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readCapped(resp.Body, maxNZBBytes, "NZB")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -335,4 +364,13 @@ func RedactURL(raw string) string {
 		u.RawQuery = strings.Join(parts, "&")
 	}
 	return u.String()
+}
+
+// UserAgentOption sends ua as the User-Agent; it does nothing when ua is empty.
+func UserAgentOption(ua string) DownloadOptions {
+	return func(r *http.Request) {
+		if ua != "" {
+			r.Header.Set("User-Agent", ua)
+		}
+	}
 }
