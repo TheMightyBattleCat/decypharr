@@ -66,9 +66,35 @@ type bodyReader struct {
 	reads uint8
 }
 
+// respTerminator is the multiline reply terminator "\r\n.\r\n", packed the
+// way Connection.bodyTail packs the newest bytes (last byte lowest).
+const (
+	respTerminator     = 0x0d0a2e0d0a
+	respTerminatorMask = 1<<40 - 1
+)
+
+// errBodyNotConsumed marks a body the decoder did not read to its end: it
+// panicked, or it stopped consuming before the terminator. It wraps
+// ErrDataCorruption, so failover treats the copy as corrupt and asks the
+// next provider. Unlike rapidyenc's own corrupt-article errors, part of the
+// reply is still in the decoder's buffer, so requestBody closes the
+// connection.
+var errBodyNotConsumed = fmt.Errorf("yEnc decoder did not read the reply to its end: %w", nntpyenc.ErrDataCorruption)
+
 func (b *bodyReader) Read(p []byte) (int, error) {
+	if b.c.bodyTail&respTerminatorMask == respTerminator {
+		// The reply's terminator has been handed over and the decoder
+		// still wants more: it stopped consuming (rapidyenc does this in
+		// uuencode mode past its first read window). The server has
+		// nothing more to send, so a read would only wait out the idle
+		// deadline.
+		return 0, fmt.Errorf("%w: it asked for more after the terminator", errBodyNotConsumed)
+	}
 	n, err := b.c.reader.Read(p)
 	if n > 0 {
+		for _, ch := range p[max(0, n-5):n] {
+			b.c.bodyTail = b.c.bodyTail<<8 | uint64(ch)
+		}
 		if b.c.firstReadNS == 0 {
 			b.c.firstReadNS = nanotimeNow()
 		}
@@ -136,7 +162,8 @@ func (c *Connection) nextBodyWithIdleDeadline(idle time.Duration) (nntpyenc.Body
 		}()
 	}
 
-	res, err := c.decoder().Next()
+	c.bodyTail = 0
+	res, err := c.decodeNext()
 	if err != nil && !nntpyenc.IsCorruptArticle(err) {
 		// The janitor sets idleNS to 0 after closing a stalled conn, but
 		// the race-free signal is "did we make progress within the
@@ -146,6 +173,19 @@ func (c *Connection) nextBodyWithIdleDeadline(idle time.Duration) (nntpyenc.Body
 		}
 	}
 	return res, err
+}
+
+// decodeNext runs the decoder on one reply. A panic inside it (rapidyenc's
+// format sniffing slices out of range on some lines before "=ybegin") is
+// returned as errBodyNotConsumed: the article is corrupt and the rest of
+// the reply is still buffered.
+func (c *Connection) decodeNext() (res nntpyenc.BodyResult, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			res, err = nntpyenc.BodyResult{}, fmt.Errorf("%w: decoder panic: %v", errBodyNotConsumed, p)
+		}
+	}()
+	return c.decoder().Next()
 }
 
 // nanotimeNow returns the monotonic clock in nanoseconds. Uses time.Now's
@@ -254,6 +294,10 @@ type Connection struct {
 	// buffer. Safe only because commands and responses strictly alternate:
 	// the decoder never reads past the current response's terminator.
 	bodyDec *nntpyenc.BodyDecoder
+	// bodyTail holds the last bytes bodyReader handed the decoder for the
+	// current reply, newest in the lowest byte; nextBodyWithIdleDeadline
+	// clears it before each reply.
+	bodyTail uint64
 
 	// Body-decode idle tracking. lastProgressNS is refreshed by bodyReader
 	// while reads make progress; idleNS is armed by nextBodyWithIdleDeadline
@@ -575,6 +619,12 @@ func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc
 	if err != nil {
 		putBodyBuf(res.Data)
 		res.Data = nil
+		if errors.Is(err, errBodyNotConsumed) {
+			// Corrupt, but part of the reply is still in the decoder's
+			// buffer: the connection can't serve another command.
+			_ = c.Close()
+			return res, NewYencDecodeError(fmt.Errorf("streaming yenc decode failed: %w", err))
+		}
 		if !nntpyenc.IsCorruptArticle(err) {
 			// Not one of the checks run at the terminator: the response
 			// may be half read.
@@ -599,6 +649,14 @@ func (c *Connection) requestBody(messageID string, idle time.Duration) (nntpyenc
 		putBodyBuf(res.Data)
 		res.Data = nil
 		return res, c.outOfStep("BODY", messageID, res.Message)
+	}
+	if !res.Yenc {
+		// No "=ybegin": rapidyenc decoded the body as uuencode, which it
+		// checks for neither size nor CRC. The reply was read to its end,
+		// but its bytes can't be trusted as the article.
+		putBodyBuf(res.Data)
+		res.Data = nil
+		return res, NewYencDecodeError(fmt.Errorf("article body has no yEnc header: %w", nntpyenc.ErrDataMissing))
 	}
 	if c.timing != nil && c.firstReadNS > 0 {
 		doneNS := nanotimeNow()

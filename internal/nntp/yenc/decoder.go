@@ -44,9 +44,11 @@ func (m DecoderMeta) End() int64 {
 }
 
 // Decode errors surfaced by Next, re-exported so callers need not import
-// rapidyenc. All three fire only once the whole response, terminator
-// included, has been read, so the connection is at a clean response
-// boundary.
+// rapidyenc. When rapidyenc itself returns one of these, the whole response,
+// terminator included, has been read, so the connection is at a clean
+// response boundary. The connection layer also wraps ErrDataCorruption for
+// faults that leave part of the response unread (a decoder panic, a
+// decoder that stops consuming); it closes the connection for those.
 var (
 	ErrDataMissing    = rapidyenc.ErrDataMissing
 	ErrDataCorruption = rapidyenc.ErrDataCorruption
@@ -80,6 +82,10 @@ type BodyResult struct {
 	// response. StatusCode 0 means the status line was never read.
 	StatusCode int
 	Message    string
+	// Yenc is true when the body carried a "=ybegin" header and was decoded
+	// as yEnc, the only format whose size and CRC are checked. rapidyenc
+	// also decodes uuencode, with no such checks.
+	Yenc bool
 }
 
 // BodyDecoder decodes complete NNTP responses (status line included) from a
@@ -116,6 +122,7 @@ func (d *BodyDecoder) Next() (BodyResult, error) {
 		Data:       resp.Data,
 		StatusCode: m.StatusCode,
 		Message:    m.Message,
+		Yenc:       m.Format == rapidyenc.FormatYenc,
 		Meta: DecoderMeta{
 			FileName:   m.FileName,
 			FileSize:   m.FileSize,

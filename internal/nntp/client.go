@@ -909,22 +909,21 @@ func (c *Client) ExecuteOnce(ctx context.Context, fn func(conn *Connection) erro
 		return nil
 	}
 
+	// Pool the connection again only after a clean single-line status
+	// reply about the article. Anything else (a dead or refusing session,
+	// a corrupt body, a recovered panic, an error from fn itself) may have
+	// left part of a reply unread, and the next user would read it.
 	var nntpErr *Error
 	if errors.As(execErr, &nntpErr) {
 		switch nntpErr.Type {
-		case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
-			// Potentially dead connection - don't return it to the pool.
-			c.release(conn)
-		case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
-			// A refusing session: its state is unknown, don't pool it.
-			c.release(conn)
-			c.noteRefusal(provider, execErr)
-		default:
+		case ErrorTypeArticleNotFound, ErrorTypeGroupNotFound:
 			c.returnOrReleaseConn(conn, provider)
+			return execErr
+		case ErrorTypeAuthentication, ErrorTypePermissionDenied, ErrorTypeProtocol, ErrorTypeInvalidCommand, ErrorTypeUnknown:
+			c.noteRefusal(provider, execErr)
 		}
-	} else {
-		c.returnOrReleaseConn(conn, provider)
 	}
+	c.release(conn)
 	return execErr
 }
 
