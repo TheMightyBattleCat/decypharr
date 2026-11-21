@@ -182,6 +182,9 @@ func TestInternalPathRefusedWithoutToken(t *testing.T) {
 func TestInternalPathIsReadOnlyAndUnlisted(t *testing.T) {
 	srv, m := newInternalServer(t)
 	tok := bearer(m.InternalToken())
+	// Login off, so the handler's own method check answers, not the login's
+	// refusal of a write (TestWebDAVInternalTokenCannotWrite covers that).
+	config.Get().UseAuth = false
 
 	for _, method := range []string{http.MethodDelete, "PROPFIND", "MOVE", http.MethodPut} {
 		resp, _ := doReq(t, method, srv.URL+"/__internal__/"+splitNZBID+"/"+splitFile, tok)

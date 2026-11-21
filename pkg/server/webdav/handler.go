@@ -201,9 +201,9 @@ func (h *Handler) commonMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("DAV", "1, 2")
 		w.Header().Set("Allow", "OPTIONS, PROPFIND GET, HEAD, POST, PUT, DELETE, MKCOL, PROPPATCH, COPY, MOVE, LOCK, UNLOCK")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, PROPFIND, HEAD, POST, PUT, DELETE, MKCOL, PROPPATCH, COPY, MOVE, LOCK, UNLOCK")
-		w.Header().Set("Access-Control-Allow-Headers", "Depth, Content-Type, Authorization")
+		// No Access-Control-* headers: no WebDAV client here (rclone, Plex,
+		// ffprobe, the Arrs) is a browser page, and allowing every origin let
+		// any web site list the library and send deletes.
 
 		next.ServeHTTP(w, r)
 	})
@@ -213,14 +213,24 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read the auth toggles live so changes apply without a restart.
 		cfg := config.Get()
-		if !cfg.UseAuth || !cfg.EnableWebdavAuth {
+		if !cfg.UseAuth {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		if h.isInternalBearer(r) {
-			next.ServeHTTP(w, r)
-			return
+		// Reads need credentials only when WebDAV auth is on as well. A
+		// request that can change something (DELETE, MOVE, COPY, anything
+		// else) needs the UI credentials whenever the login is on.
+		if isReadMethod(r.Method) {
+			if !cfg.EnableWebdavAuth {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// The internal token is for our own ffprobe reads only, and it
+			// shows on ffprobe's command line: GET and HEAD, nothing else.
+			if (r.Method == http.MethodGet || r.Method == http.MethodHead) && h.isInternalBearer(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 		}
 
 		username, password, ok := r.BasicAuth()
@@ -231,6 +241,15 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isReadMethod reports whether a WebDAV method only reads.
+func isReadMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, PROPFIND:
+		return true
+	}
+	return false
 }
 
 // isInternalBearer accepts the manager's random, in-memory, per-process token
