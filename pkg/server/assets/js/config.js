@@ -1668,6 +1668,7 @@ class ConfigManager {
             const maxConnectionsInput = getField('max_connections');
             const priorityInput = getField('priority');
             const backupInput = getField('backup');
+            const tlsSkipVerifyInput = getField('tls_skip_verify');
 
             if (!hostInput || !portInput || !usernameInput || !passwordInput || !backboneInput || !sslInput || !maxConnectionsInput || !priorityInput) {
                 return;
@@ -1686,6 +1687,7 @@ class ConfigManager {
                 password: passwordInput.value,
                 backbone: backboneInput.value.trim(),
                 ssl: sslInput.checked,
+                tls_skip_verify: tlsSkipVerifyInput ? tlsSkipVerifyInput.checked : false,
                 max_connections: parseInt(maxConnectionsInput.value) || 100,
                 priority: parseInt(priorityInput.value) || 0,
                 // Backup is optional and defaults false — old form versions
@@ -2749,6 +2751,13 @@ class ConfigManager {
                                name="usenet.providers[${index}].ssl"
                                id="usenet_provider_${index}_ssl">
                         <span class="text-sm">Use SSL</span>
+                    </label>
+                    <label class="flex items-center gap-2 cursor-pointer"
+                           title="Accept any TLS certificate from this provider. Only for a provider named by IP address or by a host name its certificate does not cover: anyone on the network path could then read the login and serve made-up articles.">
+                        <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
+                               name="usenet.providers[${index}].tls_skip_verify"
+                               id="usenet_provider_${index}_tls_skip_verify">
+                        <span class="text-sm">Skip certificate check</span>
                     </label>
                     <label class="flex items-center gap-2 cursor-pointer"
                            title="Only used when every non-backup provider is excluded (article not found, connection errors). Not used just because primary pools are busy — requests wait for a primary slot instead. Use this for block providers you only want to bill for completion.">

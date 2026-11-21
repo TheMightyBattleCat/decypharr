@@ -25,6 +25,9 @@ type UsenetProvider struct {
 	// other Usenet clients implement, and prevents block providers from
 	// being billed for articles the unlimited could have served.
 	Backup bool `json:"backup,omitempty"`
+	// TLSSkipVerify accepts any certificate on an SSL connection. Off by
+	// default: the certificate must verify for Host, or the dial fails.
+	TLSSkipVerify bool `json:"tls_skip_verify,omitempty"`
 
 	// Quota is the download cap for this provider over QuotaPeriod, as a human
 	// size like "500GB". Empty or "0" = unlimited. When the cap is reached the

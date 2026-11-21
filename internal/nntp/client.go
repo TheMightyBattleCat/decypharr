@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,9 @@ type ProviderPool struct {
 	stat        statLatency    // measured STAT latency, for BatchStat routing (stat_routing.go)
 	body        bodyThroughput // measured body download rate, for connection order (body_routing.go)
 	timing      providerTiming // per-article phase durations (fetch_timing.go)
+	// certWarned is set once a dial to this provider has failed its
+	// certificate check and the hint to set tls_skip_verify was logged.
+	certWarned atomic.Bool
 	// foreignBodies counts BODY replies a caller refused as another upload's
 	// article (NewForeignArticleError). Observability only: the refusal is a
 	// 430 like any other, and nothing routes by this count.
@@ -319,6 +323,13 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	cm.bw = newBandwidthTracker(providers, cm.logger)
 	cm.statHomes = cm.statHomePools()
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
+
+	for _, p := range providers {
+		if p.SSL && p.TLSSkipVerify {
+			cm.logger.Warn().Str("host", p.Host).
+				Msg("TLS certificate check is off for this provider (tls_skip_verify): anyone on the network path can read its login and serve made-up articles")
+		}
+	}
 
 	// Start background reaper
 	go cm.reaper()
@@ -1324,6 +1335,24 @@ func (c *Client) tuneTCP(tcpConn *net.TCPConn) {
 	}
 }
 
+// tlsRootCAs is the CA pool SSL provider certificates are verified against;
+// nil means the system pool. Tests set it to trust their own CA.
+var tlsRootCAs *x509.CertPool
+
+// warnCertFailure logs, once per provider, that a dial failed because the
+// provider's certificate did not verify, and how to turn the check off.
+func (c *Client) warnCertFailure(provider config.UsenetProvider, err error) {
+	var certErr *tls.CertificateVerificationError
+	if !errors.As(err, &certErr) {
+		return
+	}
+	if pp, ok := c.pools[provider.Host]; ok && !pp.certWarned.CompareAndSwap(false, true) {
+		return
+	}
+	c.logger.Error().Err(err).Str("host", provider.Host).
+		Msg("Provider's TLS certificate did not verify for this host name: use the host name the certificate names, or tick \"Skip certificate check\" for this provider (tls_skip_verify) if you trust the network")
+}
+
 // createConnection creates a new NNTP connection to a provider
 func (c *Client) createConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, error) {
 	address := fmt.Sprintf("%s:%d", provider.Host, provider.Port)
@@ -1342,7 +1371,8 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		// Dial with TLS directly if possible, or Dial then Wrap
 		tlsConfig := &tls.Config{
 			ServerName:         provider.Host,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: provider.TLSSkipVerify,
+			RootCAs:            tlsRootCAs,
 			MinVersion:         tls.VersionTLS12,
 		}
 		// Use tls.Dialer for simpler timeout handling
@@ -1356,6 +1386,7 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 	}
 
 	if err != nil {
+		c.warnCertFailure(provider, err)
 		return nil, NewConnectionError(fmt.Errorf("dial %s: %w", address, err))
 	}
 
